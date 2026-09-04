@@ -124,6 +124,120 @@ pub const ErrorCode = enum(u16) {
     _,
 };
 
+/// Control-frame bodies.
+///
+/// The hot path -- `output`, `input`, `snapshot_chunk` -- carries raw bytes with
+/// no body encoding at all, which is the whole point (see docs/PROTOCOL.md C1).
+/// Control frames are rare, so they use JSON: it costs nothing where it is used
+/// and it keeps the two implementations of this protocol honest with each other.
+pub const body = struct {
+    pub const Hello = struct {
+        version: u16 = version,
+        client: []const u8 = "unknown",
+    };
+
+    pub const Welcome = struct {
+        version: u16 = version,
+        server: []const u8,
+    };
+
+    pub const Create = struct {
+        session_name: []const u8 = "default",
+        name: []const u8 = "",
+        argv: []const []const u8 = &.{},
+        cwd: ?[]const u8 = null,
+        cols: u16 = 80,
+        rows: u16 = 24,
+    };
+
+    pub const Created = struct {
+        terminal: u64,
+        session: u64,
+    };
+
+    pub const TerminalInfo = struct {
+        id: u64,
+        session: u64,
+        name: []const u8,
+        command: []const u8,
+        cwd: []const u8,
+        cols: u16,
+        rows: u16,
+        residency: []const u8,
+        attached: u32,
+        pty_read_idle_ns: u64,
+        exit_code: ?i32 = null,
+    };
+
+    pub const SessionInfo = struct {
+        id: u64,
+        name: []const u8,
+        terminals: []const u64,
+    };
+
+    pub const SessionList = struct {
+        sessions: []const SessionInfo,
+        terminals: []const TerminalInfo,
+    };
+
+    pub const Attach = struct {
+        cols: u16 = 80,
+        rows: u16 = 24,
+    };
+
+    pub const Resize = struct {
+        cols: u16,
+        rows: u16,
+    };
+
+    pub const Kill = struct {
+        signal: i32 = 15,
+    };
+
+    pub const Exited = struct {
+        code: i32,
+    };
+
+    pub const Err = struct {
+        code: u16,
+        message: []const u8,
+    };
+
+    pub const SnapshotBegin = struct {
+        format: u16 = 1,
+    };
+
+    pub fn encode(alloc: std.mem.Allocator, value: anytype) ![]u8 {
+        return std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    }
+
+    pub fn decode(comptime T: type, alloc: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(T) {
+        return std.json.parseFromSlice(T, alloc, bytes, .{ .allocate = .alloc_always });
+    }
+};
+
+test "control bodies round trip through json" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const want: body.Create = .{
+        .session_name = "work",
+        .name = "build",
+        .argv = &.{ "zsh", "-l" },
+        .cols = 120,
+        .rows = 40,
+    };
+    const bytes = try body.encode(alloc, want);
+    defer alloc.free(bytes);
+
+    const got = try body.decode(body.Create, alloc, bytes);
+    defer got.deinit();
+    try testing.expectEqualStrings("work", got.value.session_name);
+    try testing.expectEqualStrings("build", got.value.name);
+    try testing.expectEqual(@as(usize, 2), got.value.argv.len);
+    try testing.expectEqual(@as(u16, 120), got.value.cols);
+}
+
 test "header round trip" {
     const testing = std.testing;
     var buf: [header_len]u8 = undefined;

@@ -5,7 +5,9 @@
 
 const std = @import("std");
 const Io = std.Io;
+const posix = std.posix;
 const illogical = @import("illogical");
+const Server = @import("Server.zig");
 
 const usage =
     \\illogicald — the illogical session server
@@ -14,14 +16,15 @@ const usage =
     \\
     \\Options:
     \\  --socket <path>   Control socket (default: $XDG_STATE_HOME/illogical/server.sock)
-    \\  --park-after <s>  Idle seconds before a session is parked (default: 60)
-    \\  --foreground      Do not daemonize
     \\  --version         Print version and exit
     \\  --help            Print this help and exit
     \\
 ;
 
+var global_server: ?*Server = null;
+
 pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
@@ -29,7 +32,10 @@ pub fn main(init: std.process.Init) !void {
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const out = &stdout_file_writer.interface;
 
-    for (args[1..]) |arg| {
+    var socket_path: ?[]const u8 = null;
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try out.writeAll(usage);
             return out.flush();
@@ -38,27 +44,60 @@ pub fn main(init: std.process.Init) !void {
             try out.print("illogicald {s}\n", .{illogical.version});
             return out.flush();
         }
+        if (std.mem.eql(u8, arg, "--socket")) {
+            i += 1;
+            if (i >= args.len) {
+                try out.writeAll("error: --socket needs a path\n");
+                try out.flush();
+                return error.InvalidArgs;
+            }
+            socket_path = args[i];
+            continue;
+        }
+        try out.print("error: unknown option '{s}'\n", .{arg});
+        try out.flush();
+        return error.InvalidArgs;
     }
 
-    try out.print(
-        \\illogicald {s}
-        \\
-        \\Not implemented yet. See docs/ROADMAP.md — M1 is the session server:
-        \\  * libxev loop over PTY masters and the control socket
-        \\  * per-session libghostty-vt terminal fed by raw PTY output
-        \\  * snapshot-on-idle parking (docs/PARKING.md)
-        \\  * the attach handshake (docs/PROTOCOL.md)
-        \\
-        \\Protocol version {d}, park threshold {d}s.
-        \\
-    , .{
-        illogical.version,
-        illogical.protocol.version,
-        illogical.park.default_park_after_ns / std.time.ns_per_s,
-    });
+    const path = if (socket_path) |p|
+        try arena.dupe(u8, p)
+    else
+        try Server.defaultSocketPath(arena);
+
+    const server = try Server.init(gpa, init.io, path);
+    defer server.deinit();
+    global_server = server;
+
+    // A client disconnecting mid-write must not take the daemon down.
+    const ignore: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &ignore, null);
+
+    const shutdown: posix.Sigaction = .{
+        .handler = .{ .handler = onSignal },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.INT, &shutdown, null);
+    posix.sigaction(posix.SIG.TERM, &shutdown, null);
+
+    try server.listen();
+    try out.print("illogicald {s} listening on {s}\n", .{ illogical.version, path });
     try out.flush();
+
+    try server.run();
+}
+
+fn onSignal(_: std.c.SIG) callconv(.c) void {
+    if (global_server) |s| s.stop();
 }
 
 test {
     _ = illogical;
+    _ = Server;
+    _ = @import("Terminal.zig");
+    _ = @import("Client.zig");
 }

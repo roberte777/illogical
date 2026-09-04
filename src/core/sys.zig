@@ -1,0 +1,274 @@
+//! The libc surface the daemon needs.
+//!
+//! Zig 0.16 removed most of `std.posix` in favour of `std.Io`, but the server's
+//! hot path is deliberately *not* evented (see docs/ARCHITECTURE.md): a hot PTY
+//! owns a thread blocked on `read()`. So we declare what we need directly. One
+//! module, explicit, and immune to further stdlib churn.
+
+const std = @import("std");
+const builtin = @import("builtin");
+
+pub const fd_t = std.c.fd_t;
+pub const pid_t = std.c.pid_t;
+pub const socklen_t = std.c.socklen_t;
+pub const sockaddr = std.c.sockaddr;
+
+pub const AF_UNIX: c_uint = 1;
+pub const SOCK_STREAM: c_uint = if (builtin.os.tag == .linux) 1 else 1;
+pub const F_GETFD: c_int = 1;
+pub const F_SETFD: c_int = 2;
+pub const FD_CLOEXEC: c_int = 1;
+
+extern "c" fn socket(domain: c_uint, sock_type: c_uint, protocol: c_uint) c_int;
+extern "c" fn bind(sockfd: fd_t, addr: *const sockaddr, len: socklen_t) c_int;
+extern "c" fn listen(sockfd: fd_t, backlog: c_uint) c_int;
+extern "c" fn accept(sockfd: fd_t, addr: ?*sockaddr, len: ?*socklen_t) c_int;
+extern "c" fn connect(sockfd: fd_t, addr: *const sockaddr, len: socklen_t) c_int;
+extern "c" fn close(fd: fd_t) c_int;
+extern "c" fn read(fd: fd_t, buf: [*]u8, n: usize) isize;
+extern "c" fn write(fd: fd_t, buf: [*]const u8, n: usize) isize;
+extern "c" fn fork() pid_t;
+extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn waitpid(pid: pid_t, status: ?*c_int, options: c_int) pid_t;
+extern "c" fn dup2(old: fd_t, new: fd_t) c_int;
+extern "c" fn chdir(path: [*:0]const u8) c_int;
+extern "c" fn setsid() pid_t;
+extern "c" fn kill(pid: pid_t, sig: c_int) c_int;
+extern "c" fn _exit(code: c_int) noreturn;
+extern "c" fn fcntl(fd: fd_t, cmd: c_int, ...) c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+pub const Error = error{
+    SocketFailed,
+    BindFailed,
+    ListenFailed,
+    AcceptFailed,
+    ConnectFailed,
+    ReadFailed,
+    WriteFailed,
+    ForkFailed,
+    NameTooLong,
+};
+
+pub fn errno() c_int {
+    return std.c._errno().*;
+}
+
+pub const STDIN = 0;
+pub const STDOUT = 1;
+pub const STDERR = 2;
+
+pub fn closeFd(fd: fd_t) void {
+    _ = close(fd);
+}
+
+pub fn readFd(fd: fd_t, buf: []u8) Error!usize {
+    while (true) {
+        const n = read(fd, buf.ptr, buf.len);
+        if (n >= 0) return @intCast(n);
+        // EINTR: a signal arrived, not a failure.
+        if (errno() == 4) continue;
+        return error.ReadFailed;
+    }
+}
+
+pub fn writeFd(fd: fd_t, buf: []const u8) Error!usize {
+    while (true) {
+        const n = write(fd, buf.ptr, buf.len);
+        if (n >= 0) return @intCast(n);
+        if (errno() == 4) continue;
+        return error.WriteFailed;
+    }
+}
+
+pub fn writeAll(fd: fd_t, bytes: []const u8) Error!void {
+    var off: usize = 0;
+    while (off < bytes.len) off += try writeFd(fd, bytes[off..]);
+}
+
+/// Fill `buf` completely or fail. Returns error.ReadFailed at end of stream.
+pub fn readAll(fd: fd_t, buf: []u8) Error!void {
+    var off: usize = 0;
+    while (off < buf.len) {
+        const n = try readFd(fd, buf[off..]);
+        if (n == 0) return error.ReadFailed;
+        off += n;
+    }
+}
+
+pub fn setCloexec(fd: fd_t) void {
+    const flags = fcntl(fd, F_GETFD);
+    if (flags == -1) return;
+    _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+// -- unix sockets ----------------------------------------------------------
+
+pub const SockAddrUn = std.c.sockaddr.un;
+
+pub fn unixAddr(path: []const u8) Error!SockAddrUn {
+    var addr: SockAddrUn = .{ .path = @splat(0) };
+    if (path.len >= addr.path.len) return error.NameTooLong;
+    @memcpy(addr.path[0..path.len], path);
+    return addr;
+}
+
+pub fn unixSocket() Error!fd_t {
+    const fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return error.SocketFailed;
+    setCloexec(fd);
+    return fd;
+}
+
+pub fn bindUnix(fd: fd_t, addr: *const SockAddrUn) Error!void {
+    if (bind(fd, @ptrCast(addr), @sizeOf(SockAddrUn)) < 0) return error.BindFailed;
+}
+
+pub fn listenFd(fd: fd_t, backlog: u31) Error!void {
+    if (listen(fd, backlog) < 0) return error.ListenFailed;
+}
+
+pub fn acceptFd(fd: fd_t) Error!fd_t {
+    while (true) {
+        const client = accept(fd, null, null);
+        if (client >= 0) {
+            setCloexec(client);
+            return client;
+        }
+        if (errno() == 4) continue;
+        return error.AcceptFailed;
+    }
+}
+
+pub fn connectUnix(path: []const u8) Error!fd_t {
+    const addr = try unixAddr(path);
+    const fd = try unixSocket();
+    errdefer closeFd(fd);
+    if (connect(fd, @ptrCast(&addr), @sizeOf(SockAddrUn)) < 0) return error.ConnectFailed;
+    return fd;
+}
+
+pub fn unlinkPath(path: [*:0]const u8) void {
+    _ = unlink(path);
+}
+
+// -- time ------------------------------------------------------------------
+
+const CLOCK_MONOTONIC: c_int = if (builtin.os.tag == .linux) 1 else 6;
+
+extern "c" fn clock_gettime(clk: c_int, tp: *std.c.timespec) c_int;
+extern "c" fn nanosleep(req: *const std.c.timespec, rem: ?*std.c.timespec) c_int;
+
+/// Sleep for `ns` nanoseconds. `std.Thread.sleep` is gone in Zig 0.16.
+pub fn sleepNs(ns: u64) void {
+    var req: std.c.timespec = .{
+        .sec = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    while (nanosleep(&req, &req) != 0) {
+        if (errno() != 4) break;
+    }
+}
+
+/// Monotonic nanoseconds. Used for the PTY-read idle clock that drives parking,
+/// so it must never go backwards.
+pub fn monotonicNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    const sec: u64 = @intCast(ts.sec);
+    const nsec: u64 = @intCast(ts.nsec);
+    return sec * std.time.ns_per_s + nsec;
+}
+
+// -- processes -------------------------------------------------------------
+
+pub fn forkProcess() Error!pid_t {
+    const pid = fork();
+    if (pid < 0) return error.ForkFailed;
+    return pid;
+}
+
+pub fn exec(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) void {
+    _ = execvp(file, argv);
+}
+
+pub fn exitProcess(code: u8) noreturn {
+    _exit(code);
+}
+
+pub fn dup2Fd(old: fd_t, new: fd_t) void {
+    _ = dup2(old, new);
+}
+
+pub fn chdirPath(path: [*:0]const u8) void {
+    _ = chdir(path);
+}
+
+pub fn newSession() bool {
+    return setsid() >= 0;
+}
+
+pub fn signal(pid: pid_t, sig: c_int) void {
+    _ = kill(pid, sig);
+}
+
+/// Wait for `pid` and return its exit code.
+pub fn wait(pid: pid_t) i32 {
+    var status: c_int = 0;
+    _ = waitpid(pid, &status, 0);
+    // WIFEXITED / WEXITSTATUS
+    if (status & 0x7f == 0) return @intCast((status >> 8) & 0xff);
+    // Killed by a signal: report it the way a shell does.
+    return 128 + @as(i32, @intCast(status & 0x7f));
+}
+
+/// Set an environment variable for the current process. Used in the forked
+/// child between `fork` and `exec`, where allocation is not allowed.
+pub fn setenvVar(name: [*:0]const u8, value: [*:0]const u8) void {
+    _ = setenv(name, value, 1);
+}
+
+pub fn getenv(name: [*:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(name) orelse return null;
+    return std.mem.span(value);
+}
+
+test "monotonic clock advances" {
+    const a = monotonicNs();
+    var spin: u64 = 0;
+    while (spin < 100_000) : (spin += 1) std.mem.doNotOptimizeAway(spin);
+    const b = monotonicNs();
+    try std.testing.expect(b >= a);
+}
+
+test "unix address rejects an over-long path" {
+    const testing = std.testing;
+    const long = "x" ** 200;
+    try testing.expectError(error.NameTooLong, unixAddr(long));
+    const ok = try unixAddr("/tmp/illogical.sock");
+    try testing.expectEqualStrings("/tmp/illogical.sock", std.mem.sliceTo(&ok.path, 0));
+}
+
+test "socketpair round trip over a unix socket" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&buf, "/tmp/illogical-test-{d}.sock", .{std.c.getpid()});
+    defer unlinkPath(path.ptr);
+
+    const addr = try unixAddr(path);
+    const server = try unixSocket();
+    defer closeFd(server);
+    try bindUnix(server, &addr);
+    try listenFd(server, 1);
+
+    const client = try connectUnix(path);
+    defer closeFd(client);
+    const accepted = try acceptFd(server);
+    defer closeFd(accepted);
+
+    try writeAll(client, "hello");
+    var got: [5]u8 = undefined;
+    try readAll(accepted, &got);
+    try testing.expectEqualStrings("hello", &got);
+}
