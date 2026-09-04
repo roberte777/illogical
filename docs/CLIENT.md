@@ -76,9 +76,17 @@ full) and per-row flags. `update` sets them and never clears them. Call
 `ghostty_render_state_clean()` after a successful frame, and remember that
 clearing one layer does not clear the other.
 
-**Glyphs.** CoreText rasterization into a Metal texture atlas. Needs ligatures,
-box drawing, powerline glyphs, emoji, and correct wide-character advance. This is
-the single largest remaining piece of work in the project.
+**Glyphs.** Today the renderer is CoreText drawing run-length spans of identical
+style straight into the view: background runs first, then text. It is correct —
+it draws exactly what libghostty's render state reports, including palette and
+true colour, bold, italic, faint, underline, strikethrough, inverse and
+selection — and it is fast enough to be pleasant.
+
+It is not the finish line. Metal with a rasterized glyph atlas is, and the swap
+is contained: `TerminalSurfaceView.draw(_:)` consumes a plain `Grid` value type
+that the engine already produces under lock, so the renderer can be replaced
+without touching the engine, the transport, or the chrome. Ligatures, box
+drawing, powerline glyphs and wide-character advance land with it.
 
 ## Scrollback is native, and sometimes absent
 

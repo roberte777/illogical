@@ -1,55 +1,166 @@
 //  SessionStore.swift
-//  Connection state for one or more hosts.
+//  Connection state for a host: its sessions, its terminals, and which one is
+//  in front.
 //
-//  SCAFFOLD: the summaries below are placeholders so the shell is navigable.
-//  M2 replaces `connect()` with a real transport (unix socket locally, an
-//  `ssh <host> illogicald --stdio` pipe remotely) speaking IllogicalProtocol.
+//  The control connection is separate from the per-terminal connections. It
+//  carries list/create/kill only; terminal traffic never touches it.
 
+import AppKit
 import Foundation
 import IllogicalProtocol
 import Observation
 
-@Observable
 @MainActor
+@Observable
 final class SessionStore {
     var host: ServerHost = .local(socketPath: SessionStore.defaultSocketPath)
+    var sessions: [SessionSummary] = []
     var terminals: [TerminalSummary] = []
     var selectedID: TerminalSummary.ID?
+    var connectionError: String?
+
+    /// Live controllers, one per open terminal.
+    private(set) var controllers: [UInt64: TerminalController] = [:]
+
+    private var control: Connection?
+    private var pump: Task<Void, Never>?
 
     var selected: TerminalSummary? {
         guard let selectedID else { return nil }
         return terminals.first { $0.id == selectedID }
     }
 
+    var selectedSession: SessionSummary? {
+        guard let selected else { return sessions.first }
+        return sessions.first { $0.id == selected.session }
+    }
+
+    /// Terminals in the session that is currently in front. These are the tabs.
+    var visibleTerminals: [TerminalSummary] {
+        guard let session = selectedSession else { return terminals }
+        return terminals.filter { $0.session == session.id }
+    }
+
     static var defaultSocketPath: String {
+        if let override = ProcessInfo.processInfo.environment["ILLOGICAL_SOCK"] {
+            return override
+        }
         let state =
             ProcessInfo.processInfo.environment["XDG_STATE_HOME"]
-            ?? FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: ".local/state").path
+            ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: ".local/state")
+            .path
         return state + "/illogical/server.sock"
     }
 
+    var socketPath: String {
+        switch host {
+        case .local(let path): path
+        case .ssh: SessionStore.defaultSocketPath
+        }
+    }
+
+    // MARK: - Control connection
+
     func connect() {
-        // TODO(M2): open the transport, send `hello`, populate from `welcome`.
-        terminals = SessionStore.placeholders
-        selectedID = terminals.first?.id
+        Trace.log("connecting to \(socketPath)")
+        do {
+            let connection = try Connection(socketPath: socketPath)
+            control = connection
+            connection.start()
+            try connection.send(.hello, json: HelloBody(client: "Illogical.app"))
+            connectionError = nil
+
+            pump = Task { [weak self] in
+                for await frame in connection.frames {
+                    guard let self else { return }
+                    await self.handle(frame)
+                }
+            }
+            refresh()
+            Trace.log("control connection up")
+        } catch {
+            Trace.log("connect failed: \(error)")
+            connectionError =
+                "No illogicald at \(socketPath). Start one with `illogicald`."
+        }
     }
 
-    func attach(_ id: TerminalSummary.ID) {
-        // TODO(M2): send `attach`, then drive SnapshotRestore from the
-        // snapshot_chunk frames while applying `output` frames live.
-        selectedID = id
+    func refresh() {
+        try? control?.send(.list)
     }
 
-    private static let placeholders: [TerminalSummary] = [
-        .init(
-            id: 1, session: 1, name: "shell", command: "zsh", cwd: "~", cols: 120,
-            rows: 40, residency: .live, attached: 1, ptyReadIdleNanoseconds: 0
-        ),
-        .init(
-            id: 2, session: 1, name: "build", command: "zig",
-            cwd: "~/coding/illogical", cols: 120, rows: 40, residency: .parked,
-            attached: 0, ptyReadIdleNanoseconds: 5 * 60 * 1_000_000_000
-        ),
-    ]
+    func createTerminal(sessionName: String? = nil) {
+        let name = sessionName ?? selectedSession?.name ?? "default"
+        try? control?.send(.create, json: CreateBody(sessionName: name, cols: 120, rows: 40))
+    }
+
+    func kill(_ id: UInt64) {
+        try? control?.send(.kill, terminal: id)
+        closeController(id)
+        refresh()
+    }
+
+    private func handle(_ frame: Frame) {
+        Trace.log("frame \(frame.type) payload=\(frame.payload.count)")
+        switch frame.type {
+        case .sessionList:
+            guard let list = try? JSONDecoder().decode(SessionListBody.self, from: frame.payload)
+            else {
+                Trace.log(
+                    "bad session list: \(String(data: frame.payload, encoding: .utf8) ?? "<binary>")"
+                )
+                return
+            }
+            Trace.log("\(list.sessions.count) sessions, \(list.terminals.count) terminals")
+            sessions = list.sessions.map {
+                SessionSummary(id: $0.id, name: $0.name, terminals: $0.terminals)
+            }
+            terminals = list.terminals.map {
+                TerminalSummary(
+                    id: $0.id,
+                    session: $0.session,
+                    name: $0.name,
+                    command: $0.command,
+                    cwd: $0.cwd,
+                    cols: $0.cols,
+                    rows: $0.rows,
+                    residency: Residency(rawValue: $0.residency) ?? .live,
+                    attached: $0.attached,
+                    ptyReadIdleNanoseconds: $0.ptyReadIdleNanoseconds,
+                    exitCode: $0.exitCode)
+            }
+            if selectedID == nil || !terminals.contains(where: { $0.id == selectedID }) {
+                selectedID = terminals.first?.id
+            }
+
+        case .created:
+            guard let created = try? JSONDecoder().decode(CreatedBody.self, from: frame.payload)
+            else { return }
+            refresh()
+            selectedID = created.terminal
+
+        case .sessionsChanged:
+            refresh()
+
+        default:
+            break
+        }
+    }
+
+    // MARK: - Per-terminal connections
+
+    /// The controller for a terminal, creating and attaching one if needed.
+    func controller(for id: UInt64, cols: UInt16, rows: UInt16) -> TerminalController? {
+        if let existing = controllers[id] { return existing }
+        guard let controller = try? TerminalController(terminalID: id, cols: cols, rows: rows)
+        else { return nil }
+        controller.connect(socketPath: socketPath, cols: cols, rows: rows)
+        controllers[id] = controller
+        return controller
+    }
+
+    func closeController(_ id: UInt64) {
+        controllers[id]?.disconnect()
+        controllers[id] = nil
+    }
 }

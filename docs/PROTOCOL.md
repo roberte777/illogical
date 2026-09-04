@@ -58,6 +58,7 @@ no parser.
 | `0x07` | `input` | raw bytes for the PTY |
 | `0x08` | `resize` | cols, rows, cell px |
 | `0x09` | `ping` | opaque token |
+| `0x0a` | `peek` | include scrollback? |
 
 ### Server → client
 
@@ -75,6 +76,12 @@ no parser.
 | `0x8a` | `sessions_changed` | — (client re-issues `list`) |
 | `0x8b` | `err` | code, message |
 | `0x8c` | `pong` | echoed token |
+| `0x8d` | `screen` | plain-text rendering, in reply to `peek` |
+
+`peek` is the automation primitive: it returns what the server's own terminal
+currently shows, as plain text, without attaching. Scripts and agents can read a
+terminal without pretending to be a client — the same idea as
+[boo](https://github.com/coder/boo)'s `peek`.
 
 `input` and `output` payloads are opaque. The server never inspects `input`
 beyond forwarding it, and never rewrites `output`.

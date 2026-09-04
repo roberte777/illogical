@@ -28,10 +28,11 @@ Optimization IDs refer to [OPTIMIZATIONS.md](OPTIMIZATIONS.md).
 
 ---
 
-## M1 — The session server
+## M1 — The session server ✅
 
 **Ends at:** `illogical new`, `illogical list`, and a terminal that keeps running
-after the CLI exits.
+after the CLI exits. **Done** — verified end to end, including that terminals
+stay `live` after every client disconnects.
 
 | | Work |
 | --- | --- |
@@ -44,12 +45,17 @@ after the CLI exits.
 | | **F1** — server answers DA/DSR/XTWINOPS, with zero or N clients attached |
 | | libxev loop for the control socket and timers only |
 
-**Gate:** a terminal survives client exit; queries answered while detached.
+**Gate:** a terminal survives client exit; queries answered while detached. ✅
 
-## M2 — Attach
+Also landed: `illogical peek`, which returns the server's rendered screen as
+plain text without attaching. It was pulled forward from M6 because it is how
+the whole stack gets tested.
 
-**Ends at:** `illogical attach` shows the correct screen instantly, then fills in
-scrollback.
+## M2 — Attach ✅ (server and client), history streaming outstanding
+
+**Ends at:** attaching shows the correct screen instantly, then fills in
+scrollback. The Mac client attaches, decodes the snapshot into its own
+libghostty-vt terminal and renders it; input round-trips to the PTY.
 
 | | Work |
 | --- | --- |
@@ -59,25 +65,30 @@ scrollback.
 | | Pause PTY processing, mark offset *N*, `snapshot_encode` at *N*, unpause |
 | | `snapshot_begin` → chunks → `ready` → history newest-first → `end` |
 | | Output fan-out to N clients |
-| | Client-side streaming `SnapshotRestore` (reader callback, not `new_buf`) |
+| | Client-side streaming `SnapshotRestore` (reader callback, not `new_buf`) — currently buffers the whole snapshot before decoding |
 | | Mac client transport + session/terminal dropdown, live |
 | | Loading state for history that has not arrived |
 
 **Gate:** attach latency does not vary between 1 MB and 100 MB of scrollback.
 
-## M3 — The renderer
+## M3 — The renderer (in progress)
 
 **Ends at:** the Mac app is a terminal you would actually use. See
 [CLIENT.md](CLIENT.md).
 
+Landed so far: a CoreText renderer over libghostty's render state (run-length
+spans, full colour and attributes, cursor), the Superlogical-style chrome
+(session button, per-terminal tab strip, breadcrumb), key encoding for the
+common cases, and resize driven by the view's own geometry.
+
 | | Work |
 | --- | --- |
-| | Metal renderer fed by `ghostty_render_state_*` |
+| | Metal renderer + glyph atlas, replacing the CoreText path |
 | | **D1** — two-phase update: lock, begin, unlock, end |
 | | **D2** — two-layer dirty tracking; `render_state_clean()` per frame |
 | | CoreText glyph rasterization + atlas: ligatures, box drawing, emoji, wide chars |
 | | Native scrollback; never synthesize wheel sequences |
-| | Key/mouse/focus encoding via libghostty-vt |
+| | Key/mouse/focus encoding via libghostty-vt, replacing the hand-rolled subset |
 | | Selection via `selection.h`'s gesture machine, tracked grid refs |
 | | Native splits: one connection per pane |
 | | `os_signpost` launch budget |

@@ -152,6 +152,13 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
             try self.server.killTerminal(header.session, signal);
         },
 
+        .peek => {
+            const t = self.server.terminal(header.session) orelse
+                return self.sendError(header.session, .no_such_session, "no such terminal");
+            const text = try t.plainText(arena);
+            try self.send(.screen, header.session, text);
+        },
+
         .ping => try self.send(.pong, header.session, payload),
 
         else => return error.UnexpectedFrame,

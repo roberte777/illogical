@@ -53,6 +53,9 @@ pub const FrameType = enum(u8) {
     /// Window size change for this client's view of a session.
     resize = 0x08,
     ping = 0x09,
+    /// Ask for the server's rendered screen as plain text. Useful for scripts
+    /// and agents that want to read a terminal without attaching to it.
+    peek = 0x0a,
 
     // ---- server -> client ------------------------------------------------
     welcome = 0x81,
@@ -77,6 +80,8 @@ pub const FrameType = enum(u8) {
     sessions_changed = 0x8a,
     err = 0x8b,
     pong = 0x8c,
+    /// Plain-text rendering of the terminal, in reply to `peek`.
+    screen = 0x8d,
 
     pub fn isClientToServer(self: FrameType) bool {
         return @intFromEnum(self) < 0x80;
@@ -205,6 +210,11 @@ pub const body = struct {
 
     pub const SnapshotBegin = struct {
         format: u16 = 1,
+    };
+
+    pub const Peek = struct {
+        /// Include scrollback, not just the active screen.
+        scrollback: bool = false,
     };
 
     pub fn encode(alloc: std.mem.Allocator, value: anytype) ![]u8 {

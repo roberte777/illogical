@@ -13,6 +13,7 @@ result-*
 clients/macos/*.xcodeproj/
 clients/macos/*.xcworkspace/
 clients/macos/.build/
+clients/macos/*/.build/
 clients/macos/DerivedData/
 clients/macos/Packages/*/.build/
 *.xcuserdatad/

@@ -328,6 +328,13 @@ fn encodeSnapshotLocked(self: *Terminal, writer: *std.Io.Writer) !void {
     try ghostty.snapshot.encode(self.gpa, writer, &self.vt, .{ .continuation = cont });
 }
 
+/// The rendered screen as plain text. Caller owns the result.
+pub fn plainText(self: *Terminal, alloc: Allocator) ![]const u8 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    return self.vt.plainString(alloc);
+}
+
 /// Nanoseconds since the PTY last produced output.
 pub fn ptyReadIdleNs(self: *Terminal) u64 {
     self.mutex.lock();

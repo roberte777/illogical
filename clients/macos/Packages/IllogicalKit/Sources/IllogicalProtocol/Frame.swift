@@ -31,6 +31,7 @@ public enum FrameType: UInt8, Sendable {
     case input = 0x07
     case resize = 0x08
     case ping = 0x09
+    case peek = 0x0A
 
     // server -> client
     case welcome = 0x81
@@ -45,6 +46,7 @@ public enum FrameType: UInt8, Sendable {
     case sessionsChanged = 0x8A
     case error = 0x8B
     case pong = 0x8C
+    case screen = 0x8D
 
     public var isClientToServer: Bool { rawValue < 0x80 }
 }
