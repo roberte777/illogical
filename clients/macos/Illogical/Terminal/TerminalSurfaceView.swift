@@ -148,6 +148,13 @@ final class TerminalSurfaceView: NSView {
         }
 
         // Then text.
+        //
+        // The view is flipped so row 0 is at the top, but CoreText lays glyphs
+        // out on an upward Y axis. Without this the text draws mirrored.
+        context.saveGState()
+        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+        defer { context.restoreGState() }
+
         for (y, row) in grid.lines.enumerated() {
             let baseline = CGFloat(y) * cellSize.height + cellSize.height - baselineOffset
             for (x, cell) in row.cells.enumerated() {
