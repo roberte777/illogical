@@ -1,0 +1,17 @@
+.{
+    .name = .illogical,
+    .version = "0.0.0",
+    .fingerprint = 0x3b761c831fa701f5,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // Pinned via the vendor/ghostty git submodule so that the daemon and
+        // the macOS client's XCFramework are always built from the exact same
+        // libghostty-vt source revision.
+        .ghostty = .{ .path = "vendor/ghostty" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

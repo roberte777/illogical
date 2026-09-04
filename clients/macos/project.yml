@@ -1,0 +1,44 @@
+name: Illogical
+
+options:
+  bundleIdPrefix: dev.illogical
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "14.0"
+  groupSortPosition: top
+
+packages:
+  IllogicalKit:
+    path: Packages/IllogicalKit
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    ENABLE_USER_SCRIPT_SANDBOXING: true
+    MARKETING_VERSION: "0.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  Illogical:
+    type: application
+    platform: macOS
+    sources:
+      - path: Illogical
+    dependencies:
+      - package: IllogicalKit
+        product: IllogicalProtocol
+      # Produced by `just xcframework`. Statically linked, so it is not
+      # embedded in the bundle.
+      - framework: Frameworks/ghostty-vt.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_NAME: Illogical
+        PRODUCT_BUNDLE_IDENTIFIER: dev.illogical.Illogical
+        INFOPLIST_FILE: Illogical/Supporting/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Illogical/Supporting/Illogical.entitlements
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_HARDENED_RUNTIME: true
+        COMBINE_HIDPI_IMAGES: true
+        LD_RUNPATH_SEARCH_PATHS: ["$(inherited)", "@executable_path/../Frameworks"]
