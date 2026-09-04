@@ -10,7 +10,7 @@ struct SessionPicker: View {
     var body: some View {
         @Bindable var store = store
         Picker("Session", selection: $store.selectedID) {
-            ForEach(store.sessions) { session in
+            ForEach(store.terminals) { session in
                 Label {
                     Text(session.name)
                 } icon: {
