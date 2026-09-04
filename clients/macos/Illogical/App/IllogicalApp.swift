@@ -80,28 +80,24 @@ struct Toolbar: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // Room the hidden title bar keeps for the traffic lights.
-            Color.clear.frame(width: Metrics.trafficLightInset, height: 1)
+            // Clears the traffic lights. AppKit owns where those sit; this is
+            // measured so the session icon lands where Superlogical's does.
+            Color.clear.frame(width: Metrics.contentInset, height: 1)
 
             SessionButton()
 
-            TabSeparator().padding(.horizontal, 7)
+            Color.clear.frame(width: Metrics.sessionToTabs, height: 1)
 
+            // Fixed-width slots laid edge to edge, as in the reference.
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 0) {
                     ForEach(Array(store.visibleTerminals.enumerated()), id: \.element.id) {
                         index, terminal in
-                        // A separator only between two adjacent inactive tabs;
-                        // the active pill provides its own edge.
-                        if index > 0, !isActive(index), !isActive(index - 1) {
-                            TabSeparator().padding(.horizontal, 7)
-                        } else if index > 0 {
-                            Color.clear.frame(width: 3)
-                        }
-
                         TerminalTab(
                             terminal: terminal,
-                            isActive: terminal.id == store.selectedID,
+                            isActive: isActive(index),
+                            showsLeadingSeparator: index > 0 && !isActive(index)
+                                && !isActive(index - 1),
                             select: { store.selectedID = terminal.id },
                             close: { store.kill(terminal.id) })
                     }
@@ -114,14 +110,14 @@ struct Toolbar: View {
                 store.createTerminal()
             } label: {
                 Image(systemName: "plus")
-                    .font(.system(size: 13, weight: .regular))
+                    .font(.system(size: 12, weight: .regular))
                     .foregroundStyle(Palette.textDim)
-                    .frame(width: 28, height: Metrics.tabHeight)
+                    .frame(width: Metrics.plusWidth, height: Metrics.tabHeight)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help("New Terminal (⌘T)")
-            .padding(.trailing, 10)
+            .padding(.trailing, Metrics.plusTrailing)
         }
         .frame(height: Metrics.toolbarHeight)
         .background(Palette.toolbar)

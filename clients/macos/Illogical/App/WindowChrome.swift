@@ -50,6 +50,20 @@ struct WindowChrome: NSViewRepresentable {
         let alreadyAdded = window.titlebarAccessoryViewControllers.contains {
             $0.view is PassthroughView
         }
+        if Trace.isEnabled {
+            let names: [(String, NSWindow.ButtonType)] = [
+                ("close", .closeButton), ("min", .miniaturizeButton), ("zoom", .zoomButton),
+            ]
+            let frames = names.compactMap { name, type -> String? in
+                guard let b = window.standardWindowButton(type) else { return nil }
+                let f = b.convert(b.bounds, to: nil)
+                return "\(name)=\(Int(f.minX)),\(Int(f.minY)) \(Int(f.width))x\(Int(f.height))"
+            }
+            Trace.log(
+                "window \(Int(window.frame.width))x\(Int(window.frame.height)) lights: \(frames.joined(separator: " "))"
+            )
+        }
+
         if extra > 0, !alreadyAdded {
             let accessory = NSTitlebarAccessoryViewController()
             let spacer = PassthroughView(frame: NSRect(x: 0, y: 0, width: 1, height: extra))

@@ -23,6 +23,25 @@
 import IllogicalProtocol
 import SwiftUI
 
+/// Reports a view's position in window coordinates when tracing is on, so the
+/// layout can be checked against the measured reference.
+extension View {
+    func traceFrame(_ label: String) -> some View {
+        background {
+            if Trace.isEnabled {
+                GeometryReader { geo in
+                    Color.clear.onAppear {
+                        let f = geo.frame(in: .global)
+                        Trace.log(
+                            "layout \(label) x=\(String(format: "%.1f", f.minX))..\(String(format: "%.1f", f.maxX)) w=\(String(format: "%.1f", f.width))"
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Measured design tokens
 
 enum Palette {
@@ -58,16 +77,43 @@ enum Palette {
     static let badgeGlyph = rgb(0x4E_D8_5F)
 }
 
+/// Measured from the reference recording, in points from the window's left edge.
+///
+///     traffic lights   15.0 → 69.6
+///     session icon     90.7 → 103.2
+///     "Demo"          114.2 → 145.9
+///     tab 1 slot      162.3 → 359.5   (badge 172.3 → 193.4, label from 203.0)
+///     tab 2 slot      359.6 → 556.9
+///     tab 3 slot      557.3 → 753.1   (the active pill fills its slot)
+///     "+" glyph      1023.4 → 1033.0
+///     window edge            1054.6
+///
+/// So: tab slots are a fixed ~197pt, laid out edge to edge, with a 1pt hairline
+/// drawn on the boundary between two inactive tabs.
 enum Metrics {
     static let toolbarHeight: CGFloat = 39
     static let breadcrumbHeight: CGFloat = 27
     static let tabHeight: CGFloat = 27
     static let tabCornerRadius: CGFloat = 13
-    static let tabMaxWidth: CGFloat = 260
-    /// Space the hidden title bar reserves for the traffic lights.
-    static let trafficLightInset: CGFloat = 76
-    static let labelSize: CGFloat = 13
-    static let badgeSize: CGFloat = 17
+    /// One tab's slot. Content is left-aligned in it and truncates.
+    static let tabWidth: CGFloat = 197
+    static let tabLeadingPadding: CGFloat = 10
+    /// Content starts here so the session icon lands at 90.7pt, clear of the
+    /// traffic lights. AppKit owns where the lights themselves sit.
+    static let contentInset: CGFloat = 81
+    static let sessionPadding: CGFloat = 8
+    /// Gap between the session button and the first tab slot.
+    static let sessionToTabs: CGFloat = 6
+    /// 12pt, not 13: "Demo" measures 31.7pt of ink in the reference and "btop"
+    /// 24.0pt, which is SF Pro at 12.
+    static let labelSize: CGFloat = 12
+    static let badgeSize: CGFloat = 20
+    static let badgeToLabel: CGFloat = 10
+    static let iconToTitle: CGFloat = 8
+    static let plusTrailing: CGFloat = 12
+    static let plusWidth: CGFloat = 28
+    /// The breadcrumb glyph starts at 27pt of ink in the reference.
+    static let breadcrumbLeading: CGFloat = 24
 }
 
 // MARK: - Shared pieces
@@ -135,15 +181,16 @@ struct SessionButton: View {
         Button {
             isPresented = true
         } label: {
-            HStack(spacing: 7) {
+            HStack(spacing: Metrics.iconToTitle) {
                 Image(systemName: "rectangle.stack")
                     .font(.system(size: 13, weight: .regular))
+                    .traceFrame("session-icon")
                 Text(store.selectedSession?.name ?? "no session")
                     .font(.system(size: Metrics.labelSize, weight: .semibold))
                     .lineLimit(1)
             }
             .foregroundStyle(Palette.textBright)
-            .padding(.horizontal, 8)
+            .padding(.horizontal, Metrics.sessionPadding)
             .frame(height: Metrics.tabHeight)
             .contentShape(Rectangle())
         }
@@ -224,24 +271,27 @@ struct SessionList: View {
 struct TerminalTab: View {
     let terminal: TerminalSummary
     let isActive: Bool
+    /// Draw the hairline on this tab's leading edge. Only between two inactive
+    /// tabs — the active pill provides its own edge.
+    let showsLeadingSeparator: Bool
     let select: () -> Void
     let close: () -> Void
 
     @State private var isHovering = false
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: Metrics.badgeToLabel) {
             ZStack {
-                TerminalBadge()
+                TerminalBadge().traceFrame("badge-\(terminal.id)")
                 // Residency rides on the badge rather than replacing the glyph,
                 // so a parked terminal still reads as a terminal.
                 if terminal.residency != .live {
                     Image(systemName: residencyIcon)
-                        .font(.system(size: 8, weight: .bold))
+                        .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(residencyColor)
                         .padding(1.5)
                         .background(Circle().fill(Palette.toolbar))
-                        .offset(x: 8, y: -7)
+                        .offset(x: 9, y: -8)
                 }
             }
 
@@ -260,9 +310,9 @@ struct TerminalTab: View {
                 .help("Close terminal")
             }
         }
-        .padding(.horizontal, 10)
-        .frame(height: Metrics.tabHeight)
-        .frame(maxWidth: Metrics.tabMaxWidth)
+        .padding(.horizontal, Metrics.tabLeadingPadding)
+        .frame(width: Metrics.tabWidth, height: Metrics.tabHeight, alignment: .leading)
+        .traceFrame("tab-\(terminal.id)")
         .background {
             if isActive {
                 RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
@@ -277,6 +327,9 @@ struct TerminalTab: View {
                 RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
                     .fill(Palette.tabHoverFill)
             }
+        }
+        .overlay(alignment: .leading) {
+            if showsLeadingSeparator { TabSeparator() }
         }
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
@@ -331,7 +384,7 @@ struct Breadcrumb: View {
             }
             Spacer()
         }
-        .padding(.horizontal, 14)
+        .padding(.leading, Metrics.breadcrumbLeading)
         .frame(height: Metrics.breadcrumbHeight)
     }
 }
