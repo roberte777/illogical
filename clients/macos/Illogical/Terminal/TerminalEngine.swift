@@ -36,6 +36,29 @@ final class TerminalEngine: @unchecked Sendable {
         var state: GhosttyRenderState?
         try check("ghostty_render_state_new") { ghostty_render_state_new(nil, &state) }
         self.renderState = state
+
+        applyThemeLocked()
+    }
+
+    /// Default foreground/background for cells that carry no explicit colour.
+    ///
+    /// libghostty defaults to white on black. Superlogical's terminal sits on
+    /// the same dark blue ground as its chrome, so the window reads as one
+    /// surface rather than a black rectangle in a blue frame.
+    enum Theme {
+        static let background = GhosttyColorRgb(r: 0x0C, g: 0x1F, b: 0x2F)
+        static let foreground = GhosttyColorRgb(r: 0xC8, g: 0xD6, b: 0xE0)
+        static let cursor = GhosttyColorRgb(r: 0xC8, g: 0xD6, b: 0xE0)
+    }
+
+    private func applyThemeLocked() {
+        guard let terminal else { return }
+        var background = Theme.background
+        var foreground = Theme.foreground
+        var cursor = Theme.cursor
+        _ = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &background)
+        _ = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &foreground)
+        _ = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &cursor)
     }
 
     deinit {
@@ -54,6 +77,8 @@ final class TerminalEngine: @unchecked Sendable {
         terminal = newTerminal
         self.cols = cols
         self.rows = rows
+        // A snapshot-decoded terminal carries libghostty's defaults, not ours.
+        applyThemeLocked()
         dirty = true
     }
 

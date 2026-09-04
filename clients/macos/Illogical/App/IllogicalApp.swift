@@ -46,9 +46,10 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             Toolbar()
-            Divider().overlay(Palette.separator)
+            Rectangle().fill(Palette.divider).frame(height: 1)
+            // No divider under the breadcrumb: it sits on the terminal's own
+            // background, as in Superlogical.
             Breadcrumb(terminal: store.selected)
-            Divider().overlay(Palette.separator)
 
             if let error = store.connectionError {
                 ServerUnavailable(message: error)
@@ -62,6 +63,8 @@ struct ContentView: View {
         .background(Palette.background)
         .frame(minWidth: 720, minHeight: 460)
         .preferredColorScheme(.dark)
+        .background(WindowChrome(toolbarHeight: Metrics.toolbarHeight))
+        .ignoresSafeArea(.container, edges: .top)
     }
 }
 
@@ -69,21 +72,33 @@ struct ContentView: View {
 struct Toolbar: View {
     @Environment(SessionStore.self) private var store
 
+    private func isActive(_ index: Int) -> Bool {
+        let terminals = store.visibleTerminals
+        guard terminals.indices.contains(index) else { return false }
+        return terminals[index].id == store.selectedID
+    }
+
     var body: some View {
         HStack(spacing: 0) {
-            // Room for the traffic lights, which the hidden title bar keeps.
-            Color.clear.frame(width: 78, height: 1)
+            // Room the hidden title bar keeps for the traffic lights.
+            Color.clear.frame(width: Metrics.trafficLightInset, height: 1)
 
             SessionButton()
 
-            Divider()
-                .frame(height: 16)
-                .overlay(Palette.separator)
-                .padding(.horizontal, 6)
+            TabSeparator().padding(.horizontal, 7)
 
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 2) {
-                    ForEach(store.visibleTerminals) { terminal in
+                HStack(spacing: 0) {
+                    ForEach(Array(store.visibleTerminals.enumerated()), id: \.element.id) {
+                        index, terminal in
+                        // A separator only between two adjacent inactive tabs;
+                        // the active pill provides its own edge.
+                        if index > 0, !isActive(index), !isActive(index - 1) {
+                            TabSeparator().padding(.horizontal, 7)
+                        } else if index > 0 {
+                            Color.clear.frame(width: 3)
+                        }
+
                         TerminalTab(
                             terminal: terminal,
                             isActive: terminal.id == store.selectedID,
@@ -91,7 +106,6 @@ struct Toolbar: View {
                             close: { store.kill(terminal.id) })
                     }
                 }
-                .padding(.horizontal, 2)
             }
 
             Spacer(minLength: 8)
@@ -100,17 +114,16 @@ struct Toolbar: View {
                 store.createTerminal()
             } label: {
                 Image(systemName: "plus")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(Palette.chromeText)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
+                    .font(.system(size: 13, weight: .regular))
+                    .foregroundStyle(Palette.textDim)
+                    .frame(width: 28, height: Metrics.tabHeight)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help("New Terminal (⌘T)")
-            .padding(.trailing, 8)
+            .padding(.trailing, 10)
         }
-        .frame(height: 38)
+        .frame(height: Metrics.toolbarHeight)
         .background(Palette.toolbar)
     }
 }
@@ -123,10 +136,10 @@ struct EmptyState: View {
             Spacer()
             Text("No terminals")
                 .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(Palette.chromeText)
+                .foregroundStyle(Palette.textBright)
             Text("Sessions keep running after you close this window.")
                 .font(.system(size: 12))
-                .foregroundStyle(Palette.chromeTextDim)
+                .foregroundStyle(Palette.textDim)
             Button("New Terminal") { store.createTerminal() }
                 .padding(.top, 4)
             Spacer()
@@ -145,13 +158,13 @@ struct ServerUnavailable: View {
             Spacer()
             Image(systemName: "bolt.horizontal.circle")
                 .font(.system(size: 26))
-                .foregroundStyle(Palette.chromeTextDim)
+                .foregroundStyle(Palette.textDim)
             Text("No server")
                 .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(Palette.chromeText)
+                .foregroundStyle(Palette.textBright)
             Text(message)
                 .font(.system(size: 12))
-                .foregroundStyle(Palette.chromeTextDim)
+                .foregroundStyle(Palette.textDim)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 420)
             Button("Try Again") { store.connect() }

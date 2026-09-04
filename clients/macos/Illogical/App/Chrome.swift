@@ -1,34 +1,131 @@
 //  Chrome.swift
-//  The window chrome, modelled on the Superlogical Mac app.
+//  The window chrome, matched to the Superlogical Mac app.
 //
-//  Layout, from the demo recordings:
+//  Every value below was measured off Mitchell's pre-alpha demo recording at
+//  2160p, where the traffic lights give a known scale: 25 frame pixels for a
+//  12pt light, so 2.083 px/pt. Colours are sampled pixels, not guesses.
 //
-//      ┌────────────────────────────────────────────────────────────┐
-//      │ ● ● ●   ⌂ Demo │ ▣ ~> blop │ ▣ ~/…> nvim │ ▣ ~/ghostty   + │  toolbar
-//      ├────────────────────────────────────────────────────────────┤
-//      │ ▣ ~/Documents/ghostty> nvim                                │  breadcrumb
-//      │                                                            │
-//      │  terminal                                                  │
+//      ┌──────────────────────────────────────────────────────────────┐
+//      │ ● ● ●  ▤ Demo │ ▣ ~> btop │ ▣ ~> htop │(▣ ~/…> nvim)      +  │ 39pt
+//      ├──────────────────────────────────────────────────────────────┤ 1px
+//      │ ▢ ~/Documents/ghostty> nvim                                  │ 27pt
+//      │                                                              │
+//      │  terminal                                                    │
 //
-//  The session button sits immediately right of the traffic lights and changes
-//  session (⌘⇧K). Tabs are terminals *within* the current session, one per PTY,
-//  the active one filled with a rounded pill. A thin breadcrumb row underneath
-//  names the focused terminal.
+//  Notes that are easy to get wrong:
+//    * The session glyph is a layered stack, not a house.
+//    * Tab glyphs are Terminal.app-style badges: dark rounded square, green
+//      prompt. The breadcrumb uses the outlined variant instead.
+//    * In a tab label the *path* is dim and the *command* is bright. The
+//      breadcrumb renders both dim.
+//    * There is a divider under the toolbar but none under the breadcrumb.
 
 import IllogicalProtocol
 import SwiftUI
 
+// MARK: - Measured design tokens
+
 enum Palette {
-    /// Sampled from the Superlogical recordings: a very dark, slightly blue
-    /// ground rather than pure black.
-    static let background = Color(red: 0.051, green: 0.098, blue: 0.129)
-    static let toolbar = Color(red: 0.035, green: 0.075, blue: 0.102)
-    static let activeTab = Color.white.opacity(0.10)
-    static let hoverTab = Color.white.opacity(0.05)
-    static let separator = Color.white.opacity(0.08)
-    static let chromeText = Color.white.opacity(0.72)
-    static let chromeTextDim = Color.white.opacity(0.42)
+    static func rgb(_ hex: UInt32) -> Color {
+        Color(
+            .sRGB,
+            red: Double((hex >> 16) & 0xff) / 255,
+            green: Double((hex >> 8) & 0xff) / 255,
+            blue: Double(hex & 0xff) / 255)
+    }
+
+    /// Sampled from empty toolbar, right of the last tab.
+    static let toolbar = rgb(0x06_1D_31)
+    /// Sampled from empty terminal background.
+    static let background = rgb(0x0C_1F_2F)
+    /// The hairline under the toolbar.
+    static let divider = rgb(0x1D_2D_3E)
+
+    /// Active tab pill.
+    static let tabActiveFill = rgb(0x17_2A_3F)
+    static let tabActiveStroke = rgb(0x2A_43_55)
+    static let tabHoverFill = Color.white.opacity(0.04)
+    /// The hairline between inactive tabs.
+    static let tabSeparator = rgb(0x2A_3F_52)
+
+    static let textBright = rgb(0xC3_D3_DE)
+    static let textDim = rgb(0x7E_93_A4)
+    static let textFaint = rgb(0x5E_72_82)
+
+    /// The Terminal.app-style badge on each tab.
+    static let badgeFill = rgb(0x3A_3D_42)
+    static let badgeStroke = rgb(0x17_19_1C)
+    static let badgeGlyph = rgb(0x4E_D8_5F)
 }
+
+enum Metrics {
+    static let toolbarHeight: CGFloat = 39
+    static let breadcrumbHeight: CGFloat = 27
+    static let tabHeight: CGFloat = 27
+    static let tabCornerRadius: CGFloat = 13
+    static let tabMaxWidth: CGFloat = 260
+    /// Space the hidden title bar reserves for the traffic lights.
+    static let trafficLightInset: CGFloat = 76
+    static let labelSize: CGFloat = 13
+    static let badgeSize: CGFloat = 17
+}
+
+// MARK: - Shared pieces
+
+/// The Terminal.app-style badge: dark rounded square, green prompt.
+struct TerminalBadge: View {
+    var size: CGFloat = Metrics.badgeSize
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
+            .fill(Palette.badgeFill)
+            .overlay(
+                RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
+                    .strokeBorder(Palette.badgeStroke, lineWidth: 1)
+            )
+            .overlay(
+                Image(systemName: "chevron.right")
+                    .font(.system(size: size * 0.42, weight: .bold))
+                    .foregroundStyle(Palette.badgeGlyph)
+                    .offset(x: -size * 0.06, y: -size * 0.08)
+            )
+            .overlay(
+                Rectangle()
+                    .fill(Palette.badgeGlyph)
+                    .frame(width: size * 0.30, height: max(1, size * 0.085))
+                    .offset(x: size * 0.16, y: size * 0.22)
+            )
+            .frame(width: size, height: size)
+    }
+}
+
+/// A terminal's label: dim path, bright command.
+struct TerminalLabel: View {
+    let terminal: TerminalSummary
+    var bright: Color = Palette.textBright
+    var dim: Color = Palette.textDim
+
+    var body: some View {
+        (Text(path + "> ").foregroundColor(dim)
+            + Text(command).foregroundColor(bright))
+            .font(.system(size: Metrics.labelSize))
+            .lineLimit(1)
+            .truncationMode(.tail)
+    }
+
+    private var path: String {
+        guard !terminal.cwd.isEmpty else { return terminal.name }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return terminal.cwd.hasPrefix(home)
+            ? "~" + terminal.cwd.dropFirst(home.count) : terminal.cwd
+    }
+
+    private var command: String {
+        (terminal.command as NSString).lastPathComponent
+    }
+}
+
+// MARK: - Session button
 
 struct SessionButton: View {
     @Environment(SessionStore.self) private var store
@@ -38,23 +135,22 @@ struct SessionButton: View {
         Button {
             isPresented = true
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "house")
-                    .font(.system(size: 11, weight: .medium))
+            HStack(spacing: 7) {
+                Image(systemName: "rectangle.stack")
+                    .font(.system(size: 13, weight: .regular))
                 Text(store.selectedSession?.name ?? "no session")
-                    .font(.system(size: 12))
+                    .font(.system(size: Metrics.labelSize, weight: .semibold))
                     .lineLimit(1)
             }
-            .foregroundStyle(Palette.chromeText)
+            .foregroundStyle(Palette.textBright)
             .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .frame(height: Metrics.tabHeight)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help("Change Session (⌘⇧K)")
         .popover(isPresented: $isPresented, arrowEdge: .bottom) {
-            SessionList(isPresented: $isPresented)
-                .environment(store)
+            SessionList(isPresented: $isPresented).environment(store)
         }
     }
 }
@@ -79,9 +175,9 @@ struct SessionList: View {
                     }
                     isPresented = false
                 } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "house")
-                            .font(.system(size: 10))
+                    HStack(spacing: 7) {
+                        Image(systemName: "rectangle.stack")
+                            .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                         Text(session.name).font(.system(size: 12))
                         Spacer(minLength: 12)
@@ -119,11 +215,12 @@ struct SessionList: View {
             .buttonStyle(.plain)
             .padding(.bottom, 6)
         }
-        .frame(minWidth: 200)
+        .frame(minWidth: 210)
     }
 }
 
-/// One terminal in the tab strip.
+// MARK: - Tabs
+
 struct TerminalTab: View {
     let terminal: TerminalSummary
     let isActive: Bool
@@ -133,90 +230,108 @@ struct TerminalTab: View {
     @State private var isHovering = false
 
     var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: icon)
-                .font(.system(size: 10))
-                .foregroundStyle(iconColor)
-            Text(label)
-                .font(.system(size: 12))
-                .lineLimit(1)
-                .truncationMode(.head)
-                .foregroundStyle(isActive ? Palette.chromeText : Palette.chromeTextDim)
+        HStack(spacing: 8) {
+            ZStack {
+                TerminalBadge()
+                // Residency rides on the badge rather than replacing the glyph,
+                // so a parked terminal still reads as a terminal.
+                if terminal.residency != .live {
+                    Image(systemName: residencyIcon)
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(residencyColor)
+                        .padding(1.5)
+                        .background(Circle().fill(Palette.toolbar))
+                        .offset(x: 8, y: -7)
+                }
+            }
+
+            TerminalLabel(
+                terminal: terminal,
+                bright: isActive ? Palette.textBright : Palette.textDim,
+                dim: isActive ? Palette.textDim : Palette.textFaint)
 
             if isHovering {
                 Button(action: close) {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(Palette.chromeTextDim)
+                        .foregroundStyle(Palette.textDim)
                 }
                 .buttonStyle(.plain)
                 .help("Close terminal")
             }
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 4)
-        .frame(maxWidth: 240)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(isActive ? Palette.activeTab : (isHovering ? Palette.hoverTab : .clear))
-        )
+        .padding(.horizontal, 10)
+        .frame(height: Metrics.tabHeight)
+        .frame(maxWidth: Metrics.tabMaxWidth)
+        .background {
+            if isActive {
+                RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
+                    .fill(Palette.tabActiveFill)
+                    .overlay(
+                        RoundedRectangle(
+                            cornerRadius: Metrics.tabCornerRadius, style: .continuous
+                        )
+                        .strokeBorder(Palette.tabActiveStroke, lineWidth: 1)
+                    )
+            } else if isHovering {
+                RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
+                    .fill(Palette.tabHoverFill)
+            }
+        }
         .contentShape(Rectangle())
         .onHover { isHovering = $0 }
         .onTapGesture(perform: select)
     }
 
-    private var label: String {
-        terminal.cwd.isEmpty
-            ? "\(terminal.name)> \(terminal.command)"
-            : "\(abbreviated(terminal.cwd))> \(terminal.command)"
-    }
-
-    private var icon: String {
+    private var residencyIcon: String {
         switch terminal.residency {
-        case .live: "terminal"
-        case .parked: "moon.zzz"
+        case .live: "circle.fill"
+        case .parked: "moon.fill"
         case .rehydrating: "arrow.clockwise"
-        case .exited: "xmark.circle"
+        case .exited: "xmark"
         }
     }
 
-    private var iconColor: Color {
+    private var residencyColor: Color {
         switch terminal.residency {
-        case .live: Palette.chromeText
-        case .parked: .orange.opacity(0.7)
-        case .rehydrating: .yellow.opacity(0.7)
-        case .exited: .red.opacity(0.7)
+        case .live: .green
+        case .parked: .orange
+        case .rehydrating: .yellow
+        case .exited: .red
         }
-    }
-
-    private func abbreviated(_ path: String) -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return path.hasPrefix(home) ? "~" + path.dropFirst(home.count) : path
     }
 }
 
-/// The thin row under the toolbar naming the focused terminal.
+/// The hairline between adjacent inactive tabs.
+struct TabSeparator: View {
+    var body: some View {
+        Rectangle()
+            .fill(Palette.tabSeparator)
+            .frame(width: 1, height: 17)
+    }
+}
+
+// MARK: - Breadcrumb
+
 struct Breadcrumb: View {
     let terminal: TerminalSummary?
 
     var body: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "square.dashed")
-                .font(.system(size: 9))
-                .foregroundStyle(Palette.chromeTextDim)
-            Text(title)
-                .font(.system(size: 11))
-                .foregroundStyle(Palette.chromeTextDim)
-                .lineLimit(1)
+        HStack(spacing: 8) {
+            Image(systemName: "apple.terminal")
+                .font(.system(size: 12))
+                .foregroundStyle(Palette.textFaint)
+            if let terminal {
+                TerminalLabel(
+                    terminal: terminal, bright: Palette.textDim, dim: Palette.textFaint)
+            } else {
+                Text("no terminal")
+                    .font(.system(size: Metrics.labelSize))
+                    .foregroundStyle(Palette.textFaint)
+            }
             Spacer()
         }
-        .padding(.horizontal, 12)
-        .frame(height: 22)
-    }
-
-    private var title: String {
-        guard let terminal else { return "no terminal" }
-        let location = terminal.cwd.isEmpty ? terminal.name : terminal.cwd
-        return "\(location)> \(terminal.command)"
+        .padding(.horizontal, 14)
+        .frame(height: Metrics.breadcrumbHeight)
     }
 }

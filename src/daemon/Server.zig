@@ -170,12 +170,16 @@ pub fn createTerminal(self: *Server, req: protocol.body.Create) !CreateResult {
     const default_argv = [_][]const u8{defaultShell()};
     const argv: []const []const u8 = if (req.argv.len > 0) req.argv else &default_argv;
 
+    // A terminal always has a working directory, because clients label tabs
+    // with it. Fall back to the user's home rather than reporting nothing.
+    const cwd = req.cwd orelse sys.getenv("HOME") orelse "/";
+
     const t = try Terminal.create(self.gpa, .{
         .id = tid,
         .session_id = sid,
         .name = name,
         .argv = argv,
-        .cwd = req.cwd,
+        .cwd = cwd,
         .cols = req.cols,
         .rows = req.rows,
     });
