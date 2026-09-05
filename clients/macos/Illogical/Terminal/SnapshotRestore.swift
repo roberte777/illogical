@@ -28,7 +28,12 @@ func check(_ operation: String, _ body: () -> GhosttyResult) throws {
     }
 }
 
-final class SnapshotRestore {
+/// Unchecked because the decoder is not thread-safe and is not made so here:
+/// it is used from the main actor through `ready()`, and then handed to
+/// exactly one background task for the history pages. What it mutates is the
+/// terminal the engine owns, so every call after `ready()` must hold the
+/// engine's lock.
+final class SnapshotRestore: @unchecked Sendable {
     private var decoder: GhosttySnapshotDecoder?
     private let bytes: [UInt8]
 

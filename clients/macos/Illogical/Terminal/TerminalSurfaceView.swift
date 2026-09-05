@@ -38,6 +38,9 @@ protocol TerminalSurfaceDelegate: AnyObject {
     /// ⌘W. Returns true when the pane was closed; false means this is the
     /// only pane, and closing it is closing the window.
     func surfaceShouldClose(_ surface: TerminalSurfaceView) -> Bool
+    /// This surface submitted its first frame, at `moment`. The launch budget
+    /// is measured against it.
+    func surface(_ surface: TerminalSurfaceView, didPresentFirstFrameAt moment: Date)
 }
 
 @MainActor
@@ -165,6 +168,12 @@ final class TerminalSurfaceView: NSView {
             }
             let renderer = TerminalRenderer(
                 context: context, grid: grid, layer: layer, source: engine)
+            renderer.onSnapshotFrame = { [weak self] moment in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.delegate?.surface(self, didPresentFirstFrameAt: moment)
+                }
+            }
             self.renderer = renderer
             updateSurfaceSize()
 

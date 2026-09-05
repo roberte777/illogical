@@ -78,6 +78,8 @@ targets:
       # SessionStore owns the tab list, and one connection per pane.
       - path: Illogical/Sessions/SessionStore.swift
       - path: Illogical/Terminal/TerminalController.swift
+      # The renderer and the controller both emit launch signposts.
+      - path: Illogical/App/Signposts.swift
       - path: Illogical/App/Palette.swift
       - path: Illogical/App/Trace.swift
       - path: Tests

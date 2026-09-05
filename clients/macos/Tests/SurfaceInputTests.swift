@@ -24,6 +24,7 @@ final class SurfaceInputTests: XCTestCase {
         /// false that this is the only one and the window should take it.
         var closesPane = false
         var closeRequests = 0
+        var firstFrames: [Date] = []
 
         var bytes: [UInt8] { sent.flatMap { $0 } }
         var text: String { String(decoding: bytes, as: UTF8.self) }
@@ -34,6 +35,9 @@ final class SurfaceInputTests: XCTestCase {
             resizes.append((cols, rows))
         }
         func surfaceDidBecomeFocused(_ surface: TerminalSurfaceView) { focusedCount += 1 }
+        func surface(_ surface: TerminalSurfaceView, didPresentFirstFrameAt moment: Date) {
+            firstFrames.append(moment)
+        }
         func surfaceShouldClose(_ surface: TerminalSurfaceView) -> Bool {
             closeRequests += 1
             return closesPane

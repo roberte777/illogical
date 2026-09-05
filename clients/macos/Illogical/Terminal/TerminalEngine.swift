@@ -50,6 +50,11 @@ final class TerminalEngine: @unchecked Sendable {
     /// an idle terminal must not cost a lock acquisition 120 times a second.
     private let dirtyFlag = Atomic(true)
 
+    /// Set by `adopt`, taken by the first frame that draws the result. The
+    /// launch budget times `snapshot_ready` to that frame, not to the blank
+    /// surface already on screen.
+    private let adoptedFlag = Atomic(false)
+
     /// Called when the engine goes from clean to dirty, so the view can
     /// restart a paused display link. An idle terminal should cost nothing,
     /// which means the display link has to actually stop.
@@ -130,6 +135,7 @@ final class TerminalEngine: @unchecked Sendable {
         // A snapshot-decoded terminal carries libghostty's defaults, not ours.
         applyThemeLocked()
         lock.unlock()
+        adoptedFlag.store(true)
         markDirty()
     }
 
@@ -147,6 +153,18 @@ final class TerminalEngine: @unchecked Sendable {
 
     func write(_ data: Data) {
         data.withUnsafeBytes { write($0) }
+    }
+
+    /// Run `body` with the engine's lock held.
+    ///
+    /// For mutations made through a handle the engine owns but did not
+    /// perform itself — the snapshot decoder's history restore writes into
+    /// the terminal it handed us, and the render thread reads that same
+    /// terminal under this lock.
+    func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
     }
 
     /// Run `body` with the raw terminal handle held under the engine's lock.
@@ -196,6 +214,8 @@ final class TerminalEngine: @unchecked Sendable {
     // MARK: - Render source
 
     var isDirty: Bool { dirtyFlag.load() }
+
+    func consumeSnapshotAdopted() -> Bool { adoptedFlag.exchange(false) }
 
     /// Take a consistent view of the terminal into `snapshot`.
     ///
