@@ -23,6 +23,7 @@ const usage =
     \\                           Create a terminal (default: $SHELL)
     \\  attach <terminal-id>     Attach this terminal to a session terminal
     \\  kill <terminal-id>       Terminate a terminal
+    \\  peek <terminal-id>       Print the terminal's screen as plain text
     \\
     \\Options:
     \\  --socket <path>          Control socket to connect to
@@ -94,6 +95,8 @@ pub fn main(init: std.process.Init) !void {
         return cmdNew(&conn, arena, out, rest.items[1..]);
     } else if (std.mem.eql(u8, cmd, "kill")) {
         return cmdKill(&conn, out, rest.items[1..]);
+    } else if (std.mem.eql(u8, cmd, "peek")) {
+        return cmdPeek(&conn, out, rest.items[1..]);
     } else if (std.mem.eql(u8, cmd, "attach")) {
         try out.flush();
         return cmdAttach(&conn, gpa, init.io, rest.items[1..]);
@@ -186,6 +189,22 @@ fn cmdKill(conn: *Conn, out: *Io.Writer, args: []const []const u8) !void {
     }
     const id = try std.fmt.parseInt(u64, args[0], 10);
     try conn.sendJson(.kill, id, protocol.body.Kill{});
+}
+
+fn cmdPeek(conn: *Conn, out: *Io.Writer, args: []const []const u8) !void {
+    if (args.len < 1) {
+        try out.writeAll("usage: illogical peek <terminal-id>\n");
+        return error.InvalidArgs;
+    }
+    const id = try std.fmt.parseInt(u64, args[0], 10);
+    try conn.sendJson(.peek, id, protocol.body.Peek{});
+
+    const frame = try conn.recv();
+    if (frame.header.type != .screen) return error.UnexpectedFrame;
+    try out.writeAll(frame.payload);
+    if (frame.payload.len > 0 and frame.payload[frame.payload.len - 1] != '\n') {
+        try out.writeAll("\n");
+    }
 }
 
 fn defaultSocketPath(alloc: std.mem.Allocator) ![]u8 {
