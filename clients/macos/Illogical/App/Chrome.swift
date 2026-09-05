@@ -175,11 +175,11 @@ struct TerminalLabel: View {
 
 struct SessionButton: View {
     @Environment(SessionStore.self) private var store
-    @State private var isPresented = false
+    @Binding var isPresented: Bool
 
     var body: some View {
         Button {
-            isPresented = true
+            isPresented.toggle()
         } label: {
             HStack(spacing: Metrics.iconToTitle) {
                 Image(systemName: "rectangle.stack")
@@ -196,73 +196,6 @@ struct SessionButton: View {
         }
         .buttonStyle(.plain)
         .help("Change Session (⌘⇧K)")
-        .popover(isPresented: $isPresented, arrowEdge: .bottom) {
-            SessionList(isPresented: $isPresented).environment(store)
-        }
-    }
-}
-
-struct SessionList: View {
-    @Environment(SessionStore.self) private var store
-    @Binding var isPresented: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("Sessions")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 10)
-                .padding(.top, 8)
-                .padding(.bottom, 4)
-
-            ForEach(store.sessions) { session in
-                Button {
-                    if let first = store.terminals.first(where: { $0.session == session.id }) {
-                        store.selectedID = first.id
-                    }
-                    isPresented = false
-                } label: {
-                    HStack(spacing: 7) {
-                        Image(systemName: "rectangle.stack")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                        Text(session.name).font(.system(size: 12))
-                        Spacer(minLength: 12)
-                        Text("\(session.terminals.count)")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-
-            if store.sessions.isEmpty {
-                Text("No sessions yet")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-            }
-
-            Divider().padding(.vertical, 4)
-
-            Button {
-                store.createTerminal(sessionName: "session-\(store.sessions.count + 1)")
-                isPresented = false
-            } label: {
-                Label("New Session", systemImage: "plus")
-                    .font(.system(size: 12))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .padding(.bottom, 6)
-        }
-        .frame(minWidth: 210)
     }
 }
 
