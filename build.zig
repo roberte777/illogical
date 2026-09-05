@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/core/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     if (ghostty_vt) |m| core.addImport("ghostty-vt", m);
 
@@ -23,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/daemon/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     daemon_mod.addImport("illogical", core);
     if (ghostty_vt) |m| daemon_mod.addImport("ghostty-vt", m);
@@ -40,8 +42,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/cli/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     cli_mod.addImport("illogical", core);
+    if (ghostty_vt) |m| cli_mod.addImport("ghostty-vt", m);
 
     const cli = b.addExecutable(.{
         .name = "illogical",
