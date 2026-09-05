@@ -255,28 +255,35 @@ final class TextShaper {
                 continue
             }
 
-            // A style change splits the run, so that ">=" whose halves are
-            // coloured differently doesn't ligate into one colour.
             if j > i {
                 let prev = row[j - 1]
 
-                // Except for a few notoriously bad ligatures, which we split
-                // unconditionally rather than let the font join them.
-                var badLigature = false
-                if prev.hasText && cell.hasText {
-                    switch prev.codepoint {
-                    case UInt32(UInt8(ascii: "f")):
-                        let cp = cell.codepoint
-                        badLigature =
-                            cp == UInt32(UInt8(ascii: "l")) || cp == UInt32(UInt8(ascii: "i"))
-                    case UInt32(UInt8(ascii: "s")):
-                        badLigature = cell.codepoint == UInt32(UInt8(ascii: "t"))
-                    default:
+                // A handful of ligatures are actively wrong in a monospace
+                // grid: the joined glyph is narrower than the two cells it
+                // spans, so the text stops lining up. We split the run to
+                // stop the font forming them at all.
+                //
+                // Only between plain codepoints — a cell carrying a grapheme
+                // cluster isn't one of these.
+                if prev.hasText, prev.graphemeLen == 0, cell.hasText, cell.graphemeLen == 0 {
+                    let prevCp = prev.codepoint
+                    let cp = cell.codepoint
+                    // fl, fi
+                    if prevCp == UInt32(UInt8(ascii: "f")),
+                        cp == UInt32(UInt8(ascii: "l")) || cp == UInt32(UInt8(ascii: "i"))
+                    {
+                        break
+                    }
+                    // st
+                    if prevCp == UInt32(UInt8(ascii: "s")), cp == UInt32(UInt8(ascii: "t")) {
                         break
                     }
                 }
 
-                if !badLigature && !runCell.shapingEqual(cell) { break }
+                // A style change splits the run too, so that ">=" whose
+                // halves are coloured differently doesn't ligate into one
+                // colour.
+                if !runCell.shapingEqual(cell) { break }
             }
 
             // The presentation the cell explicitly asks for, if any. Only the
