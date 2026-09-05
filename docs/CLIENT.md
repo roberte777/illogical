@@ -231,7 +231,11 @@ of ours:
   Ghostty's does.
 - `ghostty_mouse_encoder_encode`, given the renderer's own screen, cell and
   padding sizes so a report lands on the cell the user aimed at. Shift
-  suppresses reporting, which is how you select text inside a full-screen TUI.
+  suppresses reporting for **buttons and motion**, which is how you select
+  text inside a full-screen TUI — and deliberately not for the wheel, because
+  Ghostty's `scrollCallback` has no shift gate at all. Ghostty's full rule also
+  lets the terminal take shift back with XTSHIFTESCAPE and exposes the choice
+  as `mouse-shift-capture`; we implement its default and neither of those.
 - `ghostty_focus_encode`, gated on DEC mode 1004 — it takes no terminal and
   will happily encode a report nobody asked for.
 

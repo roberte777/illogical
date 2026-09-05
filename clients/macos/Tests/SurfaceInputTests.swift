@@ -193,7 +193,7 @@ final class SurfaceInputTests: XCTestCase {
     /// the viewport knows to stay put.
     func testWheelGoesNowhereWithoutAClaimant() throws {
         let (view, _, recorder) = try surface()
-        XCTAssertFalse(view.reportWheel(rows: 3, columns: 0, at: .zero))
+        XCTAssertFalse(view.reportWheel(rows: 3, columns: 0, mods: [], at: .zero))
         XCTAssertTrue(recorder.sent.isEmpty)
     }
 
@@ -206,7 +206,7 @@ final class SurfaceInputTests: XCTestCase {
         // renderer to supply it, so mouse reports cannot be checked for their
         // cell here — only that the program claimed the gesture.
         write(engine, "\u{1b}[?1000h\u{1b}[?1006h")
-        XCTAssertTrue(view.reportWheel(rows: 3, columns: 0, at: .zero))
+        XCTAssertTrue(view.reportWheel(rows: 3, columns: 0, mods: [], at: .zero))
         XCTAssertEqual(recorder.sent.count, 3)
         for report in recorder.sent {
             // Button 64 is wheel-up in SGR.
@@ -221,7 +221,7 @@ final class SurfaceInputTests: XCTestCase {
         let (view, engine, recorder) = try surface()
         write(engine, "\u{1b}[?1049h\u{1b}[?1007h")
 
-        XCTAssertTrue(view.reportWheel(rows: -2, columns: 0, at: .zero))
+        XCTAssertTrue(view.reportWheel(rows: -2, columns: 0, mods: [], at: .zero))
         XCTAssertEqual(recorder.text, "\u{1b}[B\u{1b}[B")
     }
 
@@ -350,4 +350,70 @@ final class SurfaceInputTests: XCTestCase {
         XCTAssertEqual(recorder.closeRequests, 1)
     }
 
+    /// Shift does *not* take the wheel away from the program. Ghostty's
+    /// `scrollCallback` has no shift gate — `mouseShiftCapture` is consulted
+    /// for clicks and motion and nowhere else — so a shift-wheel inside a
+    /// full-screen TUI is the program's, even though a shift-click is not.
+    func testShiftDoesNotSuppressWheelReporting() throws {
+        let (view, engine, recorder) = try surface()
+        write(engine, "\u{1b}[?1000h\u{1b}[?1006h")
+
+        XCTAssertTrue(view.reportWheel(rows: 1, columns: 0, mods: [.shift], at: .zero))
+        XCTAssertEqual(recorder.sent.count, 1)
+        // Shift rides along in the report rather than cancelling it: SGR
+        // button 64 plus 4 for shift.
+        XCTAssertTrue(String(decoding: recorder.bytes, as: UTF8.self).hasPrefix("\u{1b}[<68;"))
+    }
+
+    /// Shift *does* take a click away from the program, which is what lets
+    /// you select text inside one.
+    func testShiftSuppressesButtonReporting() throws {
+        let (view, engine, recorder) = try surface()
+        write(engine, "\u{1b}[?1000h\u{1b}[?1006h")
+
+        let shiftClick = try XCTUnwrap(
+            NSEvent.mouseEvent(
+                with: .leftMouseDown, location: .zero, modifierFlags: [.shift],
+                timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0,
+                clickCount: 1, pressure: 1))
+        view.mouseDown(with: shiftClick)
+        XCTAssertTrue(recorder.sent.isEmpty)
+    }
+
+    /// Both wheel claimants drop the selection, as Ghostty's `scrollCallback`
+    /// does. A highlight left behind while the program scrolls under it is
+    /// pointing at whatever ends up in those cells.
+    func testWheelClearsTheSelectionForTheProgram() throws {
+        let (view, engine, _) = try surface()
+        write(engine, "hello world\u{1b}[?1000h\u{1b}[?1006h")
+        engine.selectAll()
+        XCTAssertTrue(engine.hasSelection)
+
+        XCTAssertTrue(view.reportWheel(rows: 1, columns: 0, mods: [], at: .zero))
+        XCTAssertFalse(engine.hasSelection)
+    }
+
+    func testAlternateScrollClearsTheSelection() throws {
+        let (view, engine, _) = try surface()
+        // Text after the switch: select-all works on the active screen, and
+        // the alternate one starts empty.
+        write(engine, "\u{1b}[?1049h\u{1b}[?1007hhello")
+        engine.selectAll()
+        XCTAssertTrue(engine.hasSelection)
+
+        XCTAssertTrue(view.reportWheel(rows: -1, columns: 0, mods: [], at: .zero))
+        XCTAssertFalse(engine.hasSelection)
+    }
+
+    /// And a wheel nobody claims leaves it alone — that gesture belongs to the
+    /// viewport, and scrolling your own view is not a reason to lose what you
+    /// selected.
+    func testUnclaimedWheelKeepsTheSelection() throws {
+        let (view, engine, _) = try surface()
+        write(engine, "hello world")
+        engine.selectAll()
+
+        XCTAssertFalse(view.reportWheel(rows: 1, columns: 0, mods: [], at: .zero))
+        XCTAssertTrue(engine.hasSelection)
+    }
 }
