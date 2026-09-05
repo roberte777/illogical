@@ -228,3 +228,106 @@ final class WheelRowsTests: XCTestCase {
             1, "the tenth 3px event completes a 30px row")
     }
 }
+
+/// The horizontal axis, which exists only for wheel reports — the viewport
+/// never moves sideways. Every test here is really asserting that this is
+/// *not* the vertical code with a different cell size.
+final class WheelColumnsTests: XCTestCase {
+    private let cellWidth = 10.0
+
+    /// A notch is a column. No cell width, no multiplier, no accumulator.
+    func testDiscreteNotchIsOneColumn() {
+        var a = ScrollAccumulator()
+        XCTAssertEqual(
+            a.wheelColumns(
+                scrollingDeltaX: 1, legacyDeltaX: 0, precise: false, cellWidth: cellWidth),
+            1)
+        XCTAssertEqual(
+            a.wheelColumns(
+                scrollingDeltaX: -3, legacyDeltaX: 0, precise: false, cellWidth: cellWidth),
+            -3)
+        XCTAssertEqual(a.pendingX, 0, "the discrete path must not accumulate")
+    }
+
+    /// The asymmetry that matters: a slow vertical notch is rounded out to a
+    /// whole tick so it still scrolls, a slow horizontal one is not.
+    func testSlowNotchIsDroppedUnlikeVertical() {
+        var a = ScrollAccumulator()
+        XCTAssertEqual(
+            a.wheelColumns(
+                scrollingDeltaX: 0.1, legacyDeltaX: 0, precise: false, cellWidth: cellWidth),
+            0, "round(0.1) is zero — libghostty does not round this axis out")
+
+        var vertical = ScrollAccumulator()
+        XCTAssertEqual(
+            vertical.wheelRows(
+                scrollingDeltaY: 0.1, legacyDeltaY: 0, precise: false, cellHeight: 30),
+            3, "whereas the same magnitude vertically is a full tick")
+    }
+
+    /// The discrete multiplier is vertical-only. Three rows per notch, one
+    /// column per notch.
+    func testMultipliersDoNotApply() {
+        var a = ScrollAccumulator(precisionMultiplier: 5, discreteMultiplier: 7)
+        XCTAssertEqual(
+            a.wheelColumns(
+                scrollingDeltaX: 1, legacyDeltaX: 0, precise: false, cellWidth: cellWidth),
+            1)
+        XCTAssertEqual(
+            a.wheelColumns(
+                scrollingDeltaX: 20, legacyDeltaX: 0, precise: true, cellWidth: cellWidth),
+            2, "not 10 — the precision multiplier is vertical-only too")
+    }
+
+    /// The precise path does accumulate, against cell *width*.
+    func testPreciseDeltasAccumulateAgainstWidth() {
+        var a = ScrollAccumulator()
+        for _ in 0..<3 {
+            XCTAssertEqual(
+                a.wheelColumns(
+                    scrollingDeltaX: 3, legacyDeltaX: 0, precise: true, cellWidth: cellWidth),
+                0)
+        }
+        XCTAssertEqual(
+            a.wheelColumns(
+                scrollingDeltaX: 3, legacyDeltaX: 0, precise: true, cellWidth: cellWidth),
+            1, "12px crosses a 10px cell")
+        XCTAssertEqual(a.pendingX, 2, accuracy: 0.0001, "and carries the true 2px remainder")
+    }
+
+    /// The two axes carry their remainders separately. A diagonal trackpad
+    /// swipe must not have one axis consume the other's fraction.
+    func testAxesDoNotShareARemainder() {
+        var a = ScrollAccumulator()
+        _ = a.wheelColumns(
+            scrollingDeltaX: 7, legacyDeltaX: 0, precise: true, cellWidth: cellWidth)
+        _ = a.wheelRows(
+            scrollingDeltaY: 7, legacyDeltaY: 0, precise: true, cellHeight: 30)
+        XCTAssertEqual(a.pendingX, 7, accuracy: 0.0001)
+        XCTAssertEqual(a.pending, 7, accuracy: 0.0001)
+        a.reset()
+        XCTAssertEqual(a.pendingX, 0)
+        XCTAssertEqual(a.pending, 0)
+    }
+
+    func testZeroDeltaAndZeroWidthAreIgnored() {
+        var a = ScrollAccumulator()
+        XCTAssertEqual(
+            a.wheelColumns(
+                scrollingDeltaX: 0, legacyDeltaX: 0, precise: true, cellWidth: cellWidth),
+            0)
+        XCTAssertEqual(
+            a.wheelColumns(scrollingDeltaX: 5, legacyDeltaX: 0, precise: true, cellWidth: 0),
+            0)
+    }
+
+    /// Same legacy fallback as the vertical axis, for the same reason:
+    /// some sources fill in only the old field.
+    func testFallsBackToLegacyDelta() {
+        var a = ScrollAccumulator()
+        XCTAssertEqual(
+            a.wheelColumns(
+                scrollingDeltaX: 0, legacyDeltaX: 2, precise: true, cellWidth: cellWidth),
+            2, "treated as notches, so two columns")
+    }
+}
