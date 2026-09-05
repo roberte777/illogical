@@ -33,7 +33,7 @@
                                                       │ ghostty-vt       │
         on attach, first:                             │ Terminal         │
         snapshot through READY ─────────────────────► │       +          │
-        then: history, newest→oldest ───────────────► │ Metal renderer   │
+        then: history, newest→oldest ───────────────► │ CoreText renderer│
                                                       │       +          │
         input ◄─────────────────────────────────────  │ own viewport     │
         (serialized to the server)                    └──────────────────┘
@@ -129,7 +129,7 @@ describes: *"the same trade-off as other multiplexers"* [ARCH t=507].
 | --- | --- |
 | Shell, windows, splits, session dropdown | SwiftUI + AppKit, native widgets |
 | Terminal state | libghostty-vt via `ghostty-vt.xcframework` |
-| Rendering | Metal, CoreText-rasterized glyph atlas |
+| Rendering | CoreText, one `CTLine` per style run ([why not Metal](ROADMAP.md#why-there-is-no-metal-renderer)) |
 | Scrollback | native scroll views over the VT scrollback |
 | Transport | unix socket locally; `ssh <host> illogicald --stdio` remotely |
 

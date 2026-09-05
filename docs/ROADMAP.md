@@ -71,27 +71,53 @@ libghostty-vt terminal and renders it; input round-trips to the PTY.
 
 **Gate:** attach latency does not vary between 1 MB and 100 MB of scrollback.
 
-## M3 — The renderer (in progress)
+## M3 — The renderer (done)
 
 **Ends at:** the Mac app is a terminal you would actually use. See
 [CLIENT.md](CLIENT.md).
 
-Landed so far: a CoreText renderer over libghostty's render state (run-length
-spans, full colour and attributes, cursor), the Superlogical-style chrome
-(session button, per-terminal tab strip, breadcrumb), key encoding for the
-common cases, and resize driven by the view's own geometry.
-
 | | Work |
 | --- | --- |
-| | Metal renderer + glyph atlas, replacing the CoreText path |
-| | **D1** — two-phase update: lock, begin, unlock, end |
-| | **D2** — two-layer dirty tracking; `render_state_clean()` per frame |
-| | CoreText glyph rasterization + atlas: ligatures, box drawing, emoji, wide chars |
-| | Native scrollback; never synthesize wheel sequences |
-| | Key/mouse/focus encoding via libghostty-vt, replacing the hand-rolled subset |
-| | Selection via `selection.h`'s gesture machine, tracked grid refs |
-| | Native splits: one connection per pane |
-| | `os_signpost` launch budget |
+| x | Text drawn as style runs, not per cell (see below) |
+| x | **D1** — two-phase update: lock, begin, unlock, end |
+| x | **D2** — two-layer dirty tracking; `render_state_clean()` per frame |
+| x | Colour, attributes, cursor, wide characters, emoji |
+| x | Native scrollback; never synthesize wheel sequences |
+| x | Key/mouse/focus encoding via libghostty-vt, replacing the hand-rolled subset |
+| x | Selection via `selection.h`'s gesture machine, tracked grid refs |
+| x | Native splits: one connection per pane |
+| x | `os_signpost` launch budget |
+| ~ | Metal renderer + glyph atlas — **not done, and deliberately so** |
+
+### Why there is no Metal renderer
+
+This milestone was written assuming CoreText would have to go. It measured the
+other way, so the plan changed rather than the evidence.
+
+The first renderer built one `CTLine` per cell — about 11,000 objects a frame
+on a full grid. A/B on one binary, 192x58, dense text, full repaint every
+frame, Release:
+
+| text path | p50 | fps |
+| --- | --- | --- |
+| one `CTLine` per cell | 416ms | 2.4 |
+| one `CTLine` per style run | 3.2ms | 60 (capped) |
+
+130x, and 19% of the 16.7ms frame budget in the worst case real content can
+produce. The cost was never rasterization — CoreGraphics caches rasterized
+glyphs perfectly well. It was allocating and shaping eleven thousand objects
+to draw them.
+
+A Metal renderer would buy headroom that is already there, at the price of a
+glyph atlas, an eviction policy, a shader pipeline and their bugs. It stays on
+the shelf until a measurement asks for it. If one does — very large displays,
+or a ProMotion 120Hz budget of 8.3ms — the swap is still contained: the view
+consumes a plain `Grid` value that the engine produces under lock, so the draw
+path can be replaced without touching the engine, transport or chrome.
+
+The reusable lesson is the one that generalizes: *measure the naive
+implementation before replacing the technology.* The bottleneck was in how the
+API was being called, not in the API.
 
 **Gate:** cold launch to window under the budget; first frame independent of
 scrollback size.

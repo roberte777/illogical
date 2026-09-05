@@ -26,6 +26,15 @@ final class SessionStore {
     var sessionMenuOpen =
         ProcessInfo.processInfo.environment["ILLOGICAL_OPEN_SESSION_MENU"] != nil
 
+    /// Pane layout for the selected tab. Purely client state: the server has no
+    /// concept of splits, and each leaf is its own connection to its own PTY.
+    var layout: SplitTree = .leaf(0)
+    /// Which pane takes keyboard focus and is the target of a split.
+    var focusedTerminalID: UInt64?
+
+    /// A split is pending until the server hands back the new terminal's id.
+    private var pendingSplit: SplitTree.Axis?
+
     /// Live controllers, one per open terminal.
     private(set) var controllers: [UInt64: TerminalController] = [:]
 
@@ -35,6 +44,11 @@ final class SessionStore {
     var selected: TerminalSummary? {
         guard let selectedID else { return nil }
         return terminals.first { $0.id == selectedID }
+    }
+
+    var focusedTerminal: TerminalSummary? {
+        guard let focusedTerminalID else { return nil }
+        return terminals.first { $0.id == focusedTerminalID }
     }
 
     var selectedSession: SessionSummary? {
@@ -147,12 +161,20 @@ final class SessionStore {
             if selectedID == nil || !terminals.contains(where: { $0.id == selectedID }) {
                 selectedID = terminals.first?.id
             }
+            reconcileLayout()
 
         case .created:
             guard let created = try? JSONDecoder().decode(CreatedBody.self, from: frame.payload)
             else { return }
             refresh()
-            selectedID = created.terminal
+            if let axis = pendingSplit, let target = focusedTerminalID {
+                // A split keeps the current tab and adds a pane beside it.
+                layout = layout.splitting(target, with: created.terminal, axis: axis)
+                focusedTerminalID = created.terminal
+                pendingSplit = nil
+            } else {
+                selectedID = created.terminal
+            }
 
         case .sessionsChanged:
             refresh()
@@ -160,6 +182,44 @@ final class SessionStore {
         default:
             break
         }
+    }
+
+    // MARK: - Splits
+
+    /// Split the focused pane, creating a terminal to fill the new half.
+    func split(_ axis: SplitTree.Axis) {
+        guard focusedTerminalID != nil else { return }
+        pendingSplit = axis
+        createTerminal()
+    }
+
+    /// Close the focused pane. The last pane closing closes the terminal.
+    func closeFocusedPane() {
+        guard let focused = focusedTerminalID else { return }
+        kill(focused)
+    }
+
+    /// Keep the layout in step with the terminals that actually exist. A pane
+    /// whose terminal was retired collapses; a newly selected tab resets to a
+    /// single pane.
+    private func reconcileLayout() {
+        guard let selected = selectedID else {
+            layout = .leaf(0)
+            focusedTerminalID = nil
+            return
+        }
+
+        let live = Set(terminals.map(\.id))
+        var next = layout
+        for id in next.terminals where !live.contains(id) {
+            next = next.removing(id) ?? .leaf(selected)
+        }
+        // Switching tabs starts a fresh single-pane layout for that terminal.
+        if !next.contains(selected) { next = .leaf(selected) }
+        layout = next
+
+        if let focused = focusedTerminalID, layout.contains(focused) { return }
+        focusedTerminalID = layout.terminals.first
     }
 
     // MARK: - Per-terminal connections

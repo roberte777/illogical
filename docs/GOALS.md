@@ -102,7 +102,7 @@ low end will work really great."*
 ### G7 — Native clients, one per platform
 
 Each client is written in its platform's native toolkit and powered by
-libghostty-vt. macOS is first: Swift, AppKit/SwiftUI, Metal.
+libghostty-vt. macOS is first: Swift, AppKit/SwiftUI, CoreText.
 
 The Mac client specifically must:
 

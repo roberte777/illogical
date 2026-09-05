@@ -1,7 +1,7 @@
 # The macOS client
 
 `Illogical.app`. Swift 6, AppKit + SwiftUI, libghostty-vt via
-`ghostty-vt.xcframework`, Metal for drawing.
+`ghostty-vt.xcframework`, CoreText for drawing.
 
 The client is not a viewer. It is a **full terminal emulator running the same VT
 engine as the server**, which is what lets the server send raw bytes and stop
@@ -19,7 +19,7 @@ Illogical.app
 │   ├── GhosttyTerminal.swift    libghostty-vt wrapper
 │   ├── SnapshotRestore.swift    two-phase attach decode
 │   ├── TerminalSurface.swift    NSView host
-│   └── Renderer/                Metal renderer + glyph atlas
+│   └── TerminalSurfaceView      CoreText, drawn as style runs
 └── Transport/      unix socket, ssh stdio, framing
 
 Packages/IllogicalKit/
@@ -82,11 +82,22 @@ it draws exactly what libghostty's render state reports, including palette and
 true colour, bold, italic, faint, underline, strikethrough, inverse and
 selection — and it is fast enough to be pleasant.
 
-It is not the finish line. Metal with a rasterized glyph atlas is, and the swap
-is contained: `TerminalSurfaceView.draw(_:)` consumes a plain `Grid` value type
-that the engine already produces under lock, so the renderer can be replaced
-without touching the engine, the transport, or the chrome. Ligatures, box
-drawing, powerline glyphs and wide-character advance land with it.
+Text is drawn one `CTLine` per *style run*, not per cell. That distinction is
+the whole performance story: per cell costs 416ms a frame on a dense 192x58
+grid, per run costs 3.2ms — 19% of the 16.7ms budget in the worst case. The
+expensive part of the naive version was never rasterization, it was allocating
+eleven thousand objects to ask for it.
+
+Runs are exact because the font is monospaced and ligatures are disabled, so
+glyphs land on cell boundaries. Anything that is not a lone ASCII scalar —
+wide characters, combining marks, emoji — falls back to per-cell drawing,
+where per-cell placement is the point.
+
+Metal with a glyph atlas was the plan and is now on the shelf; see
+[ROADMAP.md](ROADMAP.md#why-there-is-no-metal-renderer). The swap stays
+contained if it is ever wanted: `TerminalSurfaceView.draw(_:)` consumes a plain
+`Grid` value type the engine produces under lock, so the renderer can be
+replaced without touching the engine, the transport, or the chrome.
 
 ## Scrollback is native, and sometimes absent
 

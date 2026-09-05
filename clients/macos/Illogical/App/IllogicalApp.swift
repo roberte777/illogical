@@ -11,7 +11,10 @@ import SwiftUI
 struct IllogicalApp: App {
     @State private var store = SessionStore()
 
-    init() { Trace.log("app init") }
+    init() {
+        Signposts.processStart = Date()
+        Trace.log("app init")
+    }
 
     var body: some Scene {
         Window("Illogical", id: "main") {
@@ -31,6 +34,13 @@ struct IllogicalApp: App {
                     store.createTerminal(sessionName: "session-\(store.sessions.count + 1)")
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
+                Divider()
+                Button("Split Right") { store.split(.horizontal) }
+                    .keyboardShortcut("d", modifiers: .command)
+                Button("Split Down") { store.split(.vertical) }
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
+                Button("Close Pane") { store.closeFocusedPane() }
+                    .keyboardShortcut("w", modifiers: .command)
             }
             CommandGroup(after: .toolbar) {
                 Button("Refresh Sessions") { store.refresh() }
@@ -49,13 +59,15 @@ struct ContentView: View {
             Rectangle().fill(Palette.divider).frame(height: 1)
             // No divider under the breadcrumb: it sits on the terminal's own
             // background, as in Superlogical.
-            Breadcrumb(terminal: store.selected)
+            Breadcrumb(terminal: store.focusedTerminal ?? store.selected)
 
             if let error = store.connectionError {
                 ServerUnavailable(message: error)
-            } else if let selected = store.selected {
-                TerminalPane(terminal: selected)
-                    .id(selected.id)
+            } else if store.selected != nil {
+                SplitTreeView(
+                    tree: store.layout,
+                    terminals: Dictionary(
+                        uniqueKeysWithValues: store.terminals.map { ($0.id, $0) }))
             } else {
                 EmptyState()
             }
@@ -80,6 +92,7 @@ struct ContentView: View {
         }
         .frame(minWidth: 720, minHeight: 460)
         .preferredColorScheme(.dark)
+        .onAppear { Signposts.markWindowVisible() }
         .background(
             WindowChrome(toolbarHeight: Metrics.toolbarHeight) {
                 Toolbar().environment(store)

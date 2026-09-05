@@ -11,6 +11,7 @@
 //  copy out a value type. Drawing then happens with no lock held — the shape
 //  libghostty's two-phase render update is designed for.
 
+import AppKit
 import Foundation
 import GhosttyVt
 
@@ -18,6 +19,8 @@ final class TerminalEngine: @unchecked Sendable {
     private var terminal: GhosttyTerminal?
     private var renderState: GhosttyRenderState?
     private let lock = NSLock()
+    private let keyEncoder = KeyEncoder()
+    private let mouseEncoder = MouseEncoder()
 
     private(set) var cols: UInt16
     private(set) var rows: UInt16
@@ -97,6 +100,33 @@ final class TerminalEngine: @unchecked Sendable {
         data.withUnsafeBytes { write($0) }
     }
 
+    /// Scroll the viewport by whole rows. Negative is up, into scrollback.
+    ///
+    /// This moves libghostty's own viewport rather than synthesising wheel
+    /// escape sequences into the PTY, so scrollback is native: the terminal
+    /// keeps its history and the running program never sees a fake wheel.
+    func scroll(rows: Int) {
+        guard rows != 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let terminal else { return }
+        var behavior = GhosttyTerminalScrollViewport()
+        behavior.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA
+        behavior.value.delta = rows
+        ghostty_terminal_scroll_viewport(terminal, behavior)
+        dirty = true
+    }
+
+    func scrollToBottom() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let terminal else { return }
+        var behavior = GhosttyTerminalScrollViewport()
+        behavior.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM
+        ghostty_terminal_scroll_viewport(terminal, behavior)
+        dirty = true
+    }
+
     func resize(cols: UInt16, rows: UInt16, cellWidth: UInt32, cellHeight: UInt32) {
         lock.lock()
         defer { lock.unlock() }
@@ -105,6 +135,71 @@ final class TerminalEngine: @unchecked Sendable {
         self.cols = cols
         self.rows = rows
         dirty = true
+    }
+
+    /// Access for the selection extension, which needs the raw handle and the
+    /// same lock. Kept internal so nothing outside this file group touches the
+    /// terminal unsynchronised.
+    var terminalHandle: GhosttyTerminal? { terminal }
+
+    func withLock<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
+
+    func markDirty() { dirty = true }
+
+    /// True while an alternate-screen program (vim, htop) is running. Those own
+    /// the wheel: there is no scrollback to move through.
+    var isAlternateScreen: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let terminal else { return false }
+        var screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY
+        _ = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen)
+        return screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE
+    }
+
+    /// True when the running program has asked for mouse reporting.
+    var wantsMouseReporting: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let terminal else { return false }
+        var tracking = GHOSTTY_MOUSE_TRACKING_NONE
+        _ = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &tracking)
+        return tracking != GHOSTTY_MOUSE_TRACKING_NONE
+    }
+
+    /// Encode a key event against the terminal's *current* modes.
+    ///
+    /// Held under the same lock as everything else: the encoding depends on
+    /// mode state that PTY output changes, so reading it unsynchronised would
+    /// race the reader thread.
+    func encode(
+        key event: NSEvent, action: GhosttyKeyAction = GHOSTTY_KEY_ACTION_PRESS
+    )
+        -> [UInt8]?
+    {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let terminal, let keyEncoder else { return nil }
+        return keyEncoder.encode(event, terminal: terminal, action: action)
+    }
+
+    func encode(
+        mouseButton button: GhosttyMouseButton,
+        action: GhosttyMouseAction,
+        mods: NSEvent.ModifierFlags,
+        column: UInt16,
+        row: UInt16
+    ) -> [UInt8]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let terminal, let mouseEncoder else { return nil }
+        return mouseEncoder.encode(
+            terminal: terminal, button: button, action: action, mods: mods,
+            column: column, row: row)
     }
 
     var needsDisplay: Bool {
@@ -121,7 +216,14 @@ final class TerminalEngine: @unchecked Sendable {
         defer { lock.unlock() }
         guard let terminal, let renderState else { return nil }
 
-        guard ghostty_render_state_update(renderState, terminal) == GHOSTTY_SUCCESS else {
+        // Two-phase update (render.h "Two-Phase Updates"): only `begin` needs
+        // the terminal, so the window where writes are blocked is as small as
+        // libghostty allows. We hold one lock for both halves today, but the
+        // split is what lets the renderer move off this thread later.
+        guard ghostty_render_state_begin_update(renderState, terminal) == GHOSTTY_SUCCESS else {
+            return nil
+        }
+        guard ghostty_render_state_end_update(renderState) == GHOSTTY_SUCCESS else {
             return nil
         }
         dirty = false
@@ -134,6 +236,9 @@ final class TerminalEngine: @unchecked Sendable {
         var colors = GhosttyRenderStateColors()
         colors.size = MemoryLayout<GhosttyRenderStateColors>.size
         _ = ghostty_render_state_get(renderState, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors)
+
+        var scrollbar = GhosttyTerminalScrollbar()
+        _ = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar)
 
         var cursorVisible = false
         _ = ghostty_render_state_get(
@@ -248,7 +353,19 @@ final class TerminalEngine: @unchecked Sendable {
             foreground: .init(colors.foreground),
             background: .init(colors.background),
             cursor: cursorVisible && cursorHasViewport
-                ? Grid.Cursor(x: Int(cursorX), y: Int(cursorY)) : nil)
+                ? Grid.Cursor(x: Int(cursorX), y: Int(cursorY)) : nil,
+            scrollbar: .init(
+                total: scrollbar.total, offset: scrollbar.offset, visible: scrollbar.len))
+    }
+
+    /// Mark the frame drawn. The two dirty layers are independent and `update`
+    /// clears neither, so this has to happen once a frame or the renderer
+    /// either redraws forever or stops redrawing.
+    func markFrameDrawn() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let renderState else { return }
+        _ = ghostty_render_state_clean(renderState)
     }
 }
 
@@ -290,10 +407,23 @@ struct Grid {
         var y: Int
     }
 
+    /// Where the viewport sits in the scrollable area, in rows.
+    struct Scrollbar {
+        var total: UInt64
+        var offset: UInt64
+        var visible: UInt64
+
+        /// True when there is history above or below the viewport.
+        var isScrollable: Bool { total > visible }
+        /// True when the viewport is pinned to the newest output.
+        var isAtBottom: Bool { offset + visible >= total }
+    }
+
     var cols: Int
     var rows: Int
     var lines: [Row]
     var foreground: RGB
     var background: RGB
     var cursor: Cursor?
+    var scrollbar: Scrollbar
 }

@@ -14,6 +14,7 @@
 import Foundation
 import GhosttyVt
 import IllogicalProtocol
+import OSLog
 
 @MainActor
 @Observable
@@ -39,6 +40,12 @@ final class TerminalController {
     /// streaming decoder (a GhosttyReader callback) is the M3 refinement.
     private var snapshotBuffer = Data()
 
+    /// Open from `attach` until the snapshot has been applied, so the G3 claim
+    /// -- first frame independent of scrollback size -- can be read off a
+    /// timeline instead of taken on faith.
+    private var attachInterval: OSSignpostIntervalState?
+    private var attachID: OSSignpostID?
+
     init(terminalID: UInt64, cols: UInt16, rows: UInt16) throws {
         self.terminalID = terminalID
         self.engine = try TerminalEngine(cols: cols, rows: rows)
@@ -55,6 +62,10 @@ final class TerminalController {
             connection.start()
 
             try connection.send(.hello, json: HelloBody(client: "Illogical.app"))
+            let id = Signposts.attach.makeSignpostID()
+            attachID = id
+            attachInterval = Signposts.attach.beginInterval("attach", id: id)
+
             try connection.send(
                 .attach, terminal: terminalID, json: AttachBody(cols: cols, rows: rows))
             state = .attaching
@@ -139,6 +150,11 @@ final class TerminalController {
             engine.adopt(terminal: terminal, cols: engine.cols, rows: engine.rows)
             // We can paint now. Everything below is scrollback catching up.
             state = .live
+            if let interval = attachInterval {
+                let bytes = snapshotBuffer.count
+                Signposts.attach.endInterval("attach", interval, "\(bytes) snapshot bytes")
+                attachInterval = nil
+            }
 
             var pages = 0
             while try restore.restoreNextHistoryPage() {

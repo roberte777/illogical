@@ -70,6 +70,12 @@ struct TerminalSurface: NSViewRepresentable {
             view.statusText = nil
             view.needsDisplay = true
             Trace.log("attached to terminal \(terminalID) at \(size.cols)x\(size.rows)")
+            if let path = ProcessInfo.processInfo.environment["ILLOGICAL_DUMP_PNG"] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    view.dumpPNG(to: path)
+                    Trace.log("dumped \(path)")
+                }
+            }
         }
 
         func surface(_ surface: TerminalSurfaceView, send bytes: [UInt8]) {
@@ -78,6 +84,18 @@ struct TerminalSurface: NSViewRepresentable {
 
         func surface(_ surface: TerminalSurfaceView, resizeTo cols: UInt16, rows: UInt16) {
             controller?.resize(cols: cols, rows: rows)
+        }
+
+        func surface(_ surface: TerminalSurfaceView, scrollWheel event: NSEvent) {
+            // Only reached when an alternate-screen program owns the wheel;
+            // the surface has already decided that.
+            guard let controller else { return }
+            let rows = Int(event.scrollingDeltaY.rounded())
+            guard rows != 0 else { return }
+            let sequence = rows > 0 ? "\u{1b}[A" : "\u{1b}[B"
+            for _ in 0..<min(abs(rows), 5) {
+                controller.send(Array(sequence.utf8))
+            }
         }
     }
 }
