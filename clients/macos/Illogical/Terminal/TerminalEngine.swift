@@ -1,15 +1,22 @@
 //  TerminalEngine.swift
 //  The client's own libghostty-vt terminal.
 //
-//  This is what makes the architecture work: the server ships raw PTY bytes and
-//  a binary snapshot, and we run the *same* VT engine it does. Two replicas of
-//  one state machine.
+//  This is what makes the architecture work: the server ships raw PTY bytes
+//  and a binary snapshot, and we run the *same* VT engine it does. Two
+//  replicas of one state machine.
 //
-//  Threading: bytes arrive on the connection's reader thread and are applied
-//  immediately, under `lock`. The view asks for a `Grid` on the main thread,
-//  which takes the same lock only long enough to update the render state and
-//  copy out a value type. Drawing then happens with no lock held — the shape
-//  libghostty's two-phase render update is designed for.
+//  Threading, and why it is shaped this way:
+//
+//  Bytes arrive on the connection's reader thread and are applied
+//  immediately under `lock`. The renderer runs on its own thread and calls
+//  `updateSnapshot`, which takes that lock for exactly one call —
+//  `ghostty_render_state_begin_update` — and then releases it. Everything
+//  after that reads memory owned by the render state, so the reader thread
+//  keeps feeding the terminal at full speed while a frame is assembled.
+//
+//  That two-phase split is the whole reason libghostty's render state exists:
+//  "This allows the render state to minimally impact terminal IO performance
+//  and also allows the renderer to be safely multi-threaded." (render.h)
 
 import Foundation
 import GhosttyVt
@@ -19,11 +26,23 @@ final class TerminalEngine: @unchecked Sendable {
     private var renderState: GhosttyRenderState?
     private let lock = NSLock()
 
+    /// Reused across frames so extraction allocates nothing.
+    private var rowIterator: GhosttyRenderStateRowIterator?
+    private var rowCells: GhosttyRenderStateRowCells?
+    private var graphemeScratch = [UInt32](repeating: 0, count: 64)
+
     private(set) var cols: UInt16
     private(set) var rows: UInt16
 
-    /// Set when new bytes have been applied and the view should redraw.
-    private var dirty = true
+    /// Set when bytes have been applied and a frame is owed. Read from the
+    /// display link every tick, so it is an atomic rather than lock-guarded:
+    /// an idle terminal must not cost a lock acquisition 120 times a second.
+    private let dirtyFlag = Atomic(true)
+
+    /// Called when the engine goes from clean to dirty, so the view can
+    /// restart a paused display link. An idle terminal should cost nothing,
+    /// which means the display link has to actually stop.
+    var onWake: (@Sendable () -> Void)?
 
     init(cols: UInt16 = 80, rows: UInt16 = 24) throws {
         self.cols = cols
@@ -36,6 +55,18 @@ final class TerminalEngine: @unchecked Sendable {
         var state: GhosttyRenderState?
         try check("ghostty_render_state_new") { ghostty_render_state_new(nil, &state) }
         self.renderState = state
+
+        var iterator: GhosttyRenderStateRowIterator?
+        try check("ghostty_render_state_row_iterator_new") {
+            ghostty_render_state_row_iterator_new(nil, &iterator)
+        }
+        self.rowIterator = iterator
+
+        var cells: GhosttyRenderStateRowCells?
+        try check("ghostty_render_state_row_cells_new") {
+            ghostty_render_state_row_cells_new(nil, &cells)
+        }
+        self.rowCells = cells
 
         applyThemeLocked()
     }
@@ -62,6 +93,8 @@ final class TerminalEngine: @unchecked Sendable {
     }
 
     deinit {
+        if let rowCells { ghostty_render_state_row_cells_free(rowCells) }
+        if let rowIterator { ghostty_render_state_row_iterator_free(rowIterator) }
         if let renderState { ghostty_render_state_free(renderState) }
         if let terminal { ghostty_terminal_free(terminal) }
     }
@@ -72,25 +105,26 @@ final class TerminalEngine: @unchecked Sendable {
     /// already has, so we adopt it wholesale instead of replaying history.
     func adopt(terminal newTerminal: GhosttyTerminal, cols: UInt16, rows: UInt16) {
         lock.lock()
-        defer { lock.unlock() }
         if let terminal { ghostty_terminal_free(terminal) }
         terminal = newTerminal
         self.cols = cols
         self.rows = rows
         // A snapshot-decoded terminal carries libghostty's defaults, not ours.
         applyThemeLocked()
-        dirty = true
+        lock.unlock()
+        markDirty()
     }
 
     /// Apply raw, unprocessed PTY bytes.
     func write(_ bytes: UnsafeRawBufferPointer) {
         guard let base = bytes.baseAddress, !bytes.isEmpty else { return }
         lock.lock()
-        defer { lock.unlock() }
-        guard let terminal else { return }
-        ghostty_terminal_vt_write(
-            terminal, base.assumingMemoryBound(to: UInt8.self), bytes.count)
-        dirty = true
+        if let terminal {
+            ghostty_terminal_vt_write(
+                terminal, base.assumingMemoryBound(to: UInt8.self), bytes.count)
+        }
+        lock.unlock()
+        markDirty()
     }
 
     func write(_ data: Data) {
@@ -98,202 +132,322 @@ final class TerminalEngine: @unchecked Sendable {
     }
 
     func resize(cols: UInt16, rows: UInt16, cellWidth: UInt32, cellHeight: UInt32) {
+        guard cols > 0, rows > 0 else { return }
         lock.lock()
-        defer { lock.unlock() }
-        guard let terminal, cols > 0, rows > 0 else { return }
-        _ = ghostty_terminal_resize(terminal, cols, rows, cellWidth, cellHeight)
-        self.cols = cols
-        self.rows = rows
-        dirty = true
-    }
-
-    var needsDisplay: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return dirty
-    }
-
-    /// Update the render state and copy out a drawable snapshot of the grid.
-    ///
-    /// The lock is held only for the copy. Drawing happens after it is released.
-    func grid() -> Grid? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let terminal, let renderState else { return nil }
-
-        guard ghostty_render_state_update(renderState, terminal) == GHOSTTY_SUCCESS else {
-            return nil
+        if let terminal {
+            _ = ghostty_terminal_resize(terminal, cols, rows, cellWidth, cellHeight)
+            self.cols = cols
+            self.rows = rows
         }
-        dirty = false
+        lock.unlock()
+        markDirty()
+    }
+
+    private func markDirty() {
+        // Only wake on the clean -> dirty edge. A terminal spewing output
+        // must not post a wakeup per write.
+        if !dirtyFlag.exchange(true) {
+            onWake?()
+        }
+    }
+
+    // MARK: - Render source
+
+    var isDirty: Bool { dirtyFlag.load() }
+
+    /// Take a consistent view of the terminal into `snapshot`.
+    ///
+    /// The terminal lock is held for the `begin_update` call only.
+    func updateSnapshot(into snapshot: TerminalSnapshot) -> Bool {
+        guard let renderState, let rowIterator, let rowCells else { return false }
+
+        lock.lock()
+        guard let terminal else {
+            lock.unlock()
+            return false
+        }
+        let beginResult = ghostty_render_state_begin_update(renderState, terminal)
+        lock.unlock()
+
+        guard beginResult == GHOSTTY_SUCCESS else { return false }
+        dirtyFlag.store(false)
+
+        // Deferred work that needs no terminal access. The reader thread is
+        // free to keep writing from here on.
+        guard ghostty_render_state_end_update(renderState) == GHOSTTY_SUCCESS else {
+            return false
+        }
 
         var colCount: UInt16 = 0
         var rowCount: UInt16 = 0
+        var dirty: GhosttyRenderStateDirty = GHOSTTY_RENDER_STATE_DIRTY_FALSE
         _ = ghostty_render_state_get(renderState, GHOSTTY_RENDER_STATE_DATA_COLS, &colCount)
         _ = ghostty_render_state_get(renderState, GHOSTTY_RENDER_STATE_DATA_ROWS, &rowCount)
+        _ = ghostty_render_state_get(renderState, GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty)
+
+        guard colCount > 0, rowCount > 0 else { return false }
+
+        // A size change invalidates every row, whatever the dirty state says.
+        let sizeChanged =
+            snapshot.columns != Int(colCount) || snapshot.rows != Int(rowCount)
+        snapshot.resize(columns: Int(colCount), rows: Int(rowCount))
 
         var colors = GhosttyRenderStateColors()
         colors.size = MemoryLayout<GhosttyRenderStateColors>.size
         _ = ghostty_render_state_get(renderState, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors)
 
-        var cursorVisible = false
-        _ = ghostty_render_state_get(
-            renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE, &cursorVisible)
-        var cursorX: UInt16 = 0
-        var cursorY: UInt16 = 0
-        var cursorHasViewport = false
-        _ = ghostty_render_state_get(
-            renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE, &cursorHasViewport)
-        if cursorHasViewport {
-            _ = ghostty_render_state_get(
-                renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &cursorX)
-            _ = ghostty_render_state_get(
-                renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &cursorY)
-        }
+        snapshot.background = PackedRGB(
+            r: colors.background.r, g: colors.background.g, b: colors.background.b)
+        snapshot.foreground = PackedRGB(
+            r: colors.foreground.r, g: colors.foreground.g, b: colors.foreground.b)
+        snapshot.cursorColor =
+            colors.cursor_has_value
+            ? PackedRGB(r: colors.cursor.r, g: colors.cursor.g, b: colors.cursor.b)
+            : .none
 
-        var rowsOut: [Grid.Row] = []
-        rowsOut.reserveCapacity(Int(rowCount))
+        var cursor = GhosttyRenderStateCursor()
+        cursor.size = MemoryLayout<GhosttyRenderStateCursor>.size
+        _ = ghostty_render_state_get(renderState, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cursor)
+        snapshot.cursor = SnapshotCursor(
+            hasViewport: cursor.viewport_has_value,
+            x: cursor.viewport_x,
+            y: cursor.viewport_y,
+            wideTail: cursor.wide_tail,
+            visible: cursor.visible,
+            blinking: cursor.blinking,
+            passwordInput: cursor.password_input,
+            style: Self.cursorStyle(cursor.visual_style))
 
-        var iterator: GhosttyRenderStateRowIterator?
+        snapshot.dirty = sizeChanged ? .full : Self.dirtyState(dirty)
+
+        // Point the reusable iterator at this update's rows.
+        var iterator: GhosttyRenderStateRowIterator? = rowIterator
         guard
-            ghostty_render_state_row_iterator_new(nil, &iterator) == GHOSTTY_SUCCESS,
             ghostty_render_state_get(
-                renderState, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &iterator) == GHOSTTY_SUCCESS
-        else { return nil }
-        defer { ghostty_render_state_row_iterator_free(iterator) }
+                renderState, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &iterator)
+                == GHOSTTY_SUCCESS
+        else { return false }
 
-        var cells: GhosttyRenderStateRowCells?
-        guard ghostty_render_state_row_cells_new(nil, &cells) == GHOSTTY_SUCCESS else {
-            return nil
+        snapshot.clearRowDirty()
+
+        if snapshot.dirty == .full {
+            var y = 0
+            while ghostty_render_state_row_iterator_next(rowIterator) {
+                if y < snapshot.rows {
+                    extractRow(
+                        into: snapshot, y: y, iterator: rowIterator, cells: rowCells,
+                        colors: &colors)
+                }
+                y += 1
+            }
+        } else if snapshot.dirty == .partial {
+            var y: UInt16 = 0
+            while ghostty_render_state_row_iterator_next_dirty(rowIterator, &y) {
+                if Int(y) < snapshot.rows {
+                    extractRow(
+                        into: snapshot, y: Int(y), iterator: rowIterator, cells: rowCells,
+                        colors: &colors)
+                }
+            }
         }
-        defer { ghostty_render_state_row_cells_free(cells) }
 
-        var utf8 = [UInt8](repeating: 0, count: 64)
+        // Consume the dirty state. Safe here rather than after the GPU work
+        // because what we just built — the snapshot — is the durable copy;
+        // the draw only uploads it.
+        _ = ghostty_render_state_clean(renderState)
+        return true
+    }
 
-        while ghostty_render_state_row_iterator_next(iterator) {
-            guard
-                ghostty_render_state_row_get(
-                    iterator, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) == GHOSTTY_SUCCESS
-            else { continue }
+    /// Pull one row's cells into the snapshot.
+    private func extractRow(
+        into snapshot: TerminalSnapshot,
+        y: Int,
+        iterator: GhosttyRenderStateRowIterator,
+        cells: GhosttyRenderStateRowCells,
+        colors: inout GhosttyRenderStateColors
+    ) {
+        snapshot.rowDirty[y] = true
+        snapshot.rowData[y].reset(columns: snapshot.columns)
 
-            var rowCells: [Grid.Cell] = []
-            rowCells.reserveCapacity(Int(colCount))
+        // One call per row for selection, rather than one per cell. The
+        // header recommends exactly this for renderers that work in spans.
+        var selection = GhosttyRenderStateRowSelection()
+        selection.size = MemoryLayout<GhosttyRenderStateRowSelection>.size
+        if ghostty_render_state_row_get(
+            iterator, GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION, &selection) == GHOSTTY_SUCCESS
+        {
+            snapshot.rowData[y].selection = (selection.start_x, selection.end_x)
+        }
 
-            while ghostty_render_state_row_cells_next(cells) {
-                var graphemeLen: UInt32 = 0
-                _ = ghostty_render_state_row_cells_get(
-                    cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, &graphemeLen)
+        var cellsHandle: GhosttyRenderStateRowCells? = cells
+        guard
+            ghostty_render_state_row_get(
+                iterator, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cellsHandle) == GHOSTTY_SUCCESS
+        else { return }
 
-                var text = ""
-                if graphemeLen > 0 {
-                    text = utf8.withUnsafeMutableBufferPointer { buffer -> String in
-                        var out = GhosttyBuffer()
-                        out.ptr = buffer.baseAddress
-                        out.cap = buffer.count
-                        out.len = 0
-                        let result = ghostty_render_state_row_cells_get(
-                            cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &out)
-                        guard result == GHOSTTY_SUCCESS, out.len > 0 else { return "" }
-                        return String(
-                            decoding: UnsafeBufferPointer(
-                                start: buffer.baseAddress, count: out.len),
-                            as: UTF8.self)
+        var x = 0
+        while ghostty_render_state_row_cells_next(cells) {
+            guard x < snapshot.columns else { break }
+            defer { x += 1 }
+
+            var raw: GhosttyCell = 0
+            var hasStyling = false
+            var graphemeLen: UInt32 = 0
+            withUnsafeMutablePointer(to: &raw) { rawPtr in
+                withUnsafeMutablePointer(to: &hasStyling) { stylingPtr in
+                    withUnsafeMutablePointer(to: &graphemeLen) { lenPtr in
+                        var keys: [GhosttyRenderStateRowCellsData] = [
+                            GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
+                            GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING,
+                            GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN,
+                        ]
+                        var values: [UnsafeMutableRawPointer?] = [
+                            UnsafeMutableRawPointer(rawPtr),
+                            UnsafeMutableRawPointer(stylingPtr),
+                            UnsafeMutableRawPointer(lenPtr),
+                        ]
+                        _ = ghostty_render_state_row_cells_get_multi(
+                            cells, 3, &keys, &values, nil)
                     }
                 }
-
-                var style = GhosttyStyle()
-                style.size = MemoryLayout<GhosttyStyle>.size
-                ghostty_style_default(&style)
-                var hasStyling = false
-                _ = ghostty_render_state_row_cells_get(
-                    cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING, &hasStyling)
-                if hasStyling {
-                    _ = ghostty_render_state_row_cells_get(
-                        cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style)
-                }
-
-                var fg = GhosttyColorRgb()
-                let hasFg =
-                    ghostty_render_state_row_cells_get(
-                        cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg) == GHOSTTY_SUCCESS
-                var bg = GhosttyColorRgb()
-                let hasBg =
-                    ghostty_render_state_row_cells_get(
-                        cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg) == GHOSTTY_SUCCESS
-
-                var selected = false
-                _ = ghostty_render_state_row_cells_get(
-                    cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_SELECTED, &selected)
-
-                rowCells.append(
-                    Grid.Cell(
-                        text: text,
-                        foreground: hasFg ? .init(fg) : nil,
-                        background: hasBg ? .init(bg) : nil,
-                        bold: style.bold,
-                        italic: style.italic,
-                        faint: style.faint,
-                        underline: style.underline != 0,
-                        strikethrough: style.strikethrough,
-                        inverse: style.inverse,
-                        invisible: style.invisible,
-                        selected: selected))
             }
-            rowsOut.append(Grid.Row(cells: rowCells))
-        }
 
-        return Grid(
-            cols: Int(colCount),
-            rows: Int(rowCount),
-            lines: rowsOut,
-            foreground: .init(colors.foreground),
-            background: .init(colors.background),
-            cursor: cursorVisible && cursorHasViewport
-                ? Grid.Cursor(x: Int(cursorX), y: Int(cursorY)) : nil)
+            var cell = RenderCell()
+            cell.hasStyling = hasStyling
+
+            var codepoint: UInt32 = 0
+            var wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW
+            var hasText = false
+            withUnsafeMutablePointer(to: &codepoint) { cpPtr in
+                withUnsafeMutablePointer(to: &wide) { widePtr in
+                    withUnsafeMutablePointer(to: &hasText) { textPtr in
+                        var keys: [GhosttyCellData] = [
+                            GHOSTTY_CELL_DATA_CODEPOINT,
+                            GHOSTTY_CELL_DATA_WIDE,
+                            GHOSTTY_CELL_DATA_HAS_TEXT,
+                        ]
+                        var values: [UnsafeMutableRawPointer?] = [
+                            UnsafeMutableRawPointer(cpPtr),
+                            UnsafeMutableRawPointer(widePtr),
+                            UnsafeMutableRawPointer(textPtr),
+                        ]
+                        _ = ghostty_cell_get_multi(raw, 3, &keys, &values, nil)
+                    }
+                }
+            }
+
+            cell.codepoint = codepoint
+            cell.hasText = hasText
+            cell.wide = CellWide(rawValue: UInt8(truncatingIfNeeded: wide.rawValue)) ?? .narrow
+
+            if hasStyling {
+                var style = GhosttyStyle()
+                ghostty_style_default(&style)
+                style.size = MemoryLayout<GhosttyStyle>.size
+                if ghostty_render_state_row_cells_get(
+                    cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style) == GHOSTTY_SUCCESS
+                {
+                    var flags: CellFlags = []
+                    if style.bold { flags.insert(.bold) }
+                    if style.italic { flags.insert(.italic) }
+                    if style.faint { flags.insert(.faint) }
+                    if style.blink { flags.insert(.blink) }
+                    if style.inverse { flags.insert(.inverse) }
+                    if style.invisible { flags.insert(.invisible) }
+                    if style.strikethrough { flags.insert(.strikethrough) }
+                    if style.overline { flags.insert(.overline) }
+                    cell.flags = flags
+                    cell.underline =
+                        CellUnderline(rawValue: UInt8(truncatingIfNeeded: style.underline))
+                        ?? .none
+                    // Foreground and background are resolved for us, but the
+                    // underline colour is not, so look up the palette here.
+                    cell.underlineColor = Self.resolve(style.underline_color, colors: &colors)
+                }
+            }
+
+            // These return GHOSTTY_INVALID_VALUE when the cell has no
+            // explicit colour, which is the common case and not an error.
+            var fg = GhosttyColorRgb()
+            if ghostty_render_state_row_cells_get(
+                cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg) == GHOSTTY_SUCCESS
+            {
+                cell.fg = PackedRGB(r: fg.r, g: fg.g, b: fg.b)
+            }
+            var bg = GhosttyColorRgb()
+            if ghostty_render_state_row_cells_get(
+                cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg) == GHOSTTY_SUCCESS
+            {
+                cell.bg = PackedRGB(r: bg.r, g: bg.g, b: bg.b)
+            }
+
+            // graphemeLen counts the base codepoint, so anything above one
+            // means there are combining marks to fetch.
+            if graphemeLen > 1 {
+                let extra = Int(graphemeLen)
+                if graphemeScratch.count < extra {
+                    graphemeScratch = [UInt32](repeating: 0, count: extra * 2)
+                }
+                let ok = graphemeScratch.withUnsafeMutableBufferPointer { buf -> Bool in
+                    ghostty_render_state_row_cells_get(
+                        cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
+                        buf.baseAddress) == GHOSTTY_SUCCESS
+                }
+                if ok {
+                    cell.graphemeOffset = UInt32(snapshot.rowData[y].graphemes.count)
+                    cell.graphemeLen = graphemeLen - 1
+                    // Skip index 0: that is the base codepoint, which we
+                    // already have.
+                    for i in 1..<extra {
+                        snapshot.rowData[y].graphemes.append(graphemeScratch[i])
+                    }
+                }
+            }
+
+            snapshot.rowData[y].cells[x] = cell
+        }
+    }
+
+    private static func resolve(
+        _ color: GhosttyStyleColor, colors: inout GhosttyRenderStateColors
+    ) -> PackedRGB {
+        switch color.tag {
+        case GHOSTTY_STYLE_COLOR_RGB:
+            let rgb = color.value.rgb
+            return PackedRGB(r: rgb.r, g: rgb.g, b: rgb.b)
+        case GHOSTTY_STYLE_COLOR_PALETTE:
+            let index = Int(color.value.palette)
+            return withUnsafeBytes(of: &colors.palette) { raw -> PackedRGB in
+                let entries = raw.bindMemory(to: GhosttyColorRgb.self)
+                guard index < entries.count else { return .none }
+                let c = entries[index]
+                return PackedRGB(r: c.r, g: c.g, b: c.b)
+            }
+        default:
+            return .none
+        }
+    }
+
+    private static func dirtyState(_ v: GhosttyRenderStateDirty) -> RenderDirty {
+        switch v {
+        case GHOSTTY_RENDER_STATE_DIRTY_FULL: return .full
+        case GHOSTTY_RENDER_STATE_DIRTY_PARTIAL: return .partial
+        default: return .clean
+        }
+    }
+
+    private static func cursorStyle(
+        _ v: GhosttyRenderStateCursorVisualStyle
+    )
+        -> TerminalCursorStyle
+    {
+        switch v {
+        case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR: return .bar
+        case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW: return .blockHollow
+        case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE: return .underline
+        default: return .block
+        }
     }
 }
 
-/// A drawable copy of the terminal grid. A value type on purpose: once the view
-/// has one it can draw without holding any lock.
-struct Grid {
-    struct RGB: Equatable {
-        var r: UInt8
-        var g: UInt8
-        var b: UInt8
-
-        init(_ c: GhosttyColorRgb) {
-            self.r = c.r
-            self.g = c.g
-            self.b = c.b
-        }
-    }
-
-    struct Cell {
-        var text: String
-        var foreground: RGB?
-        var background: RGB?
-        var bold: Bool
-        var italic: Bool
-        var faint: Bool
-        var underline: Bool
-        var strikethrough: Bool
-        var inverse: Bool
-        var invisible: Bool
-        var selected: Bool
-    }
-
-    struct Row {
-        var cells: [Cell]
-    }
-
-    struct Cursor {
-        var x: Int
-        var y: Int
-    }
-
-    var cols: Int
-    var rows: Int
-    var lines: [Row]
-    var foreground: RGB
-    var background: RGB
-    var cursor: Cursor?
-}
+extension TerminalEngine: TerminalRenderSource {}

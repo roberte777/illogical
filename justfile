@@ -37,7 +37,7 @@ fmt:
 fmt-check:
     zig fmt --check build.zig src
     alejandra --check .
-    swift-format lint --strict --recursive clients/macos/Illogical clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests
+    swift-format lint --strict --recursive clients/macos/Illogical clients/macos/Tests clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests
 
 # Measure memory per terminal, live vs parked. Reads phys_footprint, not RSS —
 # with RSS the parking win is invisible on macOS.
@@ -64,6 +64,14 @@ test-swift:
 app:
     cd clients/macos && {{xcenv}} xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Debug -derivedDataPath .build/xcode -destination 'platform=macOS' build
 
+# Run the renderer tests. Needs `just xcframework` and `just xcodeproj` first.
+test-renderer:
+    cd clients/macos && {{xcenv}} xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Debug -derivedDataPath .build/xcode -destination 'platform=macOS' test
+
+# Renderer benchmarks. Only meaningful with optimization, so Release.
+bench-renderer:
+    cd clients/macos && {{xcenv}} xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Release -derivedDataPath .build/xcode-rel -destination 'platform=macOS' test
+
 # Build and launch the Mac app.
 run-app: app
     open clients/macos/.build/xcode/Build/Products/Debug/Illogical.app
@@ -76,7 +84,7 @@ demo: build app
     open clients/macos/.build/xcode/Build/Products/Debug/Illogical.app
 
 fmt-swift:
-    swift-format format --in-place --recursive clients/macos/Illogical clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests
+    swift-format format --in-place --recursive clients/macos/Illogical clients/macos/Tests clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests
 
 # --- housekeeping -----------------------------------------------------------
 
