@@ -210,11 +210,13 @@ final class ScrollbackRestoreTests: XCTestCase {
         // well for a fixture that had no history page to apply — which is
         // precisely how the first version of this test asserted nothing.
         //
-        // There is exactly one such page. `ghostty_terminal_new` asks for
-        // libghostty's default 10 KB of scrollback and the C API exposes no
-        // way to raise it, but `PageList` floors the limit at two standard
-        // pages regardless, and that floor is the only reason anything
-        // survives behind the active screen.
+        // There is exactly one such page, and not because 40,000 lines is a
+        // lot: `ghostty_terminal_new` asks for libghostty's default 10 KB of
+        // scrollback, and `PageList` floors that at two standard pages. The
+        // floor is the only reason anything survives behind the active screen,
+        // so the line count here buys nothing above a few hundred. A fixture
+        // with real depth wants `GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES`
+        // (a NULL value removes the limit outright).
         let control = try SnapshotRestore(snapshot: Data(bytes: raw, count: len))
         let controlTerminal = try control.ready()
         defer { ghostty_terminal_free(controlTerminal) }
