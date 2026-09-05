@@ -46,7 +46,12 @@ final class TerminalRenderer: @unchecked Sendable {
     private var cells = CellContents()
     private var uniforms = IllogicalUniforms()
     private var size: RendererSize
-    private let snapshot = TerminalSnapshot()
+    /// The view of the terminal this frame is built from.
+    ///
+    /// Not private only so the tests can assert on what came out of
+    /// libghostty's render state; a wrong `wide` flag is much easier to
+    /// diagnose as a field than as a pixel.
+    let snapshot = TerminalSnapshot()
 
     /// Set when `updateFrame` produced something new to draw. `drawFrame`
     /// clears it, and skips the whole frame if it was already clear.

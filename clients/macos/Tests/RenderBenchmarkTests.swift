@@ -40,6 +40,27 @@ final class RenderBenchmarkTests: XCTestCase {
         }
     }
 
+    /// True when the tests were built without optimization.
+    ///
+    /// `assert` is compiled out under `-O`, so the closure only runs in a
+    /// debug build. More reliable than checking a build setting, and the
+    /// numbers from an unoptimized build mean nothing anyway.
+    private static let assertionsEnabled: Bool = {
+        var enabled = false
+        assert(
+            {
+                enabled = true
+                return true
+            }())
+        return enabled
+    }()
+
+    override func setUpWithError() throws {
+        try XCTSkipIf(
+            Self.assertionsEnabled,
+            "performance numbers are only meaningful in a Release build")
+    }
+
     private func time(_ iterations: Int, _ body: () -> Void) -> Double {
         let start = DispatchTime.now().uptimeNanoseconds
         for _ in 0..<iterations { body() }

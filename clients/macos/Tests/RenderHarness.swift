@@ -122,21 +122,30 @@ final class RenderHarness {
     let grid: FontGrid
     let layer: CALayer
     let renderer: TerminalRenderer
-    let source: FakeSource
+    private let renderSource: TerminalRenderSource
+
+    /// The scripted source, for tests that build a screen by hand.
+    var source: FakeSource { renderSource as! FakeSource }
 
     let cellWidth: Int
     let cellHeight: Int
 
     /// Build a harness sized to hold exactly `columns` x `rows` cells with no
     /// padding, so grid coordinates map straight onto pixels.
-    init(columns: Int, rows: Int, pointSize: Double = 13) throws {
+    convenience init(columns: Int, rows: Int, pointSize: Double = 13) throws {
+        try self.init(
+            columns: columns, rows: rows, pointSize: pointSize,
+            source: FakeSource(columns: columns, rows: rows))
+    }
+
+    init(columns: Int, rows: Int, pointSize: Double = 13, source: TerminalRenderSource) throws {
         context = try MetalContext.acquire()
         grid = FontGridSet.grid(family: "Menlo", pointSize: pointSize, scale: 2)
 
         cellWidth = Int(grid.metrics.cellWidth)
         cellHeight = Int(grid.metrics.cellHeight)
 
-        source = FakeSource(columns: columns, rows: rows)
+        renderSource = source
         layer = CALayer()
 
         var config = RendererConfig()
@@ -145,7 +154,7 @@ final class RenderHarness {
         config.windowPaddingX = 0
         config.windowPaddingY = 0
         renderer = TerminalRenderer(
-            context: context, grid: grid, layer: layer, source: source, config: config)
+            context: context, grid: grid, layer: layer, source: renderSource, config: config)
 
         let width = columns * cellWidth
         let height = rows * cellHeight
@@ -156,7 +165,7 @@ final class RenderHarness {
 
     /// Render a frame and read the pixels back.
     func render() throws -> RenderedImage {
-        source.dirty = true
+        (renderSource as? FakeSource)?.dirty = true
         renderer.updateFrame()
         renderer.drawFrame(sync: true)
 
