@@ -321,17 +321,7 @@ final class FontGrid: @unchecked Sendable {
         let atlas = presentation == .emoji ? atlasColor : atlasGrayscale
 
         var opts = options
-        if presentation == .emoji {
-            // Emoji are square and much taller than a text glyph, so they
-            // always get the same treatment: scale to cover the cells they
-            // occupy, centred, with a hair of padding so they don't touch.
-            opts.constraint = GlyphConstraint(
-                size: .cover,
-                alignVertical: .center,
-                alignHorizontal: .center,
-                padLeft: 0.025,
-                padRight: 0.025)
-        }
+        if presentation == .emoji { opts.constraintKind = .emoji }
 
         let glyph = try withAtlasGrowth(atlas) {
             try face.render(

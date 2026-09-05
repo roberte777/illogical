@@ -31,11 +31,48 @@ struct Glyph {
     var isEmpty: Bool { width == 0 || height == 0 }
 }
 
+/// Which constraint applies to a glyph.
+///
+/// The options struct is the glyph cache's key and is hashed once per glyph
+/// per frame, so it holds this rather than a `GlyphConstraint` directly: the
+/// constraint is nine doubles and four enums, and hashing that ten thousand
+/// times a frame is real time. Naming the constraint instead of carrying it
+/// keeps the key small, and keeps the mapping from name to value in exactly
+/// one place so the two can't disagree.
+enum GlyphConstraintKind: Hashable {
+    /// Leave the glyph alone. Every Latin character.
+    case none
+    /// Shrink a symbol to fit its cell(s).
+    case fit
+    /// Scale an emoji to cover its cells, centred.
+    case emoji
+    /// The per-icon rule nerd-fonts' patcher would have applied.
+    case nerdFont(UInt32)
+
+    var constraint: GlyphConstraint {
+        switch self {
+        case .none:
+            return .none
+        case .fit:
+            return GlyphConstraint(size: .fit)
+        case .emoji:
+            // Emoji are square and much taller than a text glyph, so they
+            // always get the same treatment: cover the cells they occupy,
+            // centred, with a hair of padding so they don't touch.
+            return GlyphConstraint(
+                size: .cover, alignVertical: .center, alignHorizontal: .center,
+                padLeft: 0.025, padRight: 0.025)
+        case .nerdFont(let cp):
+            return NerdFontConstraints.constraint(for: cp) ?? .none
+        }
+    }
+}
+
 /// Options controlling one rasterization.
 struct GlyphRenderOptions: Hashable {
     /// How many cells the glyph occupies (its grid width).
     var cellWidth: UInt8? = nil
-    var constraint: GlyphConstraint = .none
+    var constraintKind: GlyphConstraintKind = .none
     /// Cells available horizontally for a constrained glyph. Usually 1, but
     /// 2 when there is whitespace to the right.
     var constraintWidth: UInt8 = 1
@@ -43,6 +80,8 @@ struct GlyphRenderOptions: Hashable {
     var thicken: Bool = false
     /// 0...255. 0 is the lightest thickening available, not "none".
     var thickenStrength: UInt8 = 255
+
+    var constraint: GlyphConstraint { constraintKind.constraint }
 }
 
 enum FontFaceError: Error {
@@ -157,7 +196,8 @@ final class FontFace {
 
         // The constraint operates in cell-relative coordinates, so lift the
         // bounding box off the baseline before handing it over.
-        let constrained = options.constraint.constrain(
+        let constraint = options.constraint
+        let constrained = constraint.constrain(
             GlyphSize(
                 width: Double(rect.size.width),
                 height: Double(rect.size.height),
@@ -174,7 +214,7 @@ final class FontFace {
         // When the rounded cell is wider than the face, centre the glyph in
         // it rather than leaving it hugging the left edge. Stretched glyphs
         // already accounted for the cell width, so they are exempt.
-        if options.constraint.size != .stretch {
+        if constraint.size != .stretch {
             let dx = (cellWidth - metrics.faceWidth) / 2
             x += dx
             if dx < 0 {

@@ -496,9 +496,10 @@ final class TerminalRenderer: @unchecked Sendable {
         // Constrain symbol-like glyphs so they fit their cell(s). Nerd Font
         // codepoints have their own per-icon rules; anything else that is
         // symbol-like just gets scaled down to fit.
-        let constraint: GlyphConstraint =
-            NerdFontConstraints.constraint(for: cp)
-            ?? (CellRules.isSymbol(cp) ? GlyphConstraint(size: .fit) : .none)
+        let constraintKind: GlyphConstraintKind =
+            NerdFontConstraints.constraint(for: cp) != nil
+            ? .nerdFont(cp)
+            : (CellRules.isSymbol(cp) ? .fit : .none)
 
         let constraintWidth = CellRules.constraintWidth(
             x: x, cols: cols,
@@ -509,7 +510,7 @@ final class TerminalRenderer: @unchecked Sendable {
 
         let options = GlyphRenderOptions(
             cellWidth: cell.gridWidth,
-            constraint: constraint,
+            constraintKind: constraintKind,
             constraintWidth: constraintWidth,
             thicken: config.fontThicken,
             thickenStrength: config.fontThickenStrength)
@@ -689,7 +690,7 @@ final class TerminalRenderer: @unchecked Sendable {
             return
         }
 
-        frame.uniforms.sync([uniformsCopy])
+        frame.uniforms.sync(uniformsCopy)
         frame.cellsBg.sync(bgCells)
         let fgCount = frame.cells.sync(concatenating: fgRows)
 

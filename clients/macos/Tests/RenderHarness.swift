@@ -11,8 +11,10 @@
 import CoreGraphics
 import Foundation
 import IOSurface
+import ImageIO
 import Metal
 import QuartzCore
+import UniformTypeIdentifiers
 import XCTest
 
 /// A snapshot the test controls directly.
@@ -127,9 +129,9 @@ final class RenderHarness {
 
     /// Build a harness sized to hold exactly `columns` x `rows` cells with no
     /// padding, so grid coordinates map straight onto pixels.
-    init(columns: Int, rows: Int) throws {
+    init(columns: Int, rows: Int, pointSize: Double = 13) throws {
         context = try MetalContext.acquire()
-        grid = FontGridSet.grid(family: "Menlo", pointSize: 13, scale: 2)
+        grid = FontGridSet.grid(family: "Menlo", pointSize: pointSize, scale: 2)
 
         cellWidth = Int(grid.metrics.cellWidth)
         cellHeight = Int(grid.metrics.cellHeight)
@@ -237,5 +239,44 @@ enum ColorMath {
             UInt8(max(0, min(255, (unlinearize(max(0, min(1, v))) * 255).rounded())))
         }
         return (b: encode(p3.2), g: encode(p3.1), r: encode(p3.0), a: 255)
+    }
+}
+
+extension RenderedImage {
+    /// Write the frame out as a PNG.
+    ///
+    /// Opt-in via `ILLOGICAL_RENDER_DUMP=<dir>`, because the interesting
+    /// rendering bugs are the ones you have to look at: a glyph half a pixel
+    /// high, an underline one row too low, an atlas region off by one. A
+    /// pixel assertion tells you something is wrong; the image tells you what.
+    func dump(named name: String) {
+        guard let dir = ProcessInfo.processInfo.environment["ILLOGICAL_RENDER_DUMP"] else {
+            return
+        }
+
+        var pixels = self.pixels
+        let provider = pixels.withUnsafeMutableBytes { raw -> CGDataProvider? in
+            CGDataProvider(dataInfo: nil, data: raw.baseAddress!, size: raw.count) { _, _, _ in }
+        }
+        guard let provider,
+            let space = CGColorSpace(name: CGColorSpace.displayP3),
+            let image = CGImage(
+                width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                bytesPerRow: width * 4, space: space,
+                bitmapInfo: CGBitmapInfo(
+                    rawValue: CGBitmapInfo.byteOrder32Little.rawValue
+                        | CGImageAlphaInfo.premultipliedFirst.rawValue),
+                provider: provider, decode: nil, shouldInterpolate: false,
+                intent: .defaultIntent)
+        else { return }
+
+        let url = URL(fileURLWithPath: dir).appendingPathComponent("\(name).png")
+        guard
+            let dest = CGImageDestinationCreateWithURL(
+                url as CFURL, "public.png" as CFString, 1, nil)
+        else { return }
+        CGImageDestinationAddImage(dest, image, nil)
+        CGImageDestinationFinalize(dest)
+        print("wrote \(url.path)")
     }
 }

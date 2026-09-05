@@ -119,6 +119,33 @@ final class TextShaper {
     /// CFDictionary for every run.
     private var attrCache: [UInt16: CFDictionary] = [:]
 
+    /// Resolved face for every ASCII codepoint, per style.
+    ///
+    /// `FontGrid.index` is correct and already cached, but it takes a reader
+    /// lock and hashes a key, and the run iterator calls it *once per cell*.
+    /// At ten thousand cells a frame that is measurable. The shaper belongs
+    /// to one renderer on one thread, so it can put an unsynchronized array
+    /// in front for the case that is essentially all of them.
+    ///
+    /// Only for the default presentation: a variation selector goes the slow
+    /// way, as it should.
+    private var asciiIndex = [FontIndex?](repeating: nil, count: 128 * 4)
+    private var asciiResolved = [Bool](repeating: false, count: 128 * 4)
+
+    private func fontIndex(
+        _ cp: UInt32, _ style: FontStyle, _ presentation: FontPresentation?
+    ) -> FontIndex? {
+        guard presentation == nil, cp < 128 else {
+            return grid.index(codepoint: cp, style: style, presentation: presentation)
+        }
+        let slot = Int(cp) * 4 + style.rawValue
+        if asciiResolved[slot] { return asciiIndex[slot] }
+        let resolved = grid.index(codepoint: cp, style: style, presentation: nil)
+        asciiIndex[slot] = resolved
+        asciiResolved[slot] = true
+        return resolved
+    }
+
     /// Forces left-to-right so CoreText doesn't reorder our runs. The
     /// terminal grid is already in visual order.
     private let typesetterOptions: CFDictionary = {
@@ -137,6 +164,7 @@ final class TextShaper {
     func clearCache() {
         cache.clear()
         attrCache.removeAll(keepingCapacity: true)
+        for i in asciiResolved.indices { asciiResolved[i] = false }
     }
 
     // MARK: - Run iteration
@@ -278,20 +306,16 @@ final class TextShaper {
                 cell: cell, graphemes: graphemes, style: fontStyle,
                 presentation: presentation)
 
-            let fontIndex: FontIndex
+            let resolvedIndex: FontIndex
             var fallbackCp: UInt32? = nil
             if let idx = resolved {
-                fontIndex = idx
-            } else if let idx = grid.index(
-                codepoint: 0xFFFD, style: fontStyle, presentation: presentation)
-            {
+                resolvedIndex = idx
+            } else if let idx = self.fontIndex(0xFFFD, fontStyle, presentation) {
                 // Prefer the official replacement character.
-                fontIndex = idx
+                resolvedIndex = idx
                 fallbackCp = 0xFFFD
-            } else if let idx = grid.index(
-                codepoint: 0x20, style: fontStyle, presentation: presentation)
-            {
-                fontIndex = idx
+            } else if let idx = self.fontIndex(0x20, fontStyle, presentation) {
+                resolvedIndex = idx
                 fallbackCp = 0x20
             } else {
                 // Nothing can render even a space. Give up on this cell.
@@ -299,8 +323,8 @@ final class TextShaper {
                 continue
             }
 
-            if j == i { currentFont = fontIndex }
-            if fontIndex != currentFont { break }
+            if j == i { currentFont = resolvedIndex }
+            if resolvedIndex != currentFont { break }
 
             if let cp = fallbackCp {
                 addCodepoint(&hasher, cp, cluster)
@@ -378,12 +402,10 @@ final class TextShaper {
         presentation: FontPresentation?
     ) -> FontIndex? {
         if !cell.hasText || cell.codepoint == 0 {
-            return grid.index(codepoint: 0x20, style: style, presentation: presentation)
+            return fontIndex(0x20, style, presentation)
         }
 
-        guard
-            let primary = grid.index(
-                codepoint: cell.codepoint, style: style, presentation: presentation)
+        guard let primary = fontIndex(cell.codepoint, style, presentation)
         else { return nil }
 
         // Common case: a single codepoint, so the primary answer stands.
@@ -404,8 +426,7 @@ final class TextShaper {
                 // Components need not support the base presentation: emoji
                 // fonts commonly have the base emoji in colour but not the
                 // gender signs that combine with it.
-                guard let c = grid.index(codepoint: cp, style: style, presentation: nil)
-                else { return nil }
+                guard let c = fontIndex(cp, style, nil) else { return nil }
                 idx = c
             }
 

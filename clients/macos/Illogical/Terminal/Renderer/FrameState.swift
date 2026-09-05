@@ -45,6 +45,16 @@ final class GrowableBuffer<T> {
             options: .storageModeShared)!
     }
 
+    /// Replace the buffer contents with a single value. Separate from the
+    /// array overload so the uniforms don't allocate a one-element array on
+    /// every frame.
+    func sync(_ value: T) {
+        reserve(1)
+        withUnsafeBytes(of: value) { src in
+            buffer.contents().copyMemory(from: src.baseAddress!, byteCount: src.count)
+        }
+    }
+
     /// Replace the buffer contents with `values`.
     func sync(_ values: [T]) {
         reserve(values.count)
