@@ -196,7 +196,10 @@ pub const body = struct {
     };
 
     pub const Kill = struct {
-        signal: i32 = 15,
+        /// Zero means hang up (SIGHUP to the process group), which is what
+        /// closing a tab means. SIGTERM would be ignored by an interactive
+        /// shell, so it is deliberately not the default.
+        signal: i32 = 0,
     };
 
     pub const Exited = struct {

@@ -209,8 +209,19 @@ pub fn newSession() bool {
     return setsid() >= 0;
 }
 
+pub const SIGHUP: c_int = 1;
+pub const SIGTERM: c_int = 15;
+pub const SIGKILL: c_int = 9;
+
 pub fn signal(pid: pid_t, sig: c_int) void {
     _ = kill(pid, sig);
+}
+
+/// Signal a whole process group. The child is a session leader (we call
+/// `setsid` before exec), so this reaches the jobs it started too -- which is
+/// what closing a terminal window does.
+pub fn signalGroup(leader: pid_t, sig: c_int) void {
+    _ = kill(-leader, sig);
 }
 
 /// Wait for `pid` and return its exit code.

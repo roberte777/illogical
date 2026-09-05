@@ -108,6 +108,8 @@ pub fn listen(self: *Server) !void {
 /// Periodic housekeeping: park idle terminals, and give live ones a bounded
 /// slice of scrollback compression. See docs/PARKING.md.
 pub fn maintenanceTick(self: *Server) void {
+    self.retireExited();
+
     // Copy the terminal list so the registry lock is not held across the work.
     var ids: std.ArrayList(session.TerminalId) = .empty;
     defer ids.deinit(self.gpa);
@@ -164,6 +166,72 @@ pub fn run(self: *Server) !void {
         self.clients_mutex.unlock();
         client.start() catch |err| log.err("failed to start client: {t}", .{err});
     }
+}
+
+/// Tell every client the session/terminal list changed, so they refresh.
+///
+/// Without this a client only learns about new or gone terminals when it
+/// happens to ask, which is why an exited terminal's tab used to linger.
+pub fn notifySessionsChanged(self: *Server) void {
+    self.clients_mutex.lock();
+    defer self.clients_mutex.unlock();
+    for (self.clients.items) |c| c.notifySessionsChanged();
+}
+
+/// Retire terminals whose child has exited: unregister, then destroy.
+///
+/// This runs on the maintenance tick rather than in the reader thread, because
+/// destroying a terminal joins that very thread.
+fn retireExited(self: *Server) void {
+    var retired: std.ArrayList(*Terminal) = .empty;
+    defer retired.deinit(self.gpa);
+
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var i: usize = 0;
+        while (i < self.terminals.count()) {
+            const t = self.terminals.values()[i];
+            if (!t.finished.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            const id = self.terminals.keys()[i];
+            _ = self.terminals.orderedRemove(id);
+            if (self.sessions.getPtr(t.session_id)) |s| {
+                for (s.terminals.items, 0..) |tid, j| {
+                    if (tid == id) {
+                        _ = s.terminals.orderedRemove(j);
+                        break;
+                    }
+                }
+            }
+            retired.append(self.gpa, t) catch {};
+            // Not incrementing: removal shifted the next entry into this slot.
+        }
+
+        // Drop sessions that have no terminals left.
+        var si: usize = 0;
+        while (si < self.sessions.count()) {
+            const s = self.sessions.values()[si];
+            if (s.terminals.items.len > 0) {
+                si += 1;
+                continue;
+            }
+            const sid = self.sessions.keys()[si];
+            var removed = self.sessions.fetchOrderedRemove(sid).?;
+            removed.value.deinit(self.gpa);
+        }
+    }
+
+    if (retired.items.len == 0) return;
+    for (retired.items) |t| {
+        log.info("terminal {d} exited, retiring", .{t.id});
+        t.store.discard(self.io, t.id);
+        t.destroy();
+    }
+    self.notifySessionsChanged();
 }
 
 pub fn removeClient(self: *Server, client: *Client) void {
@@ -247,9 +315,12 @@ pub fn terminal(self: *Server, id: session.TerminalId) ?*Terminal {
     return self.terminals.get(id);
 }
 
+/// Close a terminal. `signal` of zero means "hang up", which is what a client
+/// closing a tab wants; anything else is sent to the process group verbatim.
 pub fn killTerminal(self: *Server, id: session.TerminalId, signal: i32) !void {
     const t = self.terminal(id) orelse return error.NoSuchTerminal;
-    sys.signal(t.child, @intCast(signal));
+    if (signal == 0) return t.hangup();
+    sys.signalGroup(t.child, @intCast(signal));
 }
 
 /// Snapshot of the registry for a `list` reply. Caller owns the arena.
