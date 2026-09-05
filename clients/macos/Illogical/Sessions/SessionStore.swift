@@ -102,9 +102,10 @@ final class SessionStore {
     }
 
     func kill(_ id: UInt64) {
+        // The server signals the child; the terminal is retired when it
+        // actually exits, and we find out from `sessions_changed`.
         try? control?.send(.kill, terminal: id)
         closeController(id)
-        refresh()
     }
 
     private func handle(_ frame: Frame) {
@@ -136,6 +137,13 @@ final class SessionStore {
                     ptyReadIdleNanoseconds: $0.ptyReadIdleNanoseconds,
                     exitCode: $0.exitCode)
             }
+            // Tear down connections for terminals the server has retired,
+            // otherwise their reader threads linger on a dead socket.
+            let live = Set(terminals.map(\.id))
+            for id in controllers.keys where !live.contains(id) {
+                closeController(id)
+            }
+
             if selectedID == nil || !terminals.contains(where: { $0.id == selectedID }) {
                 selectedID = terminals.first?.id
             }

@@ -217,23 +217,62 @@ struct TerminalTab: View {
 
     @State private var isHovering = false
 
+    private let closeWidth: CGFloat = 16
+
+    /// Always on the active tab, on hover for the rest — the way tab bars
+    /// everywhere behave. Hover-only made it undiscoverable.
+    private var showsClose: Bool { isActive || isHovering }
+
     var body: some View {
-        Button(action: select) {
-            label
+        // Select and close are *siblings*, never nested. SwiftUI does not
+        // reliably deliver events to a control inside another control — not in
+        // a button's label, and not in its overlay either — so a close button
+        // drawn "on top of" the tab is inert and the tab swallows the click.
+        HStack(spacing: 0) {
+            Button(action: select) {
+                label.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text(terminal.name))
+            .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : .isButton)
+
+            if showsClose {
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(Palette.textDim)
+                        .frame(width: closeWidth, height: Metrics.tabHeight)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text("Close \(terminal.name)"))
+                .help("Close terminal")
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(Text(terminal.name))
-        .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : .isButton)
+        .padding(.horizontal, Metrics.tabLeadingPadding)
+        .frame(width: Metrics.tabWidth, height: Metrics.tabHeight)
+        .background {
+            if isActive {
+                RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
+                    .fill(Palette.tabActiveFill)
+                    .overlay(
+                        RoundedRectangle(
+                            cornerRadius: Metrics.tabCornerRadius, style: .continuous
+                        )
+                        .strokeBorder(Palette.tabActiveStroke, lineWidth: 1)
+                    )
+            } else if isHovering {
+                RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
+                    .fill(Palette.tabHoverFill)
+            }
+        }
         .overlay(alignment: .leading) {
             if showsLeadingSeparator { TabSeparator() }
         }
         .onHover { isHovering = $0 }
+        .traceFrame("tab-\(terminal.id)")
     }
 
-    /// A tab was an `.onTapGesture` on a plain `HStack`, which is both
-    /// invisible to accessibility and unreliable inside a `ScrollView` — the
-    /// scroll gesture wins the recognizer race, so hovering worked and clicking
-    /// did not. A `Button` hit-tests properly and shows up as one.
     private var label: some View {
         HStack(spacing: Metrics.badgeToLabel) {
             ZStack {
@@ -255,35 +294,7 @@ struct TerminalTab: View {
                 bright: isActive ? Palette.textBright : Palette.textDim,
                 dim: isActive ? Palette.textDim : Palette.textFaint)
 
-            if isHovering {
-                Button(action: close) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(isHovering ? Palette.textDim : .clear)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel(Text("Close \(terminal.name)"))
-                .help("Close terminal")
-            }
-        }
-        .padding(.horizontal, Metrics.tabLeadingPadding)
-        .frame(width: Metrics.tabWidth, height: Metrics.tabHeight, alignment: .leading)
-        .traceFrame("tab-\(terminal.id)")
-        .background {
-            if isActive {
-                RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
-                    .fill(Palette.tabActiveFill)
-                    .overlay(
-                        RoundedRectangle(
-                            cornerRadius: Metrics.tabCornerRadius, style: .continuous
-                        )
-                        .strokeBorder(Palette.tabActiveStroke, lineWidth: 1)
-                    )
-            } else if isHovering {
-                RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
-                    .fill(Palette.tabHoverFill)
-            }
+            Spacer(minLength: 0)
         }
         .contentShape(Rectangle())
     }

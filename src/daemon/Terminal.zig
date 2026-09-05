@@ -85,6 +85,11 @@ subscribers: std.ArrayList(Subscriber) = .empty,
 
 thread: ?std.Thread = null,
 running: std.atomic.Value(bool) = .init(false),
+/// Set once the reader thread has finished and the child has been reaped, so
+/// the server can retire this terminal. The reader thread cannot destroy its
+/// own terminal -- that would join itself -- so retiring happens on the
+/// maintenance tick.
+finished: std.atomic.Value(bool) = .init(false),
 
 pub const SpawnOptions = struct {
     io: std.Io,
@@ -192,7 +197,7 @@ fn spawnChild(self: *Terminal, opts: SpawnOptions) !sys.pid_t {
 
 pub fn destroy(self: *Terminal) void {
     self.stop();
-    self.pty_pair.deinit();
+    if (!self.finished.load(.acquire)) self.pty_pair.deinit();
     self.mutex.lock();
     if (self.stream) |*stream| stream.deinit();
     if (self.vt) |*vt| vt.deinit(self.gpa);
@@ -214,10 +219,12 @@ pub fn start(self: *Terminal) !void {
 }
 
 pub fn stop(self: *Terminal) void {
-    if (!self.running.load(.acquire)) return;
-    self.running.store(false, .release);
-    // Closing the master makes the blocking read return.
-    sys.closeFd(self.pty_pair.master);
+    if (self.running.swap(false, .acq_rel)) {
+        // Closing the master makes the blocking read return. Only do this if
+        // we were still running; a terminal whose child already exited has
+        // closed it in the reader thread.
+        sys.closeFd(self.pty_pair.master);
+    }
     if (self.thread) |t| {
         t.join();
         self.thread = null;
@@ -252,11 +259,17 @@ fn readLoop(self: *Terminal) void {
 
 fn reap(self: *Terminal) void {
     const code = sys.wait(self.child);
-    self.mutex.lock();
-    defer self.mutex.unlock();
-    self.residency = .exited;
-    self.exit_code = code;
-    for (self.subscribers.items) |s| s.exitFn(s.ctx, code);
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.residency = .exited;
+        self.exit_code = code;
+        for (self.subscribers.items) |s| s.exitFn(s.ctx, code);
+    }
+    // Last, so the server never sees `finished` before the exit has been
+    // reported to everyone watching.
+    self.running.store(false, .release);
+    self.finished.store(true, .release);
 }
 
 /// Attach a client: subscribe it and stream it a snapshot, atomically.
@@ -307,6 +320,16 @@ pub fn attachedCount(self: *Terminal) u32 {
     self.mutex.lock();
     defer self.mutex.unlock();
     return @intCast(self.subscribers.items.len);
+}
+
+/// Close this terminal: hang up its process group.
+///
+/// SIGTERM is the wrong signal here. An interactive shell ignores it, so
+/// "close this tab" did nothing for the common case of a bare `$SHELL`. SIGHUP
+/// is what a terminal sends when its window goes away, and shells exit on it.
+/// It goes to the process group so the shell's jobs go down with it.
+pub fn hangup(self: *Terminal) void {
+    sys.signalGroup(self.child, sys.SIGHUP);
 }
 
 /// Write client input to the PTY. One writer: every client's input funnels

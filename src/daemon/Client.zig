@@ -118,6 +118,8 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
                 .session = result.session,
             });
             try self.send(.created, result.terminal, bytes);
+            // Everyone else's tab strip is now stale.
+            self.server.notifySessionsChanged();
         },
 
         .attach => {
@@ -146,9 +148,14 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
         },
 
         .kill => {
+            // An empty payload means "close it": fall back to the struct's
+            // own default rather than a second, different literal. This
+            // silently sent SIGTERM -- which an interactive shell ignores --
+            // so closing a tab did nothing.
+            const default: protocol.body.Kill = .{};
             const req = protocol.body.decode(protocol.body.Kill, arena, payload) catch null;
             defer if (req) |r| r.deinit();
-            const signal = if (req) |r| r.value.signal else 15;
+            const signal = if (req) |r| r.value.signal else default.signal;
             try self.server.killTerminal(header.session, signal);
         },
 
@@ -268,6 +275,11 @@ fn removeAttached(self: *Client, id: session.TerminalId) void {
             return;
         }
     }
+}
+
+/// Push a `sessions_changed` so this client re-issues `list`.
+pub fn notifySessionsChanged(self: *Client) void {
+    self.sendRaw(.sessions_changed, protocol.control_session, &.{}) catch {};
 }
 
 // -- frame output ----------------------------------------------------------

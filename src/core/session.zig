@@ -39,8 +39,10 @@ pub const Residency = enum {
     /// Unparking: the snapshot's READY prefix has been decoded, history pages
     /// are still being restored in the background.
     rehydrating,
-    /// The child process exited. Kept until the user dismisses it so the
-    /// final screen is still readable.
+    /// The child process exited. Terminals in this state are retired on the
+    /// next maintenance tick: `exit` closes a terminal, the way it does in
+    /// every terminal and multiplexer. Clients learn about it from the
+    /// `exited` frame and a `sessions_changed` broadcast.
     exited,
 };
 
