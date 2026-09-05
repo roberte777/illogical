@@ -29,13 +29,19 @@ final class TerminalController {
 
     let terminalID: UInt64
     private(set) var state: State = .connecting
-    /// Scrollback rows restored so far, for the UI to show progress.
-    private(set) var restoredHistoryRows = 0
+    /// Scrollback *pages* restored so far, for the UI to show progress.
+    ///
+    /// Pages, not rows: a page holds a variable number of rows, so this is
+    /// not rows scaled by a constant, it is a different quantity. Named after
+    /// what it holds until something can ask the scrollbar for the real
+    /// figure.
+    private(set) var restoredHistoryPages = 0
 
     let engine: TerminalEngine
     private var connection: Connection?
     private var pump: Task<Void, Never>?
     private var historyTask: Task<Void, Never>?
+    private var historyToken: HistoryToken?
 
     /// Accumulates the GHOSTSNP stream. Decoding is buffered for now; the
     /// streaming decoder (a GhosttyReader callback) is the M3 refinement.
@@ -101,7 +107,7 @@ final class TerminalController {
     }
 
     func disconnect() {
-        historyTask?.cancel()
+        stopHistoryRestore()
         pump?.cancel()
         connection?.close()
         connection = nil
@@ -178,6 +184,10 @@ final class TerminalController {
     }
 
     private func applySnapshot() {
+        // Before anything can free or replace the terminal a previous restore
+        // is decoding into. A second snapshot on one connection is what
+        // desync recovery looks like, and nothing upstream forbids it.
+        stopHistoryRestore()
         readyAt = Date()
         if let attachSentAt {
             Signposts.milestone(
@@ -215,6 +225,30 @@ final class TerminalController {
         }
     }
 
+    /// Whether a history restore may still touch its terminal.
+    ///
+    /// `Task.cancel()` is not enough on its own. A cancelled task blocked on
+    /// the engine's lock still wakes up holding it, and by then `adopt` may
+    /// have freed the terminal the decoder borrows — `snapshot.h` is explicit
+    /// that the terminal must outlive the decoder. Flipping this flag *under
+    /// the same lock* the decode happens under is what closes that window:
+    /// the task cannot be between the check and the call.
+    private final class HistoryToken: @unchecked Sendable {
+        var isCancelled = false
+    }
+
+    /// Stop any history restore from touching the current terminal again.
+    ///
+    /// Must be called before anything frees or replaces that terminal.
+    private func stopHistoryRestore() {
+        if let historyToken {
+            engine.withLock { historyToken.isCancelled = true }
+            self.historyToken = nil
+        }
+        historyTask?.cancel()
+        historyTask = nil
+    }
+
     /// Prepend the snapshot's scrollback, newest first, behind the frame the
     /// user is already looking at.
     ///
@@ -233,20 +267,35 @@ final class TerminalController {
     private func restoreHistory(_ restore: SnapshotRestore) {
         let engine = self.engine
         let terminalID = self.terminalID
-        historyTask?.cancel()
+        let token = HistoryToken()
+        historyToken = token
+
         historyTask = Task.detached(priority: .utility) { [weak self] in
             var pages = 0
             while !Task.isCancelled {
-                let more = (try? engine.withLock { try restore.restoreNextHistoryPage() }) ?? false
+                // The cancellation check and the decode are one operation
+                // under the lock. Outside it, a task that had already passed
+                // the check could still call into a decoder whose terminal
+                // `adopt` has since freed.
+                let more = engine.withLock { () -> Bool in
+                    guard !token.isCancelled else { return false }
+                    return (try? restore.restoreNextHistoryPage()) ?? false
+                }
                 guard more else { break }
                 pages += 1
                 // A well-formed snapshot terminates on its own; the bound is
-                // only so a corrupt one cannot spin forever.
-                if pages > 4096 { break }
+                // only so a corrupt one cannot spin forever. Say so rather
+                // than quietly showing a shortened history — 4096 pages was
+                // reachable at a hundred thousand lines.
+                if pages >= 1 << 20 {
+                    Trace.log(
+                        "terminal \(terminalID): history restore stopped at \(pages) pages")
+                    break
+                }
             }
             let restored = pages
             await MainActor.run {
-                self?.restoredHistoryRows = restored
+                self?.restoredHistoryPages = restored
                 Signposts.milestone(
                     "history-restored", seconds: Signposts.sinceLaunch(),
                     detail: "terminal=\(terminalID) pages=\(restored)")

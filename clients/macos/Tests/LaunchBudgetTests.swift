@@ -84,6 +84,50 @@ final class LaunchBudgetTests: XCTestCase {
         XCTAssertEqual(counter.count, 2)
     }
 
+    /// The ordering the history restore's cancellation depends on: a flag
+    /// flipped under the lock is never missed by a body that checks it under
+    /// the same lock.
+    ///
+    /// `Task.cancel()` alone does not give this. A cancelled task already
+    /// blocked on the lock wakes up holding it, and by then `adopt` may have
+    /// freed the terminal the decoder borrows — `snapshot.h` requires that
+    /// terminal to outlive the decoder. Putting the check and the call in one
+    /// critical section is what closes the window.
+    ///
+    /// The use-after-free itself is not reproducible in a test: it needs a
+    /// second snapshot on one connection and a task parked on the lock at the
+    /// moment `adopt` frees. What is testable is the property the fix rests
+    /// on, which is this one.
+    func testCancellationUnderTheLockIsNeverMissed() throws {
+        let engine = try TerminalEngine(cols: 20, rows: 5)
+        let cancelled = Counter()
+        let work = Counter()
+
+        // The shape of `restoreHistory`'s loop: check and act in one
+        // critical section.
+        let worker = Thread {
+            while true {
+                let more = engine.withLock { () -> Bool in
+                    guard cancelled.count == 0 else { return false }
+                    work.increment()
+                    return true
+                }
+                if !more { break }
+            }
+        }
+        worker.start()
+
+        // Let it get going, then cancel the way `stopHistoryRestore` does.
+        while work.count < 50 { usleep(200) }
+        engine.withLock { cancelled.increment() }
+        while !worker.isFinished { usleep(200) }
+
+        let afterCancel = work.count
+        usleep(20_000)
+        XCTAssertEqual(work.count, afterCancel, "work continued after cancellation")
+        XCTAssertGreaterThan(afterCancel, 0)
+    }
+
     /// `withLock` is what makes the history restore safe to run off the main
     /// actor: the decoder writes into the terminal the engine owns, and the
     /// render thread reads it under this same lock.
