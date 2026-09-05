@@ -85,6 +85,14 @@ final class TerminalSurfaceView: NSView {
     private var isSelecting = false
     private var trackingArea: NSTrackingArea?
 
+    private var scrollbar: ScrollbarOverlay?
+    private var scrollbarHideWork: DispatchWorkItem?
+
+    private let config = RendererConfig()
+    private lazy var scrollAccumulator = ScrollAccumulator(
+        precisionMultiplier: config.scrollMultiplierPrecision,
+        discreteMultiplier: config.scrollMultiplierDiscrete)
+
     /// Point size of the terminal font. A config option eventually.
     private static let fontPointSize: Double = 13
 
@@ -178,6 +186,9 @@ final class TerminalSurfaceView: NSView {
     }
 
     private func teardownRendering() {
+        scrollbarHideWork?.cancel()
+        scrollbarHideWork = nil
+        scrollAccumulator.reset()
         renderThread?.stop()
         renderThread = nil
         renderer = nil
@@ -364,8 +375,117 @@ final class TerminalSurfaceView: NSView {
         }
     }
 
-    // MARK: - Keyboard
+    // MARK: - Scrolling
     //
+    // The viewport is entirely client-side. We never synthesize wheel escape
+    // sequences into the PTY, and we never tell the server where we are
+    // looking: two people attached to one terminal scroll independently. The
+    // tmux behaviour where one client's scroll moves everyone's window is a
+    // bug we are deliberately not reproducing (docs/CLIENT.md, [ARCH t=323]).
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let engine else { return }
+
+        // Quantize first, and unconditionally. Every consumer of the wheel
+        // works in rows, not pixels — a mouse report is one button press per
+        // row — and the accumulator's remainder has to keep advancing even on
+        // events we hand to the program, or a gesture that crosses into the
+        // alternate screen carries a stale fraction across with it. This is
+        // the order libghostty uses in `Surface.scrollCallback`.
+        let rows = scrollAccumulator.wheelRows(
+            scrollingDeltaY: Double(event.scrollingDeltaY),
+            legacyDeltaY: Double(event.deltaY),
+            precise: event.hasPreciseScrollingDeltas,
+            cellHeight: Double(max(1, currentCellHeight)))
+        let columns = scrollAccumulator.wheelColumns(
+            scrollingDeltaX: Double(event.scrollingDeltaX),
+            legacyDeltaX: Double(event.deltaX),
+            precise: event.hasPreciseScrollingDeltas,
+            cellWidth: Double(max(1, currentCellWidth)))
+
+        // Then decide whose event it is. Two claimants write to the PTY
+        // rather than moving the viewport: a program that asked for mouse
+        // events gets wheel-button reports — scrolling inside `less` should
+        // scroll `less` — and one sitting in the alternate screen with DECSET
+        // 1007 gets cursor keys. `reportWheel` takes them in that order and
+        // says whether either took it.
+        //
+        // It claims a tracking program's gesture even when it crossed no row
+        // boundary, so the viewport does not creep on the leftover fraction.
+        guard
+            !reportWheel(
+                rows: rows, columns: columns, mods: event.modifierFlags,
+                at: convert(event.locationInWindow, from: nil))
+        else { return }
+        guard rows != 0 else { return }
+
+        // Positive rows are up; the viewport axis counts down.
+        engine.scroll(.delta(-rows))
+        renderThread?.wake()
+        showScrollbar()
+    }
+
+    /// Cell height in device pixels, which is the unit the viewport moves in.
+    private var currentCellHeight: UInt32 {
+        if let fontGrid { return fontGrid.metrics.cellHeight }
+        return Self.fallbackMetrics(scale: window?.backingScaleFactor ?? 2).cellHeight
+    }
+
+    /// Cell width, for the horizontal axis of a wheel report. Nothing scrolls
+    /// sideways here — the viewport has no horizontal axis — but buttons six
+    /// and seven do, and they are counted in columns.
+    private var currentCellWidth: UInt32 {
+        if let fontGrid { return fontGrid.metrics.cellWidth }
+        return Self.fallbackMetrics(scale: window?.backingScaleFactor ?? 2).cellWidth
+    }
+
+    private static func fallbackMetrics(scale: CGFloat) -> GridMetrics {
+        FontGridSet.grid(family: nil, pointSize: fontPointSize, scale: Double(scale)).metrics
+    }
+
+    /// Jump back to the live output.
+    func scrollToBottom() {
+        guard let engine else { return }
+        scrollAccumulator.reset()
+        engine.scroll(.bottom)
+        renderThread?.wake()
+    }
+
+    // MARK: - Scrollbar
+
+    /// Show the position indicator and start its fade.
+    ///
+    /// An overlay indicator rather than a real `NSScrollView`: the terminal's
+    /// content is an IOSurface the renderer owns, there is no document view
+    /// to scroll, and the scrollable area changes shape as output arrives.
+    private func showScrollbar() {
+        guard let engine, let layer else { return }
+        let state = engine.scrollbar
+        guard state.canScroll else {
+            scrollbar?.hide()
+            return
+        }
+
+        let bar =
+            scrollbar
+            ?? {
+                let b = ScrollbarOverlay()
+                layer.addSublayer(b.layer)
+                scrollbar = b
+                return b
+            }()
+
+        bar.update(state, in: bounds, scale: window?.backingScaleFactor ?? 2)
+        bar.show()
+
+        // Fade out after a moment, like the system's own overlay scrollbars.
+        scrollbarHideWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.scrollbar?.hide() }
+        scrollbarHideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
+    }
+
+    // MARK: - Keyboard    //
     // No local echo. The server is the single writer; what we type comes back
     // as `output` like everything else. See docs/CLIENT.md.
     //
@@ -377,7 +497,7 @@ final class TerminalSurfaceView: NSView {
 
     override func keyDown(with event: NSEvent) {
         guard let spec = KeyTranslation.spec(for: event) else { return }
-        send(encodedKey: spec)
+        send(encodedKey: spec, isTyping: true)
     }
 
     override func keyUp(with event: NSEvent) {
@@ -393,14 +513,15 @@ final class TerminalSurfaceView: NSView {
         send(encodedKey: spec)
     }
 
-    private func send(encodedKey spec: KeyEventSpec) {
+    private func send(encodedKey spec: KeyEventSpec, isTyping: Bool = false) {
         guard let bytes = inputEncoder?.encode(key: spec), !bytes.isEmpty else { return }
-        // Anything that resets view state on a keystroke belongs here, before
-        // the send: native scrollback's return-to-bottom goes alongside
-        // whatever else lands.
-        //
-        // Typing drops the selection, as it does in every terminal.
+        // Two things reset on a keystroke. The selection goes always, as it
+        // does in every terminal.
         clearSelectionIfAny()
+        // The viewport goes back to the live output only on key-*down*:
+        // under the Kitty protocol a bare modifier press also produces bytes,
+        // and holding shift is not typing.
+        if isTyping, config.scrollToBottomOnKeystroke { scrollToBottom() }
         delegate?.surface(self, send: bytes)
     }
 
@@ -532,7 +653,7 @@ final class TerminalSurfaceView: NSView {
     /// which we do not implement, and exposes the choice as config, which we
     /// have nowhere to put yet.
     private func isReportingMouse(_ event: NSEvent) -> Bool {
-        guard let inputEncoder, inputEncoder.mouseTrackingEnabled else { return false }
+        guard engine?.isMouseTracking == true else { return false }
         return !event.modifierFlags.contains(.shift)
     }
 
@@ -634,12 +755,7 @@ final class TerminalSurfaceView: NSView {
         delegate?.surface(self, send: bytes)
     }
 
-    // MARK: - Scrolling
-    //
-    // `scrollWheel` is not here. Native scrollback owns the viewport and the
-    // accumulator that turns AppKit's pixel deltas into whole rows, and it
-    // calls in here once it has them — libghostty's own order, which
-    // quantizes unconditionally and only then decides whose event it is.
+    // MARK: - The wheel's claimants
 
     /// Hand a quantized wheel gesture to the program in the terminal.
     ///
@@ -666,10 +782,10 @@ final class TerminalSurfaceView: NSView {
     func reportWheel(
         rows: Int, columns: Int, mods: NSEvent.ModifierFlags, at point: NSPoint
     ) -> Bool {
-        guard let inputEncoder else { return false }
+        guard let inputEncoder, let engine else { return false }
         let encoded = KeyTranslation.mods(mods)
 
-        if inputEncoder.mouseTrackingEnabled {
+        if engine.isMouseTracking {
             // Both claimants drop the selection first, as Ghostty's
             // `scrollCallback` does. A highlight left behind while the program
             // scrolls under it points at whatever happens to be in those cells

@@ -31,12 +31,6 @@ final class TerminalEngine: @unchecked Sendable {
     /// terminal before it is freed — see `adopt`.
     let selectionGesture = SelectionGesture()
 
-    /// Set when something changed that libghostty's per-row dirty flags do
-    /// not describe. Those flags track content, not what is on screen, so
-    /// after a selection change every row is still clean and a renderer that
-    /// trusted them would keep showing the old frame.
-    private var forceFullRebuild = false
-
     /// Reused across frames so extraction allocates nothing.
     private var rowIterator: GhosttyRenderStateRowIterator?
     private var rowCells: GhosttyRenderStateRowCells?
@@ -44,6 +38,10 @@ final class TerminalEngine: @unchecked Sendable {
 
     private(set) var cols: UInt16
     private(set) var rows: UInt16
+
+    /// Set when the whole screen must be rebuilt regardless of what
+    /// libghostty's per-row dirty flags say. Guarded by `lock`.
+    private var forceFullRebuild = false
 
     /// Set when bytes have been applied and a frame is owed. Read from the
     /// display link every tick, so it is an atomic rather than lock-guarded:
@@ -178,11 +176,109 @@ final class TerminalEngine: @unchecked Sendable {
     }
 
     /// Force the next frame to rebuild every row, and ask for one.
+    ///
+    /// The same flag a viewport move sets, for the same reason: a selection
+    /// changes no cell, so libghostty's per-row dirty flags — which describe
+    /// content, not what is on screen — do not describe it either.
     func markSelectionDirty() {
         lock.lock()
         forceFullRebuild = true
         lock.unlock()
         markDirty()
+    }
+
+    // MARK: - Viewport
+
+    /// Where to move the viewport.
+    enum ScrollTarget {
+        case top
+        case bottom
+        /// Rows, negative for up.
+        case delta(Int)
+        /// Absolute row, in the same space as `ScrollbarState.offset`.
+        case row(UInt64)
+    }
+
+    /// The scrollable area, in rows.
+    struct ScrollbarState: Equatable {
+        var total: UInt64 = 0
+        var offset: UInt64 = 0
+        var length: UInt64 = 0
+
+        /// True when the viewport is somewhere above the live output.
+        var isScrolledBack: Bool { offset + length < total }
+        /// True when there is anything to scroll at all.
+        var canScroll: Bool { total > length }
+    }
+
+    /// Move the viewport.
+    ///
+    /// Purely client-side: the server is never told, and two clients attached
+    /// to one terminal scroll independently. That is deliberate — the tmux
+    /// behaviour where one client's scroll moves everyone's window is a bug
+    /// we are not reproducing (see docs/CLIENT.md).
+    func scroll(_ target: ScrollTarget) {
+        lock.lock()
+        guard let terminal else {
+            lock.unlock()
+            return
+        }
+
+        var behavior = GhosttyTerminalScrollViewport()
+        switch target {
+        case .top:
+            behavior.tag = GHOSTTY_SCROLL_VIEWPORT_TOP
+        case .bottom:
+            behavior.tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM
+        case .delta(let rows):
+            behavior.tag = GHOSTTY_SCROLL_VIEWPORT_DELTA
+            // intptr_t on the C side.
+            behavior.value.delta = rows
+        case .row(let row):
+            behavior.tag = GHOSTTY_SCROLL_VIEWPORT_ROW
+            // size_t on the C side; the scrollbar reports UInt64.
+            behavior.value.row = Int(clamping: row)
+        }
+        ghostty_terminal_scroll_viewport(terminal, behavior)
+
+        // Moving the viewport changes every row on screen, and libghostty's
+        // per-row dirty flags describe content rather than position. Without
+        // this the next frame would rebuild nothing and the screen would not
+        // move.
+        forceFullRebuild = true
+        lock.unlock()
+        markDirty()
+    }
+
+    /// The current scrollable area. Cheap enough to read per scroll event.
+    var scrollbar: ScrollbarState {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let terminal else { return ScrollbarState() }
+        var bar = GhosttyTerminalScrollbar()
+        guard
+            ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &bar)
+                == GHOSTTY_SUCCESS
+        else { return ScrollbarState() }
+        return ScrollbarState(total: bar.total, offset: bar.offset, length: bar.len)
+    }
+
+    /// Whether the program has asked to receive mouse events.
+    ///
+    /// When it has, the wheel belongs to it and must not move our viewport —
+    /// scrolling in `less` should scroll `less`, not slide our window over its
+    /// output. We can't encode those events yet, so for now the wheel simply
+    /// does nothing in that mode.
+    var isMouseTracking: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let terminal else { return false }
+        var tracking = false
+        guard
+            ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &tracking)
+                == GHOSTTY_SUCCESS
+        else { return false }
+        return tracking
     }
 
     private func markDirty() {
@@ -209,7 +305,7 @@ final class TerminalEngine: @unchecked Sendable {
             return false
         }
         let beginResult = ghostty_render_state_begin_update(renderState, terminal)
-        let forced = forceFullRebuild
+        let mustRebuild = forceFullRebuild
         forceFullRebuild = false
         lock.unlock()
 
@@ -262,7 +358,7 @@ final class TerminalEngine: @unchecked Sendable {
             passwordInput: cursor.password_input,
             style: Self.cursorStyle(cursor.visual_style))
 
-        snapshot.dirty = (sizeChanged || forced) ? .full : Self.dirtyState(dirty)
+        snapshot.dirty = (sizeChanged || mustRebuild) ? .full : Self.dirtyState(dirty)
 
         // Point the reusable iterator at this update's rows.
         var iterator: GhosttyRenderStateRowIterator? = rowIterator
