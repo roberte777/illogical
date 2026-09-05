@@ -192,7 +192,7 @@ fn spawnChild(self: *Terminal, opts: SpawnOptions) !sys.pid_t {
     else
         null;
 
-    return self.pty_pair.spawn(argv.ptr, &pty.base_env, cwdz);
+    return self.pty_pair.spawn(argv.ptr, pty.childEnv(), cwdz);
 }
 
 pub fn destroy(self: *Terminal) void {
