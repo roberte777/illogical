@@ -72,7 +72,31 @@ pub const Store = struct {
     root: []const u8,
 
     pub const snapshot_basename = "snapshot.gsnp";
+    pub const staging_basename = "snapshot.gsnp.tmp";
     pub const meta_basename = "meta.json";
+
+    /// Park files are deflate-compressed.
+    ///
+    /// docs/PARKING.md calls for zstd, which is what Mitchell has recommended
+    /// for snapshots. Zig 0.16 ships a zstd *decompressor* only, and pulling in
+    /// a C zstd would be the project's first non-ghostty native dependency. So
+    /// this is flate for now, behind one constant, and swapping it later is a
+    /// local change.
+    pub const Container: std.compress.flate.Container = .raw;
+
+    /// Parking runs on a maintenance tick, not a user's critical path, but it
+    /// does hold the terminal lock. Level 4 is the knee: most of the ratio for
+    /// a fraction of the time of the higher levels.
+    pub const compression_level = std.compress.flate.Compress.Options.level_4;
+
+    /// Deflate needs a 64 KiB window on both sides.
+    pub const window_len = std.compress.flate.max_window_len;
+
+    pub fn ensureSessionDir(self: Store, io: std.Io, id: session.Id) !void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = try self.sessionDir(&buf, id);
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+    }
 
     pub fn sessionDir(
         self: Store,
@@ -92,6 +116,35 @@ pub const Store = struct {
             "{s}/sessions/{d}/{s}",
             .{ self.root, id, snapshot_basename },
         );
+    }
+
+    pub fn stagingPath(
+        self: Store,
+        buf: []u8,
+        id: session.Id,
+    ) std.fmt.BufPrintError![]const u8 {
+        return std.fmt.bufPrint(
+            buf,
+            "{s}/sessions/{d}/{s}",
+            .{ self.root, id, staging_basename },
+        );
+    }
+
+    /// Bytes on disk for a parked terminal, or null if it is not parked.
+    pub fn snapshotSize(self: Store, io: std.Io, id: session.Id) ?u64 {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = self.snapshotPath(&buf, id) catch return null;
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+        defer file.close(io);
+        const info = file.stat(io) catch return null;
+        return info.size;
+    }
+
+    pub fn discard(self: Store, io: std.Io, id: session.Id) void {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (self.snapshotPath(&buf, id)) |path| {
+            std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        } else |_| {}
     }
 };
 

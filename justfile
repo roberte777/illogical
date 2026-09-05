@@ -32,6 +32,11 @@ fmt-check:
     alejandra --check .
     swift-format lint --strict --recursive clients/macos/Illogical clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests
 
+# Measure memory per terminal, live vs parked. Reads phys_footprint, not RSS —
+# with RSS the parking win is invisible on macOS.
+bench-memory count="20" lines="10000": build
+    ./scripts/bench-memory.sh {{count}} {{lines}}
+
 # --- macOS client -----------------------------------------------------------
 
 # Build ghostty-vt.xcframework from vendor/ghostty and stage it for the client.

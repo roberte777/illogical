@@ -37,7 +37,7 @@ that scale. See [RESEARCH.md §7](RESEARCH.md#7-numbers).
 
 ### A1. Terminal parking — snapshot idle terminals to disk
 
-**Status: Adopt.** Milestone M4.
+**Status: Done.** Landed in M4.
 
 After 60 s with no PTY *read* activity, encode the entire terminal state with
 `ghostty_snapshot_encode`, write it to disk, and free the in-memory terminal. The
@@ -56,7 +56,8 @@ Two details that are easy to get wrong:
 
 ### A2. Attach to a parked terminal without unparking it
 
-**Status: Adopt.** Milestone M4.
+**Status: Done.** Landed in M4, with a test asserting the terminal is still
+parked after serving a client a full, decodable snapshot.
 
 The park file and the attach payload are the same bytes, so a client attaching to
 a parked terminal is served **straight from disk**. The terminal never comes back
@@ -104,7 +105,9 @@ them once a client has been idle past its initial sync; reallocate on activity
 
 ### A5. Scrollback page compression (LZ4, in memory)
 
-**Status: Free**, once we drive it. Milestone M4.
+**Status: Done.** Landed in M4 — the server's maintenance tick drives the
+activity token and incremental steps. Note the measurement trap: the win is
+invisible in RSS and only shows in `phys_footprint`.
 
 Distinct from parking and it runs while the terminal is *live*. libghostty
 compresses non-active, non-viewport scrollback pages in place:

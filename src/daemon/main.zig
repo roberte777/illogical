@@ -33,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
     const out = &stdout_file_writer.interface;
 
     var socket_path: ?[]const u8 = null;
+    var park_after_s: ?u64 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -43,6 +44,20 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--version")) {
             try out.print("illogicald {s}\n", .{illogical.version});
             return out.flush();
+        }
+        if (std.mem.eql(u8, arg, "--park-after")) {
+            i += 1;
+            if (i >= args.len) {
+                try out.writeAll("error: --park-after needs a number of seconds\n");
+                try out.flush();
+                return error.InvalidArgs;
+            }
+            park_after_s = std.fmt.parseInt(u64, args[i], 10) catch {
+                try out.print("error: bad --park-after value '{s}'\n", .{args[i]});
+                try out.flush();
+                return error.InvalidArgs;
+            };
+            continue;
         }
         if (std.mem.eql(u8, arg, "--socket")) {
             i += 1;
@@ -64,8 +79,14 @@ pub fn main(init: std.process.Init) !void {
     else
         try Server.defaultSocketPath(arena);
 
-    const server = try Server.init(gpa, init.io, path);
+    // The park store lives beside the socket.
+    const state_root = std.fs.path.dirname(path) orelse ".";
+
+    const server = try Server.init(gpa, init.io, path, state_root);
     defer server.deinit();
+    if (park_after_s) |seconds| {
+        server.park_config.park_after_ns = seconds * std.time.ns_per_s;
+    }
     global_server = server;
 
     // A client disconnecting mid-write must not take the daemon down.
@@ -85,7 +106,10 @@ pub fn main(init: std.process.Init) !void {
     posix.sigaction(posix.SIG.TERM, &shutdown, null);
 
     try server.listen();
-    try out.print("illogicald {s} listening on {s}\n", .{ illogical.version, path });
+    try out.print(
+        "illogicald {s} listening on {s} (park after {d}s)\n",
+        .{ illogical.version, path, server.park_config.park_after_ns / std.time.ns_per_s },
+    );
     try out.flush();
 
     try server.run();
