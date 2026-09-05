@@ -39,13 +39,16 @@ func check(_ operation: String, _ body: () -> GhosttyResult) throws {
 /// `GhosttyReader`. Consumed chunks are released as they are read, so the pipe
 /// holds only what the decoder has not reached yet.
 ///
-/// **A starved read reports end of file.** `snapshot.h` is explicit that a
-/// zero-byte read is permanent EOF and that a source which can starve must
-/// block in its callback — but blocking is exactly what this must not do,
-/// because `ready()` runs on the main actor and history decodes under the
-/// engine's lock. Neither can ever be starved: the server frames
-/// `snapshot_ready` after every byte it describes, and `snapshot_end` after
-/// the last of them, so each phase is driven from bytes already in hand. A
+/// **A starved read reports end of file.** `snapshot.h` gives a source that
+/// can starve two options — "wait outside the decoder or block in their
+/// callback" — and this takes the first. Blocking is what it must not do:
+/// `ready()` runs on the main actor and history decodes under the engine's
+/// lock, so a blocked callback stalls the window or the renderer for as long
+/// as the transport takes.
+///
+/// Waiting outside the decoder is what the caller does instead: `ready()` is
+/// only called once `snapshot_ready` has arrived, and `next()` only once
+/// `snapshot_end` has, so each phase is driven from bytes already in hand. A
 /// read that finds nothing therefore means the stream is malformed or was
 /// abandoned, and EOF is the honest answer — the decoder reports truncated
 /// data and the caller falls back to a blank screen.

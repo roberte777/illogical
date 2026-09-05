@@ -5,11 +5,19 @@
 //
 //      attach -> snapshot_begin -> snapshot_chunk... -> snapshot_ready
 //                                                    -> PAINT
-//             -> output / snapshot_chunk (history) interleaved
-//             -> snapshot_end
+//             -> snapshot_chunk (history)... -> snapshot_end
+//                                            -> RESTORE SCROLLBACK
+//             -> output
 //
-//  Output frames are applied on the connection's reader thread, straight into
-//  the engine, so a busy terminal never queues work onto the main thread.
+//  History is not interleaved with output, and the decode of it does not begin
+//  until `snapshot_end`. Both are properties of the current implementation
+//  rather than of the protocol, and both are explained where they are caused:
+//  the server encodes under the terminal lock (src/daemon/Terminal.zig), and
+//  `restoreHistory` below says why it waits.
+//
+//  `Connection` reads frames on its own thread, but they are delivered through
+//  an AsyncStream consumed on the main actor, so every case in `handle` runs
+//  there -- including `output`, which writes straight into the engine.
 
 import Foundation
 import GhosttyVt
@@ -300,6 +308,14 @@ final class TerminalController {
     /// byte is in the pipe, so no read here can come up short. Decoding pages
     /// as they arrive means solving that first; see docs/CLIENT.md.
     private func restoreHistory(_ restore: SnapshotRestore) {
+        // Never spawn over a live restore. Assigning `historyToken` below
+        // orphans whatever it held, and an orphaned token can never be
+        // cancelled -- which is the one thing keeping that task out of a
+        // terminal `adopt` has freed. The guard lives here rather than at the
+        // call site because it is this assignment that creates the hazard, so
+        // every future caller needs it too.
+        stopHistoryRestore()
+
         let engine = self.engine
         let terminalID = self.terminalID
         let token = HistoryToken()

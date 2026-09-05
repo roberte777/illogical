@@ -72,8 +72,9 @@ The goal is that **nothing on screen waits for the network**:
 3. Feed `snapshot_chunk` bytes into a `GhosttyReader`.
 4. `snapshot_ready` → `ghostty_snapshot_decoder_ready()` → **first frame**.
 5. `output` frames → `ghostty_terminal_vt_write()`.
-6. `snapshot_chunk` (history) → `ghostty_snapshot_decoder_next()` on a background
-   queue, one page per call, interleaved with (5).
+6. `snapshot_end` → `ghostty_snapshot_decoder_next()` on a background queue, one
+   page per call, interleaved with (5). Per the design this should start at the
+   first history chunk rather than at `snapshot_end`; why it does not is below.
 
 The decoder is the **streaming** one (`ghostty_snapshot_decoder_new` with a
 reader callback), not `new_buf`, and it pulls from `SnapshotStream` — a pipe
@@ -82,16 +83,17 @@ decoder reads it. Nothing holds a second copy of the stream, and `ready()`
 needs only the bytes through the READY marker, which is what makes step 4
 independent of scrollback size.
 
-`SnapshotStream` **reports end of file when it runs dry rather than waiting**,
-which reverses `snapshot.h`'s advice that a source which can starve must block
-in its callback. Blocking is what it must not do: `ready()` runs on the main
-actor and `next()` runs under the engine's lock, so a starved read would stall
-the window or the renderer for as long as the transport took. Neither can
-legitimately starve — the server frames `snapshot_ready` after every byte it
-describes and `snapshot_end` after the last of them, so each phase is driven
-from bytes already in hand. A read that finds nothing means the stream is
-malformed or abandoned, and the decoder reporting truncated data is the right
-outcome: the client falls back to a blank screen and takes live output.
+`SnapshotStream` **reports end of file when it runs dry rather than waiting**.
+`snapshot.h` gives a source that can starve two options — "wait outside the
+decoder or block in their callback" — and this takes the first. Blocking is
+what it must not do: `ready()` runs on the main actor and `next()` runs under
+the engine's lock, so a blocked callback would stall the window or the renderer
+for as long as the transport took. Waiting outside the decoder is what the
+caller does instead: `ready()` is called only once `snapshot_ready` has
+arrived, `next()` only once `snapshot_end` has, so each phase is driven from
+bytes already in hand. A read that finds nothing means the stream is malformed
+or abandoned, and the decoder reporting truncated data is the right outcome:
+the client falls back to a blank screen and takes live output.
 
 That is also why step 6 starts at `snapshot_end` rather than at the first
 history chunk. Decoding pages as they arrive means calling `next()` — and so
@@ -239,13 +241,18 @@ painting a terminal whose scrollback it does not have. At two hundred thousand
 lines that window is a third of a second on a unix socket, and it is the whole
 transfer over SSH.
 
-Nothing marks it yet. `scrollbackRows` stays zero until the restore finishes,
-so the scrollbar reports the screen only and there is nothing to scroll into
-rather than something wrong to scroll into — which is the safe failure, but not
-the designed one. The state to build is a distinct treatment for rows the
-snapshot has declared and not yet delivered: `SCREEN` carries each screen's
-complete logical history extent at READY, so the size is known before the pages
-arrive.
+Nothing marks it, and nothing hides it either. The scrollbar overlay reads
+`engine.scrollbar` — libghostty's own extent on the adopted terminal — so it
+grows as pages land and the thumb moves under the user while they scroll.
+`TerminalController.scrollbackRows` is not the mechanism and never was: it is
+written once when the restore finishes and **read by nothing**, which is worth
+knowing before reaching for it.
+
+The state to build is a distinct treatment for rows the snapshot has declared
+and not yet delivered. `SCREEN` carries each screen's complete logical history
+extent at READY, so the full size is known before any page arrives — the
+scrollbar can be sized correctly from the first frame and the undelivered
+region drawn as pending, rather than the extent growing to meet it.
 
 ## Selection
 

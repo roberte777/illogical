@@ -175,6 +175,49 @@ final class ScrollbackRestoreTests: XCTestCase {
             "restored scrollback should match the source")
     }
 
+    /// Abandoning a pipe mid-restore stops the history loop.
+    ///
+    /// `TerminalController` calls `abandon()` on disconnect, on a dropped
+    /// connection, and on re-attach — always while a history restore may be
+    /// running. The loop that calls `restoreNextHistoryPage` is bounded only
+    /// by a millionpage backstop, and every iteration takes the engine's lock,
+    /// so a `next()` that kept returning success without progress would be a
+    /// multi-second renderer freeze rather than a crash. This is what makes
+    /// "a starved read reports end of file" load-bearing instead of aspirational.
+    func testAbandoningMidRestoreStopsTheHistoryLoop() throws {
+        let source = try makeTerminal(cols: 80, rows: 24, lines: 40_000)
+        defer { ghostty_terminal_free(source) }
+
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len = 0
+        try check("ghostty_snapshot_encode_alloc") {
+            ghostty_snapshot_encode_alloc(source, nil, &ptr, &len)
+        }
+        let raw = try XCTUnwrap(ptr)
+        defer { ghostty_free(nil, raw, len) }
+
+        let stream = SnapshotStream()
+        let restore = try SnapshotRestore(stream: stream)
+        stream.append(Data(bytes: raw, count: len))
+        stream.close()
+
+        let restored = try restore.ready()
+        defer { ghostty_terminal_free(restored) }
+        XCTAssertTrue(try restore.restoreNextHistoryPage(), "expected history to restore")
+
+        // The connection drops here.
+        stream.abandon()
+        XCTAssertEqual(stream.pending, 0, "abandon should drop what is buffered")
+
+        var pages = 0
+        while pages < 64 {
+            let more = (try? restore.restoreNextHistoryPage()) ?? false
+            if !more { break }
+            pages += 1
+        }
+        XCTAssertLessThan(pages, 64, "history loop did not terminate after abandon")
+    }
+
     /// A snapshot that stops short does not hang: the pipe reports end of file
     /// rather than waiting for bytes that are not coming.
     func testTruncatedSnapshotFailsRatherThanBlocking() throws {

@@ -51,7 +51,7 @@ Also landed: `illogical peek`, which returns the server's rendered screen as
 plain text without attaching. It was pulled forward from M6 because it is how
 the whole stack gets tested.
 
-## M2 — Attach ✅
+## M2 — Attach ✅ (gate met), loading state outstanding
 
 **Ends at:** attaching shows the correct screen instantly, then fills in
 scrollback. The Mac client attaches, decodes the snapshot into its own
@@ -70,26 +70,43 @@ libghostty-vt terminal and renders it; input round-trips to the PTY.
 | | Loading state for history that has not arrived — now *reachable*, and still not built. See [CLIENT.md](CLIENT.md#the-loading-state) |
 
 **Gate:** attach latency does not vary between 1 MB and 100 MB of scrollback.
-**Met** — `scripts/bench-attach.sh`, Debug build, M-series, median of 7:
+**Met, within a bound the gate did not anticipate** — `scripts/bench-attach.sh`,
+Debug build, M-series, median of 5:
 
 | scrollback | attach → ready | attach → end | bytes read at ready |
 | --- | --- | --- | --- |
-| 200 lines (~14 KB) | 32.0 ms | 32.9 ms | 14,867 |
-| 20,000 lines (~1.4 MB) | 48.9 ms | 49.6 ms | 14,867 |
-| 200,000 lines (~14 MB) | 33.7 ms | 380.4 ms | 11,719 |
+| 200 lines | 32.2 ms | 32.5 ms | 14,369 |
+| 20,000 lines | 33.8 ms | 150.1 ms | 14,879 |
+| 200,000 lines | 33.0 ms | 375.4 ms | 11,719 |
+| 700,000 lines | 33.5 ms | 379.9 ms | 13,679 |
 
-The first column is the gate and it does not move; the spread across those
-three rows is launch noise, not scrollback. The second column is what the
-client used to wait for, because `snapshot_ready` went out after the whole
-encode — so the old number for the last row is the 380 ms beside it, not the
-34 ms. The third column says why it is now flat: the client paints after about
-fourteen kilobytes whatever the terminal is holding.
+The first column is the gate and it does not move — 32.2 to 33.8 ms across a
+3,500× range of scrollback. The second is what the client used to wait for,
+because `snapshot_ready` went out after the whole encode, so the old number for
+the bottom row is the 380 ms beside it, not the 34 ms. The third says why the
+first is flat: the client paints after about fourteen kilobytes whatever the
+terminal is holding.
+
+Read the bottom two rows carefully. They are the same measurement: a terminal
+is capped at 50 MB of scrollback (`SpawnOptions.max_scrollback_bytes`), so
+somewhere below two hundred thousand lines of 80-column text the history stops
+growing and 700,000 lines carries exactly as much as 200,000. **The gate's
+"100 MB" is therefore not reachable at all**, and the honest claim is narrower
+than the one it asks for: flat from a screenful to the cap. Raising the cap is
+what it would take to answer the question as written, and that is worth doing
+before M5 puts this on a network.
+
+The benchmark disables parking (`--park-after 86400`) and refuses to run
+against a terminal that is not `live`, which is not hygiene: rows fill
+sequentially, so a large one takes minutes and every smaller terminal would
+cross the 60 s park threshold while it waits. Attaching to a parked terminal
+serves the compressed park file off disk instead of encoding a live one, and an
+earlier version of this table silently timed one path against the other and
+called the difference scrollback.
 
 The server finds the READY marker by record framing as the encoder streams past
 it (`ReadyScanner` in `src/daemon/Client.zig`), which buffers nothing and works
-the same for a live encode and for a park file replayed off disk. The encoder
-reaches READY in 1–2 ms at both twenty thousand and two hundred thousand lines,
-against 57 ms and 223 ms for the complete snapshot.
+the same for a live encode and for a park file replayed off disk.
 
 Two things this does not do. The server still holds the terminal lock for the
 whole encode, so [PROTOCOL.md](PROTOCOL.md)'s "UNPAUSE at READY" is not literal
@@ -235,8 +252,9 @@ Sources and methodology in [RESEARCH.md §7](RESEARCH.md#7-numbers).
 
 Also measure, where no reference number exists:
 
-- Attach latency at 1 MB vs 100 MB scrollback — must not differ. **32–49 ms
-  across 14 KB, 1.4 MB and 14 MB**, Debug, measured in M2 above.
+- Attach latency at 1 MB vs 100 MB scrollback — must not differ. **32–34 ms
+  from 200 to 700,000 lines**, Debug, measured in M2 above. 100 MB is not
+  reachable: a terminal caps its scrollback at 50 MB.
 - Attach to parked: terminal stays parked, no allocation spike.
 - Full history restore time, in background, without regressing input latency.
 - Thread count vs terminal count — must flatten, not track.

@@ -283,6 +283,11 @@ pub fn attach(self: *Terminal, sub: Subscriber, snapshot_writer: *std.Io.Writer)
     self.mutex.lock();
     defer self.mutex.unlock();
 
+    // Replace, don't accumulate. A client re-attaching to a terminal it is
+    // already subscribed to -- desync recovery, per docs/PROTOCOL.md -- would
+    // otherwise appear twice in the fan-out and receive every subsequent PTY
+    // byte in two `output` frames, doubling every character it renders.
+    self.removeSubscriberLocked(sub.ctx);
     try self.subscribers.append(self.gpa, sub);
     errdefer self.removeSubscriberLocked(sub.ctx);
 
