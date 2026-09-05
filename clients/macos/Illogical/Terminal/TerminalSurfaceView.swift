@@ -21,6 +21,7 @@
 
 import AppKit
 import Carbon.HIToolbox
+import GhosttyVt
 import QuartzCore
 
 /// Views are main-actor bound, and so is everything that answers them.
@@ -51,9 +52,26 @@ final class TerminalSurfaceView: NSView {
     private var renderThread: RenderLoop?
     private var statusLayer: CATextLayer?
 
+    /// Key, mouse and focus encoding. Nil until there is an engine, because
+    /// every sequence it produces depends on that terminal's modes.
+    private var inputEncoder: InputEncoder?
+
     private var lastReportedSize: (cols: UInt16, rows: UInt16) = (0, 0)
     private var didSignalReady = false
     private var currentScale: CGFloat = 0
+
+    /// Matches `TerminalRenderer`'s own default, so the first real focus
+    /// change is the first one either side acts on.
+    private var isFocused = true
+    private let focusObservers = ObserverTokens()
+
+    /// How many buttons are down, which is a different question from which
+    /// one this event is about: button-tracking mode reports motion only
+    /// while something is held.
+    private var buttonsDown = 0
+    /// Sub-cell scroll left over from the last gesture.
+    private var scrollCarry: (x: Double, y: Double) = (0, 0)
+    private var trackingArea: NSTrackingArea?
 
     /// Point size of the terminal font. A config option eventually.
     private static let fontPointSize: Double = 13
@@ -81,9 +99,11 @@ final class TerminalSurfaceView: NSView {
         super.viewDidMoveToWindow()
         guard window != nil else {
             teardownRendering()
+            observeWindowFocus()
             return
         }
         setupRenderingIfNeeded()
+        observeWindowFocus()
         window?.makeFirstResponder(self)
     }
 
@@ -153,7 +173,20 @@ final class TerminalSurfaceView: NSView {
     }
 
     private func attachEngine() {
-        guard let engine else { return }
+        guard let engine else {
+            inputEncoder = nil
+            return
+        }
+
+        if inputEncoder == nil {
+            do {
+                inputEncoder = try InputEncoder(engine: engine)
+                updateEncoderSize()
+            } catch {
+                Trace.log("input encoder init failed: \(error)")
+            }
+        }
+
         // Restart a paused display link when output arrives. This is the
         // other half of stopping it when idle.
         let loop = renderThread
@@ -173,10 +206,35 @@ final class TerminalSurfaceView: NSView {
         let pixelHeight = Int((bounds.height * scale).rounded())
         renderer.setScreenSize(
             width: pixelWidth, height: pixelHeight, scale: Double(scale))
+        updateEncoderSize()
         // Draw synchronously so a live resize never shows a stale or
         // wrongly-sized surface.
         renderer.updateFrame()
         renderer.drawFrame(sync: true)
+    }
+
+    /// Hand the mouse encoder the geometry it turns a pixel into a cell with.
+    ///
+    /// It has to be the renderer's own numbers, padding included: a report
+    /// that disagrees with what was drawn puts the click a cell away from
+    /// where the user aimed.
+    private func updateEncoderSize() {
+        guard let inputEncoder, let renderer else { return }
+        let size = renderer.currentSize
+        var encoded = GhosttyMouseEncoderSize()
+        encoded.size = MemoryLayout<GhosttyMouseEncoderSize>.size
+        encoded.screen_width = size.screen.width
+        encoded.screen_height = size.screen.height
+        encoded.cell_width = size.cell.width
+        encoded.cell_height = size.cell.height
+        encoded.padding_top = size.padding.top
+        encoded.padding_bottom = size.padding.bottom
+        encoded.padding_left = size.padding.left
+        encoded.padding_right = size.padding.right
+        inputEncoder.surfaceSize = encoded
+        // The grid moved under the pointer, so the encoder's memory of the
+        // cell it last reported is stale.
+        inputEncoder.resetMouse()
     }
 
     /// The grid size this view can show, in cells.
@@ -235,72 +293,281 @@ final class TerminalSurfaceView: NSView {
     }
 
     // MARK: - Focus
+    //
+    // Two things listen for focus, and they answer different questions. The
+    // renderer wants it so the cursor is solid or hollow. The terminal wants
+    // it only if the program inside asked for DEC mode 1004, which is how a
+    // shell knows to redraw a prompt or an editor to stop blinking.
+    //
+    // Neither AppKit callback is enough on its own: `resignFirstResponder`
+    // does not fire when the window stops being key, and the window
+    // notifications do not fire when focus moves between two surfaces in one
+    // window. Effective focus is the conjunction, so both feed one place.
 
     override func becomeFirstResponder() -> Bool {
-        renderer?.setFocus(true)
-        renderThread?.wake()
-        return super.becomeFirstResponder()
+        let accepted = super.becomeFirstResponder()
+        if accepted { updateFocus(isFirstResponder: true) }
+        return accepted
     }
 
     override func resignFirstResponder() -> Bool {
-        renderer?.setFocus(false)
-        renderThread?.wake()
-        return super.resignFirstResponder()
+        let accepted = super.resignFirstResponder()
+        if accepted { updateFocus(isFirstResponder: false) }
+        return accepted
     }
 
-    // MARK: - Input
+    private func updateFocus(isFirstResponder: Bool) {
+        let focused = isFirstResponder && (window?.isKeyWindow ?? false)
+        guard focused != isFocused else { return }
+        isFocused = focused
+
+        renderer?.setFocus(focused)
+        renderThread?.wake()
+
+        if let bytes = inputEncoder?.encodeFocus(gained: focused) {
+            delegate?.surface(self, send: bytes)
+        }
+    }
+
+    private func observeWindowFocus() {
+        focusObservers.clear()
+        guard let window else { return }
+
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            let token = NotificationCenter.default.addObserver(
+                forName: name, object: window, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.updateFocus(isFirstResponder: self.window?.firstResponder === self)
+                }
+            }
+            focusObservers.tokens.append(token)
+        }
+    }
+
+    // MARK: - Keyboard
     //
     // No local echo. The server is the single writer; what we type comes back
     // as `output` like everything else. See docs/CLIENT.md.
+    //
+    // Nothing here decides what a key means. `KeyTranslation` says which
+    // physical key it was and what text the layout produced; libghostty-vt
+    // turns that into bytes against the terminal's own modes. That is the
+    // whole point: the client and the server run the same encoder, so they
+    // cannot disagree about what ctrl+shift+enter is.
 
     override func keyDown(with event: NSEvent) {
-        guard let bytes = Self.encode(event) else { return }
+        guard let spec = KeyTranslation.spec(for: event) else { return }
+        send(encodedKey: spec)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        guard let spec = KeyTranslation.spec(for: event) else { return }
+        // Legacy encoding drops these. The Kitty protocol's event-reporting
+        // flag is what makes them mean something, and whether it is set is
+        // the encoder's business, not ours.
+        send(encodedKey: spec)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        guard let spec = KeyTranslation.modifierSpec(for: event) else { return }
+        send(encodedKey: spec)
+    }
+
+    private func send(encodedKey spec: KeyEventSpec) {
+        guard let bytes = inputEncoder?.encode(key: spec), !bytes.isEmpty else { return }
         delegate?.surface(self, send: bytes)
     }
 
+    // MARK: - Mouse
+    //
+    // A mouse event is reported only when the program in the terminal asked
+    // for it, and not even then if shift is held: shift is the escape hatch
+    // that lets you select text inside a full-screen TUI, and every terminal
+    // worth using honours it.
+
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        buttonsDown += 1
+        report(mouse: event, action: GHOSTTY_MOUSE_ACTION_PRESS, button: GHOSTTY_MOUSE_BUTTON_LEFT)
     }
 
-    /// Minimal key encoding. libghostty-vt's `ghostty_encode_key` is the real
-    /// answer and lands with full keyboard-protocol support in M3; this covers
-    /// the common cases so the terminal is usable now.
-    static func encode(_ event: NSEvent) -> [UInt8]? {
-        let control = event.modifierFlags.contains(.control)
-        let option = event.modifierFlags.contains(.option)
-
-        switch Int(event.keyCode) {
-        case kVK_Return: return [0x0d]
-        case kVK_Tab: return [0x09]
-        case kVK_Delete: return [0x7f]
-        case kVK_ForwardDelete: return Array("\u{1b}[3~".utf8)
-        case kVK_Escape: return [0x1b]
-        case kVK_UpArrow: return Array("\u{1b}[A".utf8)
-        case kVK_DownArrow: return Array("\u{1b}[B".utf8)
-        case kVK_RightArrow: return Array("\u{1b}[C".utf8)
-        case kVK_LeftArrow: return Array("\u{1b}[D".utf8)
-        case kVK_Home: return Array("\u{1b}[H".utf8)
-        case kVK_End: return Array("\u{1b}[F".utf8)
-        case kVK_PageUp: return Array("\u{1b}[5~".utf8)
-        case kVK_PageDown: return Array("\u{1b}[6~".utf8)
-        default: break
-        }
-
-        guard let characters = event.charactersIgnoringModifiers, !characters.isEmpty else {
-            return nil
-        }
-
-        if control, let scalar = characters.unicodeScalars.first {
-            // Ctrl-A..Ctrl-Z and the handful of control punctuation.
-            let value = scalar.value
-            if value >= 0x61, value <= 0x7a { return [UInt8(value - 0x60)] }
-            if value >= 0x41, value <= 0x5a { return [UInt8(value - 0x40)] }
-            if value == 0x20 { return [0x00] }
-        }
-
-        guard let typed = event.characters, !typed.isEmpty else { return nil }
-        var bytes = Array(typed.utf8)
-        if option { bytes.insert(0x1b, at: 0) }
-        return bytes
+    override func mouseUp(with event: NSEvent) {
+        buttonsDown = max(0, buttonsDown - 1)
+        report(
+            mouse: event, action: GHOSTTY_MOUSE_ACTION_RELEASE, button: GHOSTTY_MOUSE_BUTTON_LEFT)
     }
+
+    override func mouseDragged(with event: NSEvent) {
+        report(mouse: event, action: GHOSTTY_MOUSE_ACTION_MOTION, button: GHOSTTY_MOUSE_BUTTON_LEFT)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        buttonsDown += 1
+        report(mouse: event, action: GHOSTTY_MOUSE_ACTION_PRESS, button: GHOSTTY_MOUSE_BUTTON_RIGHT)
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        buttonsDown = max(0, buttonsDown - 1)
+        report(
+            mouse: event, action: GHOSTTY_MOUSE_ACTION_RELEASE, button: GHOSTTY_MOUSE_BUTTON_RIGHT)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        report(
+            mouse: event, action: GHOSTTY_MOUSE_ACTION_MOTION, button: GHOSTTY_MOUSE_BUTTON_RIGHT)
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        guard let button = Self.button(forNumber: event.buttonNumber) else { return }
+        buttonsDown += 1
+        report(mouse: event, action: GHOSTTY_MOUSE_ACTION_PRESS, button: button)
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        guard let button = Self.button(forNumber: event.buttonNumber) else { return }
+        buttonsDown = max(0, buttonsDown - 1)
+        report(mouse: event, action: GHOSTTY_MOUSE_ACTION_RELEASE, button: button)
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        guard let button = Self.button(forNumber: event.buttonNumber) else { return }
+        report(mouse: event, action: GHOSTTY_MOUSE_ACTION_MOTION, button: button)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        report(mouse: event, action: GHOSTTY_MOUSE_ACTION_MOTION, button: nil)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        // The pointer left the grid, so the encoder's memory of which cell it
+        // was last in is wrong. The next motion inside should report.
+        inputEncoder?.resetMouse()
+    }
+
+    /// Turn `NSEvent.buttonNumber` into a protocol button. 0 and 1 arrive
+    /// through the dedicated left/right callbacks, so this starts at 2.
+    private static func button(forNumber number: Int) -> GhosttyMouseButton? {
+        switch number {
+        case 2: return GHOSTTY_MOUSE_BUTTON_MIDDLE
+        case 3: return GHOSTTY_MOUSE_BUTTON_EIGHT
+        case 4: return GHOSTTY_MOUSE_BUTTON_NINE
+        default: return nil
+        }
+    }
+
+    private func report(
+        mouse event: NSEvent, action: GhosttyMouseAction, button: GhosttyMouseButton?
+    ) {
+        guard let inputEncoder, isReportingMouse(event) else { return }
+        inputEncoder.anyButtonPressed = buttonsDown > 0
+        let spec = MouseEventSpec(
+            action: action,
+            button: button,
+            mods: KeyTranslation.mods(event.modifierFlags),
+            position: surfacePosition(of: event))
+        guard let bytes = inputEncoder.encode(mouse: spec), !bytes.isEmpty else { return }
+        delegate?.surface(self, send: bytes)
+    }
+
+    /// Whether this event goes to the program rather than to the UI.
+    private func isReportingMouse(_ event: NSEvent) -> Bool {
+        guard let inputEncoder, inputEncoder.mouseTrackingEnabled else { return false }
+        return !event.modifierFlags.contains(.shift)
+    }
+
+    /// The pointer in surface pixels: the same space the renderer lays the
+    /// grid out in, origin at the top-left, padding included.
+    private func surfacePosition(of event: NSEvent) -> GhosttyMousePosition {
+        let local = convert(event.locationInWindow, from: nil)
+        let backing = convertToBacking(local)
+        return GhosttyMousePosition(x: Float(backing.x), y: Float(backing.y))
+    }
+
+    // MARK: - Scrolling
+
+    override func scrollWheel(with event: NSEvent) {
+        guard isReportingMouse(event) else {
+            // Native scrollback owns the viewport, and we never synthesize
+            // wheel sequences into the PTY (docs/GOALS.md G7). Alternate
+            // scroll — DEC mode 1007, where a wheel in the alternate screen
+            // becomes cursor keys — belongs there too, because it is the same
+            // decision about what a scroll gesture means.
+            super.scrollWheel(with: event)
+            return
+        }
+
+        // Precise deltas are pixels; a wheel's are already lines. Both end up
+        // as a whole number of wheel clicks, with the remainder carried so a
+        // slow trackpad drag still eventually reports one.
+        let cell = renderer?.cellSize ?? CellSize(width: 1, height: 1)
+        let scale = window?.backingScaleFactor ?? 2
+        if event.hasPreciseScrollingDeltas {
+            let cellHeight = max(1, Double(cell.height) / Double(scale))
+            let cellWidth = max(1, Double(cell.width) / Double(scale))
+            scrollCarry.y += Double(event.scrollingDeltaY) / cellHeight
+            scrollCarry.x += Double(event.scrollingDeltaX) / cellWidth
+        } else {
+            scrollCarry.y += Double(event.scrollingDeltaY)
+            scrollCarry.x += Double(event.scrollingDeltaX)
+        }
+
+        let clicksY = Int(scrollCarry.y.rounded(.towardZero))
+        let clicksX = Int(scrollCarry.x.rounded(.towardZero))
+        scrollCarry.y -= Double(clicksY)
+        scrollCarry.x -= Double(clicksX)
+
+        // Positive Y is up, positive X is left, which is what buttons four
+        // through seven have meant since X10.
+        for _ in 0..<abs(clicksY) {
+            report(
+                mouse: event, action: GHOSTTY_MOUSE_ACTION_PRESS,
+                button: clicksY > 0 ? GHOSTTY_MOUSE_BUTTON_FOUR : GHOSTTY_MOUSE_BUTTON_FIVE)
+        }
+        for _ in 0..<abs(clicksX) {
+            report(
+                mouse: event, action: GHOSTTY_MOUSE_ACTION_PRESS,
+                button: clicksX > 0 ? GHOSTTY_MOUSE_BUTTON_SIX : GHOSTTY_MOUSE_BUTTON_SEVEN)
+        }
+    }
+
+    // MARK: - Tracking and the cursor
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        // `.activeInKeyWindow` rather than `.activeAlways`: a background
+        // window reporting motion would wake a render thread we just paused.
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func resetCursorRects() {
+        // An I-beam over text, as in every other terminal. It stays an I-beam
+        // under mouse reporting: the program can draw its own affordances but
+        // cannot change the pointer.
+        addCursorRect(bounds, cursor: .iBeam)
+    }
+}
+
+/// Notification tokens with a lifetime of their own.
+///
+/// `NSView.deinit` is nonisolated and may not touch the view's main-actor
+/// state, so the tokens cannot be unregistered there directly. Holding them
+/// here moves that cleanup off the view without leaving observers behind.
+private final class ObserverTokens: @unchecked Sendable {
+    var tokens: [any NSObjectProtocol] = []
+
+    func clear() {
+        for token in tokens { NotificationCenter.default.removeObserver(token) }
+        tokens.removeAll()
+    }
+
+    deinit { clear() }
 }

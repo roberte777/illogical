@@ -135,6 +135,17 @@ final class TerminalRenderer: @unchecked Sendable {
         return size.grid
     }
 
+    /// Screen, cell and padding for the current surface, in device pixels.
+    ///
+    /// Input needs it: a mouse report is a cell coordinate, and turning a
+    /// pointer position into one has to use the same padding the frame was
+    /// laid out with.
+    var currentSize: RendererSize {
+        mutex.lock()
+        defer { mutex.unlock() }
+        return size
+    }
+
     func setFocus(_ focused: Bool) {
         mutex.lock()
         defer { mutex.unlock() }

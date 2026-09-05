@@ -144,10 +144,28 @@ which for us is every output frame.
 
 ## Input
 
-Encode with libghostty-vt (`ghostty_encode_key`, `ghostty_encode_mouse`,
-`ghostty_encode_focus`) and send the bytes as `input`. Do not echo locally: the
-server is the single writer, and the echo comes back as `output` like everything
-else.
+Encode with libghostty-vt and send the bytes as `input`. Do not echo locally:
+the server is the single writer, and the echo comes back as `output` like
+everything else.
+
+Three encoders, all of which read the terminal's own state rather than a table
+of ours:
+
+- `ghostty_key_encoder_encode`, with the options taken from the terminal by
+  `ghostty_key_encoder_setopt_from_terminal` before every event. That is what
+  makes DECCKM, `modifyOtherKeys` and the five Kitty keyboard flags work
+  without the client tracking any of them. `macos-option-as-alt` is the one
+  option the terminal cannot supply; it defaults by keyboard layout, as
+  Ghostty's does.
+- `ghostty_mouse_encoder_encode`, given the renderer's own screen, cell and
+  padding sizes so a report lands on the cell the user aimed at. Shift
+  suppresses reporting, which is how you select text inside a full-screen TUI.
+- `ghostty_focus_encode`, gated on DEC mode 1004 — it takes no terminal and
+  will happily encode a report nobody asked for.
+
+The client translates only two things itself: the macOS virtual keycode to a
+physical key, and AppKit's `characters` to the text the layout produced. What
+those *mean* is never ours to decide.
 
 Client-side echo would be a latency optimization that breaks the one-writer
 invariant, which is what makes desync recovery trivial. Don't.
