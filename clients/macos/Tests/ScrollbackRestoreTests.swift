@@ -204,12 +204,24 @@ final class ScrollbackRestoreTests: XCTestCase {
         let restored = try restore.ready()
         defer { ghostty_terminal_free(restored) }
 
-        // Every history byte is buffered and applicable: without the abandon
-        // below, the first call in the loop returns true. That is what makes
-        // this test fail if the abandon is removed — there is not much history
-        // to work with, because `ghostty_terminal_new` builds its terminal
-        // with libghostty's default 10 KB scrollback limit and the C API
-        // exposes no way to raise it.
+        // The positive control, and it is what makes the rest of this test
+        // mean anything: a second decoder over the same bytes, not abandoned,
+        // restores a page. Without it `pages == 0` below would hold just as
+        // well for a fixture that had no history page to apply — which is
+        // precisely how the first version of this test asserted nothing.
+        //
+        // There is exactly one such page. `ghostty_terminal_new` asks for
+        // libghostty's default 10 KB of scrollback and the C API exposes no
+        // way to raise it, but `PageList` floors the limit at two standard
+        // pages regardless, and that floor is the only reason anything
+        // survives behind the active screen.
+        let control = try SnapshotRestore(snapshot: Data(bytes: raw, count: len))
+        let controlTerminal = try control.ready()
+        defer { ghostty_terminal_free(controlTerminal) }
+        XCTAssertTrue(
+            try control.restoreNextHistoryPage(),
+            "fixture carries no history page, so the assertion below proves nothing")
+
         XCTAssertGreaterThan(stream.pending, 0, "expected buffered history to apply")
 
         // The connection drops here.

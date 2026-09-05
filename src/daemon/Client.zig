@@ -358,10 +358,15 @@ fn attach(self: *Client, id: session.TerminalId, req: protocol.body.Attach) !voi
     // connection -- fanned out to on every PTY read for the life of the
     // daemon, and counted forever by `illogical list`.
     //
-    // Appending only when absent, rather than remove-then-append, because a
-    // re-attach must not leave `attached` momentarily empty: `currentTerminal`
-    // reads it from the terminal's reader thread, and would tag live output
-    // with the control session in that window.
+    // Appending only when absent, rather than remove-then-append, so a
+    // re-attach does not leave `attached` momentarily empty. That window would
+    // be new; the one below it is not. `currentTerminal` still reads this list
+    // from the terminal's reader thread while this thread appends -- unlocked,
+    // and on a first attach still empty between `t.attach` returning and the
+    // append, so output produced in that gap is tagged with the control
+    // session. Harmless today because no client reads the session id on an
+    // `output` frame, and pre-existing, but it belongs with F2's rework of
+    // this path rather than to another round of patching around it.
     if (!self.isAttached(id)) try self.attached.append(self.gpa, id);
 
     // The chunker sends `snapshot_ready` the moment the encoder passes READY.
@@ -683,6 +688,14 @@ test "the chunker frames ready between the right two chunks" {
     try chunker.interface.flush();
     try testing.expect(chunker.sent_ready);
 
+    // Half-close, so the reader below cannot outlive the frames. Without this
+    // a chunker that dropped a byte would leave `readAll` blocked forever on a
+    // socket whose write end this same thread still holds open -- the failed
+    // assertion would never be reached. Buffered frames survive the FIN, so
+    // the success path is unaffected; a starved read now returns zero, which
+    // `sys.readAll` reports as an error.
+    _ = std.c.shutdown(writer_fd, 1);
+
     // Read the frames back and reassemble.
     var chunks: std.ArrayList(u8) = .empty;
     defer chunks.deinit(gpa);
@@ -693,15 +706,7 @@ test "the chunker frames ready between the right two chunks" {
     var header_buf: [protocol.header_len]u8 = undefined;
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(gpa);
-    // Bounded, because the write end is this same thread's `client` and stays
-    // open: a chunker that dropped a byte would leave `readAll` blocked on a
-    // socket that never reaches EOF, turning a failed assertion into a hung
-    // test run. One frame per ten-byte write plus the marker is the ceiling.
-    const max_frames = bytes.len / 10 + 8;
-    var frames: usize = 0;
     while (chunks.items.len < bytes.len or readies == 0) {
-        frames += 1;
-        if (frames > max_frames) break;
         try sys.readAll(reader_fd, &header_buf);
         const header = try protocol.Header.decode(&header_buf);
         try testing.expectEqual(@as(session.TerminalId, 7), header.session);
