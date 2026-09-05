@@ -18,6 +18,13 @@ final class SessionStore {
     var terminals: [TerminalSummary] = []
     var selectedID: TerminalSummary.ID?
     var connectionError: String?
+    /// The toolbar lives in a title bar accessory and the menu lives in the
+    /// content view, so the open/closed state has to be somewhere both can see.
+    ///
+    /// ILLOGICAL_OPEN_SESSION_MENU opens it at launch, alongside
+    /// ILLOGICAL_TRACE, so it can be screenshotted without driving the mouse.
+    var sessionMenuOpen =
+        ProcessInfo.processInfo.environment["ILLOGICAL_OPEN_SESSION_MENU"] != nil
 
     /// Live controllers, one per open terminal.
     private(set) var controllers: [UInt64: TerminalController] = [:]

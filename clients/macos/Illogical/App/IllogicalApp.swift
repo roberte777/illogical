@@ -42,14 +42,10 @@ struct IllogicalApp: App {
 
 struct ContentView: View {
     @Environment(SessionStore.self) private var store
-    /// Debug affordance, alongside ILLOGICAL_TRACE: opens the session menu at
-    /// launch so it can be screenshotted without driving the mouse.
-    @State private var sessionMenuOpen =
-        ProcessInfo.processInfo.environment["ILLOGICAL_OPEN_SESSION_MENU"] != nil
 
     var body: some View {
+        @Bindable var store = store
         VStack(spacing: 0) {
-            Toolbar(sessionMenuOpen: $sessionMenuOpen)
             Rectangle().fill(Palette.divider).frame(height: 1)
             // No divider under the breadcrumb: it sits on the terminal's own
             // background, as in Superlogical.
@@ -66,33 +62,35 @@ struct ContentView: View {
         }
         .background(Palette.background)
         .overlay {
-            if sessionMenuOpen {
+            if store.sessionMenuOpen {
                 ZStack(alignment: .topLeading) {
                     // Dismiss on a click anywhere else, the way a menu does.
                     Color.black.opacity(0.001)
                         .contentShape(Rectangle())
-                        .onTapGesture { sessionMenuOpen = false }
+                        .onTapGesture { store.sessionMenuOpen = false }
 
-                    SessionMenu(isPresented: $sessionMenuOpen)
+                    SessionMenu(isPresented: $store.sessionMenuOpen)
                         .environment(store)
-                        // Anchored to the session button's leading edge, just
-                        // below the toolbar. Measured at x=80 in the reference.
-                        .offset(x: Metrics.contentInset - 1, y: Metrics.toolbarHeight + 1)
+                        // Anchored to the session button's leading edge. The
+                        // toolbar is in the title bar now, so this is measured
+                        // from the top of the content view.
+                        .offset(x: Metrics.contentInset - 1, y: 1)
                 }
-                .ignoresSafeArea()
             }
         }
         .frame(minWidth: 720, minHeight: 460)
         .preferredColorScheme(.dark)
-        .background(WindowChrome(toolbarHeight: Metrics.toolbarHeight))
-        .ignoresSafeArea(.container, edges: .top)
+        .background(
+            WindowChrome(toolbarHeight: Metrics.toolbarHeight) {
+                Toolbar().environment(store)
+            }
+        )
     }
 }
 
 /// The unified toolbar: traffic lights, session button, tab strip, new-tab.
 struct Toolbar: View {
     @Environment(SessionStore.self) private var store
-    @Binding var sessionMenuOpen: Bool
 
     private func isActive(_ index: Int) -> Bool {
         let terminals = store.visibleTerminals
@@ -101,12 +99,14 @@ struct Toolbar: View {
     }
 
     var body: some View {
+        @Bindable var store = store
         HStack(spacing: 0) {
-            // Clears the traffic lights. AppKit owns where those sit; this is
-            // measured so the session icon lands where Superlogical's does.
-            Color.clear.frame(width: Metrics.contentInset, height: 1)
+            // AppKit has already offset this accessory past the traffic
+            // lights; this is the remainder that lands the session icon at
+            // 90.7pt in the window, where Superlogical's sits.
+            Color.clear.frame(width: Metrics.toolbarLeading, height: 1)
 
-            SessionButton(isPresented: $sessionMenuOpen)
+            SessionButton(isPresented: $store.sessionMenuOpen)
 
             Color.clear.frame(width: Metrics.sessionToTabs, height: 1)
 
@@ -125,7 +125,13 @@ struct Toolbar: View {
                     }
                 }
             }
+            // Cap the strip at its content width so the leftover toolbar is
+            // genuinely empty and can drag the window. When the tabs outgrow
+            // the window this clamps to the available width and scrolls.
+            .frame(maxWidth: CGFloat(store.visibleTerminals.count) * Metrics.tabWidth)
 
+            // Bare title bar drags the window; AppKit handles it because the
+            // toolbar is a title bar accessory.
             Spacer(minLength: 8)
 
             Button {
