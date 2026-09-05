@@ -1,0 +1,25 @@
+# Zig
+.zig-cache/
+zig-out/
+zig-pkg/
+
+# Nix / direnv
+.direnv/
+result
+result-*
+.envrc.local
+
+# Swift / Xcode
+clients/macos/*.xcodeproj/
+clients/macos/*.xcworkspace/
+clients/macos/.build/
+clients/macos/DerivedData/
+clients/macos/Packages/*/.build/
+*.xcuserdatad/
+xcuserdata/
+
+# Generated libghostty-vt artifacts
+clients/macos/Frameworks/
+
+# macOS
+.DS_Store

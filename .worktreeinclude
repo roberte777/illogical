@@ -1,0 +1,2 @@
+# Files copied into every new `wt` worktree even though they are gitignored.
+.envrc.local
