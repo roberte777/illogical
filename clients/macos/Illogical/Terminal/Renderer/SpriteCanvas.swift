@@ -221,6 +221,18 @@ final class SpriteCanvas {
         ctx.restoreGState()
     }
 
+    /// Clip the drawing to the cell itself, discarding the padding.
+    ///
+    /// Glyphs defined as the inverse of another are drawn, inverted, and then
+    /// clipped: inverting turns the transparent padding opaque, and without
+    /// this the glyph would spill a quarter cell in every direction.
+    func clipToCell() {
+        clipLeft = paddingX
+        clipRight = paddingX
+        clipTop = paddingY
+        clipBottom = paddingY
+    }
+
     /// Mirror the canvas left to right, padding included.
     ///
     /// Several powerline separators are the mirror image of another, and

@@ -82,3 +82,44 @@ final class SpriteShowcaseTests: XCTestCase {
             inkRows, h.cellHeight * 3, "vertical line run has a gap between rows")
     }
 }
+
+extension SpriteShowcaseTests {
+    /// The blocks added since the original port: legacy computing, its
+    /// Unicode 16 supplement, and branch drawing.
+    func testLegacyAndBranchSheet() throws {
+        let h = try RenderHarness(columns: 34, rows: 12, pointSize: 26)
+        let s = h.source
+
+        // Sextants: a 2x3 grid, sixty-three of them.
+        s.write(String(String.UnicodeScalarView((0x1FB00...0x1FB1F).map { .init($0)! })), row: 0)
+        s.write(String(String.UnicodeScalarView((0x1FB20...0x1FB3B).map { .init($0)! })), row: 1)
+        // Smooth mosaics: diagonal-edged shapes that tile into curves.
+        s.write(String(String.UnicodeScalarView((0x1FB3C...0x1FB5D).map { .init($0)! })), row: 2)
+        // Eighths, block combinations and shades.
+        s.write(String(String.UnicodeScalarView((0x1FB70...0x1FB91).map { .init($0)! })), row: 3)
+        // Corner diagonals and cell diagonals.
+        s.write(String(String.UnicodeScalarView((0x1FBA0...0x1FBAE).map { .init($0)! })), row: 4)
+        s.write(String(String.UnicodeScalarView((0x1FBD0...0x1FBDF).map { .init($0)! })), row: 5)
+        // Circles and quarter blocks.
+        s.write(String(String.UnicodeScalarView((0x1FBE0...0x1FBEF).map { .init($0)! })), row: 6)
+        // Octants: a 2x4 grid.
+        s.write(String(String.UnicodeScalarView((0x1CD00...0x1CD1F).map { .init($0)! })), row: 7)
+        // Separated quadrants and sextants.
+        s.write(String(String.UnicodeScalarView((0x1CC21...0x1CC2F).map { .init($0)! })), row: 8)
+        s.write(String(String.UnicodeScalarView((0x1CE51...0x1CE70).map { .init($0)! })), row: 9)
+        // Branch drawing: lines, arcs and nodes.
+        s.write(String(String.UnicodeScalarView((0xF5D0...0xF5EF).map { .init($0)! })), row: 10)
+        s.write(String(String.UnicodeScalarView((0xF5F0...0xF60D).map { .init($0)! })), row: 11)
+
+        let image = try h.render()
+        image.dump(named: "sprites-legacy")
+
+        let bg = ColorMath.expected(s.snapshot.background)
+        for row in 0..<12 {
+            XCTAssertGreaterThan(
+                image.countDiffering(
+                    from: bg, x: 0, y: row * h.cellHeight, w: image.width, h: h.cellHeight),
+                0, "row \(row) drew nothing")
+        }
+    }
+}

@@ -63,6 +63,9 @@ final class SpriteFace {
         }
         if SpriteGeometric.has(cp) { return true }
         if SpritePowerline.has(cp) { return true }
+        if SpriteLegacy.has(cp) { return true }
+        if SpriteLegacySupplement.has(cp) { return true }
+        if SpriteBranch.range.contains(cp) { return true }
         return false
     }
 
@@ -157,6 +160,12 @@ final class SpriteFace {
                 SpriteGeometric.draw(cp, canvas, w, h, metrics)
             } else if SpritePowerline.has(cp) {
                 SpritePowerline.draw(cp, canvas, w, h, metrics)
+            } else if SpriteLegacy.has(cp) {
+                SpriteLegacy.draw(cp, canvas, w, h, metrics)
+            } else if SpriteLegacySupplement.has(cp) {
+                SpriteLegacySupplement.draw(cp, canvas, w, h, metrics)
+            } else if SpriteBranch.range.contains(cp) {
+                SpriteBranch.draw(cp, canvas, w, h, metrics)
             }
         }
     }
