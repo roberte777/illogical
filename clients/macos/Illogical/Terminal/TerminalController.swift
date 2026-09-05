@@ -43,9 +43,14 @@ final class TerminalController {
     private var historyTask: Task<Void, Never>?
     private var historyToken: HistoryToken?
 
-    /// Accumulates the GHOSTSNP stream. Decoding is buffered for now; the
-    /// streaming decoder (a GhosttyReader callback) is the M3 refinement.
-    private var snapshotBuffer = Data()
+    /// The attach in flight: the GHOSTSNP byte pipe and the decoder pulling
+    /// from it, live from `snapshot_begin` until history has been restored.
+    /// Nothing accumulates a copy of the stream — chunks go into the pipe and
+    /// are released as the decoder reads them.
+    private var restore: SnapshotRestore?
+    /// Set once `ready()` has produced a terminal the engine adopted, so
+    /// `snapshot_end` knows there is a decode to carry on with.
+    private var readyDecoded = false
 
     /// The attach timeline, for the launch budget. `ready` to first frame is
     /// the number docs/CLIENT.md says must not vary with scrollback size: if
@@ -108,6 +113,10 @@ final class TerminalController {
 
     func disconnect() {
         stopHistoryRestore()
+        // A half-delivered snapshot is worth nothing now, and the pipe may be
+        // holding a whole session's scrollback.
+        restore?.stream.abandon()
+        restore = nil
         pump?.cancel()
         connection?.close()
         connection = nil
@@ -121,18 +130,17 @@ final class TerminalController {
             break
 
         case .snapshotBegin:
-            snapshotBuffer.removeAll(keepingCapacity: true)
-            snapshotBytes = 0
+            beginSnapshot()
 
         case .snapshotChunk:
-            snapshotBuffer.append(frame.payload)
+            restore?.stream.append(frame.payload)
             snapshotBytes += frame.payload.count
 
         case .snapshotReady:
             applySnapshot()
 
         case .snapshotEnd:
-            snapshotBuffer.removeAll(keepingCapacity: false)
+            endSnapshot()
             if let attachSentAt {
                 Signposts.milestone(
                     "snapshot-end", seconds: Signposts.sinceLaunch(),
@@ -183,11 +191,21 @@ final class TerminalController {
         String(format: "%.2fms", seconds * 1000)
     }
 
-    private func applySnapshot() {
+    /// Open a pipe for the snapshot the server is about to send.
+    private func beginSnapshot() {
         // Before anything can free or replace the terminal a previous restore
         // is decoding into. A second snapshot on one connection is what
         // desync recovery looks like, and nothing upstream forbids it.
         stopHistoryRestore()
+        restore?.stream.abandon()
+        restore = try? SnapshotRestore(stream: SnapshotStream())
+        readyDecoded = false
+        snapshotBytes = 0
+    }
+
+    /// The server has passed the READY marker: everything needed to paint is
+    /// in the pipe, and nothing beyond it is waited for.
+    private func applySnapshot() {
         readyAt = Date()
         if let attachSentAt {
             Signposts.milestone(
@@ -196,33 +214,43 @@ final class TerminalController {
                     "terminal=\(terminalID) since-attach=\(Self.ms(Date().timeIntervalSince(attachSentAt))) bytes=\(snapshotBytes)"
             )
         }
-        guard !snapshotBuffer.isEmpty else {
+        guard let restore, snapshotBytes > 0 else {
             state = .live
             return
         }
         do {
-            let restore = try SnapshotRestore(snapshot: snapshotBuffer)
             let terminal = try restore.ready()
             engine.adopt(terminal: terminal, cols: engine.cols, rows: engine.rows)
             // We can paint now. Everything below is scrollback catching up.
+            readyDecoded = true
             state = .live
             // Split out from `ready -> first frame` on purpose: if that total
-            // moves with scrollback size, this is where it moved. Today it
-            // does, because `SnapshotRestore` copies the whole GHOSTSNP
-            // stream before decoding any of it — the streaming decoder is
-            // still outstanding from M2.
+            // moves with scrollback size, this is where it moved. It should
+            // not: the decoder stops at READY, and the bytes past it are still
+            // arriving.
             Signposts.milestone(
                 "snapshot-decoded", seconds: Signposts.sinceLaunch(),
                 detail:
                     "terminal=\(terminalID) since-ready=\(Self.ms(Date().timeIntervalSince(readyAt ?? Date()))) bytes=\(snapshotBytes)"
             )
-
-            restoreHistory(restore)
         } catch {
             // A snapshot we cannot decode is not fatal: live output still
             // renders, we just start from a blank screen.
+            self.restore?.stream.abandon()
+            self.restore = nil
             state = .live
         }
+    }
+
+    /// The last history byte has arrived. Close the pipe and start prepending.
+    private func endSnapshot() {
+        guard let restore else { return }
+        restore.stream.close()
+        guard readyDecoded else {
+            self.restore = nil
+            return
+        }
+        restoreHistory(restore)
     }
 
     /// Whether a history restore may still touch its terminal.
@@ -264,6 +292,13 @@ final class TerminalController {
     /// terminal, so this is a mutation the engine did not make and cannot
     /// know about. Per page rather than around the whole loop, so frames keep
     /// coming out while a large history restores.
+    ///
+    /// Started at `snapshot_end`, not at READY, and that is deliberate: the
+    /// decoder reads inside `next()`, under this lock, and `SnapshotStream`
+    /// cannot block a starved read without stalling the renderer for as long
+    /// as the transport takes. Once the last chunk has landed every remaining
+    /// byte is in the pipe, so no read here can come up short. Decoding pages
+    /// as they arrive means solving that first; see docs/CLIENT.md.
     private func restoreHistory(_ restore: SnapshotRestore) {
         let engine = self.engine
         let terminalID = self.terminalID
@@ -302,6 +337,9 @@ final class TerminalController {
             let restored = pages
             await MainActor.run {
                 self?.scrollbackRows = rows
+                // Drop the decoder and whatever the pipe still holds. Identity,
+                // not just non-nil: a re-attach may already have replaced it.
+                if self?.restore === restore { self?.restore = nil }
                 Trace.log(
                     "terminal \(terminalID): restored \(restored) history pages, "
                         + "\(rows) rows of scrollback")
@@ -313,6 +351,11 @@ final class TerminalController {
     }
 
     private func connectionClosed() {
+        // Whatever the pipe still holds is a snapshot that will never be
+        // completed, and it may be a session's whole scrollback.
+        stopHistoryRestore()
+        restore?.stream.abandon()
+        restore = nil
         if case .exited = state { return }
         if case .failed = state { return }
         state = .failed("disconnected")

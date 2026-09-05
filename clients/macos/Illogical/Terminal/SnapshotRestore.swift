@@ -7,6 +7,11 @@
 //
 //  Phase 2 (`restoreNextHistoryPage`) prepends scrollback a page at a time,
 //  newest first, and may be interleaved with live output.
+//
+//  The decoder pulls its bytes through a `GhosttyReader` rather than decoding a
+//  finished buffer, so phase 1 needs only the bytes the server has actually
+//  sent — which is the whole point of the server sending `snapshot_ready` at
+//  the READY marker instead of after the encode.
 
 import Foundation
 import GhosttyVt
@@ -28,6 +33,117 @@ func check(_ operation: String, _ body: () -> GhosttyResult) throws {
     }
 }
 
+/// The byte pipe between the frame pump and the snapshot decoder.
+///
+/// Chunks go in as `snapshot_chunk` frames arrive and come out through a
+/// `GhosttyReader`. Consumed chunks are released as they are read, so the pipe
+/// holds only what the decoder has not reached yet.
+///
+/// **A starved read reports end of file.** `snapshot.h` is explicit that a
+/// zero-byte read is permanent EOF and that a source which can starve must
+/// block in its callback — but blocking is exactly what this must not do,
+/// because `ready()` runs on the main actor and history decodes under the
+/// engine's lock. Neither can ever be starved: the server frames
+/// `snapshot_ready` after every byte it describes, and `snapshot_end` after
+/// the last of them, so each phase is driven from bytes already in hand. A
+/// read that finds nothing therefore means the stream is malformed or was
+/// abandoned, and EOF is the honest answer — the decoder reports truncated
+/// data and the caller falls back to a blank screen.
+final class SnapshotStream: @unchecked Sendable {
+    /// The frame pump appends on the main actor; the decoder reads from it
+    /// there and then from one background task. Those never overlap, so this
+    /// is uncontended — it is here for the memory barrier, not the exclusion.
+    private let lock = NSLock()
+    private var chunks: [Data] = []
+    /// Index of the chunk being read, and how much of it has been consumed.
+    private var next = 0
+    private var head = 0
+    private var closed = false
+
+    func append(_ data: Data) {
+        guard !data.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return }
+        chunks.append(data)
+    }
+
+    /// No more bytes are coming. Reads drain what is left, then report EOF.
+    func close() {
+        lock.lock()
+        defer { lock.unlock() }
+        closed = true
+    }
+
+    /// Drop everything and report EOF from here on, so an abandoned decode
+    /// stops rather than working through history nobody is going to see.
+    func abandon() {
+        lock.lock()
+        defer { lock.unlock() }
+        closed = true
+        chunks.removeAll(keepingCapacity: false)
+        next = 0
+        head = 0
+    }
+
+    /// Bytes buffered but not yet handed to the decoder.
+    var pending: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        var total = 0
+        for i in next..<chunks.count { total += chunks[i].count }
+        return total - head
+    }
+
+    var reader: GhosttyReader {
+        GhosttyReader(
+            read: { userdata, buffer, capacity, outRead in
+                guard let userdata, let buffer, let outRead else { return false }
+                let stream = Unmanaged<SnapshotStream>.fromOpaque(userdata)
+                    .takeUnretainedValue()
+                outRead.pointee = stream.read(into: buffer, capacity: capacity)
+                return true
+            },
+            userdata: Unmanaged.passUnretained(self).toOpaque())
+    }
+
+    private func read(into buffer: UnsafeMutablePointer<UInt8>, capacity: Int) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var written = 0
+        while written < capacity, next < chunks.count {
+            let chunk = chunks[next]
+            let take = min(capacity - written, chunk.count - head)
+            chunk.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                buffer.advanced(by: written).update(
+                    from: base.advanced(by: head).assumingMemoryBound(to: UInt8.self),
+                    count: take)
+            }
+            written += take
+            head += take
+            if head == chunk.count { advanceLocked() }
+        }
+        return written
+    }
+
+    private func advanceLocked() {
+        // Release the bytes now rather than at the next compaction: a large
+        // history is most of what this pipe ever holds.
+        chunks[next] = Data()
+        next += 1
+        head = 0
+        // Dropping the consumed prefix costs O(remaining), so only do it once
+        // the prefix is at least half the array. `removeFirst` on every chunk
+        // would make a hundred thousand lines quadratic in chunk count.
+        if next >= 32, next * 2 >= chunks.count {
+            chunks.removeFirst(next)
+            next = 0
+        }
+    }
+}
+
 /// Unchecked because the decoder is not thread-safe and is not made so here:
 /// it is used from the main actor through `ready()`, and then handed to
 /// exactly one background task for the history pages. What it mutates is the
@@ -35,18 +151,24 @@ func check(_ operation: String, _ body: () -> GhosttyResult) throws {
 /// engine's lock.
 final class SnapshotRestore: @unchecked Sendable {
     private var decoder: GhosttySnapshotDecoder?
-    private let bytes: [UInt8]
+    let stream: SnapshotStream
 
-    init(snapshot: Data) throws {
-        self.bytes = [UInt8](snapshot)
+    init(stream: SnapshotStream) throws {
+        self.stream = stream
         var decoder: GhosttySnapshotDecoder?
-        try self.bytes.withUnsafeBufferPointer { buffer in
-            try check("ghostty_snapshot_decoder_new_buf") {
-                ghostty_snapshot_decoder_new_buf(
-                    nil, &decoder, buffer.baseAddress, buffer.count)
-            }
+        try check("ghostty_snapshot_decoder_new") {
+            ghostty_snapshot_decoder_new(nil, &decoder, stream.reader)
         }
         self.decoder = decoder
+    }
+
+    /// A snapshot that is already complete in memory. The streaming form is
+    /// what the attach path uses; this is for callers that have the bytes.
+    convenience init(snapshot: Data) throws {
+        let stream = SnapshotStream()
+        stream.append(snapshot)
+        stream.close()
+        try self.init(stream: stream)
     }
 
     deinit {

@@ -19,7 +19,7 @@ final class ScrollbackRestoreTests: XCTestCase {
 
         var text = ""
         for i in 0..<lines { text += "line \(i)\r\n" }
-        var bytes = Array(text.utf8)
+        let bytes = Array(text.utf8)
         bytes.withUnsafeBufferPointer { buf in
             ghostty_terminal_vt_write(terminal, buf.baseAddress, buf.count)
         }
@@ -119,6 +119,96 @@ final class ScrollbackRestoreTests: XCTestCase {
         XCTAssertEqual(
             engineText.trimmingCharacters(in: .whitespaces), "line 0",
             "the oldest scrollback row should be the first line written")
+    }
+
+    /// The attach path, in order: the screen decodes from the bytes through
+    /// READY alone, and history from the chunks that arrive after it.
+    ///
+    /// This is the M2 gate on the client's side. If `ready()` needed anything
+    /// past READY it would come up short here, exactly as it would against a
+    /// server that has not sent the rest of the snapshot yet.
+    func testReadyDecodesBeforeHistoryHasArrived() throws {
+        let source = try makeTerminal(cols: 80, rows: 24, lines: 40_000)
+        defer { ghostty_terminal_free(source) }
+        let sourceBar = scrollbar(source)
+
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len = 0
+        try check("ghostty_snapshot_encode_alloc") {
+            ghostty_snapshot_encode_alloc(source, nil, &ptr, &len)
+        }
+        let raw = try XCTUnwrap(ptr)
+        defer { ghostty_free(nil, raw, len) }
+        let bytes = Data(bytes: raw, count: len)
+
+        // Where the server sends `snapshot_ready`, found the way it finds it.
+        let readyEnd = try XCTUnwrap(Self.readyPrefixLength(of: bytes))
+        XCTAssertLessThan(readyEnd, len, "READY should be nowhere near the end")
+
+        let stream = SnapshotStream()
+        let restore = try SnapshotRestore(stream: stream)
+
+        // Only the prefix has arrived.
+        stream.append(bytes.prefix(readyEnd))
+        let restored = try restore.ready()
+        defer { ghostty_terminal_free(restored) }
+        XCTAssertEqual(scrollbar(restored).len, 24, "the screen came back")
+        XCTAssertEqual(stream.pending, 0, "ready() should consume exactly the prefix")
+
+        // History follows, in pieces, as `snapshot_chunk` frames would.
+        var offset = readyEnd
+        while offset < len {
+            let take = min(8192, len - offset)
+            stream.append(bytes.subdata(in: offset..<(offset + take)))
+            offset += take
+        }
+        stream.close()
+
+        var pages = 0
+        while try restore.restoreNextHistoryPage() {
+            pages += 1
+            XCTAssertLessThan(pages, 10_000, "history restore did not terminate")
+        }
+        XCTAssertGreaterThan(pages, 0, "no history pages were restored")
+        XCTAssertEqual(
+            scrollbar(restored).total, sourceBar.total,
+            "restored scrollback should match the source")
+    }
+
+    /// A snapshot that stops short does not hang: the pipe reports end of file
+    /// rather than waiting for bytes that are not coming.
+    func testTruncatedSnapshotFailsRatherThanBlocking() throws {
+        let source = try makeTerminal(cols: 40, rows: 10, lines: 200)
+        defer { ghostty_terminal_free(source) }
+
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len = 0
+        try check("ghostty_snapshot_encode_alloc") {
+            ghostty_snapshot_encode_alloc(source, nil, &ptr, &len)
+        }
+        let raw = try XCTUnwrap(ptr)
+        defer { ghostty_free(nil, raw, len) }
+
+        let stream = SnapshotStream()
+        let restore = try SnapshotRestore(stream: stream)
+        stream.append(Data(bytes: raw, count: len / 3))
+        XCTAssertThrowsError(try restore.ready())
+    }
+
+    /// Offset just past the snapshot's READY record, mirroring the server's
+    /// `ReadyScanner`. Ten-byte envelope, then ten-byte record headers of
+    /// little-endian tag, payload length and CRC; READY is tag 5, and empty.
+    private static func readyPrefixLength(of bytes: Data) -> Int? {
+        var offset = 10
+        while offset + 10 <= bytes.count {
+            let tag = UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8
+            var payload: UInt32 = 0
+            for i in 0..<4 { payload |= UInt32(bytes[offset + 2 + i]) << (8 * UInt32(i)) }
+            offset += 10
+            if tag == 5 { return offset }
+            offset += Int(payload)
+        }
+        return nil
     }
 
     /// Read row 0 of the viewport as a string, through the render state.

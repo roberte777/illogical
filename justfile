@@ -73,6 +73,11 @@ test-renderer:
 bench-launch runs="5" lines="20000":
     ./scripts/bench-launch.sh {{runs}} {{lines}}
 
+# The M2 gate: attach to `snapshot_ready` across scrollback sizes, which must
+# not differ. Needs `zig build` and `just app` first.
+bench-attach runs="5" *LINES="200 20000 200000":
+    ./scripts/bench-attach.sh {{runs}} {{LINES}}
+
 # Renderer benchmarks. Only meaningful with optimization, so Release.
 bench-renderer:
     cd clients/macos && {{xcenv}} xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Release -derivedDataPath .build/xcode-rel -destination 'platform=macOS' test

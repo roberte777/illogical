@@ -51,7 +51,7 @@ Also landed: `illogical peek`, which returns the server's rendered screen as
 plain text without attaching. It was pulled forward from M6 because it is how
 the whole stack gets tested.
 
-## M2 — Attach ✅ (server and client), history streaming outstanding
+## M2 — Attach ✅
 
 **Ends at:** attaching shows the correct screen instantly, then fills in
 scrollback. The Mac client attaches, decodes the snapshot into its own
@@ -62,14 +62,42 @@ libghostty-vt terminal and renders it; input round-trips to the PTY.
 | **structural** | **C1** — raw PTY bytes teed to clients. Never diffs |
 | **structural** | **C2** — one writer, many readers; input serialized; desync ⇒ re-attach |
 | **structural** | **C3** — viewport and selection are client-side; server stores none |
-| | Pause PTY processing, mark offset *N*, `snapshot_encode` at *N*, unpause |
-| | `snapshot_begin` → chunks → `ready` → history newest-first → `end` |
-| | Output fan-out to N clients |
-| | Client-side streaming `SnapshotRestore` (reader callback, not `new_buf`) — currently buffers the whole snapshot before decoding |
-| | Mac client transport + session/terminal dropdown, live |
-| | Loading state for history that has not arrived |
+| ✅ | Pause PTY processing, mark offset *N*, `snapshot_encode` at *N*, unpause |
+| ✅ | `snapshot_begin` → chunks → `ready` → history newest-first → `end` |
+| ✅ | Output fan-out to N clients |
+| ✅ | Client-side streaming `SnapshotRestore` (reader callback, not `new_buf`) |
+| ✅ | Mac client transport + session/terminal dropdown, live |
+| | Loading state for history that has not arrived — now *reachable*, and still not built. See [CLIENT.md](CLIENT.md#the-loading-state) |
 
 **Gate:** attach latency does not vary between 1 MB and 100 MB of scrollback.
+**Met** — `scripts/bench-attach.sh`, Debug build, M-series, median of 7:
+
+| scrollback | attach → ready | attach → end | bytes read at ready |
+| --- | --- | --- | --- |
+| 200 lines (~14 KB) | 32.0 ms | 32.9 ms | 14,867 |
+| 20,000 lines (~1.4 MB) | 48.9 ms | 49.6 ms | 14,867 |
+| 200,000 lines (~14 MB) | 33.7 ms | 380.4 ms | 11,719 |
+
+The first column is the gate and it does not move; the spread across those
+three rows is launch noise, not scrollback. The second column is what the
+client used to wait for, because `snapshot_ready` went out after the whole
+encode — so the old number for the last row is the 380 ms beside it, not the
+34 ms. The third column says why it is now flat: the client paints after about
+fourteen kilobytes whatever the terminal is holding.
+
+The server finds the READY marker by record framing as the encoder streams past
+it (`ReadyScanner` in `src/daemon/Client.zig`), which buffers nothing and works
+the same for a live encode and for a park file replayed off disk. The encoder
+reaches READY in 1–2 ms at both twenty thousand and two hundred thousand lines,
+against 57 ms and 223 ms for the complete snapshot.
+
+Two things this does not do. The server still holds the terminal lock for the
+whole encode, so [PROTOCOL.md](PROTOCOL.md)'s "UNPAUSE at READY" is not literal
+— history is encoded before the PTY reader thread runs again, and splitting
+that needs a two-phase encoder libghostty-vt does not expose (`snapshot.encode`
+is one call). And the client decodes history once it has all arrived rather
+than page by page, because the decoder reads inside `next()`, under the
+engine's lock; the reasoning is in [CLIENT.md](CLIENT.md#the-attach-path-and-the-launch-budget).
 
 ## M3 — The renderer (in progress)
 
@@ -207,7 +235,8 @@ Sources and methodology in [RESEARCH.md §7](RESEARCH.md#7-numbers).
 
 Also measure, where no reference number exists:
 
-- Attach latency at 1 MB vs 100 MB scrollback — must not differ.
+- Attach latency at 1 MB vs 100 MB scrollback — must not differ. **32–49 ms
+  across 14 KB, 1.4 MB and 14 MB**, Debug, measured in M2 above.
 - Attach to parked: terminal stays parked, no allocation spike.
 - Full history restore time, in background, without regressing input latency.
 - Thread count vs terminal count — must flatten, not track.
