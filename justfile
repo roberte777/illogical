@@ -1,6 +1,13 @@
 # illogical — task runner. Everything assumes you are inside `nix develop`
 # (or have direnv active).
 
+# xcodebuild and swiftpm read environment variables as build-setting overrides,
+# so the devshell's stdenv hands them a toolchain they must not use: LD=ld
+# replaces Xcode's clang driver with the raw linker, and SDKROOT points Xcode's
+# Swift 6 compiler at nix's macOS 14.4 SDK. zig still needs all of it, so strip
+# them per-recipe instead of dropping them from the devshell.
+xcenv := "env -u LD -u CC -u CXX -u AR -u NM -u RANLIB -u STRIP -u SDKROOT -u DEVELOPER_DIR -u MACOSX_DEPLOYMENT_TARGET -u LD_DYLD_PATH"
+
 default:
     @just --list
 
@@ -45,12 +52,12 @@ xcodeproj:
 
 # Test the pure-Swift client core. Needs no XCFramework.
 test-swift:
-    cd clients/macos/Packages/IllogicalKit && swift test
+    cd clients/macos/Packages/IllogicalKit && {{xcenv}} swift test
 
 # Build the Mac app. Requires `just xcframework` and `just xcodeproj` first.
 # DerivedData is pinned so `just run-app` always launches what was just built.
 app:
-    cd clients/macos && xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Debug -derivedDataPath .build/xcode -destination 'platform=macOS' build
+    cd clients/macos && {{xcenv}} xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Debug -derivedDataPath .build/xcode -destination 'platform=macOS' build
 
 # Build and launch the Mac app.
 run-app: app
