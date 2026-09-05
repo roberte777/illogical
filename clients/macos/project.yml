@@ -63,6 +63,8 @@ targets:
       # render path, and the only part that touches libghostty.
       - path: Illogical/Terminal/TerminalEngine.swift
       - path: Illogical/Terminal/SnapshotRestore.swift
+      - path: Illogical/Terminal/ScrollAccumulator.swift
+      - path: Illogical/Terminal/ScrollbarOverlay.swift
       - path: Tests
     dependencies:
       - framework: Frameworks/ghostty-vt.xcframework

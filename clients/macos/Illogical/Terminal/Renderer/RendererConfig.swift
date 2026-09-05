@@ -52,6 +52,19 @@ struct RendererConfig {
     var selectionBackground: (r: UInt8, g: UInt8, b: UInt8)? = nil
     var selectionForeground: (r: UInt8, g: UInt8, b: UInt8)? = nil
 
+    /// Scroll speed. Precision deltas (trackpad) are pixels and pass through
+    /// as-is; discrete deltas (wheel) are ticks and get multiplied by the cell
+    /// height, so one tick is three rows. libghostty's defaults.
+    var scrollMultiplierPrecision: Double = 1
+    var scrollMultiplierDiscrete: Double = 3
+
+    /// Jump to the live output when a key is pressed, but not when output
+    /// arrives. Also libghostty's defaults: typing means you want to see what
+    /// you are typing, whereas output scrolling out from under you while you
+    /// are reading history is infuriating.
+    var scrollToBottomOnKeystroke: Bool = true
+    var scrollToBottomOnOutput: Bool = false
+
     /// How the cursor blinks, when the terminal asks it to.
     var cursorBlinkInterval: Double = 0.6
 

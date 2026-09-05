@@ -28,8 +28,9 @@ final class TerminalController {
 
     let terminalID: UInt64
     private(set) var state: State = .connecting
-    /// Scrollback rows restored so far, for the UI to show progress.
-    private(set) var restoredHistoryRows = 0
+    /// Rows of scrollback available to scroll into, once the attach
+    /// snapshot's history has been restored.
+    private(set) var scrollbackRows = 0
 
     let engine: TerminalEngine
     private var connection: Connection?
@@ -140,12 +141,25 @@ final class TerminalController {
             // We can paint now. Everything below is scrollback catching up.
             state = .live
 
+            // A well-formed snapshot terminates at FINISH; the bound is
+            // only there so a corrupt one can't spin forever. Say so when we
+            // hit it rather than quietly showing a shortened history.
+            let maximumPages = 1 << 20
             var pages = 0
             while try restore.restoreNextHistoryPage() {
                 pages += 1
-                if pages > 4096 { break }
+                if pages >= maximumPages {
+                    Trace.log(
+                        "terminal \(terminalID): history restore stopped at \(pages) pages")
+                    break
+                }
             }
-            restoredHistoryRows = pages
+
+            let bar = engine.scrollbar
+            scrollbackRows = Int(bar.total) - Int(bar.length)
+            Trace.log(
+                "terminal \(terminalID): restored \(pages) history pages, "
+                    + "\(scrollbackRows) rows of scrollback")
         } catch {
             // A snapshot we cannot decode is not fatal: live output still
             // renders, we just start from a blank screen.

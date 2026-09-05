@@ -55,6 +55,14 @@ final class TerminalSurfaceView: NSView {
     private var didSignalReady = false
     private var currentScale: CGFloat = 0
 
+    private var scrollbar: ScrollbarOverlay?
+    private var scrollbarHideWork: DispatchWorkItem?
+
+    private let config = RendererConfig()
+    private lazy var scrollAccumulator = ScrollAccumulator(
+        precisionMultiplier: config.scrollMultiplierPrecision,
+        discreteMultiplier: config.scrollMultiplierDiscrete)
+
     /// Point size of the terminal font. A config option eventually.
     private static let fontPointSize: Double = 13
 
@@ -146,6 +154,9 @@ final class TerminalSurfaceView: NSView {
     }
 
     private func teardownRendering() {
+        scrollbarHideWork?.cancel()
+        scrollbarHideWork = nil
+        scrollAccumulator.reset()
         renderThread?.stop()
         renderThread = nil
         renderer = nil
@@ -248,6 +259,86 @@ final class TerminalSurfaceView: NSView {
         return super.resignFirstResponder()
     }
 
+    // MARK: - Scrolling
+    //
+    // The viewport is entirely client-side. We never synthesize wheel escape
+    // sequences into the PTY, and we never tell the server where we are
+    // looking: two people attached to one terminal scroll independently. The
+    // tmux behaviour where one client's scroll moves everyone's window is a
+    // bug we are deliberately not reproducing (docs/CLIENT.md, [ARCH t=323]).
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let engine else { return }
+
+        // When the program has asked for mouse events the wheel belongs to
+        // it, not to us — scrolling inside `less` should scroll `less`. We
+        // can't encode those events yet, so the wheel does nothing rather
+        // than doing the wrong thing.
+        guard !engine.isMouseTracking else { return }
+
+        let rows = scrollAccumulator.viewportRows(
+            scrollingDeltaY: Double(event.scrollingDeltaY),
+            legacyDeltaY: Double(event.deltaY),
+            precise: event.hasPreciseScrollingDeltas,
+            cellHeight: Double(max(1, currentCellHeight)))
+        guard rows != 0 else { return }
+
+        engine.scroll(.delta(rows))
+        renderThread?.wake()
+        showScrollbar()
+    }
+
+    /// Cell height in device pixels, which is the unit the viewport moves in.
+    private var currentCellHeight: UInt32 {
+        if let fontGrid { return fontGrid.metrics.cellHeight }
+        let scale = window?.backingScaleFactor ?? 2
+        return FontGridSet.grid(
+            family: nil, pointSize: Self.fontPointSize, scale: Double(scale)
+        ).metrics.cellHeight
+    }
+
+    /// Jump back to the live output.
+    func scrollToBottom() {
+        guard let engine else { return }
+        scrollAccumulator.reset()
+        engine.scroll(.bottom)
+        renderThread?.wake()
+    }
+
+    // MARK: - Scrollbar
+
+    /// Show the position indicator and start its fade.
+    ///
+    /// An overlay indicator rather than a real `NSScrollView`: the terminal's
+    /// content is an IOSurface the renderer owns, there is no document view
+    /// to scroll, and the scrollable area changes shape as output arrives.
+    private func showScrollbar() {
+        guard let engine, let layer else { return }
+        let state = engine.scrollbar
+        guard state.canScroll else {
+            scrollbar?.hide()
+            return
+        }
+
+        let bar =
+            scrollbar
+            ?? {
+                let b = ScrollbarOverlay()
+                layer.addSublayer(b.layer)
+                scrollbar = b
+                return b
+            }()
+
+        bar.update(state, in: bounds, scale: window?.backingScaleFactor ?? 2)
+        bar.show()
+
+        // Fade out after a moment, like the system's own overlay scrollbars.
+        scrollbarHideWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.scrollbar?.hide() }
+        scrollbarHideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
+    }
+
     // MARK: - Input
     //
     // No local echo. The server is the single writer; what we type comes back
@@ -255,6 +346,8 @@ final class TerminalSurfaceView: NSView {
 
     override func keyDown(with event: NSEvent) {
         guard let bytes = Self.encode(event) else { return }
+        // Typing means you want to see what you are typing.
+        if config.scrollToBottomOnKeystroke { scrollToBottom() }
         delegate?.surface(self, send: bytes)
     }
 
