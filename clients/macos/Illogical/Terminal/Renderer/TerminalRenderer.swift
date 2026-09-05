@@ -61,6 +61,8 @@ final class TerminalRenderer: @unchecked Sendable {
     /// Reset whenever the terminal produces output, so the cursor is solid
     /// while you type rather than winking mid-keystroke.
     private var blinkEpoch = CACurrentMediaTime()
+    /// The blink phase the last frame was drawn with. Nil before the first.
+    private var lastBlinkPhase: Bool?
 
     /// The layer we hand finished IOSurfaces to.
     private let layer: CALayer
@@ -201,8 +203,11 @@ final class TerminalRenderer: @unchecked Sendable {
         mutex.lock()
         defer { mutex.unlock() }
         if cellsRebuilt { return true }
-        // A blinking cursor needs frames even when nothing else changes.
-        return blinkingCursorLocked
+        // A blinking cursor needs frames even when nothing else changes —
+        // but only when the phase actually flips. Redrawing on every tick
+        // would keep a display link alive at 120 Hz to animate something
+        // that changes twice a second.
+        return blinkingCursorLocked && blinkVisible != lastBlinkPhase
     }
 
     private var blinkingCursorLocked: Bool {
@@ -272,6 +277,7 @@ final class TerminalRenderer: @unchecked Sendable {
         }
 
         rebuildCursorLocked()
+        lastBlinkPhase = blinkVisible
 
         cellsRebuilt = true
     }
@@ -418,6 +424,15 @@ final class TerminalRenderer: @unchecked Sendable {
             }
 
             if runIndex < runs.count {
+                // Shaping is supposed to produce monotonically increasing x,
+                // and we sort the rare runs where CoreText says it didn't.
+                // A cell left behind the cursor would otherwise never match
+                // and would stall every glyph after it in the run.
+                while shapedIndex < shaped.count
+                    && shapedRunOffset + Int(shaped[shapedIndex].x) < x
+                {
+                    shapedIndex += 1
+                }
                 while shapedIndex < shaped.count
                     && shapedRunOffset + Int(shaped[shapedIndex].x) == x
                 {

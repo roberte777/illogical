@@ -132,13 +132,19 @@ final class RenderHarness {
 
     /// Build a harness sized to hold exactly `columns` x `rows` cells with no
     /// padding, so grid coordinates map straight onto pixels.
-    convenience init(columns: Int, rows: Int, pointSize: Double = 13) throws {
+    convenience init(
+        columns: Int, rows: Int, pointSize: Double = 13,
+        configure: ((inout RendererConfig) -> Void)? = nil
+    ) throws {
         try self.init(
             columns: columns, rows: rows, pointSize: pointSize,
-            source: FakeSource(columns: columns, rows: rows))
+            source: FakeSource(columns: columns, rows: rows), configure: configure)
     }
 
-    init(columns: Int, rows: Int, pointSize: Double = 13, source: TerminalRenderSource) throws {
+    init(
+        columns: Int, rows: Int, pointSize: Double = 13, source: TerminalRenderSource,
+        configure: ((inout RendererConfig) -> Void)? = nil
+    ) throws {
         context = try MetalContext.acquire()
         grid = FontGridSet.grid(family: "Menlo", pointSize: pointSize, scale: 2)
 
@@ -153,6 +159,7 @@ final class RenderHarness {
         // the assertions harder to follow for no benefit.
         config.windowPaddingX = 0
         config.windowPaddingY = 0
+        configure?(&config)
         renderer = TerminalRenderer(
             context: context, grid: grid, layer: layer, source: renderSource, config: config)
 
