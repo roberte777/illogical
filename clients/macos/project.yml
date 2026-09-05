@@ -70,6 +70,8 @@ targets:
       - path: Illogical/Terminal/Input
       - path: Illogical/Terminal/Selection
       - path: Illogical/Terminal/TerminalSurfaceView.swift
+      - path: Illogical/Terminal/ScrollAccumulator.swift
+      - path: Illogical/Terminal/ScrollbarOverlay.swift
       - path: Illogical/App/Palette.swift
       - path: Illogical/App/Trace.swift
       - path: Tests
