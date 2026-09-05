@@ -98,9 +98,14 @@ enum Metrics {
     /// One tab's slot. Content is left-aligned in it and truncates.
     static let tabWidth: CGFloat = 197
     static let tabLeadingPadding: CGFloat = 10
-    /// Content starts here so the session icon lands at 90.7pt, clear of the
-    /// traffic lights. AppKit owns where the lights themselves sit.
+    /// Where the session menu is anchored, in *window* coordinates: the
+    /// session button's leading edge, measured at 80pt in the reference.
     static let contentInset: CGFloat = 81
+    /// Leading padding inside the title bar accessory. This is a different
+    /// coordinate space from `contentInset`: AppKit already offsets the
+    /// accessory past the traffic lights, so this only adds the remainder
+    /// needed to land the session icon at 90.7pt in the window.
+    static let toolbarLeading: CGFloat = 3
     static let sessionPadding: CGFloat = 8
     /// Gap between the session button and the first tab slot.
     static let sessionToTabs: CGFloat = 6
@@ -213,6 +218,23 @@ struct TerminalTab: View {
     @State private var isHovering = false
 
     var body: some View {
+        Button(action: select) {
+            label
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(Text(terminal.name))
+        .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : .isButton)
+        .overlay(alignment: .leading) {
+            if showsLeadingSeparator { TabSeparator() }
+        }
+        .onHover { isHovering = $0 }
+    }
+
+    /// A tab was an `.onTapGesture` on a plain `HStack`, which is both
+    /// invisible to accessibility and unreliable inside a `ScrollView` — the
+    /// scroll gesture wins the recognizer race, so hovering worked and clicking
+    /// did not. A `Button` hit-tests properly and shows up as one.
+    private var label: some View {
         HStack(spacing: Metrics.badgeToLabel) {
             ZStack {
                 TerminalBadge().traceFrame("badge-\(terminal.id)")
@@ -237,9 +259,11 @@ struct TerminalTab: View {
                 Button(action: close) {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(Palette.textDim)
+                        .foregroundStyle(isHovering ? Palette.textDim : .clear)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(Text("Close \(terminal.name)"))
                 .help("Close terminal")
             }
         }
@@ -261,12 +285,7 @@ struct TerminalTab: View {
                     .fill(Palette.tabHoverFill)
             }
         }
-        .overlay(alignment: .leading) {
-            if showsLeadingSeparator { TabSeparator() }
-        }
         .contentShape(Rectangle())
-        .onHover { isHovering = $0 }
-        .onTapGesture(perform: select)
     }
 
     private var residencyIcon: String {
