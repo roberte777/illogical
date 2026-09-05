@@ -388,14 +388,24 @@ final class TerminalSurfaceView: NSView {
 
     private func send(encodedKey spec: KeyEventSpec) {
         guard let bytes = inputEncoder?.encode(key: spec), !bytes.isEmpty else { return }
-        // Typing drops the selection, as it does in every terminal. Guarded
-        // because clearing forces a full repaint, and doing that on every
-        // keystroke would undo the dirty tracking the renderer is built on.
-        if let engine, engine.hasSelection {
-            engine.clearSelection()
-            renderThread?.wake()
-        }
+        // Anything that resets view state on a keystroke belongs here, before
+        // the send: native scrollback's return-to-bottom goes alongside
+        // whatever else lands.
+        //
+        // Typing drops the selection, as it does in every terminal.
+        clearSelectionIfAny()
         delegate?.surface(self, send: bytes)
+    }
+
+    /// Drop the selection, if there is one.
+    ///
+    /// Guarded rather than unconditional because clearing forces a full
+    /// repaint, and doing that on every keystroke would undo the dirty
+    /// tracking the renderer is built on.
+    private func clearSelectionIfAny() {
+        guard let engine, engine.hasSelection else { return }
+        engine.clearSelection()
+        renderThread?.wake()
     }
 
     // MARK: - Mouse
@@ -507,6 +517,13 @@ final class TerminalSurfaceView: NSView {
     }
 
     /// Whether this event goes to the program rather than to the UI.
+    ///
+    /// Shift overrides reporting for buttons and motion, which is how you
+    /// select text inside a full-screen TUI. That is Ghostty's default —
+    /// `mouse-shift-capture` is `false` — but not the whole of its rule: it
+    /// also lets the terminal itself take shift back with XTSHIFTESCAPE,
+    /// which we do not implement, and exposes the choice as config, which we
+    /// have nowhere to put yet.
     private func isReportingMouse(_ event: NSEvent) -> Bool {
         guard let inputEncoder, inputEncoder.mouseTrackingEnabled else { return false }
         return !event.modifierFlags.contains(.shift)
@@ -626,21 +643,43 @@ final class TerminalSurfaceView: NSView {
     ///
     /// Counts, not pixels. A wheel report is one button press per row, so a
     /// caller handing this raw trackpad deltas would emit ten reports where a
-    /// mouse sends one. Positive is up and left, which is what buttons four
-    /// through seven have meant since X10.
+    /// mouse sends one.
+    ///
+    /// No shift override here, unlike the button path. Ghostty's
+    /// `scrollCallback` has no shift gate at all — `mouseShiftCapture` is
+    /// consulted for clicks and motion and nowhere else — so a shift-wheel
+    /// inside a full-screen TUI goes to the program, and shift is only an
+    /// escape hatch for selecting with the buttons.
+    ///
+    /// `mods` is the gesture's own modifier state, not
+    /// `NSEvent.modifierFlags`: the latter is whatever is held right now,
+    /// which is a different question and is untestable without faking global
+    /// state.
     @discardableResult
-    func reportWheel(rows: Int, columns: Int, at point: NSPoint) -> Bool {
-        let mods = NSEvent.modifierFlags
-        guard let inputEncoder, !mods.contains(.shift) else { return false }
+    func reportWheel(
+        rows: Int, columns: Int, mods: NSEvent.ModifierFlags, at point: NSPoint
+    ) -> Bool {
+        guard let inputEncoder else { return false }
         let encoded = KeyTranslation.mods(mods)
 
         if inputEncoder.mouseTrackingEnabled {
+            // Both claimants drop the selection first, as Ghostty's
+            // `scrollCallback` does. A highlight left behind while the program
+            // scrolls under it points at whatever happens to be in those cells
+            // now, which is worse than no highlight.
+            clearSelectionIfAny()
+
             for _ in 0..<abs(rows) {
                 report(
                     action: GHOSTTY_MOUSE_ACTION_PRESS,
                     button: rows > 0 ? GHOSTTY_MOUSE_BUTTON_FOUR : GHOSTTY_MOUSE_BUTTON_FIVE,
                     mods: encoded, at: point)
             }
+            // Four/five and six/seven, mapped from the sign exactly as
+            // Ghostty's `scrollCallback` maps it. Which physical direction
+            // button six *is* the mouse header does not say and Ghostty's own
+            // doc comment disagrees with the label used here, so this matches
+            // by construction rather than by reasoning about it.
             for _ in 0..<abs(columns) {
                 report(
                     action: GHOSTTY_MOUSE_ACTION_PRESS,
@@ -653,6 +692,7 @@ final class TerminalSurfaceView: NSView {
         }
 
         guard let bytes = inputEncoder.encodeAlternateScroll(rows: rows) else { return false }
+        clearSelectionIfAny()
         delegate?.surface(self, send: bytes)
         return true
     }
