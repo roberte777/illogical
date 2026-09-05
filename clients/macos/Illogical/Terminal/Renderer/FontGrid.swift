@@ -330,13 +330,25 @@ final class FontGrid: @unchecked Sendable {
         return GlyphRender(glyph: glyph, presentation: presentation)
     }
 
-    /// Run `body`, doubling the atlas and retrying once if it doesn't fit.
+    /// Largest atlas we will grow to. Comfortably inside every Metal
+    /// device's maximum texture size, and far past what a session needs:
+    /// 8192x8192 grayscale holds tens of thousands of glyphs.
+    private static let maxAtlasSize: UInt32 = 8192
+
+    /// Run `body`, doubling the atlas until it fits.
+    ///
+    /// One retry isn't always enough — a single glyph at a very large font
+    /// size can be bigger than the whole atlas — so this keeps doubling. If
+    /// it hits the cap the error propagates and the caller drops the glyph,
+    /// which is the right failure: a missing glyph, not a crash.
     private func withAtlasGrowth(_ atlas: Atlas, _ body: () throws -> Glyph) throws -> Glyph {
-        do {
-            return try body()
-        } catch AtlasError.full {
-            atlas.grow(to: atlas.size * 2)
-            return try body()
+        while true {
+            do {
+                return try body()
+            } catch AtlasError.full {
+                guard atlas.size < Self.maxAtlasSize else { throw AtlasError.full }
+                atlas.grow(to: min(atlas.size * 2, Self.maxAtlasSize))
+            }
         }
     }
 

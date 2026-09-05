@@ -93,9 +93,14 @@ final class RenderLoop: NSObject, @unchecked Sendable {
         self.thread = nil
         stateLock.unlock()
 
-        thread?.cancel()
-        // Wake the run loop so it notices the cancellation and unwinds.
-        wake(force: true)
+        guard let thread, thread.isExecuting else { return }
+        thread.cancel()
+        // Wake the run loop so it notices the cancellation and unwinds. This
+        // has to go to the thread we just took out of `self.thread`, not
+        // through `wake`, which would find it already nil. And it has to
+        // happen at all: if the display link is paused there is nothing else
+        // to wake the run loop, and the thread would block forever.
+        signal(thread)
     }
 
     /// Restart a paused display link.
@@ -104,17 +109,23 @@ final class RenderLoop: NSObject, @unchecked Sendable {
     /// edge, so it must be safe from anywhere and cheap when the link is
     /// already running — which is the usual case, since we only pause after
     /// a second of quiet.
-    func wake(force: Bool = false) {
-        guard force || paused.load() else { return }
+    func wake() {
+        guard paused.load() else { return }
 
         stateLock.lock()
         let thread = self.thread
         stateLock.unlock()
 
         guard let thread, thread.isExecuting else { return }
-        // Hop to the render thread: CADisplayLink's threading contract isn't
-        // documented, and this doubles as the run loop wakeup we need when
-        // the link is paused and nothing else would fire.
+        signal(thread)
+    }
+
+    /// Hop to the render thread.
+    ///
+    /// CADisplayLink's threading contract isn't documented, so unpausing
+    /// happens on the thread that owns it. This doubles as the run loop
+    /// wakeup we need when the link is paused and nothing else would fire.
+    private func signal(_ thread: Thread) {
         perform(
             #selector(resume), on: thread, with: nil, waitUntilDone: false,
             modes: [RunLoop.Mode.default.rawValue, RunLoop.Mode.common.rawValue])
