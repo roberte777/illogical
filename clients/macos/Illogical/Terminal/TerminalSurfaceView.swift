@@ -69,6 +69,14 @@ final class TerminalSurfaceView: NSView {
     /// one this event is about: button-tracking mode reports motion only
     /// while something is held.
     private var buttonsDown = 0
+
+    /// Whether the held left-button gesture is a selection.
+    ///
+    /// Decided at mouse-down and kept for the whole gesture: a program that
+    /// turns mouse tracking on mid-drag must not strand a selection that was
+    /// already begun, and one that turns it off must not have its drag turn
+    /// into a selection halfway through.
+    private var isSelecting = false
     private var trackingArea: NSTrackingArea?
 
     private var scrollbar: ScrollbarOverlay?
@@ -245,6 +253,11 @@ final class TerminalSurfaceView: NSView {
         // cell it last reported is stale.
         inputEncoder.resetMouse()
     }
+
+    /// The renderer's screen, cell and padding, in device pixels. Only the
+    /// tests need it: turning a cell index into a pointer position means
+    /// knowing where the renderer decided to put the grid.
+    var rendererSizeForTesting: RendererSize? { renderer?.currentSize }
 
     /// The grid size this view can show, in cells.
     var gridSize: (cols: UInt16, rows: UInt16) {
@@ -495,12 +508,25 @@ final class TerminalSurfaceView: NSView {
 
     private func send(encodedKey spec: KeyEventSpec, isTyping: Bool = false) {
         guard let bytes = inputEncoder?.encode(key: spec), !bytes.isEmpty else { return }
-        // Typing means you want to see what you are typing.
-        //
-        // Only on key-down. Under the Kitty protocol a bare modifier press
-        // also produces bytes, and holding shift is not typing.
+        // Two things reset on a keystroke. The selection goes always, as it
+        // does in every terminal.
+        clearSelectionIfAny()
+        // The viewport goes back to the live output only on key-*down*:
+        // under the Kitty protocol a bare modifier press also produces bytes,
+        // and holding shift is not typing.
         if isTyping, config.scrollToBottomOnKeystroke { scrollToBottom() }
         delegate?.surface(self, send: bytes)
+    }
+
+    /// Drop the selection, if there is one.
+    ///
+    /// Guarded rather than unconditional because clearing forces a full
+    /// repaint, and doing that on every keystroke would undo the dirty
+    /// tracking the renderer is built on.
+    private func clearSelectionIfAny() {
+        guard let engine, engine.hasSelection else { return }
+        engine.clearSelection()
+        renderThread?.wake()
     }
 
     // MARK: - Mouse
@@ -513,16 +539,20 @@ final class TerminalSurfaceView: NSView {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         buttonsDown += 1
+        isSelecting = !isReportingMouse(event)
+        guard !isSelecting else { return beginSelection(with: event) }
         report(mouse: event, action: GHOSTTY_MOUSE_ACTION_PRESS, button: GHOSTTY_MOUSE_BUTTON_LEFT)
     }
 
     override func mouseUp(with event: NSEvent) {
         buttonsDown = max(0, buttonsDown - 1)
+        guard !isSelecting else { return endSelection(with: event) }
         report(
             mouse: event, action: GHOSTTY_MOUSE_ACTION_RELEASE, button: GHOSTTY_MOUSE_BUTTON_LEFT)
     }
 
     override func mouseDragged(with event: NSEvent) {
+        guard !isSelecting else { return extendSelection(with: event) }
         report(mouse: event, action: GHOSTTY_MOUSE_ACTION_MOTION, button: GHOSTTY_MOUSE_BUTTON_LEFT)
     }
 
@@ -620,6 +650,104 @@ final class TerminalSurfaceView: NSView {
         return !event.modifierFlags.contains(.shift)
     }
 
+    // MARK: - Selection
+    //
+    // The gesture machine is `selection.h`'s, held by the engine because its
+    // anchors are tracked references into the terminal. This end supplies the
+    // pointer, the geometry, and the click timing AppKit already knows.
+    //
+    // Nothing here decides what a double-click selects, or how a drag that
+    // started mid-word extends. That is the state machine's job, and it is
+    // the reason not to hand-roll this: a word-granular drag backwards over
+    // its own anchor is where every home-grown implementation goes wrong.
+
+    private func beginSelection(with event: NSEvent) {
+        guard let engine, let size = renderer?.currentSize else { return }
+        engine.beginSelection(
+            at: surfacePoint(of: event),
+            size: size,
+            timestamp: event.timestamp,
+            repeatInterval: NSEvent.doubleClickInterval,
+            rectangle: event.modifierFlags.contains(.option))
+        renderThread?.wake()
+    }
+
+    private func extendSelection(with event: NSEvent) {
+        guard let engine, let size = renderer?.currentSize else { return }
+        engine.extendSelection(
+            to: surfacePoint(of: event),
+            size: size,
+            rectangle: event.modifierFlags.contains(.option))
+        renderThread?.wake()
+
+        // A drag held past the edge wants the viewport to follow it. Moving
+        // the viewport belongs to native scrollback; when that lands, this is
+        // where its scroll and `tickSelectionAutoscroll` go.
+        _ = engine.selectionAutoscroll
+    }
+
+    private func endSelection(with event: NSEvent) {
+        isSelecting = false
+        guard let engine, let size = renderer?.currentSize else { return }
+        engine.endSelection(at: surfacePoint(of: event), size: size)
+    }
+
+    /// The pointer in surface pixels — the space the renderer lays the grid
+    /// out in, origin at the top-left, padding included.
+    private func surfacePoint(of event: NSEvent) -> CGPoint {
+        convertToBacking(convert(event.locationInWindow, from: nil))
+    }
+
+    // MARK: - Clipboard
+
+    @objc func copy(_ sender: Any?) {
+        guard let text = engine?.selectionText(), !text.isEmpty else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    @objc func paste(_ sender: Any?) {
+        guard let text = NSPasteboard.general.string(forType: .string) else { return }
+        paste(text: text)
+    }
+
+    override func selectAll(_ sender: Any?) {
+        engine?.selectAll()
+        renderThread?.wake()
+    }
+
+    /// Paste, asking first when the text would run itself.
+    ///
+    /// A pasted newline is a pressed return, and outside bracketed paste the
+    /// shell cannot tell the difference — which is the whole mechanism behind
+    /// "copy this command from a web page" attacks. libghostty decides what
+    /// counts as unsafe; the confirmation is ours.
+    private func paste(text: String) {
+        guard !text.isEmpty else { return }
+        guard !TerminalEngine.pasteIsSafe(text), let window else {
+            send(paste: text)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Paste this text?"
+        alert.informativeText =
+            "It contains a newline or an escape sequence, so the shell will run it as soon as it arrives rather than waiting for you to press return."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Paste")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            MainActor.assumeIsolated { self?.send(paste: text) }
+        }
+    }
+
+    private func send(paste text: String) {
+        guard let bytes = engine?.encodePaste(text), !bytes.isEmpty else { return }
+        delegate?.surface(self, send: bytes)
+    }
+
     // MARK: - The wheel's claimants
 
     /// Hand a quantized wheel gesture to the program in the terminal.
@@ -651,6 +779,12 @@ final class TerminalSurfaceView: NSView {
         let encoded = KeyTranslation.mods(mods)
 
         if engine.isMouseTracking {
+            // Both claimants drop the selection first, as Ghostty's
+            // `scrollCallback` does. A highlight left behind while the program
+            // scrolls under it points at whatever happens to be in those cells
+            // now, which is worse than no highlight.
+            clearSelectionIfAny()
+
             for _ in 0..<abs(rows) {
                 report(
                     action: GHOSTTY_MOUSE_ACTION_PRESS,
@@ -674,6 +808,7 @@ final class TerminalSurfaceView: NSView {
         }
 
         guard let bytes = inputEncoder.encodeAlternateScroll(rows: rows) else { return false }
+        clearSelectionIfAny()
         delegate?.surface(self, send: bytes)
         return true
     }
@@ -694,11 +829,38 @@ final class TerminalSurfaceView: NSView {
         trackingArea = area
     }
 
+    override func menu(for event: NSEvent) -> NSMenu? {
+        // A program with mouse tracking on gets the right button; it may be
+        // drawing its own menu.
+        guard !isReportingMouse(event) else { return nil }
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Select All", action: #selector(selectAll(_:)), keyEquivalent: "")
+        return menu
+    }
+
     override func resetCursorRects() {
         // An I-beam over text, as in every other terminal. It stays an I-beam
         // under mouse reporting: the program can draw its own affordances but
         // cannot change the pointer.
         addCursorRect(bounds, cursor: .iBeam)
+    }
+}
+
+extension TerminalSurfaceView: NSMenuItemValidation {
+    /// Grey out Copy with nothing selected and Paste with nothing on the
+    /// pasteboard, so the Edit menu tells the truth.
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(copy(_:)):
+            return engine?.hasSelection ?? false
+        case #selector(paste(_:)):
+            return NSPasteboard.general.string(forType: .string) != nil
+        default:
+            return true
+        }
     }
 }
 

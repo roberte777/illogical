@@ -68,6 +68,7 @@ targets:
       # view comes with them: the wiring from an NSEvent to bytes on the wire
       # is only worth anything if the responder methods are in the test too.
       - path: Illogical/Terminal/Input
+      - path: Illogical/Terminal/Selection
       - path: Illogical/Terminal/TerminalSurfaceView.swift
       - path: Illogical/Terminal/ScrollAccumulator.swift
       - path: Illogical/Terminal/ScrollbarOverlay.swift
