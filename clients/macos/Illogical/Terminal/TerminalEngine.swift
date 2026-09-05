@@ -135,6 +135,22 @@ final class TerminalEngine: @unchecked Sendable {
         data.withUnsafeBytes { write($0) }
     }
 
+    /// Run `body` with the raw terminal handle held under the engine's lock.
+    ///
+    /// The input encoders need terminal state the client does not otherwise
+    /// model — cursor-key mode, keypad mode, the Kitty keyboard flags, mouse
+    /// tracking — and that state changes on the reader thread. Reading it and
+    /// then encoding against it outside the lock would encode against modes
+    /// the terminal has already left. Returns nil when there is no terminal,
+    /// which happens between `init` and the first snapshot only if that
+    /// snapshot fails to decode.
+    func withTerminal<T>(_ body: (GhosttyTerminal) -> T?) -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let terminal else { return nil }
+        return body(terminal)
+    }
+
     func resize(cols: UInt16, rows: UInt16, cellWidth: UInt32, cellHeight: UInt32) {
         guard cols > 0, rows > 0 else { return }
         lock.lock()

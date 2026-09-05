@@ -63,8 +63,16 @@ targets:
       # render path, and the only part that touches libghostty.
       - path: Illogical/Terminal/TerminalEngine.swift
       - path: Illogical/Terminal/SnapshotRestore.swift
+      # Input is encoded by libghostty against the terminal's own modes, so
+      # its tests need the same engine the renderer tests do. The surface
+      # view comes with them: the wiring from an NSEvent to bytes on the wire
+      # is only worth anything if the responder methods are in the test too.
+      - path: Illogical/Terminal/Input
+      - path: Illogical/Terminal/TerminalSurfaceView.swift
       - path: Illogical/Terminal/ScrollAccumulator.swift
       - path: Illogical/Terminal/ScrollbarOverlay.swift
+      - path: Illogical/App/Palette.swift
+      - path: Illogical/App/Trace.swift
       - path: Tests
     dependencies:
       - framework: Frameworks/ghostty-vt.xcframework

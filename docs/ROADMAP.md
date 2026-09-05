@@ -78,8 +78,8 @@ libghostty-vt terminal and renders it; input round-trips to the PTY.
 
 Landed so far: the Metal renderer described in [CLIENT.md](CLIENT.md), ported
 from libghostty's own; the Superlogical-style chrome (session button,
-per-terminal tab strip, breadcrumb); key encoding for the common cases; and
-resize driven by the view's own geometry.
+per-terminal tab strip, breadcrumb); key, mouse and focus encoding through
+libghostty-vt's own encoders; and resize driven by the view's own geometry.
 
 | | Work |
 | --- | --- |
@@ -88,7 +88,7 @@ resize driven by the view's own geometry.
 | ✅ | **D2** — two-layer dirty tracking; `render_state_clean()` per frame |
 | ✅ | CoreText glyph rasterization + atlas: ligatures, box drawing, emoji, wide chars |
 | ✅ | Native scrollback; never synthesize wheel sequences |
-| | Key/mouse/focus encoding via libghostty-vt, replacing the hand-rolled subset |
+| ✅ | Key/mouse/focus encoding via libghostty-vt, replacing the hand-rolled subset |
 | | Selection via `selection.h`'s gesture machine, tracked grid refs |
 | | Native splits: one connection per pane |
 | | `os_signpost` launch budget |

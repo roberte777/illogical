@@ -186,10 +186,43 @@ is missing is the input half that sets it.
 
 ## Input
 
-Encode with libghostty-vt (`ghostty_encode_key`, `ghostty_encode_mouse`,
-`ghostty_encode_focus`) and send the bytes as `input`. Do not echo locally: the
-server is the single writer, and the echo comes back as `output` like everything
-else.
+Encode with libghostty-vt and send the bytes as `input`. Do not echo locally:
+the server is the single writer, and the echo comes back as `output` like
+everything else.
+
+Three encoders, all of which read the terminal's own state rather than a table
+of ours:
+
+- `ghostty_key_encoder_encode`, with the options taken from the terminal by
+  `ghostty_key_encoder_setopt_from_terminal` before every event. That is what
+  makes DECCKM, `modifyOtherKeys` and the five Kitty keyboard flags work
+  without the client tracking any of them. `macos-option-as-alt` is the one
+  option the terminal cannot supply; it defaults by keyboard layout, as
+  Ghostty's does.
+- `ghostty_mouse_encoder_encode`, given the renderer's own screen, cell and
+  padding sizes so a report lands on the cell the user aimed at. Shift
+  suppresses reporting for **buttons and motion**, which is how you select
+  text inside a full-screen TUI — and deliberately not for the wheel, because
+  Ghostty's `scrollCallback` has no shift gate at all. Ghostty's full rule also
+  lets the terminal take shift back with XTSHIFTESCAPE and exposes the choice
+  as `mouse-shift-capture`; we implement its default and neither of those.
+- `ghostty_focus_encode`, gated on DEC mode 1004 — it takes no terminal and
+  will happily encode a report nobody asked for.
+
+The wheel has three possible claimants and libghostty's own order decides
+between them: quantize the gesture to whole rows *unconditionally*, then give
+it to mouse reporting if the program asked for the mouse, else to alternate
+scroll (DECSET 1007 in the alternate screen, where a wheel becomes the cursor
+keys `less` already understands), else to the viewport. The first two write to
+the PTY and belong to the encoder; the third is native scrollback's, and owns
+`scrollWheel` and the accumulator. Quantizing first is not a detail: a report
+is one button press per row, so a caller handing raw trackpad deltas to the
+encoder would emit ten reports where a mouse emits one, and a gesture that
+crossed into a mouse-tracking program would carry a stale fraction back out.
+
+The client translates only two things itself: the macOS virtual keycode to a
+physical key, and AppKit's `characters` to the text the layout produced. What
+those *mean* is never ours to decide.
 
 Client-side echo would be a latency optimization that breaks the one-writer
 invariant, which is what makes desync recovery trivial. Don't.
