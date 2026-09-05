@@ -76,22 +76,33 @@ libghostty-vt terminal and renders it; input round-trips to the PTY.
 **Ends at:** the Mac app is a terminal you would actually use. See
 [CLIENT.md](CLIENT.md).
 
-Landed so far: a CoreText renderer over libghostty's render state (run-length
-spans, full colour and attributes, cursor), the Superlogical-style chrome
-(session button, per-terminal tab strip, breadcrumb), key encoding for the
-common cases, and resize driven by the view's own geometry.
+Landed so far: the Metal renderer described in [CLIENT.md](CLIENT.md), ported
+from libghostty's own; the Superlogical-style chrome (session button,
+per-terminal tab strip, breadcrumb); key encoding for the common cases; and
+resize driven by the view's own geometry.
 
 | | Work |
 | --- | --- |
-| | Metal renderer + glyph atlas, replacing the CoreText path |
-| | **D1** — two-phase update: lock, begin, unlock, end |
-| | **D2** — two-layer dirty tracking; `render_state_clean()` per frame |
-| | CoreText glyph rasterization + atlas: ligatures, box drawing, emoji, wide chars |
+| ✅ | Metal renderer + glyph atlas, replacing the CoreText path |
+| ✅ | **D1** — two-phase update: lock, begin, unlock, end |
+| ✅ | **D2** — two-layer dirty tracking; `render_state_clean()` per frame |
+| ✅ | CoreText glyph rasterization + atlas: ligatures, box drawing, emoji, wide chars |
 | | Native scrollback; never synthesize wheel sequences |
 | | Key/mouse/focus encoding via libghostty-vt, replacing the hand-rolled subset |
 | | Selection via `selection.h`'s gesture machine, tracked grid refs |
 | | Native splits: one connection per pane |
 | | `os_signpost` launch budget |
+
+Renderer numbers, Release, M-series, 200x50 cells:
+
+| | CPU | with a synchronous GPU wait |
+| --- | --- | --- |
+| Full rebuild (a `clear`, a resize) | 1.2 ms | 2.5 ms |
+| One dirty row (a keystroke) | 0.03 ms | 0.9 ms |
+
+The gap between those two rows is what the dirty tracking buys. The GPU column
+is what a benchmark measures because it blocks; the renderer does not, so in
+the app that work overlaps the next frame's.
 
 **Gate:** cold launch to window under the budget; first frame independent of
 scrollback size.

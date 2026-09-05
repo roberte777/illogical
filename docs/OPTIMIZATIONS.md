@@ -280,7 +280,7 @@ set. This is both a correctness win over tmux and a memory win.
 
 ### D1. Two-phase render state update
 
-**Status: Free.** Milestone M3.
+**Status: Done.** Landed in M3.
 
 `ghostty_render_state_begin_update` needs exclusive terminal access;
 `ghostty_render_state_end_update` completes using only render-state memory. A
@@ -292,7 +292,8 @@ feeding the terminal while the frame is assembled.
 
 ### D2. Two-layer dirty tracking
 
-**Status: Free.** Milestone M3.
+**Status: Done.** Landed in M3. Worth 1.2 ms → 0.03 ms of CPU per frame on a
+200×50 grid: a full rebuild versus one dirty row.
 
 Global dirty state (clean / partially dirty / fully dirty) plus per-row dirty
 flags, with dedicated dirty-row iteration [GH `ad6e72ddc`]. The renderer redraws
@@ -301,6 +302,51 @@ only changed rows.
 The API's own warning is worth repeating: the two layers are independent, and
 `update` does not clear either. Use `ghostty_render_state_clean()` after a
 successful frame.
+
+### D2a. No geometry for cell backgrounds
+
+**Status: Adopt.** Landed in M3.
+
+Both background passes are a single full-screen triangle. The fragment shader
+derives its grid position from the fragment coordinate and indexes a flat
+colour buffer, so a screen of backgrounds costs two triangles and four bytes
+per cell rather than a quad per cell. Text is one instanced 32-byte quad per
+glyph — the size libghostty settled on, and worth holding to: a full screen
+with underlines is tens of thousands of them per frame.
+
+### D2b. Shared, incrementally uploaded glyph atlases
+
+**Status: Adopt.** Landed in M3.
+
+Skyline-packed atlases, grayscale for text and BGRA for emoji, shared across
+every surface in the process rather than per-pane — four splits should not
+rasterize the same 'e' four times or carry four textures. Each atlas keeps a
+modified counter; a frame that adds no glyph uploads nothing.
+
+### D2c. Run shaping cache
+
+**Status: Adopt.** Landed in M3.
+
+Shaping accounted for 96% of libghostty's frame time before they cached it
+[GH `src/font/shaper/Cache.zig`]. The cache key is a hash of the run's
+contents with cluster positions taken relative to the run start, so the same
+word shaped at column 3 and column 40 shares one entry. Fixed-size and
+set-associative, so it neither allocates per frame nor grows without bound.
+
+### D2d. Render off the main thread, and stop when idle
+
+**Status: Adapt.** Landed in M3.
+
+libghostty runs a renderer thread per surface driven by a display link. We do
+the same, with the display link on the render thread rather than the main one,
+and additionally **pause the link** after a second with nothing to draw. An
+idle terminal is the case this whole project is built around (see A1); it
+should not wake a thread 120 times a second to be told there is nothing to do.
+
+Frames are triple-buffered and presented by handing a CALayer a finished
+IOSurface. Not a `CAMetalDrawable`: `nextDrawable` blocks on the display, which
+stalls a renderer that could be building the next frame, and it behaves poorly
+under live resize.
 
 ### D3. Incremental, caller-driven search
 

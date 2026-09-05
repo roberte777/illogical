@@ -16,10 +16,11 @@ Illogical.app
 ├── App/            window, menus, session dropdown
 ├── Sessions/       connection state, session + terminal lists
 ├── Terminal/
-│   ├── GhosttyTerminal.swift    libghostty-vt wrapper
+│   ├── TerminalEngine.swift     libghostty-vt wrapper + snapshot extraction
 │   ├── SnapshotRestore.swift    two-phase attach decode
-│   ├── TerminalSurface.swift    NSView host
-│   └── Renderer/                Metal renderer + glyph atlas
+│   ├── TerminalController.swift one connection, one terminal
+│   ├── TerminalSurfaceView.swift  NSView host, layer, input
+│   └── Renderer/                Metal renderer, atlases, fonts, sprites
 └── Transport/      unix socket, ssh stdio, framing
 
 Packages/IllogicalKit/
@@ -76,17 +77,51 @@ full) and per-row flags. `update` sets them and never clears them. Call
 `ghostty_render_state_clean()` after a successful frame, and remember that
 clearing one layer does not clear the other.
 
-**Glyphs.** Today the renderer is CoreText drawing run-length spans of identical
-style straight into the view: background runs first, then text. It is correct —
-it draws exactly what libghostty's render state reports, including palette and
-true colour, bold, italic, faint, underline, strikethrough, inverse and
-selection — and it is fast enough to be pleasant.
+**Three passes.** The renderer is Metal, ported closely enough from
+libghostty's own (`src/renderer/`) that the two can be diffed against each
+other. A frame is three draw calls:
 
-It is not the finish line. Metal with a rasterized glyph atlas is, and the swap
-is contained: `TerminalSurfaceView.draw(_:)` consumes a plain `Grid` value type
-that the engine already produces under lock, so the renderer can be replaced
-without touching the engine, the transport, or the chrome. Ligatures, box
-drawing, powerline glyphs and wide-character advance land with it.
+1. `bg_color` — one full-screen triangle for the surface background.
+2. `cell_bg` — one more triangle; the fragment shader derives its grid
+   position from the fragment coordinate and indexes a per-cell colour
+   buffer. There is no geometry per cell: an 80×24 screen of backgrounds is
+   two triangles and 1,920 bytes, not 1,920 quads.
+3. `cell_text` — one instanced 32-byte quad per glyph, underline,
+   strikethrough, overline and cursor.
+
+**Colour.** The target is an IOSurface tagged Display P3, and the shaders
+convert from sRGB, enforce a configurable WCAG minimum contrast, and can
+correct alpha so linear blending keeps the apparent stroke weight of
+gamma-incorrect blending. The default matches Ghostty's on macOS: blend in the
+display's own space, which is what the system's own apps do.
+
+**Glyphs.** Rasterized with CoreText into skyline-packed atlases — grayscale
+for text, BGRA for emoji — shared process-wide and uploaded only when
+something new is added. Sub-pixel positioning is kept out of the atlas
+coordinates and folded into the drawing transform, so a glyph that wants to
+sit at x=3.4 is rasterized *as* 3.4 rather than snapped. Metrics come from the
+OpenType tables directly: CoreText rounds to points and hides whether the font
+specified an underline position at all.
+
+**Sprites.** Cursors, the five underline styles, strikethrough, overline, box
+drawing, block elements, braille, powerline separators, sextants, octants and
+the branch-drawing set are drawn by us, not loaded from a font. Not for lack
+of glyphs — for tiling. A font glyph is positioned by advance-width rounding,
+so a vertical line in one cell lands a pixel off the one below it and a table
+border comes out visibly ragged.
+
+**Shaping.** CoreText run shaping, split at every boundary where shaping must
+restart (a style change, a selection edge, the cursor), cached on a
+position-independent hash of the run's contents. Shaping was 96% of frame time
+in libghostty before they cached it; the same cache means an unchanged line
+costs a hash lookup per run.
+
+**Threading.** A dedicated render thread per surface, woken by a display link
+on that thread rather than on the main thread, and paused outright after a
+second with nothing to draw. Frames are triple-buffered and presented by
+handing a CALayer a finished IOSurface — not a `CAMetalDrawable`, whose
+`nextDrawable` blocks on the display and stalls a renderer that could be
+building the next frame.
 
 ## Scrollback is native, and sometimes absent
 
