@@ -3,17 +3,21 @@
 A terminal multiplexer with persistent sessions, built on
 [libghostty-vt](https://github.com/ghostty-org/ghostty).
 
-The server owns the PTYs and keeps a real terminal per session. Clients are
-native applications running the same VT engine, so the server can ship them
-**unprocessed** output and let them draw it. Attaching paints the current screen
-immediately from a binary snapshot, then streams scrollback in behind it. Idle
-sessions are snapshotted to disk and cost nothing until they speak again.
+The server owns the PTYs and keeps a real terminal per terminal. Clients are
+native applications running the same VT engine, so the server can tee them
+**unprocessed** PTY bytes — like SSH — and let them draw. Attaching paints the
+current screen immediately from a binary snapshot, then streams scrollback in
+behind it, newest first. Idle terminals are snapshotted to disk and cost nothing
+until they speak again.
 
-> Clean-room build against the public description of Superlogical. See
-> [docs/GOALS.md](docs/GOALS.md) for what that means and what it does not.
+> Clean-room build against the public description of Superlogical. No Superlogical
+> source is public; everything here derives from Mitchell Hashimoto's own talks
+> and posts, and from libghostty's source. The evidence is written down with
+> citations in [docs/RESEARCH.md](docs/RESEARCH.md).
 
-**Status: scaffold.** Everything builds and the protocol is defined on both
-sides; the daemon does not run sessions yet. See [docs/ROADMAP.md](docs/ROADMAP.md).
+**Status: scaffold + design.** Everything builds and the protocol is defined on
+both sides; the daemon does not run sessions yet. The design is researched and
+written down. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Getting started
 
@@ -49,23 +53,35 @@ just test-swift        # protocol tests; needs neither of the above
 
 ```
 child ──► PTY ──► illogicald ──┬──► ghostty-vt terminal ──► snapshot.gsnp (park)
+                               │                                    │
+                               │         attach to a parked terminal │
+                               │         is served straight from it ─┘
                                │
                                └──► raw bytes ──► client ──► ghostty-vt ──► Metal
 ```
 
 Both ends run the same terminal implementation, built from the same pinned
-ghostty revision. The server's copy exists so that attach is O(screen) instead
-of O(history); the client's copy exists so it can draw.
+ghostty revision — "a distributed system of synchronized finite state machines".
+The server's copy is authoritative and makes attach O(screen) instead of
+O(history); the client's copy lets it draw at full speed no matter what the
+server is doing.
+
+A **session** is a named container of **terminals**. Each terminal is 1:1 with a
+PTY and gets its own connection; splits and tabs are native widgets in the
+client, not something the server draws.
 
 Read in this order:
 
 | Document | |
 | --- | --- |
 | [docs/GOALS.md](docs/GOALS.md) | what this is for, and how we will know it works |
+| [docs/RESEARCH.md](docs/RESEARCH.md) | what Superlogical actually does, with citations |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | components and data flow |
+| [docs/OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) | every performance technique, and whether we adopt it |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | the wire format and the attach handshake |
-| [docs/PARKING.md](docs/PARKING.md) | snapshot-on-idle and rehydration |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | milestones and open questions |
+| [docs/PARKING.md](docs/PARKING.md) | the three levels of parking |
+| [docs/CLIENT.md](docs/CLIENT.md) | macOS client design |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | milestones, benchmarks and open questions |
 
 ## Layout
 
@@ -106,6 +122,12 @@ If `vendor/ghostty` is empty after a clone:
 ```bash
 git submodule update --init --recursive
 ```
+
+## Benchmarks
+
+Superlogical has published memory numbers. They are the bar, and two of the four
+are ones tmux currently wins — see
+[docs/ROADMAP.md](docs/ROADMAP.md#the-benchmark-suite).
 
 ## Naming
 

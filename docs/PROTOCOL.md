@@ -1,28 +1,47 @@
 # Wire protocol
 
-Version 1. Implemented by [`src/core/protocol.zig`](../src/core/protocol.zig)
-and [`IllogicalProtocol/Frame.swift`](../clients/macos/Packages/IllogicalKit/Sources/IllogicalProtocol/Frame.swift).
-Those two files must stay byte-for-byte in step; both carry the same tests.
+Version 1. Implemented by [`src/core/protocol.zig`](../src/core/protocol.zig) and
+[`IllogicalProtocol/Frame.swift`](../clients/macos/Packages/IllogicalKit/Sources/IllogicalProtocol/Frame.swift).
+Those two must stay byte-for-byte in step; both carry the same tests.
+
+> **Revised 2026-09-04.** Superlogical's own framing has never been published, so
+> ours is invented — but the *semantics* below are taken from
+> [RESEARCH.md](RESEARCH.md). Corrections from the first draft marked ⚠.
+
+## Design rules
+
+Three rules, all from [ARCH t=203–356]. Everything else is mechanism.
+
+1. **Raw bytes, never diffs.** The payload of `output` is exactly what the child
+   wrote. tmux and zellij track a screen and ship diffs; we tee PTY bytes "like
+   SSH" to every client and assume each one is a correct, fast terminal.
+2. **One writer, many readers.** Input is serialized through the server, which
+   owns authoritative state. Clients are replicas — "synchronized finite state
+   machines". A wrong client renders wrongly and affects nothing else.
+3. **Recovery is re-attach, not reconciliation.** A desynced client tears down
+   and replays the handshake. There is no merge protocol to get wrong.
 
 ## Framing
 
-One connection multiplexes every session a client cares about.
+⚠ **One connection per terminal**, not per session [ARCH t=440]. A client showing
+four splits holds four connections. Session-level operations use a separate
+control connection.
 
 ```
 byte  0      1                9              13          13 + len
       +------+----------------+--------------+--------------+
-      | type | session        | len          | payload      |
+      | type | terminal       | len          | payload      |
       | u8   | u64 LE         | u32 LE       | len bytes    |
       +------+----------------+--------------+--------------+
 ```
 
-- Session id `0` is reserved for connection-level control frames.
-- `len` must not exceed 1 MiB. Senders chunk larger payloads.
-- The high bit of `type` marks direction: `< 0x80` is client→server.
+- Terminal id `0` is the connection-level control channel.
+- `len` ≤ 1 MiB; senders chunk.
+- High bit of `type` marks direction: `< 0x80` is client→server.
 
-Thirteen bytes of header on every frame is deliberate. Output frames are by far
-the most common, and decoding one must cost a bounds check and two loads —
-nothing that needs an allocator or a parser.
+Thirteen bytes on every frame is deliberate. Decoding an `output` frame — by far
+the most common — must cost a bounds check and two loads, with no allocator and
+no parser.
 
 ## Frames
 
@@ -32,7 +51,7 @@ nothing that needs an allocator or a parser.
 | --- | --- | --- |
 | `0x01` | `hello` | protocol version, client name, capabilities |
 | `0x02` | `list` | — |
-| `0x03` | `create` | name, argv, env overrides, cwd, initial size |
+| `0x03` | `create` | session id, name, argv, env, cwd, initial size |
 | `0x04` | `attach` | size, scrollback budget |
 | `0x05` | `detach` | — |
 | `0x06` | `kill` | signal |
@@ -45,8 +64,8 @@ nothing that needs an allocator or a parser.
 | Type | Name | Payload |
 | --- | --- | --- |
 | `0x81` | `welcome` | protocol version, server version, session list |
-| `0x82` | `session_list` | session summaries |
-| `0x83` | `created` | new session id |
+| `0x82` | `session_list` | sessions and their terminals |
+| `0x83` | `created` | new terminal id |
 | `0x84` | `snapshot_begin` | snapshot format version |
 | `0x85` | `snapshot_chunk` | verbatim `GHOSTSNP` bytes |
 | `0x86` | `snapshot_ready` | — |
@@ -58,23 +77,22 @@ nothing that needs an allocator or a parser.
 | `0x8c` | `pong` | echoed token |
 
 `input` and `output` payloads are opaque. The server never inspects `input`
-beyond forwarding it, and never rewrites `output`. That is goal G2.
+beyond forwarding it, and never rewrites `output`.
 
 ## The attach handshake
-
-This is the part that matters.
 
 ```
 client                                                  server
   │                                                       │
-  ├── attach{session=7, cols=120, rows=40} ──────────────►│
+  ├── attach{terminal=7, cols=120, rows=40} ─────────────►│
+  │                                                       │  PAUSE PTY processing
   │                                                       │  mark output offset N
   │                                                       │  encode terminal @ N
   │◄── snapshot_begin{format=1} ──────────────────────────┤
   │◄── snapshot_chunk (TERMINAL, SCREEN, PAGE…, CONT) ────┤
   │◄── snapshot_ready ────────────────────────────────────┤
-  │                                                       │
-  │  ★ PAINT. The screen is correct and complete.         │
+  │                                                       │  UNPAUSE
+  │  ★ PAINT. Screen correct. User can type/select/scroll │
   │                                                       │
   │◄── output (bytes ≥ N) ────────────────────────────────┤   ┐
   │◄── snapshot_chunk (HISTORY PAGE, newest first) ───────┤   │ interleaved
@@ -82,40 +100,73 @@ client                                                  server
   │◄── snapshot_chunk (HISTORY PAGE) ─────────────────────┤   ┘
   │◄── snapshot_end ──────────────────────────────────────┤
   │                                                       │
-  │  scrollback is now complete                           │
+  │  scrollback complete                                  │
 ```
 
-The client drives this with libghostty-vt directly:
+The pause is real and is stated directly: the server *"pauses processing at that
+moment when a client is connecting of the current PTY bytes"*, sends enough state
+to render, sends the ready frame, and *"then the core server part unpauses"*
+[ARCH t=118–203]. It is what makes offset *N* well defined.
+
+The client drives this with libghostty-vt:
 
 | Wire | libghostty-vt |
 | --- | --- |
-| `snapshot_chunk` before ready | bytes into `GhosttyReader` |
-| `snapshot_ready` | `ghostty_snapshot_decoder_ready()` → a renderable terminal |
+| `snapshot_chunk` before ready | bytes into a `GhosttyReader` |
+| `snapshot_ready` | `ghostty_snapshot_decoder_ready()` → renderable terminal |
 | `snapshot_chunk` after ready | `ghostty_snapshot_decoder_next()`, one page each |
 | `output` | `ghostty_terminal_vt_write()` on that same terminal |
 | `snapshot_end` | `next()` returns `GHOSTTY_NO_VALUE` |
 
-Interleaving `output` with `next()` is explicitly supported: the snapshot
-decoder applies history to the caller-owned terminal, and the terminal "may be
-rendered, resized, and fed live PTY input between calls". A history page that
-can no longer be applied safely is consumed, validated, and reported as zero
-rows — so a busy session degrades to *less scrollback*, never to a wrong screen.
+Interleaving `output` with `next()` is explicitly supported. A history page that
+can no longer be applied is consumed, validated and reported as zero rows — so a
+busy terminal degrades to *less scrollback*, never to a wrong screen.
+
+⚠ **Attaching to a parked terminal does not unpark it.** The server streams the
+park file from disk as `snapshot_chunk` frames and the terminal stays parked
+[MEM t=660]. The client cannot tell the difference, which is the point.
 
 ### Why the offset mark matters
 
-The snapshot is encoded from the terminal's state at a specific point in the
-output stream. If the server sent live output that predated the snapshot, the
-client would apply those bytes twice. If it dropped output produced *during*
-encoding, the client would miss them. So: mark at *N*, encode at *N*, send
-everything from *N* onward as `output`.
+The snapshot is encoded at a specific point in the output stream. Send live
+output that predates it and the client applies bytes twice; drop output produced
+*during* encoding and the client misses them. So: pause, mark at *N*, encode at
+*N*, resume, and send everything from *N* onward as `output`.
+
+## Viewport and selection are client-side
+
+⚠ The server stores **no** viewport state. Scroll position and selection live
+entirely in the client [ARCH t=323]. Two clients on one terminal scroll
+independently — unlike tmux, where *"when one of them scrolls, it scrolls
+everybody's window"*.
+
+Consequences:
+
+- `output` is identical for every attached client. Fan-out is one `write` per
+  subscriber, no per-client rendering.
+- Scrolling into history that has not arrived yet is a **client-side loading
+  state** [ARCH t=308], not a server round trip.
+- Resize is per-terminal, not per-client. See the open question below.
+
+## Desync
+
+There is no reconciliation. If a client detects it is wrong — CRC failure, a
+snapshot it cannot decode, a gap in the stream — it discards its terminal and
+re-attaches from scratch [ARCH t=356]. Cheap, because attach is O(screen).
+
+This is also the flow-control escape hatch: a client too far behind is dropped
+back to a fresh attach rather than served an unbounded replay.
 
 ## Version negotiation
 
-`hello` carries the client's protocol version. A mismatch gets `err` with
-`version_mismatch` and the connection closes. There is no compatibility window
-yet — and note that the *snapshot* format has no compatibility guarantee at all
-in libghostty-vt right now, which is why client and server are built from one
-pinned ghostty revision.
+`hello` carries the client's protocol version; a mismatch gets `err` with
+`version_mismatch` and the connection closes.
+
+Note the *snapshot* format has **no compatibility guarantee** in libghostty-vt
+right now, which is why client and server are built from one pinned ghostty
+revision. Superlogical intends its protocol to be open and shipped as part of
+libghostty [ARCH t=524]; if that lands, we should adopt it and delete this
+document.
 
 ## Transport
 
@@ -124,16 +175,18 @@ pinned ghostty revision.
 | Local | unix domain socket at `$XDG_STATE_HOME/illogical/server.sock` |
 | Remote | `ssh <dest> illogicald --stdio`, same frames on stdin/stdout |
 
-There is no listening TCP socket, no TLS, and no authentication of our own.
-Access to the unix socket is filesystem permissions; access to a remote server
-is whatever SSH already decided.
+No listening TCP socket, no TLS, no authentication of our own. Access to the
+socket is filesystem permissions; remote access is whatever SSH decided.
 
-## Flow control
+## Open questions
 
-Not designed yet. The problem: a session producing output faster than a slow
-client can drain it must not stall the PTY for *other* clients, and must not
-grow an unbounded buffer.
-
-The intended shape is a per-client bounded queue where overflow drops the client
-back to a fresh attach — a client that has fallen far enough behind is better
-served by a new snapshot than by a long replay. See [ROADMAP.md](ROADMAP.md) M4.
+- **Resize with disagreeing clients.** The terminal has one size; clients may
+  have different window sizes. Provisionally the session's configured size wins
+  and clients letterbox. Superlogical has never said.
+- **Flow control.** Bounded per-client queue, overflow ⇒ forced re-attach. Never
+  addressed in any source; see [OPTIMIZATIONS.md §F2](OPTIMIZATIONS.md#f2-flow-control).
+- **Terminal queries.** The server always answers; see
+  [ARCHITECTURE.md](ARCHITECTURE.md#terminal-queries).
+- **Session sharing.** Superlogical ships live sharing from day one [ANN]. Our
+  protocol permits it — many readers is already the model — but nothing above
+  addresses identity or permissions.

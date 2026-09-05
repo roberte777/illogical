@@ -13,12 +13,12 @@ import Observation
 @MainActor
 final class SessionStore {
     var host: ServerHost = .local(socketPath: SessionStore.defaultSocketPath)
-    var sessions: [SessionSummary] = []
-    var selectedID: SessionSummary.ID?
+    var terminals: [TerminalSummary] = []
+    var selectedID: TerminalSummary.ID?
 
-    var selected: SessionSummary? {
+    var selected: TerminalSummary? {
         guard let selectedID else { return nil }
-        return sessions.first { $0.id == selectedID }
+        return terminals.first { $0.id == selectedID }
     }
 
     static var defaultSocketPath: String {
@@ -31,25 +31,25 @@ final class SessionStore {
 
     func connect() {
         // TODO(M2): open the transport, send `hello`, populate from `welcome`.
-        sessions = SessionStore.placeholders
-        selectedID = sessions.first?.id
+        terminals = SessionStore.placeholders
+        selectedID = terminals.first?.id
     }
 
-    func attach(_ id: SessionSummary.ID) {
+    func attach(_ id: TerminalSummary.ID) {
         // TODO(M2): send `attach`, then drive SnapshotRestore from the
         // snapshot_chunk frames while applying `output` frames live.
         selectedID = id
     }
 
-    private static let placeholders: [SessionSummary] = [
+    private static let placeholders: [TerminalSummary] = [
         .init(
-            id: 1, name: "shell", command: "zsh", cwd: "~", cols: 120, rows: 40,
-            residency: .live, attached: 1, idleNanoseconds: 0
+            id: 1, session: 1, name: "shell", command: "zsh", cwd: "~", cols: 120,
+            rows: 40, residency: .live, attached: 1, ptyReadIdleNanoseconds: 0
         ),
         .init(
-            id: 2, name: "build", command: "zig", cwd: "~/coding/illogical",
-            cols: 120, rows: 40, residency: .parked, attached: 0,
-            idleNanoseconds: 5 * 60 * 1_000_000_000
+            id: 2, session: 1, name: "build", command: "zig",
+            cwd: "~/coding/illogical", cols: 120, rows: 40, residency: .parked,
+            attached: 0, ptyReadIdleNanoseconds: 5 * 60 * 1_000_000_000
         ),
     ]
 }
