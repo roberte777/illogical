@@ -17,6 +17,7 @@ const Terminal = @This();
 const std = @import("std");
 const sys = illogical.sys;
 const Allocator = std.mem.Allocator;
+const flate = std.compress.flate;
 const ghostty = @import("ghostty-vt");
 const illogical = @import("illogical");
 const pty = illogical.pty;
@@ -44,6 +45,10 @@ pub const Subscriber = struct {
 };
 
 gpa: Allocator,
+io: std.Io,
+/// Where this terminal's snapshot lives when parked.
+store: illogical.park.Store,
+park_config: illogical.park.Config,
 id: session.TerminalId,
 session_id: session.Id,
 name: []u8,
@@ -57,10 +62,17 @@ child: sys.pid_t,
 /// requires that a terminal is never touched by two threads at once.
 mutex: illogical.thread.Mutex = .{},
 tiny_io: ghostty.TinyIo,
-vt: ghostty.Terminal,
+/// Null while parked: the whole point is that a parked terminal holds no
+/// terminal state in memory.
+vt: ?ghostty.Terminal,
 /// Persistent parser state. Must outlive individual writes so escape sequences
-/// split across `read()` boundaries are handled correctly.
-stream: ghostty.TerminalStream,
+/// split across `read()` boundaries are handled correctly. Freed with `vt`.
+stream: ?ghostty.TerminalStream,
+/// Set while history pages are being restored on a background thread.
+rehydration: ?*Rehydration = null,
+/// Cached compression activity token; when it changes the idle timer restarts.
+compression_activity: u64 = 0,
+compression_idle_since_ns: u64 = 0,
 cols: u16,
 rows: u16,
 residency: session.Residency = .live,
@@ -75,6 +87,9 @@ thread: ?std.Thread = null,
 running: std.atomic.Value(bool) = .init(false),
 
 pub const SpawnOptions = struct {
+    io: std.Io,
+    store: illogical.park.Store,
+    park_config: illogical.park.Config = .{},
     id: session.TerminalId,
     session_id: session.Id,
     name: []const u8,
@@ -101,6 +116,9 @@ pub fn create(gpa: Allocator, opts: SpawnOptions) !*Terminal {
 
     self.* = .{
         .gpa = gpa,
+        .io = opts.io,
+        .store = opts.store,
+        .park_config = opts.park_config,
         .id = opts.id,
         .session_id = opts.session_id,
         .name = name,
@@ -121,36 +139,39 @@ pub fn create(gpa: Allocator, opts: SpawnOptions) !*Terminal {
         .rows = opts.rows,
         .max_scrollback_bytes = opts.max_scrollback_bytes,
     });
-    errdefer self.vt.deinit(gpa);
+    errdefer self.vt.?.deinit(gpa);
 
     // Continuation tracking must be on *before* the input that produces an
     // unfinished parser state is written -- there is no retroactive path. So we
     // enable it unconditionally at creation. See docs/PARKING.md.
     self.stream = .init(.{
         .allocator = gpa,
-        .handler = self.vt.vtHandler(),
+        .handler = self.vt.?.vtHandler(),
         .continuation_max_bytes = max_continuation_bytes,
     });
-    self.stream.handler.effects = .{
-        .write_pty = writePtyEffect,
-        .bell = null,
-        .desktop_notification = null,
-        .drag_and_drop = null,
-        .color_scheme = null,
-        .device_attributes = null,
-        .enquiry = null,
-        .size = sizeEffect,
-        .xtversion = null,
-        .title_changed = null,
-        .pwd_changed = null,
-        .progress_report = null,
-        .clipboard_write = null,
-        .clipboard_read = null,
-    };
+    self.stream.?.handler.effects = effects;
+    _ = &effects;
 
     self.child = try self.spawnChild(opts);
     return self;
 }
+
+const effects: ghostty.TerminalStream.Handler.Effects = .{
+    .write_pty = writePtyEffect,
+    .bell = null,
+    .desktop_notification = null,
+    .drag_and_drop = null,
+    .color_scheme = null,
+    .device_attributes = null,
+    .enquiry = null,
+    .size = sizeEffect,
+    .xtversion = null,
+    .title_changed = null,
+    .pwd_changed = null,
+    .progress_report = null,
+    .clipboard_write = null,
+    .clipboard_read = null,
+};
 
 fn spawnChild(self: *Terminal, opts: SpawnOptions) !sys.pid_t {
     const gpa = self.gpa;
@@ -173,8 +194,10 @@ pub fn destroy(self: *Terminal) void {
     self.stop();
     self.pty_pair.deinit();
     self.mutex.lock();
-    self.stream.deinit();
-    self.vt.deinit(self.gpa);
+    if (self.stream) |*stream| stream.deinit();
+    if (self.vt) |*vt| vt.deinit(self.gpa);
+    self.stream = null;
+    self.vt = null;
     self.mutex.unlock();
     self.subscribers.deinit(self.gpa);
     self.gpa.free(self.name);
@@ -212,7 +235,13 @@ fn readLoop(self: *Terminal) void {
         // that `attach` can insert itself at an exact point in the byte stream
         // and no client can miss or double-apply a chunk.
         self.mutex.lock();
-        self.stream.nextSlice(bytes);
+        // A read is exactly what unparks a terminal. Do it before applying,
+        // or the bytes that woke us would be dropped on the floor.
+        if (self.residency == .parked) {
+            self.unparkLocked() catch |err|
+                log.err("terminal {d} failed to unpark: {t}", .{ self.id, err });
+        }
+        if (self.stream) |*stream| stream.nextSlice(bytes);
         self.last_read_ns = sys.monotonicNs();
         // The exact same bytes, to everyone. No re-encoding. (G2)
         for (self.subscribers.items) |sub| sub.write(bytes);
@@ -244,6 +273,10 @@ pub fn attach(self: *Terminal, sub: Subscriber, snapshot_writer: *std.Io.Writer)
     try self.subscribers.append(self.gpa, sub);
     errdefer self.removeSubscriberLocked(sub.ctx);
 
+    // A parked terminal is served from disk and stays parked (docs/PARKING.md).
+    if (self.residency == .parked) {
+        return self.streamParkFileLocked(self.store, snapshot_writer);
+    }
     try self.encodeSnapshotLocked(snapshot_writer);
 }
 
@@ -286,7 +319,7 @@ pub fn resize(self: *Terminal, cols: u16, rows: u16) !void {
     self.mutex.lock();
     defer self.mutex.unlock();
     if (cols == self.cols and rows == self.rows) return;
-    try self.vt.resize(self.gpa, .{ .cols = cols, .rows = rows });
+    if (self.vt) |*vt| try vt.resize(self.gpa, .{ .cols = cols, .rows = rows });
     try self.pty_pair.setSize(.{ .cols = cols, .rows = rows });
     self.cols = cols;
     self.rows = rows;
@@ -309,9 +342,12 @@ fn encodeSnapshotLocked(self: *Terminal, writer: *std.Io.Writer) !void {
     var cont_buf: std.ArrayList(u8) = .empty;
     defer cont_buf.deinit(self.gpa);
 
-    const cont: ghostty.snapshot.Continuation = if (self.stream.ground()) .ground else blk: {
+    const stream = &(self.stream orelse return error.TerminalParked);
+    const vt = &(self.vt orelse return error.TerminalParked);
+
+    const cont: ghostty.snapshot.Continuation = if (stream.ground()) .ground else blk: {
         var aw: std.Io.Writer.Allocating = .fromArrayList(self.gpa, &cont_buf);
-        self.stream.writeContinuation(&aw.writer) catch |err| switch (err) {
+        stream.writeContinuation(&aw.writer) catch |err| switch (err) {
             // Tracking is on, so this only happens if the tracker gave up.
             // Falling back to ground loses the partial sequence but keeps the
             // snapshot valid, which is the better failure.
@@ -325,14 +361,15 @@ fn encodeSnapshotLocked(self: *Terminal, writer: *std.Io.Writer) !void {
         break :blk .{ .bytes = cont_buf.items };
     };
 
-    try ghostty.snapshot.encode(self.gpa, writer, &self.vt, .{ .continuation = cont });
+    try ghostty.snapshot.encode(self.gpa, writer, vt, .{ .continuation = cont });
 }
 
 /// The rendered screen as plain text. Caller owns the result.
 pub fn plainText(self: *Terminal, alloc: Allocator) ![]const u8 {
     self.mutex.lock();
     defer self.mutex.unlock();
-    return self.vt.plainString(alloc);
+    const vt = &(self.vt orelse return error.TerminalParked);
+    return vt.plainString(alloc);
 }
 
 /// Nanoseconds since the PTY last produced output.
@@ -366,6 +403,272 @@ pub fn summary(self: *Terminal) session.TerminalSummary {
     };
 }
 
+// -- parking ---------------------------------------------------------------
+//
+// See docs/PARKING.md. Three properties matter and each is load-bearing:
+//
+//   * "Idle" means no PTY *reads*. Keystrokes do not count, which is what lets
+//     an attached, focused terminal stay parked while it produces nothing.
+//   * Unparking is two-phase: `ready` restores the active screen on the hot
+//     path, history pages follow on a pool thread.
+//   * Attaching to a parked terminal does **not** unpark it. The park file and
+//     the attach payload are the same bytes, so we stream from disk.
+
+/// Background restore of history pages after `ready`.
+///
+/// Heap-allocated because the decoder holds a pointer into the decompressor,
+/// which holds one into the file reader. The thread owns this and frees it.
+const Rehydration = struct {
+    terminal: *Terminal,
+    file: std.Io.File,
+    file_reader: std.Io.File.Reader,
+    decompress: flate.Decompress,
+    decoder: ghostty.snapshot.Decoder,
+    file_buf: []u8,
+    window: []u8,
+    thread: ?std.Thread = null,
+
+    fn destroy(self: *Rehydration) void {
+        const gpa = self.terminal.gpa;
+        self.file.close(self.terminal.io);
+        gpa.free(self.file_buf);
+        gpa.free(self.window);
+        gpa.destroy(self);
+    }
+};
+
+/// Snapshot to disk and release the in-memory terminal.
+pub fn park(self: *Terminal) !void {
+    const store = self.store;
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    if (self.residency != .live) return;
+
+    try store.ensureSessionDir(self.io, self.id);
+
+    var staging_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var final_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const staging = try store.stagingPath(&staging_buf, self.id);
+    const final = try store.snapshotPath(&final_buf, self.id);
+
+    const cwd: std.Io.Dir = .cwd();
+    {
+        const file = try cwd.createFile(self.io, staging, .{ .truncate = true });
+        errdefer file.close(self.io);
+
+        var out_buf: [64 * 1024]u8 = undefined;
+        var file_writer = file.writer(self.io, &out_buf);
+
+        const window = try self.gpa.alloc(u8, illogical.park.Store.window_len);
+        defer self.gpa.free(window);
+        var compress = try flate.Compress.init(
+            &file_writer.interface,
+            window,
+            illogical.park.Store.Container,
+            illogical.park.Store.compression_level,
+        );
+
+        try self.encodeSnapshotLocked(&compress.writer);
+        try compress.finish();
+        try file_writer.interface.flush();
+
+        // Durable before the rename, so a crash leaves either the previous
+        // good snapshot or this one, never a torn file.
+        try file.sync(self.io);
+        file.close(self.io);
+    }
+    try cwd.rename(staging, cwd, final, self.io);
+
+    if (self.stream) |*stream| stream.deinit();
+    if (self.vt) |*vt| vt.deinit(self.gpa);
+    self.stream = null;
+    self.vt = null;
+    self.residency = .parked;
+
+    log.debug("parked terminal {d}", .{self.id});
+}
+
+/// Restore from disk. Returns once the terminal is renderable; history pages
+/// keep arriving on a background thread.
+pub fn unpark(self: *Terminal) !void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    return self.unparkLocked();
+}
+
+fn unparkLocked(self: *Terminal) !void {
+    const store = self.store;
+    if (self.residency != .parked) return;
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try store.snapshotPath(&path_buf, self.id);
+
+    const rehydration = try self.gpa.create(Rehydration);
+    errdefer self.gpa.destroy(rehydration);
+
+    const file_buf = try self.gpa.alloc(u8, 64 * 1024);
+    errdefer self.gpa.free(file_buf);
+    const window = try self.gpa.alloc(u8, illogical.park.Store.window_len);
+    errdefer self.gpa.free(window);
+
+    const file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
+    errdefer file.close(self.io);
+
+    rehydration.* = .{
+        .terminal = self,
+        .file = file,
+        .file_reader = undefined,
+        .decompress = undefined,
+        .decoder = undefined,
+        .file_buf = file_buf,
+        .window = window,
+    };
+    // Each of these retains a pointer to the previous, so they must be built
+    // in place at their final addresses.
+    rehydration.file_reader = file.reader(self.io, rehydration.file_buf);
+    rehydration.decompress = .init(
+        &rehydration.file_reader.interface,
+        illogical.park.Store.Container,
+        rehydration.window,
+    );
+    rehydration.decoder = .init(&rehydration.decompress.reader);
+
+    // Phase 1: the renderable prefix. This is the number that matters.
+    var decoded = try rehydration.decoder.ready(self.gpa, self.tiny_io.io(), .{
+        .max_continuation_bytes = max_continuation_bytes,
+    });
+    defer decoded.deinit(self.gpa);
+
+    self.vt = decoded.toOwned();
+    errdefer if (self.vt) |*vt| {
+        vt.deinit(self.gpa);
+        self.vt = null;
+    };
+
+    self.stream = .init(.{
+        .allocator = self.gpa,
+        .handler = self.vt.?.vtHandler(),
+        .continuation_max_bytes = max_continuation_bytes,
+    });
+    self.stream.?.handler.effects = effects;
+
+    // Resume inside whatever escape sequence was in flight when we parked.
+    switch (decoded.continuation) {
+        .ground => {},
+        .bytes => |bytes| self.stream.?.nextSlice(bytes),
+    }
+
+    self.residency = .rehydrating;
+    self.rehydration = rehydration;
+    rehydration.thread = std.Thread.spawn(.{}, restoreHistory, .{rehydration}) catch |err| {
+        // Without the background thread we still have a correct, renderable
+        // terminal -- just no scrollback.
+        log.warn("history restore thread failed: {t}", .{err});
+        self.residency = .live;
+        self.rehydration = null;
+        rehydration.destroy();
+        return;
+    };
+}
+
+/// Phase 2: prepend history pages, newest first, off the critical path.
+fn restoreHistory(r: *Rehydration) void {
+    const self = r.terminal;
+    while (true) {
+        self.mutex.lock();
+        if (self.residency != .rehydrating) {
+            self.mutex.unlock();
+            break;
+        }
+        const vt = &(self.vt orelse {
+            self.mutex.unlock();
+            break;
+        });
+        const more = r.decoder.next(self.gpa, vt) catch |err| {
+            log.warn("history restore stopped: {t}", .{err});
+            self.mutex.unlock();
+            break;
+        };
+        self.mutex.unlock();
+        if (more == null) break;
+    }
+
+    self.mutex.lock();
+    if (self.residency == .rehydrating) self.residency = .live;
+    self.rehydration = null;
+    self.mutex.unlock();
+    r.destroy();
+}
+
+/// Write this terminal's snapshot to `writer` for an attaching client.
+///
+/// A parked terminal is served straight from disk and stays parked, so a client
+/// hammering attach/detach never wakes anything.
+pub fn serveSnapshot(self: *Terminal, writer: *std.Io.Writer) !void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    if (self.residency == .parked) return self.streamParkFileLocked(self.store, writer);
+    return self.encodeSnapshotLocked(writer);
+}
+
+fn streamParkFileLocked(
+    self: *Terminal,
+    store: illogical.park.Store,
+    writer: *std.Io.Writer,
+) !void {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try store.snapshotPath(&path_buf, self.id);
+
+    const file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
+    defer file.close(self.io);
+
+    var file_buf: [64 * 1024]u8 = undefined;
+    var file_reader = file.reader(self.io, &file_buf);
+
+    const window = try self.gpa.alloc(u8, illogical.park.Store.window_len);
+    defer self.gpa.free(window);
+    var decompress: flate.Decompress = .init(
+        &file_reader.interface,
+        illogical.park.Store.Container,
+        window,
+    );
+
+    _ = try decompress.reader.streamRemaining(writer);
+}
+
+/// One bounded step of scrollback compression, for an idle-ish terminal.
+///
+/// libghostty-vt creates no timer and no thread for this: the embedder decides
+/// when. Incremental mode does bounded work; MODE_FULL can stall on a large
+/// scrollback and must never run here.
+pub fn compressStep(self: *Terminal) void {
+    const cfg = self.park_config;
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const vt = &(self.vt orelse return);
+
+    const activity = vt.compressionActivity();
+    const now = sys.monotonicNs();
+    if (activity != self.compression_activity) {
+        // New content: restart the idle delay.
+        self.compression_activity = activity;
+        self.compression_idle_since_ns = now;
+        return;
+    }
+    if (now -| self.compression_idle_since_ns < cfg.compress_after_ns) return;
+
+    switch (vt.compress(.incremental)) {
+        // Still work to do; the next tick continues it.
+        .pending => {},
+        // Nothing more until the activity token changes.
+        .complete => self.compression_idle_since_ns = now +| cfg.compress_after_ns,
+        // No OS primitive to discard physical pages here (not macOS or
+        // 64-bit Linux). Stop asking.
+        .unsupported => self.compression_idle_since_ns = std.math.maxInt(u64),
+    }
+}
+
 // -- effects ---------------------------------------------------------------
 //
 // The server answers terminal queries itself, with zero or fifty clients
@@ -374,7 +677,8 @@ pub fn summary(self: *Terminal) session.TerminalSummary {
 
 fn fromHandler(h: *ghostty.TerminalStream.Handler) *Terminal {
     const stream: *ghostty.TerminalStream = @fieldParentPtr("handler", h);
-    return @fieldParentPtr("stream", stream);
+    const opt: *?ghostty.TerminalStream = @ptrCast(stream);
+    return @fieldParentPtr("stream", opt);
 }
 
 fn writePtyEffect(h: *ghostty.TerminalStream.Handler, data: []const u8) void {
@@ -403,8 +707,13 @@ test "pty output reaches terminal state and survives a snapshot round trip" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
     const marker = "ILLOGICAL_SNAPSHOT_MARKER";
     const t = try Terminal.create(gpa, .{
+        .io = threaded.io(),
+        .store = .{ .root = "/tmp/illogical-unused" },
         .id = 1,
         .session_id = 1,
         .name = "test",
@@ -419,7 +728,7 @@ test "pty output reaches terminal state and survives a snapshot round trip" {
     var waited: usize = 0;
     while (waited < 3000) : (waited += 10) {
         t.mutex.lock();
-        const text = try t.vt.plainString(gpa);
+        const text = try t.vt.?.plainString(gpa);
         t.mutex.unlock();
         defer gpa.free(text);
         if (std.mem.indexOf(u8, text, marker) != null) break;
@@ -456,7 +765,12 @@ test "idle clock tracks PTY reads, not wall time" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
     const t = try Terminal.create(gpa, .{
+        .io = threaded.io(),
+        .store = .{ .root = "/tmp/illogical-unused" },
         .id = 2,
         .session_id = 1,
         .name = "idle",
@@ -472,4 +786,173 @@ test "idle clock tracks PTY reads, not wall time" {
     // even though it was just created and its child is running.
     try testing.expect(t.ptyReadIdleNs() >= 40 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u32, 0), t.attachedCount());
+}
+
+test "park writes a snapshot, unpark restores the screen" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-park-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const marker = "PARK_ROUND_TRIP_MARKER";
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = root },
+        .id = 1,
+        .session_id = 1,
+        .name = "park",
+        .argv = &.{ "/bin/sh", "-c", "printf '" ++ marker ++ "\\n'; sleep 10" },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    try t.start();
+
+    // Wait for the child's output to reach our state.
+    var waited: usize = 0;
+    while (waited < 3000) : (waited += 10) {
+        const text = t.plainText(gpa) catch {
+            sys.sleepNs(10 * std.time.ns_per_ms);
+            continue;
+        };
+        defer gpa.free(text);
+        if (std.mem.indexOf(u8, text, marker) != null) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.MarkerNeverArrived;
+
+    // Park it.
+    try t.park();
+    try testing.expectEqual(session.Residency.parked, t.summary().residency);
+    // No terminal state in memory any more.
+    try testing.expect(t.vt == null);
+    try testing.expect(t.stream == null);
+    // And a snapshot on disk.
+    const size = t.store.snapshotSize(io, t.id) orelse return error.NoSnapshotOnDisk;
+    try testing.expect(size > 0);
+
+    // Peeking must not wake it.
+    try testing.expectError(error.TerminalParked, t.plainText(gpa));
+    try testing.expectEqual(session.Residency.parked, t.summary().residency);
+
+    // Unpark restores the screen.
+    try t.unpark();
+    var settle: usize = 0;
+    while (settle < 2000) : (settle += 10) {
+        if (t.summary().residency == .live) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    }
+    const text = try t.plainText(gpa);
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, marker) != null);
+}
+
+test "attaching to a parked terminal serves from disk and leaves it parked" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-attach-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const marker = "SERVED_FROM_DISK";
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = root },
+        .id = 2,
+        .session_id = 1,
+        .name = "disk",
+        .argv = &.{ "/bin/sh", "-c", "printf '" ++ marker ++ "\\n'; sleep 10" },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    try t.start();
+
+    var waited: usize = 0;
+    while (waited < 3000) : (waited += 10) {
+        const text = t.plainText(gpa) catch break;
+        defer gpa.free(text);
+        if (std.mem.indexOf(u8, text, marker) != null) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    }
+    try t.park();
+
+    // Serve a snapshot the way an attaching client would.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    try t.serveSnapshot(&aw.writer);
+    try aw.writer.flush();
+    buf = aw.toArrayList();
+
+    // It is a real snapshot...
+    try testing.expect(buf.items.len > 0);
+    try testing.expectEqualStrings("GHOSTSNP", buf.items[0..8]);
+
+    // ...and the terminal is still parked. This is the property that makes
+    // attach/detach cycling free.
+    try testing.expectEqual(session.Residency.parked, t.summary().residency);
+    try testing.expect(t.vt == null);
+
+    // What we served decodes back to the same screen.
+    var tiny: ghostty.TinyIo = .init;
+    var reader: std.Io.Reader = .fixed(buf.items);
+    var decoder: ghostty.snapshot.Decoder = .init(&reader);
+    var decoded = try decoder.ready(gpa, tiny.io(), .{
+        .max_continuation_bytes = max_continuation_bytes,
+    });
+    defer decoded.deinit(gpa);
+    const restored = &(decoded.terminal orelse return error.NoTerminal);
+    const text = try restored.plainString(gpa);
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, marker) != null);
+}
+
+test "scrollback compression reports what it actually does" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var tiny: ghostty.TinyIo = .init;
+    var vt: ghostty.Terminal = try .init(tiny.io(), gpa, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = 50 * 1024 * 1024,
+    });
+    defer vt.deinit(gpa);
+
+    var stream = vt.vtStream();
+    defer stream.deinit();
+
+    // Fill well past the active area so there is cold scrollback to compress.
+    var line: [96]u8 = undefined;
+    for (0..10_000) |i| {
+        const text = try std.fmt.bufPrint(
+            &line,
+            "line {d} ---- filler text to make this a realistic terminal line\r\n",
+            .{i},
+        );
+        stream.nextSlice(text);
+    }
+
+    // Incremental steps must be bounded and must terminate. If the platform
+    // has no primitive for discarding physical pages, `unsupported` is the
+    // honest answer and the scheduler stops asking.
+    var steps: usize = 0;
+    var last: ghostty.Terminal.CompressionResult = .pending;
+    while (steps < 2000) : (steps += 1) {
+        last = vt.compress(.incremental);
+        if (last != .pending) break;
+    }
+    try testing.expect(last == .complete or last == .unsupported);
+    try testing.expect(steps < 2000);
 }

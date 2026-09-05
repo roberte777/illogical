@@ -137,8 +137,14 @@ Mitchell confirms both and names neither:
 > often secrets in scrollback, so we have to protect against that. We'll talk
 > about that another time." — [MEM t=278]
 
-Ours: **zstd** for compression (recommended for snapshots in a ghostty
-discussion). Encryption is deferred to M4 and tracked as an open question.
+**We use deflate, not zstd.** Zig 0.16 ships a zstd *decompressor* only, and a C
+zstd would be this project's first non-ghostty native dependency. It sits behind
+one constant (`park.Store.Container`) so swapping it later is a local change.
+Measured: a filled 10,000-line terminal parks to **32 KiB** on disk.
+
+**Encryption is not implemented.** Scrollback holds secrets and the park file is
+plaintext on disk today. This is the one part of parking that is a genuine gap
+rather than a deferred refinement — see [ROADMAP.md](ROADMAP.md).
 
 ⚠ Do not use LZ4 here by analogy with level-1.5 below. That is a different
 problem: in-memory pages need infallible, instant decompression; on-disk
@@ -239,14 +245,37 @@ for now.
 | `pty_park_unobserved_after` | 5 s | delay before demoting an unwatched PTY |
 | `max_snapshot_bytes` | 256 MiB | refuse to park beyond this; stay resident |
 
-## What to measure
+## Measuring it
+
+⚠ **Use `phys_footprint`, not RSS.** libghostty releases compressed scrollback
+with `MADV_FREE_REUSABLE`, which on macOS leaves the pages counted in RSS until
+there is memory pressure. Measured with `ps -o rss`, compression and parking
+appear to do *nothing*; measured with `phys_footprint` the win is plain. This is
+also the metric Superlogical's own charts report, so it is the only way to
+compare honestly. `scripts/bench-memory.sh` reads it from `vmmap --summary`.
+
+Results from `scripts/bench-memory.sh 20 10000` (macOS, Apple M4 Max), against
+the reference figures in [RESEARCH.md](RESEARCH.md#7-numbers):
+
+| | ours | Superlogical | tmux 3.5a |
+| --- | --- | --- | --- |
+| Server start, no terminals | **2.38 MiB** | 10.6 MiB | 2.50 MiB |
+| Per filled 10,000-line terminal, live | 1867 KiB | 407 KiB | 4.89 MiB |
+| Per filled 10,000-line terminal, parked | **374 KiB** | — | — |
+| Snapshot on disk | 32 KiB | — | — |
+| Reclaimed by parking | 79% | — | — |
+
+Read this carefully before claiming a win. Superlogical's 407 KiB is labelled
+"per filled terminal" and does not say whether it was parked. Our *parked*
+number lands next to it and our *live* number is 4.5× worse, so the honest
+reading is either that their figure is a settled/parked measurement too, or that
+their live representation is leaner than ours. We do not know which.
+
+Still to measure:
 
 - Park wall time vs. scrollback size.
-- **Unpark → `ready()` returns.** The headline number; target ~200 µs at 64 MB
+- **Unpark → `ready()` returns.** The headline latency; target ~200 µs at 64 MB
   excluding disk.
-- Attach-to-parked: confirm the terminal stays parked and no allocation spike.
 - Full history restore time (background; must not regress interactivity).
-- RSS per terminal: live, live+compressed, parked. Target ~400 KB full,
-  and match tmux on empty.
 - IO throughput, hot vs parked PTY. Target ≤10% loss.
 - Thread count vs terminal count. Should flatten, not track.

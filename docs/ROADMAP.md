@@ -96,26 +96,29 @@ common cases, and resize driven by the view's own geometry.
 **Gate:** cold launch to window under the budget; first frame independent of
 scrollback size.
 
-## M4 — Parking and the memory work
+## M4 — Parking and the memory work (core landed)
 
 **Ends at:** 10,000 idle terminals on a laptop, and you cannot tell. This is the
 milestone the whole architecture exists for. See [PARKING.md](PARKING.md).
 
 | | Work |
 | --- | --- |
-| | **A1** — terminal parking. Idle = **no PTY reads** for 60 s. Not keystrokes |
-| | Snapshot encode → compress (zstd) → fsync → atomic rename → free terminal |
-| | Streaming unpark: `decoder_ready()` on the hot path, history on a pool thread |
-| | **A2** — attach to a parked terminal streams from disk and does **not** unpark |
+| ✅ | **A1** — terminal parking. Idle = **no PTY reads** for 60 s. Not keystrokes |
+| ✅ | Snapshot encode → compress → fsync → atomic rename → free terminal |
+| ✅ | Streaming unpark: `ready()` on the hot path, history on a background thread |
+| ✅ | **A2** — attach to a parked terminal streams from disk and does **not** unpark |
+| ✅ | **A5** — live scrollback compression: activity token, incremental steps on idle, never `MODE_FULL` on a hot path |
+| ✅ | The benchmark, as `scripts/bench-memory.sh` (not yet in CI — there is no CI) |
 | | **A3** (second half) — PTY fd migration between dedicated thread and shared poller, with hysteresis |
 | | **A4** — client buffer parking |
-| | **A5** — live scrollback compression: activity token, incremental steps on idle, never `MODE_FULL` on a hot path |
 | | **A6** — per-terminal fixed costs: zero-init, lazy allocation, shared palette |
 | | **F2** — flow control: bounded per-client queue, overflow ⇒ forced re-attach |
-| | **F3** — snapshot encryption (scrollback holds secrets) |
-| | The benchmark suite below, in CI |
+| | **F3** — snapshot **encryption**. Compression landed; encryption did not, so park files are plaintext on disk and scrollback holds secrets. This is a real gap, not a refinement |
 
-**Gate:** the benchmark table.
+**Gate:** the benchmark table. Partially met — see below.
+
+Deflate is used rather than zstd: Zig 0.16 ships a zstd decompressor only, and a
+C zstd would be the first non-ghostty native dependency. One constant to change.
 
 ## M5 — Remote
 
@@ -145,14 +148,26 @@ milestone the whole architecture exists for. See [PARKING.md](PARKING.md).
 Superlogical's published numbers are the bar. Measure the same way they did —
 macOS, `phys_footprint`, same terminal shapes — and report losses honestly.
 
-| Benchmark | Superlogical | tmux 3.5a | Our target |
-| --- | --- | --- | --- |
-| Server start, one session | 10.6 MiB | **2.50 MiB** | beat Superlogical |
-| Per empty 80×24 terminal | 68 KiB | **15 KiB** | **beat tmux** — the case Superlogical loses |
-| Per terminal, 10,000 lines | **407 KiB** | 4.89 MiB | match Superlogical |
-| Per client connection (50 filled) | **85 KiB** | 157 KiB | match Superlogical |
-| Unpark, 64 MB scrollback | ~200 µs (excl. disk) | — | match |
-| Parked-PTY throughput cost | 5–10% | — | ≤10% |
+| Benchmark | Superlogical | tmux 3.5a | ours | status |
+| --- | --- | --- | --- | --- |
+| Server start, no terminals | 10.6 MiB | 2.50 MiB | **2.38 MiB** | measured |
+| Per terminal, 10,000 lines, live | **407 KiB** | 4.89 MiB | 1867 KiB | measured |
+| Per terminal, 10,000 lines, parked | — | — | **374 KiB** | measured |
+| Per empty 80×24 terminal | 68 KiB | **15 KiB** | — | not measured |
+| Per client connection (50 filled) | **85 KiB** | 157 KiB | — | not measured |
+| Unpark, 64 MB scrollback | ~200 µs (excl. disk) | — | — | not measured |
+| Parked-PTY throughput cost | 5–10% | — | — | A3 not implemented |
+
+Run it with `scripts/bench-memory.sh 20 10000`.
+
+Two things to be careful about when reading that table. First, it is
+`phys_footprint`, not RSS — with RSS the compression and parking wins are
+invisible on macOS, because `MADV_FREE_REUSABLE` leaves pages counted until
+there is pressure. Second, Superlogical's 407 KiB does not say whether it was
+measured parked. Our parked figure lands beside it and our live figure is 4.5×
+worse, so either their number is also a settled measurement or their live
+representation is genuinely leaner. We do not know which, and should not claim
+the win either way.
 
 Sources and methodology in [RESEARCH.md §7](RESEARCH.md#7-numbers).
 

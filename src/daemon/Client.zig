@@ -155,7 +155,15 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
         .peek => {
             const t = self.server.terminal(header.session) orelse
                 return self.sendError(header.session, .no_such_session, "no such terminal");
-            const text = try t.plainText(arena);
+            const text = t.plainText(arena) catch |err| switch (err) {
+                // Peeking must not wake a parked terminal; that would defeat
+                // the point. Say so instead.
+                error.TerminalParked => {
+                    try self.send(.screen, header.session, "<parked>\n");
+                    return;
+                },
+                else => return err,
+            };
             try self.send(.screen, header.session, text);
         },
 

@@ -31,6 +31,8 @@ pub const Session = struct {
 gpa: Allocator,
 io: std.Io,
 socket_path: []const u8,
+store: illogical.park.Store,
+park_config: illogical.park.Config = .{},
 listener: sys.fd_t = -1,
 
 /// Guards the session/terminal tables and the id counters.
@@ -44,19 +46,25 @@ clients_mutex: illogical.thread.Mutex = .{},
 clients: std.ArrayList(*Client) = .empty,
 
 running: std.atomic.Value(bool) = .init(false),
+maintenance: ?std.Thread = null,
 
-pub fn init(gpa: Allocator, io: std.Io, socket_path: []const u8) !*Server {
+pub fn init(gpa: Allocator, io: std.Io, socket_path: []const u8, state_root: []const u8) !*Server {
     const self = try gpa.create(Server);
     self.* = .{
         .gpa = gpa,
         .io = io,
         .socket_path = try gpa.dupe(u8, socket_path),
+        .store = .{ .root = try gpa.dupe(u8, state_root) },
     };
     return self;
 }
 
 pub fn deinit(self: *Server) void {
     self.stop();
+    if (self.maintenance) |t| {
+        t.join();
+        self.maintenance = null;
+    }
 
     self.clients_mutex.lock();
     for (self.clients.items) |c| c.destroy();
@@ -71,6 +79,7 @@ pub fn deinit(self: *Server) void {
     self.mutex.unlock();
 
     self.gpa.free(self.socket_path);
+    self.gpa.free(self.store.root);
     self.gpa.destroy(self);
 }
 
@@ -92,7 +101,43 @@ pub fn listen(self: *Server) !void {
     try sys.listenFd(fd, 64);
     self.listener = fd;
     self.running.store(true, .release);
+    self.maintenance = try std.Thread.spawn(.{}, maintenanceLoop, .{self});
     log.info("listening on {s}", .{self.socket_path});
+}
+
+/// Periodic housekeeping: park idle terminals, and give live ones a bounded
+/// slice of scrollback compression. See docs/PARKING.md.
+pub fn maintenanceTick(self: *Server) void {
+    // Copy the terminal list so the registry lock is not held across the work.
+    var ids: std.ArrayList(session.TerminalId) = .empty;
+    defer ids.deinit(self.gpa);
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        ids.appendSlice(self.gpa, self.terminals.keys()) catch return;
+    }
+
+    for (ids.items) |id| {
+        const t = self.terminal(id) orelse continue;
+        const summary = t.summary();
+        if (illogical.park.shouldPark(
+            self.park_config,
+            summary.residency,
+            summary.pty_read_idle_ns,
+            summary.attached,
+        )) {
+            t.park() catch |err| log.warn("terminal {d} failed to park: {t}", .{ id, err });
+        } else if (summary.residency == .live) {
+            t.compressStep();
+        }
+    }
+}
+
+fn maintenanceLoop(self: *Server) void {
+    while (self.running.load(.acquire)) {
+        sys.sleepNs(250 * std.time.ns_per_ms);
+        self.maintenanceTick();
+    }
 }
 
 pub fn stop(self: *Server) void {
@@ -175,6 +220,9 @@ pub fn createTerminal(self: *Server, req: protocol.body.Create) !CreateResult {
     const cwd = req.cwd orelse sys.getenv("HOME") orelse "/";
 
     const t = try Terminal.create(self.gpa, .{
+        .io = self.io,
+        .store = self.store,
+        .park_config = self.park_config,
         .id = tid,
         .session_id = sid,
         .name = name,
