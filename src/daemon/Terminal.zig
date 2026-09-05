@@ -167,10 +167,10 @@ const effects: ghostty.TerminalStream.Handler.Effects = .{
     .desktop_notification = null,
     .drag_and_drop = null,
     .color_scheme = null,
-    .device_attributes = null,
+    .device_attributes = deviceAttributesEffect,
     .enquiry = null,
     .size = sizeEffect,
-    .xtversion = null,
+    .xtversion = xtversionEffect,
     .title_changed = null,
     .pwd_changed = null,
     .progress_report = null,
@@ -722,6 +722,51 @@ fn writePtyEffect(h: *ghostty.TerminalStream.Handler, data: []const u8) void {
     };
 }
 
+/// Answer device attribute queries (CSI c, CSI > c, CSI = c).
+///
+/// Leaving this null does not merely omit a nicety: libghostty-vt drops the
+/// query on the floor and the child waits. Neovim ends its exit sequence with
+/// a DA1 request used as a sentinel -- it restores the terminal modes, asks
+/// who we are, and only leaves the alternate screen once we answer. Unanswered,
+/// every `:qa` paid Neovim's full one-second timeout before the shell came
+/// back. Measured on this machine: 1.11s unanswered, 0.10s answered.
+///
+/// What we claim is what the daemon's VT actually is: a VT220 with color. Not
+/// clipboard access (feature 52), which Ghostty advertises and we cannot honour
+/// -- `clipboard_read` and `clipboard_write` above are null, so a program that
+/// believed us would wait on a reply that never comes. Exactly the bug this
+/// function exists to fix.
+fn deviceAttributesEffect(
+    _: *ghostty.TerminalStream.Handler,
+) DeviceAttributes {
+    return .{
+        .primary = .{
+            // `level_2` is the VT200 series; `.vt220` is a lowercase alias for
+            // it, and an alias is a declaration, not a field, so it cannot be
+            // written as an enum literal here.
+            .conformance_level = .level_2,
+            .features = &.{.ansi_color},
+        },
+    };
+}
+
+/// libghostty-vt's public Zig API re-exports the device *status* namespace but
+/// not `device_attributes`, so the response type has no name we can spell.
+/// Recover it from the signature of the effect that returns it.
+const DeviceAttributes = @typeInfo(@typeInfo(@typeInfo(
+    @FieldType(ghostty.TerminalStream.Handler.Effects, "device_attributes"),
+).optional.child).pointer.child).@"fn".return_type.?;
+
+/// Answer XTVERSION (CSI > q) with our own name.
+///
+/// Unlike the device attributes above, libghostty-vt always replies here; with
+/// no effect installed it reports itself as "libghostty". That is the wrong
+/// name for a program probing what it is talking to -- the child's environment
+/// already says `TERM_PROGRAM=illogical`, and the two should agree.
+fn xtversionEffect(_: *ghostty.TerminalStream.Handler) []const u8 {
+    return "illogical " ++ illogical.version;
+}
+
 fn sizeEffect(h: *ghostty.TerminalStream.Handler) ?ghostty.size_report.Size {
     const self = fromHandler(h);
     return .{
@@ -988,4 +1033,73 @@ test "scrollback compression reports what it actually does" {
     }
     try testing.expect(last == .complete or last == .unsupported);
     try testing.expect(steps < 2000);
+}
+
+test "the device attributes response encodes as a VT220 with color" {
+    const testing = std.testing;
+
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try deviceAttributesEffect(undefined).encode(.primary, &writer);
+
+    // Not `;52c`: advertising clipboard access we do not implement would
+    // strand the next program on a reply that never comes.
+    try testing.expectEqualStrings("\x1b[?62;22c", buf[0..writer.end]);
+}
+
+test "a device attributes query is answered back through the pty" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    // Ask for DA1, read back exactly the 9 bytes of the reply, and print them
+    // somewhere `plainText` can see. Raw mode because the reply carries no
+    // newline, and a canonical-mode read would block waiting for one.
+    //
+    // The watchdog is what makes a regression *fail* rather than hang: with no
+    // answer the `dd` below blocks forever, and closing the master does not
+    // reliably get the child killed. `childPreExec` puts every child in a fresh
+    // session, so `kill 0` reaches that child's group and nothing else.
+    const script =
+        \\stty raw -echo
+        \\{ sleep 3; kill -9 0; } &
+        \\printf '\033[c'
+        \\R=$(dd bs=1 count=9 2>/dev/null | od -An -c | tr -d ' \n')
+        \\printf 'DA1<%s>' "$R"
+        \\sleep 10
+    ;
+    const t = try Terminal.create(gpa, .{
+        .io = threaded.io(),
+        .store = .{ .root = "/tmp/illogical-unused" },
+        .id = 1,
+        .session_id = 1,
+        .name = "da1",
+        .argv = &.{ "/bin/sh", "-c", script },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    try t.start();
+
+    // Unanswered, the child stays blocked in `dd` and this loop runs out --
+    // which is exactly the failure this test is here to catch.
+    var waited: usize = 0;
+    while (waited < 5000) : (waited += 10) {
+        const text = t.plainText(gpa) catch {
+            sys.sleepNs(10 * std.time.ns_per_ms);
+            continue;
+        };
+        defer gpa.free(text);
+        if (std.mem.indexOf(u8, text, "DA1<033[?62;22c>") != null) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.DeviceAttributesNeverAnswered;
+}
+
+test "xtversion reports illogical, not the library underneath" {
+    try std.testing.expectEqualStrings(
+        "illogical " ++ illogical.version,
+        xtversionEffect(undefined),
+    );
 }
