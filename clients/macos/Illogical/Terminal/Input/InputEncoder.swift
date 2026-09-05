@@ -167,18 +167,6 @@ final class InputEncoder {
         ghostty_mouse_encoder_reset(mouseEncoder)
     }
 
-    /// Whether the program in the terminal has asked to see the mouse.
-    var mouseTrackingEnabled: Bool {
-        engine.withTerminal { terminal -> Bool? in
-            var enabled = false
-            guard
-                ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &enabled)
-                    == GHOSTTY_SUCCESS
-            else { return false }
-            return enabled
-        } ?? false
-    }
-
     // MARK: - Alternate scroll
 
     /// Cursor keys for a wheel gesture in the alternate screen.

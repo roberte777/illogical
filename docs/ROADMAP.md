@@ -87,7 +87,7 @@ libghostty-vt's own encoders; and resize driven by the view's own geometry.
 | ✅ | **D1** — two-phase update: lock, begin, unlock, end |
 | ✅ | **D2** — two-layer dirty tracking; `render_state_clean()` per frame |
 | ✅ | CoreText glyph rasterization + atlas: ligatures, box drawing, emoji, wide chars |
-| | Native scrollback; never synthesize wheel sequences |
+| ✅ | Native scrollback; never synthesize wheel sequences |
 | ✅ | Key/mouse/focus encoding via libghostty-vt, replacing the hand-rolled subset |
 | ✅ | Selection via `selection.h`'s gesture machine, tracked grid refs |
 | ✅ | Native splits: one connection per pane |

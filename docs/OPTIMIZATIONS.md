@@ -268,11 +268,15 @@ protocol to get wrong, and no per-client server-side screen state to maintain.
 
 ### C3. Per-client viewport
 
-**Status: Adopt.** Milestone M2.
+**Status: Done** for scroll position, landed in M3. Selection is still to come.
 
 Scroll position and selection live entirely in the client [ARCH t=323]. The
 server stores nothing per client except its buffers (see A4) and its subscription
 set. This is both a correctness win over tmux and a memory win.
+
+Concretely: the client calls `ghostty_terminal_scroll_viewport` on its own
+replica and tells the server nothing. Two clients attached to one terminal
+scroll independently, and neither can move the other's window.
 
 ---
 

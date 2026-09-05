@@ -39,12 +39,16 @@ cleanup() {
 
   # Children first, then the daemon. A daemon holding a terminal sits in an
   # uninterruptible PTY read and does not die on SIGTERM *or* SIGKILL until
-  # that read returns -- so killing it first leaves it around for as long as
-  # its child runs, which for our filler is ten minutes. Killing the child
-  # closes the other end, the read returns, and the pending signal lands.
+  # that read returns, so killing it first leaves it around for as long as
+  # its child runs -- ten minutes, for our filler.
+  #
+  # Close the other end instead and the daemon exits cleanly on its own,
+  # with no signal to it at all: shutdown works, it just cannot be asked for
+  # first. And the child needs SIGKILL, not SIGTERM: `pkill -P` sends TERM,
+  # which an interactive `sh` ignores outright.
   for p in "${pids[@]:-}"; do
     [ -n "$p" ] || continue
-    pkill -P "$p" 2>/dev/null || true
+    pkill -9 -P "$p" 2>/dev/null || true
   done
   sleep 0.3
   for p in "${pids[@]:-}"; do

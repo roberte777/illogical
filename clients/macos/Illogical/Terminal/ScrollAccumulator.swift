@@ -1,0 +1,162 @@
+//  ScrollAccumulator.swift
+//  Turning wheel and trackpad events into whole rows.
+//
+//  Ported from the delta handling in libghostty's `Surface.scrollCallback`.
+//  Two quirks make this more than a division:
+//
+//  A trackpad reports pixels, a few at a time, so most events are smaller
+//  than a row and would round to nothing. The remainder has to carry between
+//  events or the terminal never scrolls.
+//
+//  A wheel reports ticks, but macOS fakes precision for wheels by ramping the
+//  tick magnitude with speed — a slow single click arrives as 0.1. Rounding
+//  the magnitude out to at least one tick is what stops slow scrolling from
+//  being swallowed.
+
+import Foundation
+
+struct ScrollAccumulator {
+    /// Sub-row movement carried between events.
+    private(set) var pending: Double = 0
+
+    /// Sub-column movement, carried only on the precise path. See
+    /// `wheelColumns` for why the two axes are not symmetric.
+    private(set) var pendingX: Double = 0
+
+    /// Scroll speed. libghostty's defaults: precision deltas pass through,
+    /// discrete ticks become three rows each.
+    var precisionMultiplier: Double = 1
+    var discreteMultiplier: Double = 3
+
+    init(precisionMultiplier: Double = 1, discreteMultiplier: Double = 3) {
+        self.precisionMultiplier = precisionMultiplier
+        self.discreteMultiplier = discreteMultiplier
+    }
+
+    /// Feed one event's vertical delta and get whole rows back.
+    ///
+    /// `delta` is in the OS's own units — pixels when `precise`, ticks when
+    /// not — and keeps the OS's sign convention, where positive means the
+    /// content moves down toward older output. The result uses the same
+    /// convention; the caller flips it for the viewport axis.
+    mutating func rows(delta: Double, precise: Bool, cellHeight: Double) -> Int {
+        guard delta != 0, cellHeight > 0 else { return 0 }
+
+        let pixels: Double
+        if precise {
+            pixels = delta * precisionMultiplier
+        } else {
+            let ticks = delta > 0 ? Swift.max(delta, 1) : Swift.min(delta, -1)
+            pixels = ticks * cellHeight * discreteMultiplier
+        }
+
+        let total = pending + pixels
+        guard abs(total) >= cellHeight else {
+            pending = total
+            return 0
+        }
+
+        let whole = (total / cellHeight).rounded(.towardZero)
+        // Carry the true remainder. libghostty subtracts the *unrounded*
+        // quotient at this point, which always leaves zero and quietly drops
+        // up to a row of movement on every event that fires.
+        pending = total - whole * cellHeight
+        return Int(whole)
+    }
+
+    /// Whole rows from one AppKit scroll event, in the OS's sign convention:
+    /// positive is up, negative is down.
+    ///
+    /// This is the quantization every consumer of the wheel shares — the
+    /// viewport, and mouse reporting once it lands, which sends one wheel
+    /// button press per *row* rather than per event. Call it exactly once per
+    /// event, before deciding who the event belongs to, so the remainder keeps
+    /// advancing across a gesture that changes hands mid-way.
+    ///
+    /// It handles the one thing that is easy to get wrong at the AppKit
+    /// boundary: `scrollingDeltaY` is the modern field, but not every source
+    /// fills it in — synthesized events and some drivers set only the legacy
+    /// `deltaY`, which is in lines — so we fall back rather than ignoring the
+    /// event.
+    mutating func wheelRows(
+        scrollingDeltaY: Double,
+        legacyDeltaY: Double,
+        precise: Bool,
+        cellHeight: Double
+    ) -> Int {
+        var delta = scrollingDeltaY
+        var isPrecise = precise
+        if delta == 0 {
+            delta = legacyDeltaY
+            isPrecise = false
+        }
+        return rows(delta: delta, precise: isPrecise, cellHeight: cellHeight)
+    }
+
+    /// Whole columns from one AppKit scroll event, for horizontal wheel
+    /// reports. Positive is the same direction libghostty sends as button six.
+    ///
+    /// The viewport never moves sideways, so this axis exists only for the
+    /// program in the terminal, and it is deliberately *not* the y code with a
+    /// different cell size. libghostty treats the two differently
+    /// (`Surface.scrollCallback`), and copying y here would be wrong in three
+    /// ways at once:
+    ///
+    /// A non-precise horizontal delta is rounded and used as-is — no cell
+    /// width, no accumulator, no multiplier. One notch is one column, and a
+    /// slow notch reported as 0.1 rounds to nothing rather than being rounded
+    /// out to a whole tick the way a vertical one is.
+    ///
+    /// Neither multiplier applies to this axis at all, on either path.
+    mutating func wheelColumns(
+        scrollingDeltaX: Double,
+        legacyDeltaX: Double,
+        precise: Bool,
+        cellWidth: Double
+    ) -> Int {
+        var delta = scrollingDeltaX
+        var isPrecise = precise
+        if delta == 0 {
+            delta = legacyDeltaX
+            isPrecise = false
+        }
+        guard delta != 0 else { return 0 }
+
+        guard isPrecise else { return Int(delta.rounded()) }
+
+        guard cellWidth > 0 else { return 0 }
+        let total = pendingX + delta
+        guard abs(total) >= cellWidth else {
+            pendingX = total
+            return 0
+        }
+        let whole = (total / cellWidth).rounded(.towardZero)
+        // The true remainder, as on the vertical axis. libghostty subtracts
+        // the unrounded quotient here too, which always leaves zero.
+        pendingX = total - whole * cellWidth
+        return Int(whole)
+    }
+
+    /// Rows to move the *viewport* by, for the same event.
+    ///
+    /// The sign is flipped from `wheelRows`: the OS reports positive when the
+    /// content should move down, which is toward *older* output, whereas the
+    /// viewport axis counts downward from the top of the scrollback.
+    mutating func viewportRows(
+        scrollingDeltaY: Double,
+        legacyDeltaY: Double,
+        precise: Bool,
+        cellHeight: Double
+    ) -> Int {
+        -wheelRows(
+            scrollingDeltaY: scrollingDeltaY, legacyDeltaY: legacyDeltaY,
+            precise: precise, cellHeight: cellHeight)
+    }
+
+    /// Forget any partial movement. Used when the viewport jumps somewhere
+    /// absolute, so a stale fraction doesn't nudge the next scroll.
+    mutating func reset() {
+        pending = 0
+        pendingX = 0
+    }
+}

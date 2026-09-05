@@ -166,19 +166,66 @@ handing a CALayer a finished IOSurface — not a `CAMetalDrawable`, whose
 `nextDrawable` blocks on the display and stalls a renderer that could be
 building the next frame.
 
-## Scrollback is native, and sometimes absent
+## Scrollback is native
 
-Two requirements that pull against each other:
+The viewport is entirely client-side [ARCH t=323]. We call
+`ghostty_terminal_scroll_viewport` on our own replica and tell the server
+nothing, so two people attached to one terminal scroll independently — the
+tmux behaviour where one client's scroll moves everyone's window is a bug we
+are deliberately not reproducing.
 
-- Scrolling is a real scroll view with real momentum. We never synthesize wheel
-  escape sequences into the PTY.
-- History arrives **after** the first frame, newest-first. Scrolling into a
-  region that has not landed yet must show a **loading state**, not block and not
-  lie [ARCH t=308].
+We never synthesize wheel sequences into the PTY. There is no arrow-key
+translation and no alternate-scroll mode: the wheel moves our window over the
+history, and that is all it does. When the program has asked for mouse events
+the wheel belongs to it instead and we leave the viewport alone.
 
-The viewport is entirely client-side [ARCH t=323]. Two people attached to one
-terminal scroll independently — the tmux behaviour where one client's scroll
-moves everyone's window is a bug we are deliberately not reproducing.
+**Turning gestures into rows** is `ScrollAccumulator`, ported from
+libghostty's `scrollCallback`. Two device quirks make it more than a division.
+A trackpad reports a few pixels at a time, so the remainder has to carry
+between events or nothing ever moves. A wheel reports ticks, but macOS fakes
+precision for wheels by ramping the tick magnitude with speed — a slow single
+click arrives as 0.1 — so the magnitude is rounded out to a whole tick.
+Momentum needs no special handling: the OS keeps sending events after the
+fingers lift and they run through the same path.
+
+**Moving the viewport forces a full repaint.** libghostty's per-row dirty
+flags describe content, not position, so after a scroll every row is still
+"clean" and a renderer that trusted them would show the old screen. The engine
+marks the next frame fully dirty instead.
+
+Typing jumps back to the live output; output arriving does not. Those are
+libghostty's defaults and they are the right ones — output scrolling out from
+under you while you read history is infuriating.
+
+The position indicator is an overlay layer, not an `NSScrollView`. There is no
+document view to scroll (the content is an IOSurface the renderer repaints in
+place) and the scrollable area changes shape as output arrives and scrollback
+is pruned, so there is nothing for a scroll view to manage.
+
+### The loading state we do not need yet
+
+The design called for history arriving **after** the first frame, newest-first,
+with a loading state for regions that had not landed [ARCH t=308]. The server
+does not do that yet: `Client.attach` encodes the whole snapshot — screen and
+history — into `snapshot_chunk` frames, and only then sends `snapshot_ready`
+and `snapshot_end`. So by the time the client can paint, the history is already
+in hand and there is no window in which to be missing anything.
+
+The client is written for either shape: it decodes through READY, paints, then
+prepends history pages until FINISH. When the server starts streaming history
+after READY — [#19](https://github.com/roberte777/illogical/issues/19) — the
+loading state becomes reachable, and that is the point to build it. Building it
+now would mean building against a protocol shape nothing produces.
+
+## Selection
+
+Selection is per-client too, for the same reason the viewport is. Use
+`selection.h`'s gesture state machine rather than hand-rolling drag handling,
+and keep endpoints as **tracked** grid refs — plain `GhosttyGridRef`s are
+invalidated by the next terminal mutation, which for us is every output frame.
+
+The renderer already draws a selection when the render state reports one; what
+is missing is the input half that sets it.
 
 Selection is likewise per-client, and is `selection.h`'s gesture state machine
 rather than hand-rolled drag handling. The client supplies a pointer position,
@@ -213,7 +260,6 @@ Paste is `ghostty_paste_encode`, which strips control bytes and wraps in
 bracketed paste when the program asked for it; `ghostty_paste_is_safe` decides
 when to ask the user first, because a pasted newline is a pressed return and
 outside bracketed paste the shell cannot tell the difference.
-
 ## Input
 
 Encode with libghostty-vt and send the bytes as `input`. Do not echo locally:

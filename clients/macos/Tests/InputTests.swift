@@ -152,7 +152,7 @@ final class InputTests: XCTestCase {
         let engine = try engine()
         let encoder = try mouseEncoder(engine)
 
-        XCTAssertFalse(encoder.mouseTrackingEnabled)
+        XCTAssertFalse(engine.isMouseTracking)
         XCTAssertNil(
             encoder.encode(
                 mouse: MouseEventSpec(
@@ -170,7 +170,7 @@ final class InputTests: XCTestCase {
         let encoder = try mouseEncoder(engine)
         write(engine, "\u{1b}[?1000h\u{1b}[?1006h")
 
-        XCTAssertTrue(encoder.mouseTrackingEnabled)
+        XCTAssertTrue(engine.isMouseTracking)
         let press = MouseEventSpec(
             action: GHOSTTY_MOUSE_ACTION_PRESS,
             button: GHOSTTY_MOUSE_BUTTON_LEFT,

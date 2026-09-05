@@ -29,13 +29,13 @@ final class TerminalController {
 
     let terminalID: UInt64
     private(set) var state: State = .connecting
-    /// Scrollback *pages* restored so far, for the UI to show progress.
+    /// Rows of scrollback available to scroll into, once the attach
+    /// snapshot's history has been restored.
     ///
-    /// Pages, not rows: a page holds a variable number of rows, so this is
-    /// not rows scaled by a constant, it is a different quantity. Named after
-    /// what it holds until something can ask the scrollbar for the real
-    /// figure.
-    private(set) var restoredHistoryPages = 0
+    /// Rows, not pages. A page holds a variable number of rows, so a page
+    /// count is not rows scaled by a constant — it is a different quantity,
+    /// and only the scrollbar knows the one anybody wants.
+    private(set) var scrollbackRows = 0
 
     let engine: TerminalEngine
     private var connection: Connection?
@@ -293,12 +293,21 @@ final class TerminalController {
                     break
                 }
             }
+            // How many *rows* those pages held, which is the quantity anyone
+            // wants and the only one the scrollbar can answer. Outside
+            // `withLock`: `scrollbar` takes the same lock itself, and NSLock
+            // is not recursive.
+            let bar = engine.scrollbar
+            let rows = Int(bar.total) - Int(bar.length)
             let restored = pages
             await MainActor.run {
-                self?.restoredHistoryPages = restored
+                self?.scrollbackRows = rows
+                Trace.log(
+                    "terminal \(terminalID): restored \(restored) history pages, "
+                        + "\(rows) rows of scrollback")
                 Signposts.milestone(
                     "history-restored", seconds: Signposts.sinceLaunch(),
-                    detail: "terminal=\(terminalID) pages=\(restored)")
+                    detail: "terminal=\(terminalID) pages=\(restored) rows=\(rows)")
             }
         }
     }
