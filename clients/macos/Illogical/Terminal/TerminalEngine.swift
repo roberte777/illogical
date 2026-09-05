@@ -329,9 +329,24 @@ final class TerminalEngine: @unchecked Sendable {
                 _ = ghostty_render_state_row_cells_get(
                     cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_SELECTED, &selected)
 
+                // Width class, so the renderer knows which cells advance one
+                // cell and can batch them. Without it the run loop has to
+                // guess from the scalar value, which sends box drawing and
+                // accented Latin down the slow per-cell path.
+                var raw: GhosttyCell = 0
+                var wide = GHOSTTY_CELL_WIDE_NARROW
+                if ghostty_render_state_row_cells_get(
+                    cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw) == GHOSTTY_SUCCESS
+                {
+                    _ = ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide)
+                }
+
                 rowCells.append(
                     Grid.Cell(
                         text: text,
+                        narrow: wide == GHOSTTY_CELL_WIDE_NARROW,
+                        spacer: wide == GHOSTTY_CELL_WIDE_SPACER_TAIL
+                            || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD,
                         foreground: hasFg ? .init(fg) : nil,
                         background: hasBg ? .init(bg) : nil,
                         bold: style.bold,
@@ -386,6 +401,10 @@ struct Grid {
 
     struct Cell {
         var text: String
+        /// Advances exactly one cell, so a run of these lands on the grid.
+        var narrow: Bool
+        /// The trailing half of a wide character. Never rendered.
+        var spacer: Bool
         var foreground: RGB?
         var background: RGB?
         var bold: Bool

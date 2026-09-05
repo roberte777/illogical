@@ -57,7 +57,7 @@ child ──► PTY ──► illogicald ──┬──► ghostty-vt terminal 
                                │         attach to a parked terminal │
                                │         is served straight from it ─┘
                                │
-                               └──► raw bytes ──► client ──► ghostty-vt ──► Metal
+                               └──► raw bytes ──► client ──► ghostty-vt ──► CoreText
 ```
 
 Both ends run the same terminal implementation, built from the same pinned

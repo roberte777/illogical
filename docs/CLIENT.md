@@ -84,14 +84,19 @@ selection — and it is fast enough to be pleasant.
 
 Text is drawn one `CTLine` per *style run*, not per cell. That distinction is
 the whole performance story: per cell costs 416ms a frame on a dense 192x58
-grid, per run costs 3.2ms — 19% of the 16.7ms budget in the worst case. The
-expensive part of the naive version was never rasterization, it was allocating
-eleven thousand objects to ask for it.
+grid, per run costs 0.9ms for prose and 1.75ms for box drawing. The expensive
+part of the naive version was never rasterization, it was allocating eleven
+thousand objects to ask for it.
 
-Runs are exact because the font is monospaced and ligatures are disabled, so
-glyphs land on cell boundaries. Anything that is not a lone ASCII scalar —
-wide characters, combining marks, emoji — falls back to per-cell drawing,
-where per-cell placement is the point.
+Runs land on the grid because the fonts carry `kCTFontFixedAdvanceAttribute`,
+so every glyph advances exactly one cell whatever face CoreText substitutes.
+Do not rely on "the font is monospaced" instead — `cellSize.width` is the
+advance rounded up, so a run drifts about a cell every ten characters without
+the fixed advance.
+
+A cell joins a run when libghostty reports it as width-class narrow and it is
+a single scalar. Wide characters and their spacers draw per cell, where
+per-cell placement is the point.
 
 Metal with a glyph atlas was the plan and is now on the shelf; see
 [ROADMAP.md](ROADMAP.md#why-there-is-no-metal-renderer). The swap stays

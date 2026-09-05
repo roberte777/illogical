@@ -61,19 +61,40 @@ final class TerminalSurfaceView: NSView {
 
     override init(frame frameRect: NSRect) {
         let size: CGFloat = 13
-        font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
-        boldFont = NSFont.monospacedSystemFont(ofSize: size, weight: .bold)
-        italicFont =
-            NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask)
-        let advance = font.maximumAdvancement.width
-        let lineHeight = (font.ascender - font.descender + font.leading).rounded(.up)
-        cellSize = CGSize(width: advance.rounded(.up), height: lineHeight)
-        baselineOffset = -font.descender
+        let base = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
+        let bold = NSFont.monospacedSystemFont(ofSize: size, weight: .bold)
+        let italic = NSFontManager.shared.convert(base, toHaveTrait: .italicFontMask)
+        let advance = base.maximumAdvancement.width
+        let lineHeight = (base.ascender - base.descender + base.leading).rounded(.up)
+        let cell = CGSize(width: advance.rounded(.up), height: lineHeight)
+        cellSize = cell
+        baselineOffset = -base.descender
+
+        // Pin the pen to the cell grid.
+        //
+        // cellSize.width is the advance rounded UP, so it is wider than the
+        // glyph — 9.0 against 8.036 for the 13pt system mono. Drawing a run as
+        // one CTLine lets CoreText advance by the font's own width, and the
+        // error compounds: 1 cell of drift by 10 characters, 8.6 by 80, 20 by
+        // 190. The per-cell renderer never showed it, because every glyph was
+        // pinned to its own origin. kCTFontFixedAdvanceAttribute makes the
+        // advance exactly one cell, so a run lands on the grid no matter which
+        // face CoreText substitutes for a glyph the mono font lacks.
+        font = Self.fixedAdvance(base, cell: cell.width)
+        boldFont = Self.fixedAdvance(bold, cell: cell.width)
+        italicFont = Self.fixedAdvance(italic, cell: cell.width)
         super.init(frame: frameRect)
         wantsLayer = true
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }
+
+    /// The same face, but advancing exactly one cell per glyph.
+    private static func fixedAdvance(_ font: NSFont, cell: CGFloat) -> NSFont {
+        let key = NSFontDescriptor.AttributeName(kCTFontFixedAdvanceAttribute as String)
+        let descriptor = font.fontDescriptor.addingAttributes([key: cell])
+        return NSFont(descriptor: descriptor, size: font.pointSize) ?? font
+    }
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -217,31 +238,32 @@ final class TerminalSurfaceView: NSView {
             var index = 0
             while index < row.cells.count {
                 let cell = row.cells[index]
-                guard !cell.text.isEmpty, cell.text != " ", !cell.invisible else {
+                guard hasInk(cell) else {
                     index += 1
                     continue
                 }
 
-                guard isSimple(cell.text) else {
-                    draw(
-                        cell.text, cell: cell, grid: grid, x: index, baseline: baseline, in: context
-                    )
-                    index += 1
-                    continue
-                }
-
-                // Extend the run while style and simplicity hold.
+                // Extend the run while style and simplicity hold. Spaces stay
+                // inside it: ending a run at every word boundary would fragment
+                // an ordinary line of prose into a dozen CTLines.
                 var end = index + 1
+                var lastInk = index
                 var text = cell.text
-                while end < row.cells.count {
-                    let next = row.cells[end]
-                    guard !next.invisible, isSimple(next.text), next.text != " ",
-                        sameStyle(cell, next, grid: grid)
-                    else { break }
-                    text += next.text
-                    end += 1
+                if isSimple(cell) {
+                    while end < row.cells.count {
+                        let next = row.cells[end]
+                        guard !next.invisible, isSimple(next),
+                            sameStyle(cell, next, grid: grid)
+                        else { break }
+                        text += next.text
+                        if hasInk(next) { lastInk = end }
+                        end += 1
+                    }
                 }
 
+                // Trailing blanks carry no ink, so drop them rather than
+                // shaping the rest of an empty line.
+                if lastInk < end - 1 { text = String(text.prefix(lastInk - index + 1)) }
                 draw(text, cell: cell, grid: grid, x: index, baseline: baseline, in: context)
                 index = end
             }
@@ -264,19 +286,35 @@ final class TerminalSurfaceView: NSView {
         engine?.markFrameDrawn()
     }
 
-    /// Single-scalar ASCII: exactly one cell wide in a monospaced font, so a
-    /// run of them lands on cell boundaries without per-glyph positioning.
-    private func isSimple(_ text: String) -> Bool {
-        guard text.unicodeScalars.count == 1, let scalar = text.unicodeScalars.first
-        else { return false }
-        return scalar.value >= 0x21 && scalar.value < 0x7f
+    /// Whether a cell can join a run: it advances exactly one cell and is a
+    /// single scalar, so the fixed-advance font puts it on the grid.
+    ///
+    /// This asks libghostty for the width class rather than testing the scalar
+    /// against an ASCII range. The range version sent box drawing, block
+    /// elements and accented Latin down the per-cell path — 51.7ms a frame on
+    /// a screen of U+2500, against 0.9ms for the same screen of ASCII. A TUI
+    /// is mostly box drawing, so the whitelist excluded the case that needed
+    /// batching most.
+    private func isSimple(_ cell: Grid.Cell) -> Bool {
+        cell.narrow && !cell.spacer && cell.text.unicodeScalars.count == 1
     }
 
+    /// Whether a cell puts anything on screen. A blank cell still has ink when
+    /// it is underlined or struck through — terminals draw those across spaces.
+    private func hasInk(_ cell: Grid.Cell) -> Bool {
+        if cell.invisible || cell.spacer { return false }
+        if cell.underline || cell.strikethrough { return true }
+        return !cell.text.isEmpty && cell.text != " "
+    }
+
+    /// Selection is deliberately absent: it only changes the background, which
+    /// the fill pass has already drawn, so including it would split text runs
+    /// at both selection edges for no visible difference.
     private func sameStyle(_ a: Grid.Cell, _ b: Grid.Cell, grid: Grid) -> Bool {
         resolvedForeground(a, grid: grid) == resolvedForeground(b, grid: grid)
             && a.bold == b.bold && a.italic == b.italic && a.faint == b.faint
             && a.underline == b.underline && a.strikethrough == b.strikethrough
-            && a.inverse == b.inverse && a.selected == b.selected
+            && a.inverse == b.inverse
     }
 
     private func draw(

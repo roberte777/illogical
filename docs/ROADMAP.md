@@ -71,53 +71,73 @@ libghostty-vt terminal and renders it; input round-trips to the PTY.
 
 **Gate:** attach latency does not vary between 1 MB and 100 MB of scrollback.
 
-## M3 — The renderer (done)
+## M3 — The renderer (in progress)
 
 **Ends at:** the Mac app is a terminal you would actually use. See
 [CLIENT.md](CLIENT.md).
 
 | | Work |
 | --- | --- |
-| x | Text drawn as style runs, not per cell (see below) |
-| x | **D1** — two-phase update: lock, begin, unlock, end |
-| x | **D2** — two-layer dirty tracking; `render_state_clean()` per frame |
+| x | Text drawn as style runs on a fixed advance (see below) |
 | x | Colour, attributes, cursor, wide characters, emoji |
-| x | Native scrollback; never synthesize wheel sequences |
-| x | Key/mouse/focus encoding via libghostty-vt, replacing the hand-rolled subset |
-| x | Selection via `selection.h`'s gesture machine, tracked grid refs |
+| x | Native scrollback and an overlay scrollbar |
 | x | Native splits: one connection per pane |
 | x | `os_signpost` launch budget |
+| ~ | **D1** — begin/end are split but the lock is held across both, so the IO path still blocks for the whole frame |
+| ~ | **D2** — the global dirty layer is read; per-row dirty is never queried, and `render_state_clean()` clears it before anything can |
+| ~ | Key/mouse/focus encoding — routed through libghostty-vt, but option-as-alt is unset, C0/PUA text is passed where the header forbids it, and the mouse encoder never gets `OPT_SIZE`, so mouse reporting does not work |
+| ~ | Selection — uses untracked grid refs, which libghostty invalidates on the next terminal write, and hand-rolls the drag instead of using `selection.h`'s gesture machine |
+| | Never synthesize wheel sequences — the alternate-screen path still sends `ESC [ A` |
 | ~ | Metal renderer + glyph atlas — **not done, and deliberately so** |
 
 ### Why there is no Metal renderer
 
-This milestone was written assuming CoreText would have to go. It measured the
-other way, so the plan changed rather than the evidence.
+This milestone assumed CoreText would have to go. It measured the other way,
+so the plan changed rather than the evidence.
 
 The first renderer built one `CTLine` per cell — about 11,000 objects a frame
-on a full grid. A/B on one binary, 192x58, dense text, full repaint every
-frame, Release:
+on a full grid. Measured A/B in one Release binary, 192x58, full repaint every
+frame:
 
-| text path | p50 | fps |
+| text path | content | p50 |
 | --- | --- | --- |
-| one `CTLine` per cell | 416ms | 2.4 |
-| one `CTLine` per style run | 3.2ms | 60 (capped) |
+| one `CTLine` per cell | ASCII | 416ms |
+| one `CTLine` per style run | ASCII prose | 0.9ms |
+| one `CTLine` per style run | box drawing | 1.75ms |
 
-130x, and 19% of the 16.7ms frame budget in the worst case real content can
-produce. The cost was never rasterization — CoreGraphics caches rasterized
-glyphs perfectly well. It was allocating and shaping eleven thousand objects
-to draw them.
+The cost was never rasterization — CoreGraphics caches rasterized glyphs well.
+It was allocating and shaping eleven thousand objects to draw them.
+
+Two corrections to that story are worth keeping, because both were found by
+review after the number was already written down:
+
+- **The first measurement used a stream with no spaces.** Spaces ended a run,
+  so ordinary prose fragmented into a dozen `CTLine`s a line and measured
+  3.2ms rather than 0.9ms. A benchmark that avoids the most common character
+  on a terminal screen is not measuring a terminal.
+- **Runs drifted off the cell grid.** `cellSize.width` is the font advance
+  rounded *up* — 9.0 against 8.036 — so letting CoreText advance a run by its
+  own metrics lost about a cell every ten characters, 20 cells across a full
+  line. Per-cell drawing had hidden it by pinning every glyph.
+  `kCTFontFixedAdvanceAttribute` makes the advance exactly one cell.
+
+Batching is now decided by libghostty's width class rather than an ASCII
+range. That matters more than it sounds: the range version sent box drawing,
+block elements and accented Latin down the per-cell path, so a screen of
+U+2500 cost **51.7ms a frame — 19fps** — while ASCII cost 0.9ms. A TUI is
+mostly box drawing, so the whitelist excluded precisely the case that needed
+batching. With the width class it is 1.75ms.
 
 A Metal renderer would buy headroom that is already there, at the price of a
 glyph atlas, an eviction policy, a shader pipeline and their bugs. It stays on
-the shelf until a measurement asks for it. If one does — very large displays,
-or a ProMotion 120Hz budget of 8.3ms — the swap is still contained: the view
-consumes a plain `Grid` value that the engine produces under lock, so the draw
-path can be replaced without touching the engine, transport or chrome.
+the shelf until a measurement asks for it. The swap is contained: the view
+consumes a plain `Grid` value the engine produces under lock, so the draw path
+can be replaced without touching the engine, transport or chrome.
 
 The reusable lesson is the one that generalizes: *measure the naive
-implementation before replacing the technology.* The bottleneck was in how the
-API was being called, not in the API.
+implementation before replacing the technology, and check the benchmark
+resembles the workload.* The bottleneck was in how the API was called, not in
+the API.
 
 **Gate:** cold launch to window under the budget; first frame independent of
 scrollback size.
