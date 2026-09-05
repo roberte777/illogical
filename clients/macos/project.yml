@@ -70,12 +70,22 @@ targets:
       - path: Illogical/Terminal/Input
       - path: Illogical/Terminal/Selection
       - path: Illogical/Terminal/TerminalSurfaceView.swift
+      # The split tree and the tab list it lives in — the model files only,
+      # not the views over them. That is the point of keeping them apart: a
+      # layout is testable without a window, a socket or a terminal.
+      - path: Illogical/Splits/SplitTree.swift
+      - path: Illogical/Splits/TabLayout.swift
+      # SessionStore owns the tab list, and one connection per pane.
+      - path: Illogical/Sessions/SessionStore.swift
+      - path: Illogical/Terminal/TerminalController.swift
       - path: Illogical/App/Palette.swift
       - path: Illogical/App/Trace.swift
       - path: Tests
     dependencies:
       - framework: Frameworks/ghostty-vt.xcframework
         embed: false
+      - package: IllogicalKit
+        product: IllogicalProtocol
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.illogical.RendererTests

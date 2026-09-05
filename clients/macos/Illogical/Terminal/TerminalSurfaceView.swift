@@ -32,6 +32,12 @@ protocol TerminalSurfaceDelegate: AnyObject {
     func surfaceIsReady(_ surface: TerminalSurfaceView)
     func surface(_ surface: TerminalSurfaceView, send bytes: [UInt8])
     func surface(_ surface: TerminalSurfaceView, resizeTo cols: UInt16, rows: UInt16)
+    /// This surface took keyboard focus. Focus lives in AppKit's responder
+    /// chain and the layout follows it, not the other way round.
+    func surfaceDidBecomeFocused(_ surface: TerminalSurfaceView)
+    /// ⌘W. Returns true when the pane was closed; false means this is the
+    /// only pane, and closing it is closing the window.
+    func surfaceShouldClose(_ surface: TerminalSurfaceView) -> Bool
 }
 
 @MainActor
@@ -334,6 +340,7 @@ final class TerminalSurfaceView: NSView {
 
         renderer?.setFocus(focused)
         renderThread?.wake()
+        if focused { delegate?.surfaceDidBecomeFocused(self) }
 
         if let bytes = inputEncoder?.encodeFocus(gained: focused) {
             delegate?.surface(self, send: bytes)
@@ -690,6 +697,19 @@ final class TerminalSurfaceView: NSView {
         // under mouse reporting: the program can draw its own affordances but
         // cannot change the pointer.
         addCursorRect(bounds, cursor: .iBeam)
+    }
+}
+
+extension TerminalSurfaceView {
+    /// ⌘W. The menu item's action walks the responder chain to the window,
+    /// so a first responder that implements it gets first refusal — which is
+    /// how a terminal makes ⌘W close a pane without fighting the standard
+    /// Close Window item for the shortcut.
+    @objc func performClose(_ sender: Any?) {
+        guard delegate?.surfaceShouldClose(self) == true else {
+            window?.performClose(sender)
+            return
+        }
     }
 }
 

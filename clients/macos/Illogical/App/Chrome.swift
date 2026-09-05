@@ -80,6 +80,11 @@ enum Metrics {
     static let badgeSize: CGFloat = 20
     static let badgeToLabel: CGFloat = 10
     static let iconToTitle: CGFloat = 8
+    /// The per-terminal header's controls: split right, split down, zoom,
+    /// close. Sized to sit inside the 27pt breadcrumb without crowding it.
+    static let paneButtonSize: CGFloat = 20
+    static let paneButtonSpacing: CGFloat = 2
+    static let paneButtonTrailing: CGFloat = 8
     static let plusTrailing: CGFloat = 12
     static let plusWidth: CGFloat = 28
     /// The breadcrumb glyph starts at 27pt of ink in the reference.
@@ -172,7 +177,9 @@ struct SessionButton: View {
 // MARK: - Tabs
 
 struct TerminalTab: View {
-    let terminal: TerminalSummary
+    /// Nil while the server has not yet listed the tab's terminal, which is
+    /// the window between creating one and the list arriving.
+    let terminal: TerminalSummary?
     let isActive: Bool
     /// Draw the hairline on this tab's leading edge. Only between two inactive
     /// tabs — the active pill provides its own edge.
@@ -188,6 +195,12 @@ struct TerminalTab: View {
     /// everywhere behave. Hover-only made it undiscoverable.
     private var showsClose: Bool { isActive || isHovering }
 
+    private var name: String { terminal?.name ?? "terminal" }
+    private var residency: Residency { terminal?.residency ?? .live }
+    /// Identifies the slot for layout tracing, whether or not the server has
+    /// listed the terminal yet.
+    private var traceID: String { terminal.map { "\($0.id)" } ?? "pending" }
+
     var body: some View {
         // Select and close are *siblings*, never nested. SwiftUI does not
         // reliably deliver events to a control inside another control — not in
@@ -198,7 +211,7 @@ struct TerminalTab: View {
                 label.frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(Text(terminal.name))
+            .accessibilityLabel(Text(name))
             .accessibilityAddTraits(isActive ? [.isButton, .isSelected] : .isButton)
 
             if showsClose {
@@ -210,7 +223,7 @@ struct TerminalTab: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(Text("Close \(terminal.name)"))
+                .accessibilityLabel(Text("Close \(name)"))
                 .help("Close terminal")
             }
         }
@@ -235,16 +248,16 @@ struct TerminalTab: View {
             if showsLeadingSeparator { TabSeparator() }
         }
         .onHover { isHovering = $0 }
-        .traceFrame("tab-\(terminal.id)")
+        .traceFrame("tab-\(traceID)")
     }
 
     private var label: some View {
         HStack(spacing: Metrics.badgeToLabel) {
             ZStack {
-                TerminalBadge().traceFrame("badge-\(terminal.id)")
+                TerminalBadge().traceFrame("badge-\(traceID)")
                 // Residency rides on the badge rather than replacing the glyph,
                 // so a parked terminal still reads as a terminal.
-                if terminal.residency != .live {
+                if residency != .live {
                     Image(systemName: residencyIcon)
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(residencyColor)
@@ -254,10 +267,16 @@ struct TerminalTab: View {
                 }
             }
 
-            TerminalLabel(
-                terminal: terminal,
-                bright: isActive ? Palette.textBright : Palette.textDim,
-                dim: isActive ? Palette.textDim : Palette.textFaint)
+            if let terminal {
+                TerminalLabel(
+                    terminal: terminal,
+                    bright: isActive ? Palette.textBright : Palette.textDim,
+                    dim: isActive ? Palette.textDim : Palette.textFaint)
+            } else {
+                Text("starting…")
+                    .font(.system(size: Metrics.labelSize))
+                    .foregroundStyle(Palette.textFaint)
+            }
 
             Spacer(minLength: 0)
         }
@@ -265,7 +284,7 @@ struct TerminalTab: View {
     }
 
     private var residencyIcon: String {
-        switch terminal.residency {
+        switch residency {
         case .live: "circle.fill"
         case .parked: "moon.fill"
         case .rehydrating: "arrow.clockwise"
@@ -274,7 +293,7 @@ struct TerminalTab: View {
     }
 
     private var residencyColor: Color {
-        switch terminal.residency {
+        switch residency {
         case .live: .green
         case .parked: .orange
         case .rehydrating: .yellow
@@ -289,30 +308,5 @@ struct TabSeparator: View {
         Rectangle()
             .fill(Palette.tabSeparator)
             .frame(width: 1, height: 17)
-    }
-}
-
-// MARK: - Breadcrumb
-
-struct Breadcrumb: View {
-    let terminal: TerminalSummary?
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "apple.terminal")
-                .font(.system(size: 12))
-                .foregroundStyle(Palette.textFaint)
-            if let terminal {
-                TerminalLabel(
-                    terminal: terminal, bright: Palette.textDim, dim: Palette.textFaint)
-            } else {
-                Text("no terminal")
-                    .font(.system(size: Metrics.labelSize))
-                    .foregroundStyle(Palette.textFaint)
-            }
-            Spacer()
-        }
-        .padding(.leading, Metrics.breadcrumbLeading)
-        .frame(height: Metrics.breadcrumbHeight)
     }
 }

@@ -19,6 +19,11 @@ final class SurfaceInputTests: XCTestCase {
         var sent: [[UInt8]] = []
         var resizes: [(cols: UInt16, rows: UInt16)] = []
         var readied = false
+        var focusedCount = 0
+        /// What `performClose` should report: true means a pane was closed,
+        /// false that this is the only one and the window should take it.
+        var closesPane = false
+        var closeRequests = 0
 
         var bytes: [UInt8] { sent.flatMap { $0 } }
         var text: String { String(decoding: bytes, as: UTF8.self) }
@@ -27,6 +32,11 @@ final class SurfaceInputTests: XCTestCase {
         func surface(_ surface: TerminalSurfaceView, send bytes: [UInt8]) { sent.append(bytes) }
         func surface(_ surface: TerminalSurfaceView, resizeTo cols: UInt16, rows: UInt16) {
             resizes.append((cols, rows))
+        }
+        func surfaceDidBecomeFocused(_ surface: TerminalSurfaceView) { focusedCount += 1 }
+        func surfaceShouldClose(_ surface: TerminalSurfaceView) -> Bool {
+            closeRequests += 1
+            return closesPane
         }
     }
 
@@ -321,4 +331,19 @@ final class SurfaceInputTests: XCTestCase {
             with: try click(view, column: 5, row: 0, across: 0.8, type: .leftMouseDragged))
         XCTAssertFalse(engine.hasSelection)
     }
+
+    // MARK: - Closing
+
+    /// ⌘W. The menu item walks the responder chain, so the focused surface
+    /// gets first refusal and closes its pane; when it is the only pane it
+    /// declines and the standard Close Window item does its usual job. That
+    /// is how a terminal takes ⌘W without fighting SwiftUI for the shortcut.
+    func testCloseGoesToThePaneFirst() throws {
+        let (view, _, recorder) = try surface()
+        recorder.closesPane = true
+
+        view.performClose(nil)
+        XCTAssertEqual(recorder.closeRequests, 1)
+    }
+
 }
