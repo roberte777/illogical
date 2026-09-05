@@ -99,14 +99,22 @@ The first renderer built one `CTLine` per cell — about 11,000 objects a frame
 on a full grid. Measured A/B in one Release binary, 192x58, full repaint every
 frame:
 
-| text path | content | p50 |
-| --- | --- | --- |
-| one `CTLine` per cell | ASCII | 416ms |
-| one `CTLine` per style run | ASCII prose | 0.9ms |
-| one `CTLine` per style run | box drawing | 1.75ms |
+| content | runs/frame | p50 | 60Hz budget |
+| --- | --- | --- | --- |
+| ASCII, one `CTLine` per cell | 11,136 | 416ms | 2500% |
+| ASCII prose | ~60 | 0.9ms | 5% |
+| box drawing | ~58 | 1.75ms | 10% |
+| heavy syntax colour | ~1,400 | 7.7ms | 46% |
 
 The cost was never rasterization — CoreGraphics caches rasterized glyphs well.
-It was allocating and shaping eleven thousand objects to draw them.
+It was allocating and shaping the objects to draw them, and the count of those
+is the run count. Per-cell is simply the degenerate end of the same line, where
+every cell is its own run, so the win decays smoothly as content gets more
+styled rather than being a fixed 130x.
+
+That decay is the number to keep. The worst realistic case measured here is
+**2.2x inside the 60Hz budget, not 10x** — and at 120Hz the budget is 8.3ms,
+which heavily-coloured content at 7.7ms does not clear with any margin.
 
 Two corrections to that story are worth keeping, because both were found by
 review after the number was already written down:
@@ -128,11 +136,22 @@ U+2500 cost **51.7ms a frame — 19fps** — while ASCII cost 0.9ms. A TUI is
 mostly box drawing, so the whitelist excluded precisely the case that needed
 batching. With the width class it is 1.75ms.
 
-A Metal renderer would buy headroom that is already there, at the price of a
-glyph atlas, an eviction policy, a shader pipeline and their bugs. It stays on
-the shelf until a measurement asks for it. The swap is contained: the view
-consumes a plain `Grid` value the engine produces under lock, so the draw path
-can be replaced without touching the engine, transport or chrome.
+A Metal renderer stays on the shelf, but not because the margin is luxurious.
+It stays there because two cheaper things have to happen first and would each
+move the number further than a glyph atlas would:
+
+- **Stop repainting everything.** Every measurement above is a full repaint;
+  `draw(_:)` ignores `dirtyRect` and per-row dirty is never read (the open D2
+  row). Typing one character costs the same as a full-screen redraw.
+- **Stop rebuilding per-run state.** The attribute dictionary, `NSColor` and
+  `NSAttributedString` are constructed fresh for every run — 1,400 times a
+  frame on the colour workload, to express a handful of distinct styles.
+
+Only if those land and a measurement still misses the budget — a 120Hz target,
+or a much larger grid — is an atlas and shader pipeline worth its bugs. The
+swap stays contained: the view consumes a plain `Grid` value the engine
+produces under lock, so the draw path can be replaced without touching the
+engine, transport or chrome.
 
 The reusable lesson is the one that generalizes: *measure the naive
 implementation before replacing the technology, and check the benchmark
