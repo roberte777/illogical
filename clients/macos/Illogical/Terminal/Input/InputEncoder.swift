@@ -179,6 +179,58 @@ final class InputEncoder {
         } ?? false
     }
 
+    // MARK: - Alternate scroll
+
+    /// Cursor keys for a wheel gesture in the alternate screen.
+    ///
+    /// DECSET 1007, and only when the program is not reporting the mouse: a
+    /// wheel inside `less` or `man` becomes the arrow keys they already
+    /// understand. Nil when either condition does not hold, which means the
+    /// gesture belongs to the viewport instead.
+    ///
+    /// Spelled out rather than run through the key encoder on purpose. Under
+    /// the Kitty protocol the encoder would produce a Kitty sequence, and the
+    /// programs alternate scroll exists for predate it — Ghostty emits the
+    /// legacy cursor key here too, varying only with DECCKM.
+    func encodeAlternateScroll(rows: Int) -> [UInt8]? {
+        guard rows != 0 else { return nil }
+
+        return engine.withTerminal { terminal -> [UInt8]? in
+            var screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY
+            guard
+                ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen)
+                    == GHOSTTY_SUCCESS,
+                screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE
+            else { return nil }
+
+            var altScroll = GhosttyTerminalModeConfig(
+                mode: ghostty_mode_new(1007, false), value: false)
+            guard
+                ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MODE, &altScroll)
+                    == GHOSTTY_SUCCESS,
+                altScroll.value
+            else { return nil }
+
+            var cursorKeys = GhosttyTerminalModeConfig(
+                mode: ghostty_mode_new(1, false), value: false)
+            _ = ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MODE, &cursorKeys)
+
+            let sequence: String
+            switch (cursorKeys.value, rows > 0) {
+            case (true, true): sequence = "\u{1b}OA"
+            case (true, false): sequence = "\u{1b}OB"
+            case (false, true): sequence = "\u{1b}[A"
+            case (false, false): sequence = "\u{1b}[B"
+            }
+
+            let one = Array(sequence.utf8)
+            var out: [UInt8] = []
+            out.reserveCapacity(one.count * abs(rows))
+            for _ in 0..<abs(rows) { out.append(contentsOf: one) }
+            return out
+        }
+    }
+
     // MARK: - Focus
 
     /// Encode a focus change, but only when the terminal asked for one.

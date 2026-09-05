@@ -69,8 +69,6 @@ final class TerminalSurfaceView: NSView {
     /// one this event is about: button-tracking mode reports motion only
     /// while something is held.
     private var buttonsDown = 0
-    /// Sub-cell scroll left over from the last gesture.
-    private var scrollCarry: (x: Double, y: Double) = (0, 0)
     private var trackingArea: NSTrackingArea?
 
     /// Point size of the terminal font. A config option eventually.
@@ -460,13 +458,26 @@ final class TerminalSurfaceView: NSView {
     private func report(
         mouse event: NSEvent, action: GhosttyMouseAction, button: GhosttyMouseButton?
     ) {
-        guard let inputEncoder, isReportingMouse(event) else { return }
+        guard isReportingMouse(event) else { return }
+        report(
+            action: action, button: button, mods: KeyTranslation.mods(event.modifierFlags),
+            at: convert(event.locationInWindow, from: nil))
+    }
+
+    private func report(
+        action: GhosttyMouseAction, button: GhosttyMouseButton?, mods: GhosttyMods,
+        at point: NSPoint
+    ) {
+        guard let inputEncoder else { return }
         inputEncoder.anyButtonPressed = buttonsDown > 0
+        // Surface pixels: the space the renderer lays the grid out in, origin
+        // at the top-left, padding included.
+        let backing = convertToBacking(point)
         let spec = MouseEventSpec(
             action: action,
             button: button,
-            mods: KeyTranslation.mods(event.modifierFlags),
-            position: surfacePosition(of: event))
+            mods: mods,
+            position: GhosttyMousePosition(x: Float(backing.x), y: Float(backing.y)))
         guard let bytes = inputEncoder.encode(mouse: spec), !bytes.isEmpty else { return }
         delegate?.surface(self, send: bytes)
     }
@@ -477,59 +488,51 @@ final class TerminalSurfaceView: NSView {
         return !event.modifierFlags.contains(.shift)
     }
 
-    /// The pointer in surface pixels: the same space the renderer lays the
-    /// grid out in, origin at the top-left, padding included.
-    private func surfacePosition(of event: NSEvent) -> GhosttyMousePosition {
-        let local = convert(event.locationInWindow, from: nil)
-        let backing = convertToBacking(local)
-        return GhosttyMousePosition(x: Float(backing.x), y: Float(backing.y))
-    }
-
     // MARK: - Scrolling
+    //
+    // `scrollWheel` is not here. Native scrollback owns the viewport and the
+    // accumulator that turns AppKit's pixel deltas into whole rows, and it
+    // calls in here once it has them — libghostty's own order, which
+    // quantizes unconditionally and only then decides whose event it is.
 
-    override func scrollWheel(with event: NSEvent) {
-        guard isReportingMouse(event) else {
-            // Native scrollback owns the viewport, and we never synthesize
-            // wheel sequences into the PTY (docs/GOALS.md G7). Alternate
-            // scroll — DEC mode 1007, where a wheel in the alternate screen
-            // becomes cursor keys — belongs there too, because it is the same
-            // decision about what a scroll gesture means.
-            super.scrollWheel(with: event)
-            return
+    /// Hand a quantized wheel gesture to the program in the terminal.
+    ///
+    /// Returns true when the program took it, which means the viewport must
+    /// not move. Two claimants, in libghostty's order: one that asked for
+    /// mouse events gets wheel-button reports, and one sitting in the
+    /// alternate screen with DECSET 1007 gets cursor keys.
+    ///
+    /// Counts, not pixels. A wheel report is one button press per row, so a
+    /// caller handing this raw trackpad deltas would emit ten reports where a
+    /// mouse sends one. Positive is up and left, which is what buttons four
+    /// through seven have meant since X10.
+    @discardableResult
+    func reportWheel(rows: Int, columns: Int, at point: NSPoint) -> Bool {
+        let mods = NSEvent.modifierFlags
+        guard let inputEncoder, !mods.contains(.shift) else { return false }
+        let encoded = KeyTranslation.mods(mods)
+
+        if inputEncoder.mouseTrackingEnabled {
+            for _ in 0..<abs(rows) {
+                report(
+                    action: GHOSTTY_MOUSE_ACTION_PRESS,
+                    button: rows > 0 ? GHOSTTY_MOUSE_BUTTON_FOUR : GHOSTTY_MOUSE_BUTTON_FIVE,
+                    mods: encoded, at: point)
+            }
+            for _ in 0..<abs(columns) {
+                report(
+                    action: GHOSTTY_MOUSE_ACTION_PRESS,
+                    button: columns > 0 ? GHOSTTY_MOUSE_BUTTON_SIX : GHOSTTY_MOUSE_BUTTON_SEVEN,
+                    mods: encoded, at: point)
+            }
+            // The wheel belongs to the program whether or not this particular
+            // gesture crossed a row boundary.
+            return true
         }
 
-        // Precise deltas are pixels; a wheel's are already lines. Both end up
-        // as a whole number of wheel clicks, with the remainder carried so a
-        // slow trackpad drag still eventually reports one.
-        let cell = renderer?.cellSize ?? CellSize(width: 1, height: 1)
-        let scale = window?.backingScaleFactor ?? 2
-        if event.hasPreciseScrollingDeltas {
-            let cellHeight = max(1, Double(cell.height) / Double(scale))
-            let cellWidth = max(1, Double(cell.width) / Double(scale))
-            scrollCarry.y += Double(event.scrollingDeltaY) / cellHeight
-            scrollCarry.x += Double(event.scrollingDeltaX) / cellWidth
-        } else {
-            scrollCarry.y += Double(event.scrollingDeltaY)
-            scrollCarry.x += Double(event.scrollingDeltaX)
-        }
-
-        let clicksY = Int(scrollCarry.y.rounded(.towardZero))
-        let clicksX = Int(scrollCarry.x.rounded(.towardZero))
-        scrollCarry.y -= Double(clicksY)
-        scrollCarry.x -= Double(clicksX)
-
-        // Positive Y is up, positive X is left, which is what buttons four
-        // through seven have meant since X10.
-        for _ in 0..<abs(clicksY) {
-            report(
-                mouse: event, action: GHOSTTY_MOUSE_ACTION_PRESS,
-                button: clicksY > 0 ? GHOSTTY_MOUSE_BUTTON_FOUR : GHOSTTY_MOUSE_BUTTON_FIVE)
-        }
-        for _ in 0..<abs(clicksX) {
-            report(
-                mouse: event, action: GHOSTTY_MOUSE_ACTION_PRESS,
-                button: clicksX > 0 ? GHOSTTY_MOUSE_BUTTON_SIX : GHOSTTY_MOUSE_BUTTON_SEVEN)
-        }
+        guard let bytes = inputEncoder.encodeAlternateScroll(rows: rows) else { return false }
+        delegate?.surface(self, send: bytes)
+        return true
     }
 
     // MARK: - Tracking and the cursor

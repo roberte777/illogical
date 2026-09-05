@@ -163,6 +163,17 @@ of ours:
 - `ghostty_focus_encode`, gated on DEC mode 1004 — it takes no terminal and
   will happily encode a report nobody asked for.
 
+The wheel has three possible claimants and libghostty's own order decides
+between them: quantize the gesture to whole rows *unconditionally*, then give
+it to mouse reporting if the program asked for the mouse, else to alternate
+scroll (DECSET 1007 in the alternate screen, where a wheel becomes the cursor
+keys `less` already understands), else to the viewport. The first two write to
+the PTY and belong to the encoder; the third is native scrollback's, and owns
+`scrollWheel` and the accumulator. Quantizing first is not a detail: a report
+is one button press per row, so a caller handing raw trackpad deltas to the
+encoder would emit ten reports where a mouse emits one, and a gesture that
+crossed into a mouse-tracking program would carry a stale fraction back out.
+
 The client translates only two things itself: the macOS virtual keycode to a
 physical key, and AppKit's `characters` to the text the layout produced. What
 those *mean* is never ours to decide.

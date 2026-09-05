@@ -198,6 +198,42 @@ final class InputTests: XCTestCase {
         XCTAssertEqual(string(encoder.encode(mouse: up)), "\u{1b}[<64;1;1M")
     }
 
+    // MARK: - Alternate scroll
+
+    /// Both conditions have to hold. In the primary screen, or without
+    /// DECSET 1007, the wheel belongs to the viewport and nothing goes to the
+    /// PTY — which is the invariant that keeps us from ever synthesizing
+    /// wheel sequences (docs/GOALS.md G7).
+    func testAlternateScrollNeedsBothConditions() throws {
+        let engine = try engine()
+        let encoder = try InputEncoder(engine: engine)
+
+        XCTAssertNil(encoder.encodeAlternateScroll(rows: 1))
+
+        // Mode 1007 alone, still on the primary screen.
+        write(engine, "\u{1b}[?1007h")
+        XCTAssertNil(encoder.encodeAlternateScroll(rows: 1))
+
+        // Alternate screen alone, 1007 off.
+        write(engine, "\u{1b}[?1007l\u{1b}[?1049h")
+        XCTAssertNil(encoder.encodeAlternateScroll(rows: 1))
+    }
+
+    /// One cursor key per row, and DECCKM decides which spelling — the same
+    /// two answers the arrow keys themselves get.
+    func testAlternateScrollEmitsCursorKeys() throws {
+        let engine = try engine()
+        let encoder = try InputEncoder(engine: engine)
+        write(engine, "\u{1b}[?1049h\u{1b}[?1007h")
+
+        XCTAssertEqual(string(encoder.encodeAlternateScroll(rows: 1)), "\u{1b}[A")
+        XCTAssertEqual(string(encoder.encodeAlternateScroll(rows: -3)), "\u{1b}[B\u{1b}[B\u{1b}[B")
+        XCTAssertNil(encoder.encodeAlternateScroll(rows: 0))
+
+        write(engine, "\u{1b}[?1h")
+        XCTAssertEqual(string(encoder.encodeAlternateScroll(rows: 2)), "\u{1b}OA\u{1b}OA")
+    }
+
     // MARK: - Focus
 
     func testFocusReportsOnlyUnderMode1004() throws {

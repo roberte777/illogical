@@ -171,4 +171,43 @@ final class SurfaceInputTests: XCTestCase {
         _ = view.resignFirstResponder()
         XCTAssertTrue(recorder.sent.isEmpty)
     }
+
+    // MARK: - The wheel
+
+    /// `reportWheel` is the seam native scrollback calls once it has whole
+    /// rows. It answers whether the program took the gesture, which is how
+    /// the viewport knows to stay put.
+    func testWheelGoesNowhereWithoutAClaimant() throws {
+        let (view, _, recorder) = try surface()
+        XCTAssertFalse(view.reportWheel(rows: 3, columns: 0, at: .zero))
+        XCTAssertTrue(recorder.sent.isEmpty)
+    }
+
+    /// One wheel-button press per row, not one per event. A trackpad delivers
+    /// a few pixels at a time, so a seam taking raw deltas would report ten
+    /// times where a mouse reports once.
+    func testWheelReportsOnePressPerRow() throws {
+        let (view, engine, recorder) = try surface()
+        // The report needs geometry, and without a window there is no
+        // renderer to supply it, so mouse reports cannot be checked for their
+        // cell here — only that the program claimed the gesture.
+        write(engine, "\u{1b}[?1000h\u{1b}[?1006h")
+        XCTAssertTrue(view.reportWheel(rows: 3, columns: 0, at: .zero))
+        XCTAssertEqual(recorder.sent.count, 3)
+        for report in recorder.sent {
+            // Button 64 is wheel-up in SGR.
+            XCTAssertTrue(String(decoding: report, as: UTF8.self).hasPrefix("\u{1b}[<64;"))
+        }
+    }
+
+    /// In the alternate screen with DECSET 1007 and no mouse reporting, the
+    /// wheel becomes cursor keys — which is what makes the wheel work in
+    /// `less`.
+    func testWheelBecomesCursorKeysUnderAlternateScroll() throws {
+        let (view, engine, recorder) = try surface()
+        write(engine, "\u{1b}[?1049h\u{1b}[?1007h")
+
+        XCTAssertTrue(view.reportWheel(rows: -2, columns: 0, at: .zero))
+        XCTAssertEqual(recorder.text, "\u{1b}[B\u{1b}[B")
+    }
 }
