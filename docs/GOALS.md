@@ -153,7 +153,7 @@ way and reported honestly, including where we lose.
 | G6 | Memory per **full** terminal | ~400 KB (tmux ≈ 5 MB) ([MEM t=183]) |
 | G6 | Memory per **empty** terminal | Match tmux — the case Superlogical currently loses |
 | G6 | 10,000 idle terminals + 200 attachments | Total RSS, p99 input latency |
-| G7 | Cold launch to window visible | Measured with `os_signpost` |
+| G7 | Cold launch to window visible | Measured with `os_signpost`; 148 ms Debug, and flat against scrollback |
 
 ## A note on the source material
 

@@ -112,6 +112,10 @@ struct TerminalSurface: NSViewRepresentable {
             store.focus(pane, in: tab)
         }
 
+        func surface(_ surface: TerminalSurfaceView, didPresentFirstFrameAt moment: Date) {
+            controller?.didPresentFirstFrame(at: moment)
+        }
+
         func surfaceShouldClose(_ surface: TerminalSurfaceView) -> Bool {
             guard let tab = store.tabs.first(where: { $0.id == tab }), tab.isSplit else {
                 return false

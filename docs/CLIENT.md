@@ -77,10 +77,34 @@ The goal is that **nothing on screen waits for the network**:
 
 Use the **streaming** decoder (`ghostty_snapshot_decoder_new` with a reader
 callback), not `new_buf`. Decode should overlap the network read; the scaffold's
-buffered version is a placeholder.
+buffered version is a placeholder. It is not currently a latency problem —
+decoding through the READY marker measures 0.2–0.4 ms whatever the scrollback —
+because the server sends the whole snapshot before `snapshot_ready` anyway
+(#19). Fixing that end will make this end matter.
+
+Step 6 is not optional and not a refinement. History restored inline after
+`adopt` pushes the first frame back by however long it takes, which was 8 ms at
+twenty thousand lines: G3 says the first frame must not depend on how much
+scrollback there is, and G4 says history must not block anything. It runs on a
+background task at utility priority, one page per call — each under the
+engine's lock, because the decoder writes into the terminal the engine now owns
+and the render thread reads that same terminal.
 
 Measure steps 1 and 4 with `os_signpost`. Step 4 must not vary with scrollback
 size — if it does, something is buffering that should be streaming.
+
+`Signposts` emits both as `os_signpost` for Instruments and, under
+`ILLOGICAL_TRACE`, as `milestone <name> <seconds>` lines, because a gate has to
+be runnable without a GUI. `scripts/bench-launch.sh` (`just bench-launch`)
+reads the latter and compares three terminals: empty, a screenful with no
+history, and a screenful with a large one. The gate is the last two matching;
+the first is expected to differ, because an empty first frame has almost no
+glyphs to shape.
+
+"First frame" means the frame carrying the adopted snapshot, not the
+renderer's first frame — the blank surface is drawn at layout, before the
+attach handshake has even been sent, and timing that would report a number
+that is always the same and always wrong.
 
 ## Rendering
 

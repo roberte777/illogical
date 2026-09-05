@@ -57,6 +57,15 @@ final class TerminalRenderer: @unchecked Sendable {
     /// clears it, and skips the whole frame if it was already clear.
     private var cellsRebuilt = false
 
+    /// Called on the render thread when the first frame carrying an adopted
+    /// snapshot is submitted, with the moment it happened.
+    ///
+    /// The timestamp is taken there rather than wherever the callback lands,
+    /// because the hop to the main thread is exactly the kind of delay this
+    /// measurement exists to notice.
+    var onSnapshotFrame: (@Sendable (Date) -> Void)?
+    private var snapshotFramePending = false
+
     private(set) var focused = true
     /// Reset whenever the terminal produces output, so the cursor is solid
     /// while you type rather than winking mid-keystroke.
@@ -235,6 +244,9 @@ final class TerminalRenderer: @unchecked Sendable {
     func updateFrame() {
         guard let source else { return }
 
+        let interval = Signposts.render.beginInterval("updateFrame")
+        defer { Signposts.render.endInterval("updateFrame", interval) }
+
         mutex.lock()
         defer { mutex.unlock() }
 
@@ -242,6 +254,7 @@ final class TerminalRenderer: @unchecked Sendable {
         // `updateSnapshot`, which takes and releases the terminal lock
         // itself.
         guard source.updateSnapshot(into: snapshot) else { return }
+        if source.consumeSnapshotAdopted() { snapshotFramePending = true }
 
         rebuildCellsLocked()
     }
@@ -683,6 +696,9 @@ final class TerminalRenderer: @unchecked Sendable {
     /// thread, which is what a live resize needs so the window never shows a
     /// stale or wrongly-sized surface.
     func drawFrame(sync: Bool = false) {
+        let interval = Signposts.render.beginInterval("drawFrame")
+        defer { Signposts.render.endInterval("drawFrame", interval) }
+
         mutex.lock()
 
         guard size.screen.width > 0, size.screen.height > 0 else {
@@ -800,6 +816,13 @@ final class TerminalRenderer: @unchecked Sendable {
         } else {
             setLayerContents(target.surface, sync: false)
         }
+
+        // Timed here rather than wherever the callback lands: the hop to the
+        // main thread is exactly the delay this measurement exists to notice.
+        if snapshotFramePending {
+            snapshotFramePending = false
+            onSnapshotFrame?(Date())
+        }
     }
 
     /// Hand a finished surface to the layer.
@@ -844,6 +867,18 @@ protocol TerminalRenderSource: AnyObject {
     /// as little as possible, and for consuming the render state's dirty
     /// flags once it has read them.
     func updateSnapshot(into snapshot: TerminalSnapshot) -> Bool
+
+    /// True once, for the first frame after a snapshot was adopted.
+    ///
+    /// The launch budget's second number is `snapshot_ready` to the frame
+    /// that *shows* it. Timing the renderer's first frame instead would time
+    /// the blank surface drawn at layout, which is already on screen before
+    /// the attach handshake has even been sent.
+    func consumeSnapshotAdopted() -> Bool
+}
+
+extension TerminalRenderSource {
+    func consumeSnapshotAdopted() -> Bool { false }
 }
 
 /// Carries a non-Sendable value across a concurrency boundary where the

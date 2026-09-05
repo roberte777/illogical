@@ -14,6 +14,7 @@
 import Foundation
 import GhosttyVt
 import IllogicalProtocol
+import OSLog
 
 @MainActor
 @Observable
@@ -30,15 +31,30 @@ final class TerminalController {
     private(set) var state: State = .connecting
     /// Rows of scrollback available to scroll into, once the attach
     /// snapshot's history has been restored.
+    ///
+    /// Rows, not pages. A page holds a variable number of rows, so a page
+    /// count is not rows scaled by a constant — it is a different quantity,
+    /// and only the scrollbar knows the one anybody wants.
     private(set) var scrollbackRows = 0
 
     let engine: TerminalEngine
     private var connection: Connection?
     private var pump: Task<Void, Never>?
+    private var historyTask: Task<Void, Never>?
+    private var historyToken: HistoryToken?
 
     /// Accumulates the GHOSTSNP stream. Decoding is buffered for now; the
     /// streaming decoder (a GhosttyReader callback) is the M3 refinement.
     private var snapshotBuffer = Data()
+
+    /// The attach timeline, for the launch budget. `ready` to first frame is
+    /// the number docs/CLIENT.md says must not vary with scrollback size: if
+    /// it does, something is buffering that should be streaming.
+    private var attachSentAt: Date?
+    private var readyAt: Date?
+    private var didReportFirstFrame = false
+    private var attachInterval: OSSignpostIntervalState?
+    private var snapshotBytes = 0
 
     init(terminalID: UInt64, cols: UInt16, rows: UInt16) throws {
         self.terminalID = terminalID
@@ -59,6 +75,11 @@ final class TerminalController {
             try connection.send(
                 .attach, terminal: terminalID, json: AttachBody(cols: cols, rows: rows))
             state = .attaching
+            attachSentAt = Date()
+            attachInterval = Signposts.attach.beginInterval("attach")
+            Signposts.milestone(
+                "attach-sent", seconds: Signposts.sinceLaunch(),
+                detail: "terminal=\(terminalID)")
 
             pump = Task { [weak self] in
                 for await frame in connection.frames {
@@ -86,6 +107,7 @@ final class TerminalController {
     }
 
     func disconnect() {
+        stopHistoryRestore()
         pump?.cancel()
         connection?.close()
         connection = nil
@@ -100,15 +122,28 @@ final class TerminalController {
 
         case .snapshotBegin:
             snapshotBuffer.removeAll(keepingCapacity: true)
+            snapshotBytes = 0
 
         case .snapshotChunk:
             snapshotBuffer.append(frame.payload)
+            snapshotBytes += frame.payload.count
 
         case .snapshotReady:
             applySnapshot()
 
         case .snapshotEnd:
             snapshotBuffer.removeAll(keepingCapacity: false)
+            if let attachSentAt {
+                Signposts.milestone(
+                    "snapshot-end", seconds: Signposts.sinceLaunch(),
+                    detail:
+                        "terminal=\(terminalID) since-attach=\(Self.ms(Date().timeIntervalSince(attachSentAt)))"
+                )
+            }
+            if let attachInterval {
+                Signposts.attach.endInterval("attach", attachInterval)
+                self.attachInterval = nil
+            }
 
         case .output:
             // Straight into our VT engine, unmodified. This is the whole point.
@@ -129,7 +164,38 @@ final class TerminalController {
         }
     }
 
+    /// The first frame this terminal's renderer submitted.
+    ///
+    /// Reported by the surface with the timestamp taken on the render thread,
+    /// so the hop to the main actor is not counted as part of it.
+    func didPresentFirstFrame(at moment: Date) {
+        guard !didReportFirstFrame else { return }
+        didReportFirstFrame = true
+        let sinceReady = readyAt.map { moment.timeIntervalSince($0) }
+        Signposts.milestone(
+            "first-frame", seconds: Signposts.sinceLaunch(moment),
+            detail:
+                "terminal=\(terminalID) since-ready=\(sinceReady.map(Self.ms) ?? "n/a") snapshot=\(snapshotBytes)B"
+        )
+    }
+
+    private static func ms(_ seconds: TimeInterval) -> String {
+        String(format: "%.2fms", seconds * 1000)
+    }
+
     private func applySnapshot() {
+        // Before anything can free or replace the terminal a previous restore
+        // is decoding into. A second snapshot on one connection is what
+        // desync recovery looks like, and nothing upstream forbids it.
+        stopHistoryRestore()
+        readyAt = Date()
+        if let attachSentAt {
+            Signposts.milestone(
+                "snapshot-ready", seconds: Signposts.sinceLaunch(),
+                detail:
+                    "terminal=\(terminalID) since-attach=\(Self.ms(Date().timeIntervalSince(attachSentAt))) bytes=\(snapshotBytes)"
+            )
+        }
         guard !snapshotBuffer.isEmpty else {
             state = .live
             return
@@ -140,30 +206,109 @@ final class TerminalController {
             engine.adopt(terminal: terminal, cols: engine.cols, rows: engine.rows)
             // We can paint now. Everything below is scrollback catching up.
             state = .live
+            // Split out from `ready -> first frame` on purpose: if that total
+            // moves with scrollback size, this is where it moved. Today it
+            // does, because `SnapshotRestore` copies the whole GHOSTSNP
+            // stream before decoding any of it — the streaming decoder is
+            // still outstanding from M2.
+            Signposts.milestone(
+                "snapshot-decoded", seconds: Signposts.sinceLaunch(),
+                detail:
+                    "terminal=\(terminalID) since-ready=\(Self.ms(Date().timeIntervalSince(readyAt ?? Date()))) bytes=\(snapshotBytes)"
+            )
 
-            // A well-formed snapshot terminates at FINISH; the bound is
-            // only there so a corrupt one can't spin forever. Say so when we
-            // hit it rather than quietly showing a shortened history.
-            let maximumPages = 1 << 20
+            restoreHistory(restore)
+        } catch {
+            // A snapshot we cannot decode is not fatal: live output still
+            // renders, we just start from a blank screen.
+            state = .live
+        }
+    }
+
+    /// Whether a history restore may still touch its terminal.
+    ///
+    /// `Task.cancel()` is not enough on its own. A cancelled task blocked on
+    /// the engine's lock still wakes up holding it, and by then `adopt` may
+    /// have freed the terminal the decoder borrows — `snapshot.h` is explicit
+    /// that the terminal must outlive the decoder. Flipping this flag *under
+    /// the same lock* the decode happens under is what closes that window:
+    /// the task cannot be between the check and the call.
+    private final class HistoryToken: @unchecked Sendable {
+        var isCancelled = false
+    }
+
+    /// Stop any history restore from touching the current terminal again.
+    ///
+    /// Must be called before anything frees or replaces that terminal.
+    private func stopHistoryRestore() {
+        if let historyToken {
+            engine.withLock { historyToken.isCancelled = true }
+            self.historyToken = nil
+        }
+        historyTask?.cancel()
+        historyTask = nil
+    }
+
+    /// Prepend the snapshot's scrollback, newest first, behind the frame the
+    /// user is already looking at.
+    ///
+    /// Off the main actor and at a lower priority than the render thread, on
+    /// purpose: this used to run inline after `adopt`, which pushed the first
+    /// frame back by however long the history took — eight milliseconds at
+    /// twenty thousand lines, measurably worse than an empty terminal. G3
+    /// says the first frame must not depend on how much scrollback there is,
+    /// and G4 says history must not block anything, so it cannot be here.
+    ///
+    /// Each page is decoded under the engine's lock. The decoder writes into
+    /// the terminal the engine now owns and the render thread reads that same
+    /// terminal, so this is a mutation the engine did not make and cannot
+    /// know about. Per page rather than around the whole loop, so frames keep
+    /// coming out while a large history restores.
+    private func restoreHistory(_ restore: SnapshotRestore) {
+        let engine = self.engine
+        let terminalID = self.terminalID
+        let token = HistoryToken()
+        historyToken = token
+
+        historyTask = Task.detached(priority: .utility) { [weak self] in
             var pages = 0
-            while try restore.restoreNextHistoryPage() {
+            while !Task.isCancelled {
+                // The cancellation check and the decode are one operation
+                // under the lock. Outside it, a task that had already passed
+                // the check could still call into a decoder whose terminal
+                // `adopt` has since freed.
+                let more = engine.withLock { () -> Bool in
+                    guard !token.isCancelled else { return false }
+                    return (try? restore.restoreNextHistoryPage()) ?? false
+                }
+                guard more else { break }
                 pages += 1
-                if pages >= maximumPages {
+                // A well-formed snapshot terminates on its own; the bound is
+                // only so a corrupt one cannot spin forever. Say so rather
+                // than quietly showing a shortened history — 4096 pages was
+                // reachable at a hundred thousand lines.
+                if pages >= 1 << 20 {
                     Trace.log(
                         "terminal \(terminalID): history restore stopped at \(pages) pages")
                     break
                 }
             }
-
+            // How many *rows* those pages held, which is the quantity anyone
+            // wants and the only one the scrollbar can answer. Outside
+            // `withLock`: `scrollbar` takes the same lock itself, and NSLock
+            // is not recursive.
             let bar = engine.scrollbar
-            scrollbackRows = Int(bar.total) - Int(bar.length)
-            Trace.log(
-                "terminal \(terminalID): restored \(pages) history pages, "
-                    + "\(scrollbackRows) rows of scrollback")
-        } catch {
-            // A snapshot we cannot decode is not fatal: live output still
-            // renders, we just start from a blank screen.
-            state = .live
+            let rows = Int(bar.total) - Int(bar.length)
+            let restored = pages
+            await MainActor.run {
+                self?.scrollbackRows = rows
+                Trace.log(
+                    "terminal \(terminalID): restored \(restored) history pages, "
+                        + "\(rows) rows of scrollback")
+                Signposts.milestone(
+                    "history-restored", seconds: Signposts.sinceLaunch(),
+                    detail: "terminal=\(terminalID) pages=\(restored) rows=\(rows)")
+            }
         }
     }
 

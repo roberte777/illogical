@@ -68,6 +68,11 @@ app:
 test-renderer:
     cd clients/macos && {{xcenv}} xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Debug -derivedDataPath .build/xcode -destination 'platform=macOS' test
 
+# The M3 gate: launch to window, and first frame against 0 vs N lines of
+# scrollback. Needs `zig build` and `just app` first.
+bench-launch runs="5" lines="20000":
+    ./scripts/bench-launch.sh {{runs}} {{lines}}
+
 # Renderer benchmarks. Only meaningful with optimization, so Release.
 bench-renderer:
     cd clients/macos && {{xcenv}} xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Release -derivedDataPath .build/xcode-rel -destination 'platform=macOS' test

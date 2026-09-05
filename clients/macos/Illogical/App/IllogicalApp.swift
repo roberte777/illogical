@@ -5,20 +5,27 @@
 //  draw immediately and fill the terminal in as the attach handshake's snapshot
 //  arrives. See docs/GOALS.md G7.
 
+import QuartzCore
 import SwiftUI
 
 @main
 struct IllogicalApp: App {
     @State private var store = SessionStore()
 
-    init() { Trace.log("app init") }
+    init() {
+        Trace.log("app init")
+        Signposts.milestone("app-init", seconds: Signposts.sinceLaunch())
+    }
 
     var body: some Scene {
         Window("Illogical", id: "main") {
             ContentView()
                 .environment(store)
+                .onAppear { LaunchReport.contentDidAppear() }
                 .task {
                     Trace.log("content task fired")
+                    // Connecting is deliberately *after* the first layout:
+                    // nothing on screen waits for the network. G7.
                     store.connect()
                 }
         }
@@ -226,5 +233,27 @@ struct ServerUnavailable: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Palette.background)
+    }
+}
+
+/// When the window actually reached the screen.
+///
+/// `onAppear` fires during a layout pass, before anything has been handed to
+/// the render server. Committing an empty transaction from inside that pass
+/// gets a completion block that runs once the enclosing commit has gone
+/// through — which is the first moment the chrome is genuinely visible, and
+/// the number docs/GOALS.md G7 is about.
+@MainActor
+enum LaunchReport {
+    private static var reported = false
+
+    static func contentDidAppear() {
+        guard !reported else { return }
+        reported = true
+        CATransaction.begin()
+        CATransaction.setCompletionBlock {
+            Signposts.milestone("window-visible", seconds: Signposts.sinceLaunch())
+        }
+        CATransaction.commit()
     }
 }

@@ -91,7 +91,7 @@ libghostty-vt's own encoders; and resize driven by the view's own geometry.
 | ✅ | Key/mouse/focus encoding via libghostty-vt, replacing the hand-rolled subset |
 | ✅ | Selection via `selection.h`'s gesture machine, tracked grid refs |
 | ✅ | Native splits: one connection per pane |
-| | `os_signpost` launch budget |
+| ✅ | `os_signpost` launch budget |
 
 Renderer numbers, Release, M-series, 200x50 cells:
 
@@ -105,7 +105,30 @@ is what a benchmark measures because it blocks; the renderer does not, so in
 the app that work overlaps the next frame's.
 
 **Gate:** cold launch to window under the budget; first frame independent of
-scrollback size.
+scrollback size. **Met** — `scripts/bench-launch.sh`, Debug build, M-series,
+median of 7:
+
+| scrollback | launch → window | ready → first frame |
+| --- | --- | --- |
+| empty terminal | 148 ms | 25–28 ms |
+| a screenful, no history | 148 ms | 30–31 ms |
+| 20,000 lines | 148 ms | 31 ms |
+| 100,000 lines | 149 ms | 31–33 ms |
+
+Two things to read out of that. Launch to window does not move at all with
+scrollback, which is the point of connecting *after* the first layout: nothing
+on screen waits for the network. And the first frame is the same whether there
+are two hundred lines of history or a hundred thousand — a 5× increase in
+scrollback costs nothing, so nothing is being buffered that should be
+streaming. The 4 ms between an empty terminal and a full screen is glyph work
+on the first frame, which is content, not history.
+
+That second row only became true in this milestone. Restoring history ran
+inline after `adopt`, so the first frame waited behind however much scrollback
+there was — 8 ms at twenty thousand lines. It now runs off the main actor at
+utility priority, one page at a time under the engine's lock.
+
+Launch to window is a Debug build; treat 148 ms as a ceiling.
 
 ## M4 — Parking and the memory work (core landed)
 
@@ -189,7 +212,7 @@ Also measure, where no reference number exists:
 - Full history restore time, in background, without regressing input latency.
 - Thread count vs terminal count — must flatten, not track.
 - p99 input latency at 200 attachments.
-- Client cold launch to window.
+- Client cold launch to window. **148 ms**, Debug, measured above.
 
 ---
 
