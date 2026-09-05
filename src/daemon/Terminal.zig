@@ -283,14 +283,24 @@ pub fn attach(self: *Terminal, sub: Subscriber, snapshot_writer: *std.Io.Writer)
     self.mutex.lock();
     defer self.mutex.unlock();
 
+    // Replace, don't accumulate. A client re-attaching to a terminal it is
+    // already subscribed to -- desync recovery, per docs/PROTOCOL.md -- would
+    // otherwise appear twice in the fan-out and receive every subsequent PTY
+    // byte in two `output` frames, doubling every character it renders.
+    self.removeSubscriberLocked(sub.ctx);
     try self.subscribers.append(self.gpa, sub);
     errdefer self.removeSubscriberLocked(sub.ctx);
 
     // A parked terminal is served from disk and stays parked (docs/PARKING.md).
     if (self.residency == .parked) {
-        return self.streamParkFileLocked(self.store, snapshot_writer);
+        try self.streamParkFileLocked(self.store, snapshot_writer);
+    } else {
+        try self.encodeSnapshotLocked(snapshot_writer);
     }
-    try self.encodeSnapshotLocked(snapshot_writer);
+    // Flush inside the lock. A byte still held here when this returns would
+    // reach the client *behind* live output, and a client that applies output
+    // before the snapshot it belongs after has a wrong screen.
+    try snapshot_writer.flush();
 }
 
 pub fn subscribe(self: *Terminal, sub: Subscriber) !void {

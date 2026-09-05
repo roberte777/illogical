@@ -9,6 +9,7 @@ const Client = @This();
 const std = @import("std");
 const sys = illogical.sys;
 const Allocator = std.mem.Allocator;
+const ghostty = @import("ghostty-vt");
 const illogical = @import("illogical");
 const protocol = illogical.protocol;
 const session = illogical.session;
@@ -182,13 +183,109 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
 
 // -- attach ----------------------------------------------------------------
 
+/// Finds the end of a snapshot's READY marker in a byte stream, by record
+/// framing alone.
+///
+/// A snapshot is a ten-byte envelope followed by records, each a ten-byte
+/// header — tag, payload length, CRC32C — and its payload. READY is an empty
+/// record separating the renderable screen from history, so locating it needs
+/// no payload decoding and buffers nothing beyond one header. See
+/// `vendor/ghostty/src/terminal/snapshot/main.zig`.
+///
+/// This is what lets `snapshot_ready` go out mid-encode. Without it the marker
+/// carries no information: the whole snapshot, history included, is already on
+/// the wire before the client is told it can paint, and attach latency grows
+/// linearly with scrollback.
+const ReadyScanner = struct {
+    const header_len = ghostty.snapshot.record.Header.len;
+    const ready_tag = @intFromEnum(ghostty.snapshot.record.Tag.ready);
+
+    phase: Phase = .envelope,
+    /// Bytes still to skip: the rest of the envelope, or of the current payload.
+    remaining: usize = ghostty.snapshot.envelope.encoded_len,
+    /// Header bytes buffered so far, while `phase` is `.header`.
+    have: usize = 0,
+    header: [header_len]u8 = undefined,
+    /// Whether the record currently being skipped is READY.
+    is_ready: bool = false,
+
+    const Phase = enum { envelope, header, payload, done };
+
+    /// Consume `bytes`, returning the offset just past the READY record if it
+    /// ends inside this slice. Returns null before that, and forever after.
+    fn scan(self: *ReadyScanner, bytes: []const u8) ?usize {
+        var i: usize = 0;
+        while (i < bytes.len) {
+            switch (self.phase) {
+                .done => return null,
+
+                // Neither carries information we need, so both are skipped by
+                // length. `remaining` is never zero here: a zero-length payload
+                // is completed below, where its header is decoded.
+                .envelope, .payload => {
+                    const take = @min(self.remaining, bytes.len - i);
+                    i += take;
+                    self.remaining -= take;
+                    if (self.remaining > 0) continue;
+                    if (self.phase == .payload and self.is_ready) {
+                        self.phase = .done;
+                        return i;
+                    }
+                    self.expectHeader();
+                },
+
+                .header => {
+                    const take = @min(header_len - self.have, bytes.len - i);
+                    @memcpy(self.header[self.have..][0..take], bytes[i..][0..take]);
+                    self.have += take;
+                    i += take;
+                    // Ran out of bytes mid-header; resume on the next slice.
+                    if (self.have < header_len) break;
+
+                    const tag = std.mem.readInt(u16, self.header[0..2], .little);
+                    self.is_ready = tag == ready_tag;
+                    self.remaining = std.mem.readInt(u32, self.header[2..6], .little);
+                    self.phase = .payload;
+                    if (self.remaining > 0) continue;
+                    // READY is an empty record, so it ends with its header.
+                    if (self.is_ready) {
+                        self.phase = .done;
+                        return i;
+                    }
+                    self.expectHeader();
+                },
+            }
+        }
+        return null;
+    }
+
+    fn expectHeader(self: *ReadyScanner) void {
+        self.phase = .header;
+        self.have = 0;
+    }
+};
+
 /// Frames snapshot bytes as they are produced, so the client can start
 /// decoding before the encode finishes. See docs/PROTOCOL.md.
+///
+/// The writer is unbuffered because `snapshot_ready` is latency, not framing:
+/// a buffer would hold the READY marker until it filled, which is the number
+/// the M2 gate measures. The scanner does not need it — it is built to find
+/// the marker across arbitrary slice boundaries and `sendBytes` splits within
+/// a slice.
+///
+/// The cost is frame count. `record.Writer.finish` emits each record as two
+/// writes, a ten-byte header and its payload, so every snapshot record becomes
+/// two `snapshot_chunk` frames — one of them ten bytes of payload behind a
+/// thirteen-byte header. Bounded by record count, and worth revisiting if the
+/// SSH transport makes per-frame overhead matter.
 const SnapshotChunker = struct {
     client: *Client,
     terminal_id: session.TerminalId,
     interface: std.Io.Writer,
-    buf: [32 * 1024]u8 = undefined,
+    scanner: ReadyScanner = .{},
+    /// Whether `snapshot_ready` has gone out yet.
+    sent_ready: bool = false,
 
     fn init(client: *Client, terminal_id: session.TerminalId) SnapshotChunker {
         return .{
@@ -198,6 +295,22 @@ const SnapshotChunker = struct {
         };
     }
 
+    /// Frame one run of snapshot bytes, splitting it at READY if the marker
+    /// ends inside it.
+    fn sendBytes(self: *SnapshotChunker, bytes: []const u8) !void {
+        const split = self.scanner.scan(bytes) orelse
+            return self.client.send(.snapshot_chunk, self.terminal_id, bytes);
+
+        if (split > 0) {
+            try self.client.send(.snapshot_chunk, self.terminal_id, bytes[0..split]);
+        }
+        try self.client.send(.snapshot_ready, self.terminal_id, &.{});
+        self.sent_ready = true;
+        if (split < bytes.len) {
+            try self.client.send(.snapshot_chunk, self.terminal_id, bytes[split..]);
+        }
+    }
+
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *SnapshotChunker = @fieldParentPtr("interface", w);
         var written: usize = 0;
@@ -205,8 +318,7 @@ const SnapshotChunker = struct {
             const times = if (i == data.len - 1) splat else 1;
             for (0..times) |_| {
                 if (slice.len == 0) continue;
-                self.client.send(.snapshot_chunk, self.terminal_id, slice) catch
-                    return error.WriteFailed;
+                self.sendBytes(slice) catch return error.WriteFailed;
                 written += slice.len;
             }
         }
@@ -225,6 +337,12 @@ fn attach(self: *Client, id: session.TerminalId, req: protocol.body.Attach) !voi
     try self.send(.snapshot_begin, id, begin);
 
     var chunker = SnapshotChunker.init(self, id);
+    // `Terminal.attach` drops any subscriber we already had before installing
+    // the new one, so from here on a failure means we are subscribed to
+    // nothing -- including on a re-attach, where we *were* subscribed on the
+    // way in. This errdefer is above the call for that reason: it has to undo
+    // the record of an attachment that no longer exists.
+    errdefer self.removeAttached(id);
     // Subscribe and snapshot under the terminal's lock, so the client gets
     // every byte after the snapshot and none from before it.
     try t.attach(.{
@@ -232,11 +350,31 @@ fn attach(self: *Client, id: session.TerminalId, req: protocol.body.Attach) !voi
         .writeFn = onOutput,
         .exitFn = onExit,
     }, &chunker.interface);
-    try chunker.interface.flush();
+    errdefer t.unsubscribe(self);
 
-    try self.send(.snapshot_ready, id, &.{});
+    // Record it before the frames below, because `detachAll` only knows about
+    // ids in `attached`: a client that closes its socket during them makes
+    // those `send`s return EPIPE, and without this the subscriber outlives the
+    // connection -- fanned out to on every PTY read for the life of the
+    // daemon, and counted forever by `illogical list`.
+    //
+    // Appending only when absent, rather than remove-then-append, so a
+    // re-attach does not leave `attached` momentarily empty. That window would
+    // be new; the one below it is not. `currentTerminal` still reads this list
+    // from the terminal's reader thread while this thread appends -- unlocked,
+    // and on a first attach still empty between `t.attach` returning and the
+    // append, so output produced in that gap is tagged with the control
+    // session. Harmless today because no client reads the session id on an
+    // `output` frame, and pre-existing, but it belongs with F2's rework of
+    // this path rather than to another round of patching around it.
+    if (!self.isAttached(id)) try self.attached.append(self.gpa, id);
+
+    // The chunker sends `snapshot_ready` the moment the encoder passes READY.
+    // If the scan never found it — a snapshot format change, a truncated park
+    // file — send it here, so the client paints a blank screen and takes live
+    // output rather than waiting forever.
+    if (!chunker.sent_ready) try self.send(.snapshot_ready, id, &.{});
     try self.send(.snapshot_end, id, &.{});
-    try self.attached.append(self.gpa, id);
 }
 
 fn onOutput(ctx: *anyopaque, bytes: []const u8) void {
@@ -266,6 +404,13 @@ fn detachAll(self: *Client) void {
         if (self.server.terminal(id)) |t| t.unsubscribe(self);
     }
     self.attached.clearRetainingCapacity();
+}
+
+fn isAttached(self: *Client, id: session.TerminalId) bool {
+    for (self.attached.items) |a| {
+        if (a == id) return true;
+    }
+    return false;
 }
 
 fn removeAttached(self: *Client, id: session.TerminalId) void {
@@ -329,4 +474,291 @@ fn sendError(
         .{ @intFromEnum(code), message },
     ) catch return;
     try self.sendRaw(.err, id, body);
+}
+
+// -- tests -----------------------------------------------------------------
+
+/// Encode a snapshot of an 80x24 terminal carrying `lines` of scrollback.
+/// Caller owns the bytes.
+fn testSnapshot(gpa: Allocator, lines: usize) ![]u8 {
+    var tiny: ghostty.TinyIo = .init;
+    var vt: ghostty.Terminal = try .init(tiny.io(), gpa, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_bytes = null,
+    });
+    defer vt.deinit(gpa);
+
+    var stream = vt.vtStream();
+    defer stream.deinit();
+
+    var line_buf: [64]u8 = undefined;
+    for (0..lines) |i| {
+        stream.nextSlice(try std.fmt.bufPrint(&line_buf, "line {d}\r\n", .{i}));
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &out);
+    try ghostty.snapshot.encode(gpa, &aw.writer, &vt, .{ .continuation = .ground });
+    try aw.writer.flush();
+    out = aw.toArrayList();
+    return out.toOwnedSlice(gpa);
+}
+
+/// Scan `bytes` in fixed-size pieces, as the chunker sees them, and return the
+/// absolute offset just past READY.
+fn scanInPieces(bytes: []const u8, piece: usize) ?usize {
+    var scanner: ReadyScanner = .{};
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const take = @min(piece, bytes.len - offset);
+        if (scanner.scan(bytes[offset..][0..take])) |split| return offset + split;
+        offset += take;
+    }
+    return null;
+}
+
+/// Append one record with `tag` and `payload` to `out`, framed the way
+/// `record.Writer` frames it. The CRC is not computed: nothing under test
+/// validates it, and a wrong one proves the scanner is not reading it.
+fn appendRecord(gpa: Allocator, out: *std.ArrayList(u8), tag: u16, payload: []const u8) !void {
+    var header: [10]u8 = undefined;
+    std.mem.writeInt(u16, header[0..2], tag, .little);
+    std.mem.writeInt(u32, header[2..6], @intCast(payload.len), .little);
+    std.mem.writeInt(u32, header[6..10], 0xDEADBEEF, .little);
+    try out.appendSlice(gpa, &header);
+    try out.appendSlice(gpa, payload);
+}
+
+test "a READY header inside a payload is skipped by length, not matched" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const ready_tag = @intFromEnum(ghostty.snapshot.record.Tag.ready);
+    const page_tag = @intFromEnum(ghostty.snapshot.record.Tag.page);
+
+    // A page payload that contains a well-formed, empty READY header. Page
+    // data is mostly zeroes, so this byte sequence is ordinary content, and a
+    // scanner that pattern-matched instead of following record lengths would
+    // split the stream in the middle of this record.
+    var decoy: [40]u8 = @splat(0);
+    std.mem.writeInt(u16, decoy[16..18], ready_tag, .little);
+    std.mem.writeInt(u32, decoy[18..22], 0, .little);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try out.appendSlice(gpa, ghostty.snapshot.envelope.magic);
+    try out.appendSlice(gpa, &.{ 1, 0 });
+    try appendRecord(gpa, &out, page_tag, &decoy);
+    const real_ready_at = out.items.len + 10;
+    try appendRecord(gpa, &out, ready_tag, &.{});
+    try appendRecord(gpa, &out, page_tag, &(@as([64]u8, @splat(0))));
+
+    // Every split, because the decoy straddles different boundaries in each.
+    for ([_]usize{ 1, 2, 3, 7, 10, 17, 64, 4096 }) |piece| {
+        try testing.expectEqual(real_ready_at, scanInPieces(out.items, piece) orelse
+            return error.NoReadyMarker);
+    }
+}
+
+test "a stream with no READY record is reported as such" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const page_tag = @intFromEnum(ghostty.snapshot.record.Tag.page);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try out.appendSlice(gpa, ghostty.snapshot.envelope.magic);
+    try out.appendSlice(gpa, &.{ 1, 0 });
+    try appendRecord(gpa, &out, page_tag, &(@as([32]u8, @splat(0))));
+    try appendRecord(gpa, &out, page_tag, &(@as([8]u8, @splat(0))));
+
+    // This is what makes `attach`'s fallback reachable rather than dead code.
+    for ([_]usize{ 1, 7, 4096 }) |piece| {
+        try testing.expect(scanInPieces(out.items, piece) == null);
+    }
+}
+
+test "the READY marker is found at the same offset however the stream is split" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const bytes = try testSnapshot(gpa, 2_000);
+    defer gpa.free(bytes);
+
+    const whole = scanInPieces(bytes, bytes.len) orelse return error.NoReadyMarker;
+    // History follows READY, so the marker is nowhere near the end. This is
+    // the property the whole change exists for.
+    try testing.expect(whole < bytes.len);
+
+    // The encoder hands us record-aligned writes; a park file streamed off
+    // disk does not. Both have to find the same byte.
+    for ([_]usize{ 1, 7, 10, 64, 4096 }) |piece| {
+        try testing.expectEqual(whole, scanInPieces(bytes, piece) orelse
+            return error.NoReadyMarker);
+    }
+}
+
+test "the READY prefix decodes into a renderable terminal on its own" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const bytes = try testSnapshot(gpa, 2_000);
+    defer gpa.free(bytes);
+
+    const split = scanInPieces(bytes, 4096) orelse return error.NoReadyMarker;
+
+    // Exactly what the client has in hand when `snapshot_ready` arrives.
+    var tiny: ghostty.TinyIo = .init;
+    var reader: std.Io.Reader = .fixed(bytes[0..split]);
+    var decoder: ghostty.snapshot.Decoder = .init(&reader);
+    var decoded = try decoder.ready(gpa, tiny.io(), .{
+        .max_continuation_bytes = 0,
+    });
+    defer decoded.deinit(gpa);
+
+    const restored = &(decoded.terminal orelse return error.NoTerminal);
+    const text = try restored.plainString(gpa);
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "line 1999") != null);
+}
+
+test "the chunker frames ready between the right two chunks" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    // A real `Client` writing to a real socket, which is all `send` needs:
+    // `Server.init` allocates but binds nothing, and no reader thread is
+    // started. Reading the other end back gives us the frames in wire order.
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(
+        &path_buf,
+        "/tmp/illogical-chunker-{d}.sock",
+        .{std.c.getpid()},
+    );
+    defer sys.unlinkPath(path.ptr);
+
+    const addr = try sys.unixAddr(path);
+    const listener = try sys.unixSocket();
+    defer sys.closeFd(listener);
+    try sys.bindUnix(listener, &addr);
+    try sys.listenFd(listener, 1);
+    const reader_fd = try sys.connectUnix(path);
+    defer sys.closeFd(reader_fd);
+    const writer_fd = try sys.acceptFd(listener);
+
+    const server = try Server.init(gpa, threaded.io(), path, "/tmp/illogical-unused");
+    defer server.deinit();
+    const client = try Client.create(server, writer_fd);
+    defer client.destroy();
+
+    // A synthetic stream, not a real snapshot. `send` writes to the socket
+    // synchronously and nothing is draining the far end until this thread
+    // finishes writing, so the whole exchange has to fit inside the socket
+    // buffer -- a real snapshot is tens of kilobytes and deadlocks here. The
+    // framing is what is under test, and these are the same records.
+    const ready_tag = @intFromEnum(ghostty.snapshot.record.Tag.ready);
+    const page_tag = @intFromEnum(ghostty.snapshot.record.Tag.page);
+
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(gpa);
+    try stream.appendSlice(gpa, ghostty.snapshot.envelope.magic);
+    try stream.appendSlice(gpa, &.{ 1, 0 });
+    try appendRecord(gpa, &stream, page_tag, &(@as([200]u8, @splat('a'))));
+    const split = stream.items.len + 10;
+    try appendRecord(gpa, &stream, ready_tag, &.{});
+    try appendRecord(gpa, &stream, page_tag, &(@as([200]u8, @splat('b'))));
+    const bytes = stream.items;
+    try testing.expect(bytes.len < 1024);
+
+    var chunker = SnapshotChunker.init(client, 7);
+    // Ten bytes at a time, the way `record.Writer` emits a header before its
+    // payload: that lands READY at the end of a slice rather than inside one,
+    // which is the case where an off-by-one would not show up in the offset.
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const take = @min(@as(usize, 10), bytes.len - offset);
+        try chunker.interface.writeAll(bytes[offset..][0..take]);
+        offset += take;
+    }
+    try chunker.interface.flush();
+    try testing.expect(chunker.sent_ready);
+
+    // Half-close, so the reader below cannot outlive the frames. Without this
+    // a chunker that dropped a byte would leave `readAll` blocked forever on a
+    // socket whose write end this same thread still holds open -- the failed
+    // assertion would never be reached. Buffered frames survive the FIN, so
+    // the success path is unaffected; a starved read now returns zero, which
+    // `sys.readAll` reports as an error.
+    _ = std.c.shutdown(writer_fd, 1);
+
+    // Read the frames back and reassemble.
+    var chunks: std.ArrayList(u8) = .empty;
+    defer chunks.deinit(gpa);
+    var before_ready: usize = 0;
+    var readies: usize = 0;
+    var saw_chunk_after_ready = false;
+
+    var header_buf: [protocol.header_len]u8 = undefined;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    while (chunks.items.len < bytes.len or readies == 0) {
+        try sys.readAll(reader_fd, &header_buf);
+        const header = try protocol.Header.decode(&header_buf);
+        try testing.expectEqual(@as(session.TerminalId, 7), header.session);
+        try payload.resize(gpa, header.len);
+        if (header.len > 0) try sys.readAll(reader_fd, payload.items);
+
+        switch (header.type) {
+            .snapshot_chunk => {
+                try chunks.appendSlice(gpa, payload.items);
+                if (readies == 0) before_ready += payload.items.len else saw_chunk_after_ready = true;
+            },
+            .snapshot_ready => {
+                try testing.expectEqual(@as(u32, 0), header.len);
+                readies += 1;
+            },
+            else => return error.UnexpectedFrame,
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 1), readies);
+    // The marker lands on exactly the byte the client's decoder stops at...
+    try testing.expectEqual(split, before_ready);
+    // ...history follows it...
+    try testing.expect(saw_chunk_after_ready);
+    // ...and not one byte was dropped or duplicated by the split.
+    try testing.expectEqualSlices(u8, bytes, chunks.items);
+}
+
+test "the READY prefix does not grow with scrollback" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const small = try testSnapshot(gpa, 2_000);
+    defer gpa.free(small);
+    const large = try testSnapshot(gpa, 20_000);
+    defer gpa.free(large);
+
+    const small_ready = scanInPieces(small, 4096) orelse return error.NoReadyMarker;
+    const large_ready = scanInPieces(large, 4096) orelse return error.NoReadyMarker;
+
+    // Ten times the scrollback, and the whole snapshot grows with it. The
+    // prefix the client waits on before it can paint does not: that is the M2
+    // gate, and it is the only reason any of this scanning exists.
+    try testing.expect(large.len > small.len * 5);
+
+    // An absolute bound, not a ratio: the prefix is the active screen plus
+    // whatever of the page it sits in, so it moves by less than one page
+    // between two terminals of the same geometry, no matter how much history
+    // is behind them. The largest post-READY page record these inputs produce
+    // is a little under 8 KiB, so 16 KiB is two pages of slack -- tight enough
+    // to catch a partial revert that leaves a page or two ahead of the marker,
+    // which is the realistic way this breaks. Observed drift is ~3 KiB.
+    const drift = @max(large_ready, small_ready) - @min(large_ready, small_ready);
+    try testing.expect(drift < 16 * 1024);
 }

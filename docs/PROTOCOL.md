@@ -115,19 +115,34 @@ moment when a client is connecting of the current PTY bytes"*, sends enough stat
 to render, sends the ready frame, and *"then the core server part unpauses"*
 [ARCH t=118–203]. It is what makes offset *N* well defined.
 
+⚠ **The server does not unpause at READY.** `Terminal.attach` holds the terminal
+lock across the whole encode, history included, so `snapshot_ready` goes out
+early — the client paints after O(screen) bytes, which is the point — but no
+`output` frame can interleave with the history chunks that follow it. The
+diagram above is the intended shape, not the current one. Splitting the encode
+needs a two-phase encoder libghostty-vt does not expose: `snapshot.encode` is
+one call. Offset *N* is unaffected either way, because the subscribe and the
+encode happen under the same lock.
+
 The client drives this with libghostty-vt:
 
 | Wire | libghostty-vt |
 | --- | --- |
 | `snapshot_chunk` before ready | bytes into a `GhosttyReader` |
 | `snapshot_ready` | `ghostty_snapshot_decoder_ready()` → renderable terminal |
-| `snapshot_chunk` after ready | `ghostty_snapshot_decoder_next()`, one page each |
+| `snapshot_chunk` after ready | bytes into that same `GhosttyReader` |
 | `output` | `ghostty_terminal_vt_write()` on that same terminal |
-| `snapshot_end` | `next()` returns `GHOSTTY_NO_VALUE` |
+| `snapshot_end` | `ghostty_snapshot_decoder_next()`, one page each, to `GHOSTTY_NO_VALUE` |
 
 Interleaving `output` with `next()` is explicitly supported. A history page that
 can no longer be applied is consumed, validated and reported as zero rows — so a
 busy terminal degrades to *less scrollback*, never to a wrong screen.
+
+⚠ **The Mac client does not call `next()` as history arrives**, either; it waits
+for `snapshot_end` and decodes the pages then. Nothing in the protocol requires
+that. `next()` reads inside the engine's lock, so a decoder starved mid-page
+would stall the renderer for as long as the transport took — the reasoning is
+in [CLIENT.md](CLIENT.md#the-attach-path-and-the-launch-budget).
 
 ⚠ **Attaching to a parked terminal does not unpark it.** The server streams the
 park file from disk as `snapshot_chunk` frames and the terminal stays parked
