@@ -35,14 +35,33 @@ splits, tabs and windows are ordinary AppKit views.
 
 ```
 NSWindow
-├── split view
-│   ├── TerminalSurface ── connection ── terminal 3 ── PTY
-│   └── TerminalSurface ── connection ── terminal 7 ── PTY
-└── toolbar: session dropdown
+├── tab: a split tree
+│   ├── TerminalPane ── connection ── terminal 3 ── PTY
+│   └── TerminalPane ── connection ── terminal 7 ── PTY
+└── toolbar: session dropdown, tab strip
 ```
 
 This is why the server never divides a grid, and why closing a split is just
 closing a connection.
+
+A **tab** is a layout of panes, not a terminal. It has an identity of its own,
+because a tab named by the terminal it started as has nothing to be called once
+you close that pane and keep working in the other one; its label follows its
+focused pane, so a split tab says what you are working in. Splitting creates a
+terminal on the server and a connection to it, and adds a pane — never a tab.
+
+The split controls live in **each terminal's own header**, not the window
+toolbar: in a tab with four panes, "split right" has to mean "split this one",
+and a button in the title bar cannot say which one it means. Split right, split
+down, zoom, close — with zoom disabled in a tab with one pane, because there is
+nothing to zoom out of.
+
+Focus is AppKit's. The pane the layout calls focused is whichever surface is
+first responder, reported back by the surface, rather than a SwiftUI tap
+gesture layered over the terminal that would swallow the clicks selection
+needs. ⌘W reaches the focused surface as `performClose:` through the responder
+chain, so it closes a pane and falls through to closing the window when there
+is only one — no fight with the standard Close Window item for the shortcut.
 
 ## The attach path, and the launch budget
 

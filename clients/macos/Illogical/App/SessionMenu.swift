@@ -167,8 +167,8 @@ struct SessionMenu: View {
     }
 
     private func select(_ session: SessionSummary) {
-        if let first = store.terminals.first(where: { $0.session == session.id }) {
-            store.selectedID = first.id
+        if let first = store.tabs.first(where: { $0.session == session.id }) {
+            store.selectedTabID = first.id
         }
         isPresented = false
     }

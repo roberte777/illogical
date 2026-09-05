@@ -32,9 +32,34 @@ struct IllogicalApp: App {
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
             }
+            // Splits. ⌘W is deliberately absent: closing a pane goes through
+            // the responder chain as `performClose:`, so the surface gets
+            // first refusal and the standard Close Window item keeps working
+            // when there is only one pane. See TerminalSurfaceView.
+            CommandGroup(after: .newItem) {
+                Divider()
+                Button("Split Right") { store.split(.columns) }
+                    .keyboardShortcut("d", modifiers: .command)
+                Button("Split Down") { store.split(.rows) }
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
+                Button(store.selectedTab?.zoomed == nil ? "Zoom Pane" : "Unzoom Pane") {
+                    store.toggleZoomOnFocusedPane()
+                }
+                .keyboardShortcut(.return, modifiers: [.command, .shift])
+                .disabled(store.selectedTab?.isSplit != true)
+            }
             CommandGroup(after: .toolbar) {
                 Button("Refresh Sessions") { store.refresh() }
                     .keyboardShortcut("r", modifiers: .command)
+                Divider()
+                Button("Focus Pane Left") { store.moveFocus(.left) }
+                    .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+                Button("Focus Pane Right") { store.moveFocus(.right) }
+                    .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
+                Button("Focus Pane Above") { store.moveFocus(.up) }
+                    .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+                Button("Focus Pane Below") { store.moveFocus(.down) }
+                    .keyboardShortcut(.downArrow, modifiers: [.command, .option])
             }
         }
     }
@@ -47,15 +72,16 @@ struct ContentView: View {
         @Bindable var store = store
         VStack(spacing: 0) {
             Rectangle().fill(Palette.divider).frame(height: 1)
-            // No divider under the breadcrumb: it sits on the terminal's own
-            // background, as in Superlogical.
-            Breadcrumb(terminal: store.selected)
 
             if let error = store.connectionError {
                 ServerUnavailable(message: error)
-            } else if let selected = store.selected {
-                TerminalPane(terminal: selected)
-                    .id(selected.id)
+            } else if let tab = store.selectedTab {
+                // Each pane carries its own header. There is no divider under
+                // it: it sits on the terminal's own background, as in
+                // Superlogical.
+                SplitContainer(tab: tab)
+                    .environment(store)
+                    .id(tab.id)
             } else {
                 EmptyState()
             }
@@ -93,9 +119,9 @@ struct Toolbar: View {
     @Environment(SessionStore.self) private var store
 
     private func isActive(_ index: Int) -> Bool {
-        let terminals = store.visibleTerminals
-        guard terminals.indices.contains(index) else { return false }
-        return terminals[index].id == store.selectedID
+        let tabs = store.visibleTabs
+        guard tabs.indices.contains(index) else { return false }
+        return tabs[index].id == store.selectedTabID
     }
 
     var body: some View {
@@ -113,22 +139,25 @@ struct Toolbar: View {
             // Fixed-width slots laid edge to edge, as in the reference.
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 0) {
-                    ForEach(Array(store.visibleTerminals.enumerated()), id: \.element.id) {
-                        index, terminal in
+                    ForEach(Array(store.visibleTabs.enumerated()), id: \.element.id) {
+                        index, tab in
                         TerminalTab(
-                            terminal: terminal,
+                            // A tab's label is its focused pane's terminal, so
+                            // a split tab names what you are working in rather
+                            // than what it started as.
+                            terminal: store.label(for: tab),
                             isActive: isActive(index),
                             showsLeadingSeparator: index > 0 && !isActive(index)
                                 && !isActive(index - 1),
-                            select: { store.selectedID = terminal.id },
-                            close: { store.kill(terminal.id) })
+                            select: { store.selectedTabID = tab.id },
+                            close: { store.closeTab(tab.id) })
                     }
                 }
             }
             // Cap the strip at its content width so the leftover toolbar is
             // genuinely empty and can drag the window. When the tabs outgrow
             // the window this clamps to the available width and scrolls.
-            .frame(maxWidth: CGFloat(store.visibleTerminals.count) * Metrics.tabWidth)
+            .frame(maxWidth: CGFloat(store.visibleTabs.count) * Metrics.tabWidth)
 
             // Bare title bar drags the window; AppKit handles it because the
             // toolbar is a title bar accessory.

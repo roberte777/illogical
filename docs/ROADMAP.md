@@ -90,7 +90,7 @@ libghostty-vt's own encoders; and resize driven by the view's own geometry.
 | ✅ | Native scrollback; never synthesize wheel sequences |
 | ✅ | Key/mouse/focus encoding via libghostty-vt, replacing the hand-rolled subset |
 | ✅ | Selection via `selection.h`'s gesture machine, tracked grid refs |
-| | Native splits: one connection per pane |
+| ✅ | Native splits: one connection per pane |
 | | `os_signpost` launch budget |
 
 Renderer numbers, Release, M-series, 200x50 cells:
