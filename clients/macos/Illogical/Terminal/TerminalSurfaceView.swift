@@ -1,22 +1,33 @@
 //  TerminalSurfaceView.swift
-//  Draws a terminal grid and turns key events into PTY bytes.
+//  The Metal surface a terminal draws into, and the input that drives it.
 //
-//  The renderer is CoreText over a monospaced font, drawing run-length spans of
-//  identical style rather than per-cell. That is fast enough to be pleasant and,
-//  more importantly, correct — it reads exactly what libghostty's render state
-//  reports. Swapping in Metal means replacing `draw(_:)` and nothing else; the
-//  grid it consumes is already a plain value type.
+//  The view owns almost nothing. It holds a plain CALayer whose `contents`
+//  the renderer swaps for a finished IOSurface, a render thread, and a
+//  display link on that thread. Everything about *what* gets drawn lives in
+//  `Renderer/`.
 //
-//  See docs/ROADMAP.md M3.
+//  Two decisions worth explaining:
+//
+//  The layer is a CALayer, not a CAMetalLayer. `nextDrawable` blocks on the
+//  display, which stalls a renderer that could otherwise be building the next
+//  frame, and it behaves poorly under live resize. Handing a CALayer an
+//  IOSurface avoids both. This is what Ghostty does.
+//
+//  The display link lives on the render thread, not the main thread. A
+//  terminal at 120Hz would otherwise wake the main thread 120 times a second
+//  just to ask "anything to draw?". And when there is nothing to draw for a
+//  while we stop the link entirely: an idle terminal should cost nothing,
+//  which is the whole thesis of this project.
 
 import AppKit
 import Carbon.HIToolbox
+import QuartzCore
 
 /// Views are main-actor bound, and so is everything that answers them.
 @MainActor
 protocol TerminalSurfaceDelegate: AnyObject {
-    /// The view has a window and a real size, so its grid dimensions are known.
-    /// Attaching before this point would guess at cols/rows.
+    /// The view has a window and a real size, so its grid dimensions are
+    /// known. Attaching before this point would guess at cols/rows.
     func surfaceIsReady(_ surface: TerminalSurfaceView)
     func surface(_ surface: TerminalSurfaceView, send bytes: [UInt8])
     func surface(_ surface: TerminalSurfaceView, resizeTo cols: UInt16, rows: UInt16)
@@ -27,35 +38,34 @@ final class TerminalSurfaceView: NSView {
     weak var delegate: TerminalSurfaceDelegate?
 
     var engine: TerminalEngine? {
-        didSet { needsDisplay = true }
+        didSet { attachEngine() }
     }
 
     /// Shown instead of the grid while the first snapshot is in flight.
     var statusText: String? {
-        didSet { needsDisplay = true }
+        didSet { updateStatusLayer() }
     }
 
-    private let font: NSFont
-    private let boldFont: NSFont
-    private let italicFont: NSFont
-    private let cellSize: CGSize
-    private let baselineOffset: CGFloat
-    private var redrawTimer: Timer?
+    private var renderer: TerminalRenderer?
+    private var fontGrid: FontGrid?
+    private var renderThread: RenderLoop?
+    private var statusLayer: CATextLayer?
+
     private var lastReportedSize: (cols: UInt16, rows: UInt16) = (0, 0)
     private var didSignalReady = false
+    private var currentScale: CGFloat = 0
+
+    /// Point size of the terminal font. A config option eventually.
+    private static let fontPointSize: Double = 13
 
     override init(frame frameRect: NSRect) {
-        let size: CGFloat = 13
-        font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular)
-        boldFont = NSFont.monospacedSystemFont(ofSize: size, weight: .bold)
-        italicFont =
-            NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask)
-        let advance = font.maximumAdvancement.width
-        let lineHeight = (font.ascender - font.descender + font.leading).rounded(.up)
-        cellSize = CGSize(width: advance.rounded(.up), height: lineHeight)
-        baselineOffset = -font.descender
         super.init(frame: frameRect)
         wantsLayer = true
+        layerContentsRedrawPolicy = .never
+        // Top-left gravity means a resize doesn't stretch the last frame
+        // while we draw the next one.
+        layer?.contentsGravity = .topLeft
+        layer?.backgroundColor = Palette.background.cgColor
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }
@@ -63,28 +73,35 @@ final class TerminalSurfaceView: NSView {
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var wantsUpdateLayer: Bool { true }
+
+    // MARK: - Lifecycle
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard window != nil else {
-            redrawTimer?.invalidate()
-            redrawTimer = nil
+            teardownRendering()
             return
         }
-        // A modest redraw tick. The engine reports whether anything actually
-        // changed, so an idle terminal costs one cheap check per frame.
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self, let engine = self.engine, engine.needsDisplay else { return }
-            self.needsDisplay = true
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        redrawTimer = timer
+        setupRenderingIfNeeded()
         window?.makeFirstResponder(self)
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        guard let window, window.backingScaleFactor != currentScale else { return }
+        // A different display means different pixel metrics, so the font
+        // grid and every rasterized glyph in it are wrong. Rebuild.
+        teardownRendering()
+        setupRenderingIfNeeded()
     }
 
     override func layout() {
         super.layout()
         guard window != nil, bounds.width > 1, bounds.height > 1 else { return }
+        setupRenderingIfNeeded()
+        updateSurfaceSize()
+
         if !didSignalReady {
             didSignalReady = true
             lastReportedSize = gridSize
@@ -94,11 +111,90 @@ final class TerminalSurfaceView: NSView {
         reportSizeIfNeeded()
     }
 
+    private func setupRenderingIfNeeded() {
+        guard renderer == nil, let window, bounds.width > 1, bounds.height > 1 else { return }
+
+        let scale = window.backingScaleFactor
+        currentScale = scale
+
+        let grid = FontGridSet.grid(
+            family: nil, pointSize: Self.fontPointSize, scale: Double(scale))
+        fontGrid = grid
+
+        guard let layer else { return }
+        layer.contentsScale = scale
+
+        do {
+            let context = try MetalContext.acquire()
+            guard let engine else {
+                // No engine yet: we still want the grid so `gridSize` can
+                // answer, but there is nothing to render.
+                return
+            }
+            let renderer = TerminalRenderer(
+                context: context, grid: grid, layer: layer, source: engine)
+            self.renderer = renderer
+            updateSurfaceSize()
+
+            let loop = RenderLoop(renderer: renderer)
+            renderThread = loop
+            loop.start(hostView: self)
+            attachEngine()
+        } catch {
+            Trace.log("renderer init failed: \(error)")
+        }
+    }
+
+    private func teardownRendering() {
+        renderThread?.stop()
+        renderThread = nil
+        renderer = nil
+        engine?.onWake = nil
+    }
+
+    private func attachEngine() {
+        guard let engine else { return }
+        // Restart a paused display link when output arrives. This is the
+        // other half of stopping it when idle.
+        let loop = renderThread
+        engine.onWake = { [weak loop] in loop?.wake() }
+        if renderer == nil {
+            setupRenderingIfNeeded()
+        } else {
+            renderThread?.wake()
+        }
+        updateStatusLayer()
+    }
+
+    private func updateSurfaceSize() {
+        guard let renderer, let window else { return }
+        let scale = window.backingScaleFactor
+        let pixelWidth = Int((bounds.width * scale).rounded())
+        let pixelHeight = Int((bounds.height * scale).rounded())
+        renderer.setScreenSize(
+            width: pixelWidth, height: pixelHeight, scale: Double(scale))
+        // Draw synchronously so a live resize never shows a stale or
+        // wrongly-sized surface.
+        renderer.updateFrame()
+        renderer.drawFrame(sync: true)
+    }
+
     /// The grid size this view can show, in cells.
     var gridSize: (cols: UInt16, rows: UInt16) {
-        let cols = max(1, Int(bounds.width / cellSize.width))
-        let rows = max(1, Int(bounds.height / cellSize.height))
-        return (UInt16(min(cols, Int(UInt16.max))), UInt16(min(rows, Int(UInt16.max))))
+        guard let renderer else {
+            // Before the renderer exists, fall back to the shared grid's
+            // metrics so an attach can still pick a sensible size.
+            let scale = window?.backingScaleFactor ?? 2
+            let grid = FontGridSet.grid(
+                family: nil, pointSize: Self.fontPointSize, scale: Double(scale))
+            let cellW = max(1, Double(grid.metrics.cellWidth))
+            let cellH = max(1, Double(grid.metrics.cellHeight))
+            let cols = max(1, Int(bounds.width * scale / cellW))
+            let rows = max(1, Int(bounds.height * scale / cellH))
+            return (UInt16(min(cols, Int(UInt16.max))), UInt16(min(rows, Int(UInt16.max))))
+        }
+        let g = renderer.gridSize
+        return (g.columns, g.rows)
     }
 
     private func reportSizeIfNeeded() {
@@ -108,115 +204,48 @@ final class TerminalSurfaceView: NSView {
         delegate?.surface(self, resizeTo: size.cols, rows: size.rows)
     }
 
-    // MARK: - Drawing
+    // MARK: - Status overlay
 
-    override func draw(_ dirtyRect: NSRect) {
-        guard let context = NSGraphicsContext.current?.cgContext else { return }
-
-        guard let grid = engine?.grid() else {
-            drawPlaceholder(in: context)
+    /// The attaching/error message. A text layer rather than a drawn string:
+    /// the view has no `draw(_:)` any more, its contents are an IOSurface.
+    private func updateStatusLayer() {
+        guard let text = statusText, engine == nil else {
+            statusLayer?.removeFromSuperlayer()
+            statusLayer = nil
             return
         }
 
-        context.setFillColor(grid.background.cgColor)
-        context.fill(bounds)
+        let textLayer =
+            statusLayer
+            ?? {
+                let l = CATextLayer()
+                l.alignmentMode = .center
+                l.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+                l.fontSize = 12
+                l.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                l.contentsScale = window?.backingScaleFactor ?? 2
+                layer?.addSublayer(l)
+                statusLayer = l
+                return l
+            }()
 
-        // Backgrounds first, as runs, so adjacent cells with the same colour
-        // become one fill.
-        for (y, row) in grid.lines.enumerated() {
-            var runStart = 0
-            var runColor: Grid.RGB?
-            func flush(_ end: Int) {
-                guard let color = runColor, end > runStart else { return }
-                context.setFillColor(color.cgColor)
-                context.fill(
-                    CGRect(
-                        x: CGFloat(runStart) * cellSize.width,
-                        y: CGFloat(y) * cellSize.height,
-                        width: CGFloat(end - runStart) * cellSize.width,
-                        height: cellSize.height))
-            }
-            for (x, cell) in row.cells.enumerated() {
-                let color = resolvedBackground(cell, grid: grid)
-                if color != runColor {
-                    flush(x)
-                    runStart = x
-                    runColor = color
-                }
-            }
-            flush(row.cells.count)
-        }
-
-        // Then text.
-        //
-        // The view is flipped so row 0 is at the top, but CoreText lays glyphs
-        // out on an upward Y axis. Without this the text draws mirrored.
-        context.saveGState()
-        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
-        defer { context.restoreGState() }
-
-        for (y, row) in grid.lines.enumerated() {
-            let baseline = CGFloat(y) * cellSize.height + cellSize.height - baselineOffset
-            for (x, cell) in row.cells.enumerated() {
-                guard !cell.text.isEmpty, cell.text != " ", !cell.invisible else { continue }
-                let color = resolvedForeground(cell, grid: grid)
-                let face: NSFont =
-                    cell.bold ? boldFont : (cell.italic ? italicFont : font)
-                var attributes: [NSAttributedString.Key: Any] = [
-                    .font: face,
-                    .foregroundColor: NSColor(
-                        srgbRed: CGFloat(color.r) / 255,
-                        green: CGFloat(color.g) / 255,
-                        blue: CGFloat(color.b) / 255,
-                        alpha: cell.faint ? 0.65 : 1.0),
-                ]
-                if cell.underline { attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue }
-                if cell.strikethrough {
-                    attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
-                }
-                let line = CTLineCreateWithAttributedString(
-                    NSAttributedString(string: cell.text, attributes: attributes))
-                context.textPosition = CGPoint(x: CGFloat(x) * cellSize.width, y: baseline)
-                CTLineDraw(line, context)
-            }
-        }
-
-        if let cursor = grid.cursor {
-            context.setFillColor(
-                grid.foreground.cgColor.copy(alpha: 0.75) ?? grid.foreground.cgColor)
-            context.fill(
-                CGRect(
-                    x: CGFloat(cursor.x) * cellSize.width,
-                    y: CGFloat(cursor.y) * cellSize.height,
-                    width: cellSize.width,
-                    height: cellSize.height))
-        }
+        textLayer.string = text
+        textLayer.frame = CGRect(
+            x: 0, y: (bounds.height - 16) / 2, width: bounds.width, height: 16)
     }
 
-    private func resolvedBackground(_ cell: Grid.Cell, grid: Grid) -> Grid.RGB {
-        if cell.selected { return Grid.RGB(r: 60, g: 80, b: 110) }
-        if cell.inverse { return cell.foreground ?? grid.foreground }
-        return cell.background ?? grid.background
+    // MARK: - Focus
+
+    override func becomeFirstResponder() -> Bool {
+        renderer?.setFocus(true)
+        renderThread?.wake()
+        return super.becomeFirstResponder()
     }
 
-    private func resolvedForeground(_ cell: Grid.Cell, grid: Grid) -> Grid.RGB {
-        if cell.inverse { return cell.background ?? grid.background }
-        return cell.foreground ?? grid.foreground
-    }
-
-    private func drawPlaceholder(in context: CGContext) {
-        context.setFillColor(NSColor.textBackgroundColor.cgColor)
-        context.fill(bounds)
-        guard let text = statusText else { return }
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]
-        let size = text.size(withAttributes: attributes)
-        text.draw(
-            at: NSPoint(
-                x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2),
-            withAttributes: attributes)
+    override func resignFirstResponder() -> Bool {
+        renderer?.setFocus(false)
+        renderThread?.wake()
+        return super.resignFirstResponder()
     }
 
     // MARK: - Input
@@ -273,18 +302,5 @@ final class TerminalSurfaceView: NSView {
         var bytes = Array(typed.utf8)
         if option { bytes.insert(0x1b, at: 0) }
         return bytes
-    }
-}
-
-extension Grid.RGB {
-    init(r: UInt8, g: UInt8, b: UInt8) {
-        self.r = r
-        self.g = g
-        self.b = b
-    }
-
-    var cgColor: CGColor {
-        CGColor(
-            srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255, blue: CGFloat(b) / 255, alpha: 1)
     }
 }

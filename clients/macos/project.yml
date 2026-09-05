@@ -23,6 +23,9 @@ targets:
   Illogical:
     type: application
     platform: macOS
+    # Shaders.metal compiles into the bundle's default.metallib. That needs
+    # Xcode's Metal toolchain, which since Xcode 16 is a separate download:
+    # `xcodebuild -downloadComponent MetalToolchain`.
     sources:
       - path: Illogical
     dependencies:
@@ -37,8 +40,28 @@ targets:
         PRODUCT_NAME: Illogical
         PRODUCT_BUNDLE_IDENTIFIER: dev.illogical.Illogical
         INFOPLIST_FILE: Illogical/Supporting/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: Illogical/Terminal/Renderer/ShaderTypes.h
         CODE_SIGN_ENTITLEMENTS: Illogical/Supporting/Illogical.entitlements
         CODE_SIGN_IDENTITY: "-"
         ENABLE_HARDENED_RUNTIME: true
         COMBINE_HIDPI_IMAGES: true
         LD_RUNPATH_SEARCH_PATHS: ["$(inherited)", "@executable_path/../Frameworks"]
+    scheme:
+      testTargets:
+        - IllogicalRendererTests
+
+  # The renderer has no dependency on libghostty: it consumes a plain
+  # TerminalSnapshot. That lets these tests drive it end to end — build a
+  # screen, render it to an IOSurface, read the pixels back — without a
+  # terminal, a socket or the XCFramework.
+  IllogicalRendererTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Illogical/Terminal/Renderer
+      - path: Tests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.illogical.RendererTests
+        SWIFT_OBJC_BRIDGING_HEADER: Illogical/Terminal/Renderer/ShaderTypes.h
+        GENERATE_INFOPLIST_FILE: true
