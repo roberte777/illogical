@@ -210,6 +210,48 @@ final class SurfaceInputTests: XCTestCase {
         }
     }
 
+    /// Horizontal is buttons six and seven, one press per column. Untested
+    /// until now because every caller passed `columns: 0`; native scrollback's
+    /// `wheelColumns` is about to start feeding it.
+    func testWheelReportsColumnsAsButtonsSixAndSeven() throws {
+        let (view, engine, recorder) = try surface()
+        write(engine, "\u{1b}[?1000h\u{1b}[?1006h")
+
+        XCTAssertTrue(view.reportWheel(rows: 0, columns: 2, mods: [], at: .zero))
+        XCTAssertEqual(recorder.sent.count, 2)
+        for report in recorder.sent {
+            XCTAssertTrue(String(decoding: report, as: UTF8.self).hasPrefix("\u{1b}[<66;"))
+        }
+
+        recorder.sent.removeAll()
+        XCTAssertTrue(view.reportWheel(rows: 0, columns: -1, mods: [], at: .zero))
+        XCTAssertEqual(recorder.sent.count, 1)
+        XCTAssertTrue(recorder.text.hasPrefix("\u{1b}[<67;"))
+    }
+
+    /// A diagonal gesture reports both axes, vertical first — the order
+    /// `scrollCallback` uses.
+    func testDiagonalWheelReportsBothAxes() throws {
+        let (view, engine, recorder) = try surface()
+        write(engine, "\u{1b}[?1000h\u{1b}[?1006h")
+
+        XCTAssertTrue(view.reportWheel(rows: 1, columns: 1, mods: [], at: .zero))
+        XCTAssertEqual(recorder.sent.count, 2)
+        XCTAssertTrue(String(decoding: recorder.sent[0], as: UTF8.self).hasPrefix("\u{1b}[<64;"))
+        XCTAssertTrue(String(decoding: recorder.sent[1], as: UTF8.self).hasPrefix("\u{1b}[<66;"))
+    }
+
+    /// A gesture that crossed no boundary still belongs to the program, so
+    /// the viewport must not move on the leftover fraction. This is what
+    /// native scrollback's `guard !claimed` depends on.
+    func testTrackingProgramClaimsEvenAZeroGesture() throws {
+        let (view, engine, recorder) = try surface()
+        write(engine, "\u{1b}[?1000h\u{1b}[?1006h")
+
+        XCTAssertTrue(view.reportWheel(rows: 0, columns: 0, mods: [], at: .zero))
+        XCTAssertTrue(recorder.sent.isEmpty, "claimed, but nothing to report")
+    }
+
     /// In the alternate screen with DECSET 1007 and no mouse reporting, the
     /// wheel becomes cursor keys — which is what makes the wheel work in
     /// `less`.
