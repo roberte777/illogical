@@ -270,20 +270,33 @@ final class TerminalSurfaceView: NSView {
     override func scrollWheel(with event: NSEvent) {
         guard let engine else { return }
 
-        // When the program has asked for mouse events the wheel belongs to
-        // it, not to us — scrolling inside `less` should scroll `less`. We
-        // can't encode those events yet, so the wheel does nothing rather
-        // than doing the wrong thing.
-        guard !engine.isMouseTracking else { return }
-
-        let rows = scrollAccumulator.viewportRows(
+        // Quantize first, and unconditionally. Every consumer of the wheel
+        // works in rows, not pixels — a mouse report is one button press per
+        // row — and the accumulator's remainder has to keep advancing even on
+        // events we hand to the program, or a gesture that crosses into the
+        // alternate screen carries a stale fraction across with it. This is
+        // the order libghostty uses in `Surface.scrollCallback`.
+        let rows = scrollAccumulator.wheelRows(
             scrollingDeltaY: Double(event.scrollingDeltaY),
             legacyDeltaY: Double(event.deltaY),
             precise: event.hasPreciseScrollingDeltas,
             cellHeight: Double(max(1, currentCellHeight)))
+
+        // Then decide whose event it is. When the program has asked for mouse
+        // events the wheel belongs to it — scrolling inside `less` should
+        // scroll `less` — and the viewport must not move. The encoder that
+        // turns these rows into wheel-button reports lands with mouse
+        // reporting; until then the wheel does nothing here rather than doing
+        // the wrong thing.
+        //
+        // Alternate scroll (DECSET 1007 in the alternate screen, with no
+        // mouse reporting) is the other claimant, and also writes to the PTY
+        // rather than moving the viewport. Both belong to the input encoder.
+        guard !engine.isMouseTracking else { return }
         guard rows != 0 else { return }
 
-        engine.scroll(.delta(rows))
+        // Positive rows are up; the viewport axis counts down.
+        engine.scroll(.delta(-rows))
         renderThread?.wake()
         showScrollbar()
     }

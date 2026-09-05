@@ -168,3 +168,63 @@ final class ViewportRowsTests: XCTestCase {
             -1, "a precise 30px delta is one row, not 99 ticks")
     }
 }
+
+/// `wheelRows` is what the wheel's other claimants consume — mouse reporting
+/// sends one button press per row, and alternate scroll one cursor key per
+/// row. It has to agree with the viewport about *how much* and disagree about
+/// which way.
+final class WheelRowsTests: XCTestCase {
+    private let cellHeight = 30.0
+
+    /// libghostty's convention, which the wheel-button encoding is written
+    /// against: positive is up (button 4), negative is down (button 5).
+    func testPositiveIsUp() {
+        var a = ScrollAccumulator()
+        XCTAssertEqual(
+            a.wheelRows(
+                scrollingDeltaY: 60, legacyDeltaY: 0, precise: true, cellHeight: cellHeight),
+            2)
+        a.reset()
+        XCTAssertEqual(
+            a.wheelRows(
+                scrollingDeltaY: -60, legacyDeltaY: 0, precise: true, cellHeight: cellHeight),
+            -2)
+    }
+
+    /// The viewport is the negation and nothing else. If these ever diverge by
+    /// more than a sign, one of the two paths is quantizing differently.
+    func testViewportIsTheNegation() {
+        let deltas: [(Double, Double, Bool)] = [
+            (60, 0, true), (-60, 0, true), (7, 0, true), (0, 1, false),
+            (0.1, 0, false), (-0.1, 0, false), (0, 0, true), (145, 0, true),
+        ]
+        for (modern, legacy, precise) in deltas {
+            var wheel = ScrollAccumulator()
+            var viewport = ScrollAccumulator()
+            let w = wheel.wheelRows(
+                scrollingDeltaY: modern, legacyDeltaY: legacy, precise: precise,
+                cellHeight: cellHeight)
+            let v = viewport.viewportRows(
+                scrollingDeltaY: modern, legacyDeltaY: legacy, precise: precise,
+                cellHeight: cellHeight)
+            XCTAssertEqual(v, -w, "delta \(modern)/\(legacy) precise=\(precise)")
+        }
+    }
+
+    /// The remainder advances on every event, including the ones a caller
+    /// discards because the program owns the wheel. Ten sub-row events add up
+    /// to a scroll whether or not anyone acted on the first nine.
+    func testRemainderCarriesAcrossDiscardedEvents() {
+        var a = ScrollAccumulator()
+        for _ in 0..<9 {
+            XCTAssertEqual(
+                a.wheelRows(
+                    scrollingDeltaY: 3, legacyDeltaY: 0, precise: true, cellHeight: cellHeight),
+                0)
+        }
+        XCTAssertEqual(
+            a.wheelRows(
+                scrollingDeltaY: 3, legacyDeltaY: 0, precise: true, cellHeight: cellHeight),
+            1, "the tenth 3px event completes a 30px row")
+    }
+}

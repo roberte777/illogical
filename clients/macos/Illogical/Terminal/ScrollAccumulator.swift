@@ -60,17 +60,21 @@ struct ScrollAccumulator {
         return Int(whole)
     }
 
-    /// Rows to move the *viewport* by, given a scroll event's two delta
-    /// fields.
+    /// Whole rows from one AppKit scroll event, in the OS's sign convention:
+    /// positive is up, negative is down.
     ///
-    /// Handles the two things that are easy to get wrong at the AppKit
-    /// boundary. `scrollingDeltaY` is the modern field, but not every source
+    /// This is the quantization every consumer of the wheel shares — the
+    /// viewport, and mouse reporting once it lands, which sends one wheel
+    /// button press per *row* rather than per event. Call it exactly once per
+    /// event, before deciding who the event belongs to, so the remainder keeps
+    /// advancing across a gesture that changes hands mid-way.
+    ///
+    /// It handles the one thing that is easy to get wrong at the AppKit
+    /// boundary: `scrollingDeltaY` is the modern field, but not every source
     /// fills it in — synthesized events and some drivers set only the legacy
     /// `deltaY`, which is in lines — so we fall back rather than ignoring the
-    /// event. And the sign is flipped: the OS reports positive when the
-    /// content should move down, which is toward *older* output, whereas the
-    /// viewport axis counts downward from the top of the scrollback.
-    mutating func viewportRows(
+    /// event.
+    mutating func wheelRows(
         scrollingDeltaY: Double,
         legacyDeltaY: Double,
         precise: Bool,
@@ -82,7 +86,23 @@ struct ScrollAccumulator {
             delta = legacyDeltaY
             isPrecise = false
         }
-        return -rows(delta: delta, precise: isPrecise, cellHeight: cellHeight)
+        return rows(delta: delta, precise: isPrecise, cellHeight: cellHeight)
+    }
+
+    /// Rows to move the *viewport* by, for the same event.
+    ///
+    /// The sign is flipped from `wheelRows`: the OS reports positive when the
+    /// content should move down, which is toward *older* output, whereas the
+    /// viewport axis counts downward from the top of the scrollback.
+    mutating func viewportRows(
+        scrollingDeltaY: Double,
+        legacyDeltaY: Double,
+        precise: Bool,
+        cellHeight: Double
+    ) -> Int {
+        -wheelRows(
+            scrollingDeltaY: scrollingDeltaY, legacyDeltaY: legacyDeltaY,
+            precise: precise, cellHeight: cellHeight)
     }
 
     /// Forget any partial movement. Used when the viewport jumps somewhere
