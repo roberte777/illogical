@@ -210,4 +210,115 @@ final class SurfaceInputTests: XCTestCase {
         XCTAssertTrue(view.reportWheel(rows: -2, columns: 0, at: .zero))
         XCTAssertEqual(recorder.text, "\u{1b}[B\u{1b}[B")
     }
+
+    // MARK: - Selection
+
+    /// The surface needs a window before it has a renderer, and it needs a
+    /// renderer before it knows the geometry a selection is measured in. Not
+    /// a *key* window — an xctest process cannot have one — just a window.
+    private func windowedSurface() throws -> (TerminalSurfaceView, TerminalEngine, NSWindow) {
+        let engine = try TerminalEngine(cols: 80, rows: 20)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 400),
+            styleMask: [.titled], backing: .buffered, defer: false)
+        // Otherwise `close()` releases it and ARC releases it again.
+        window.isReleasedWhenClosed = false
+        let view = TerminalSurfaceView(frame: window.contentLayoutRect)
+        window.contentView = view
+        view.engine = engine
+        view.layoutSubtreeIfNeeded()
+        return (view, engine, window)
+    }
+
+    /// Take the view out of its window first, which stops the render thread.
+    private func tearDown(_ view: TerminalSurfaceView, _ window: NSWindow) {
+        window.contentView = NSView(frame: view.frame)
+        window.close()
+    }
+
+    /// A pointer event inside a given cell.
+    ///
+    /// `across` is where in the cell horizontally, because libghostty
+    /// includes a cell in a drag only once the pointer is past its midpoint.
+    /// The grid does not start at the view's origin — the renderer balances
+    /// padding around it — so this goes through the renderer's own geometry
+    /// rather than assuming.
+    private func click(
+        _ view: TerminalSurfaceView, column: Int, row: Int, across: Double = 0.5,
+        type: NSEvent.EventType
+    ) throws -> NSEvent {
+        let size = try XCTUnwrap(view.rendererSizeForTesting)
+        let backing = NSPoint(
+            x: Double(size.padding.left) + (Double(column) + across) * Double(size.cell.width),
+            y: Double(size.padding.top) + (Double(row) + 0.5) * Double(size.cell.height))
+        let local = view.convertFromBacking(backing)
+        return try XCTUnwrap(
+            NSEvent.mouseEvent(
+                with: type,
+                // Window coordinates are bottom-up; the surface is flipped.
+                location: NSPoint(x: local.x, y: view.bounds.height - local.y),
+                modifierFlags: [],
+                timestamp: 0,
+                windowNumber: view.window?.windowNumber ?? 0,
+                context: nil,
+                eventNumber: 0,
+                clickCount: 1,
+                pressure: 1))
+    }
+
+    /// Press, drag, release through the responder methods, ending in text on
+    /// the way to the clipboard.
+    func testDragSelectsThroughTheResponderChain() throws {
+        let (view, engine, window) = try windowedSurface()
+        defer { tearDown(view, window) }
+        write(engine, "hello world")
+
+        view.mouseDown(with: try click(view, column: 0, row: 0, type: .leftMouseDown))
+        view.mouseDragged(
+            with: try click(view, column: 4, row: 0, across: 0.8, type: .leftMouseDragged))
+        view.mouseUp(with: try click(view, column: 4, row: 0, across: 0.8, type: .leftMouseUp))
+
+        XCTAssertEqual(engine.selectionText(), "hello")
+        XCTAssertTrue(engine.hasSelection)
+    }
+
+    /// Typing drops the selection, as it does in every terminal.
+    func testTypingClearsTheSelection() throws {
+        let (view, engine, window) = try windowedSurface()
+        defer { tearDown(view, window) }
+        write(engine, "hello world")
+        engine.selectAll()
+        XCTAssertTrue(engine.hasSelection)
+
+        view.keyDown(with: try XCTUnwrap(keyDown(kVK_ANSI_A, characters: "a")))
+        XCTAssertFalse(engine.hasSelection)
+    }
+
+    /// Copy is disabled with nothing selected, which is the only thing the
+    /// Edit menu can tell the user before they try it.
+    func testCopyIsValidatedAgainstTheSelection() throws {
+        let (view, engine, window) = try windowedSurface()
+        defer { tearDown(view, window) }
+        write(engine, "hello")
+
+        let copyItem = NSMenuItem(
+            title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "")
+        XCTAssertFalse(view.validateMenuItem(copyItem))
+
+        engine.selectAll()
+        XCTAssertTrue(view.validateMenuItem(copyItem))
+    }
+
+    /// A program with mouse tracking on gets the click; the selection gesture
+    /// does not start behind its back.
+    func testMouseTrackingTakesPrecedenceOverSelection() throws {
+        let (view, engine, window) = try windowedSurface()
+        defer { tearDown(view, window) }
+        write(engine, "hello world\u{1b}[?1000h\u{1b}[?1006h")
+
+        view.mouseDown(with: try click(view, column: 0, row: 0, type: .leftMouseDown))
+        view.mouseDragged(
+            with: try click(view, column: 5, row: 0, across: 0.8, type: .leftMouseDragged))
+        XCTAssertFalse(engine.hasSelection)
+    }
 }

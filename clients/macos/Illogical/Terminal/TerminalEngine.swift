@@ -26,6 +26,17 @@ final class TerminalEngine: @unchecked Sendable {
     private var renderState: GhosttyRenderState?
     private let lock = NSLock()
 
+    /// Selection gesture state. Owned here because it holds *tracked*
+    /// references into `terminal`, which have to be released against that
+    /// terminal before it is freed — see `adopt`.
+    let selectionGesture = SelectionGesture()
+
+    /// Set when something changed that libghostty's per-row dirty flags do
+    /// not describe. Those flags track content, not what is on screen, so
+    /// after a selection change every row is still clean and a renderer that
+    /// trusted them would keep showing the old frame.
+    private var forceFullRebuild = false
+
     /// Reused across frames so extraction allocates nothing.
     private var rowIterator: GhosttyRenderStateRowIterator?
     private var rowCells: GhosttyRenderStateRowCells?
@@ -93,6 +104,8 @@ final class TerminalEngine: @unchecked Sendable {
     }
 
     deinit {
+        // Before the terminal: the gesture's tracked references belong to it.
+        selectionGesture.free(terminal: terminal)
         if let rowCells { ghostty_render_state_row_cells_free(rowCells) }
         if let rowIterator { ghostty_render_state_row_iterator_free(rowIterator) }
         if let renderState { ghostty_render_state_free(renderState) }
@@ -105,7 +118,12 @@ final class TerminalEngine: @unchecked Sendable {
     /// already has, so we adopt it wholesale instead of replaying history.
     func adopt(terminal newTerminal: GhosttyTerminal, cols: UInt16, rows: UInt16) {
         lock.lock()
-        if let terminal { ghostty_terminal_free(terminal) }
+        if let terminal {
+            // Tracked references into a terminal do not survive it, and the
+            // gesture cannot find that out on its own.
+            selectionGesture.reset(terminal: terminal)
+            ghostty_terminal_free(terminal)
+        }
         terminal = newTerminal
         self.cols = cols
         self.rows = rows
@@ -159,6 +177,14 @@ final class TerminalEngine: @unchecked Sendable {
         markDirty()
     }
 
+    /// Force the next frame to rebuild every row, and ask for one.
+    func markSelectionDirty() {
+        lock.lock()
+        forceFullRebuild = true
+        lock.unlock()
+        markDirty()
+    }
+
     private func markDirty() {
         // Only wake on the clean -> dirty edge. A terminal spewing output
         // must not post a wakeup per write.
@@ -183,6 +209,8 @@ final class TerminalEngine: @unchecked Sendable {
             return false
         }
         let beginResult = ghostty_render_state_begin_update(renderState, terminal)
+        let forced = forceFullRebuild
+        forceFullRebuild = false
         lock.unlock()
 
         guard beginResult == GHOSTTY_SUCCESS else { return false }
@@ -234,7 +262,7 @@ final class TerminalEngine: @unchecked Sendable {
             passwordInput: cursor.password_input,
             style: Self.cursorStyle(cursor.visual_style))
 
-        snapshot.dirty = sizeChanged ? .full : Self.dirtyState(dirty)
+        snapshot.dirty = (sizeChanged || forced) ? .full : Self.dirtyState(dirty)
 
         // Point the reusable iterator at this update's rows.
         var iterator: GhosttyRenderStateRowIterator? = rowIterator

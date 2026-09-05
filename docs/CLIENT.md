@@ -137,10 +137,39 @@ The viewport is entirely client-side [ARCH t=323]. Two people attached to one
 terminal scroll independently — the tmux behaviour where one client's scroll
 moves everyone's window is a bug we are deliberately not reproducing.
 
-Selection is likewise per-client. Use `selection.h`'s gesture state machine
-rather than hand-rolling drag handling, and keep endpoints as **tracked** grid
-refs — plain `GhosttyGridRef`s are invalidated by the next terminal mutation,
-which for us is every output frame.
+Selection is likewise per-client, and is `selection.h`'s gesture state machine
+rather than hand-rolled drag handling. The client supplies a pointer position,
+the click timing AppKit already knows, and the renderer's own geometry; the
+gesture decides what a double-click selects and how a word-granular drag
+extends backwards over its own anchor.
+
+Endpoints must be **tracked** grid refs: a plain `GhosttyGridRef` is
+invalidated by the next terminal mutation, which for us is every output frame.
+Two mechanisms give us that, and neither requires holding a ref ourselves.
+Installing a selection with `GHOSTTY_TERMINAL_OPT_SELECTION` makes the terminal
+copy it into tracked state, so the *result* of a gesture survives; and the
+gesture owns tracked references for its own anchor, so the gesture in progress
+survives too. The consequence is a lifetime rule: those references belong to
+the terminal that made them and must be released before it is freed, which is
+why `TerminalEngine` owns the gesture and resets it in `adopt` rather than the
+view owning it and finding out later.
+
+Deriving a ref and using it are one operation under the terminal lock, for the
+same reason. Points are resolved in **viewport** coordinates, which
+`ghostty_terminal_grid_ref` interprets against wherever the viewport currently
+sits — so the conversion is already correct while scrolled back into history,
+with no offset to plumb through.
+
+A selection changes no cell, so libghostty's per-row dirty flags do not
+describe it and the frame has to be rebuilt in full when it changes.
+
+Copy is `ghostty_terminal_selection_format_alloc` with plain output, unwrap and
+trim — the combination the header names as matching Ghostty's own
+`selectionString()`, and what makes a copied command paste back as one command.
+Paste is `ghostty_paste_encode`, which strips control bytes and wraps in
+bracketed paste when the program asked for it; `ghostty_paste_is_safe` decides
+when to ask the user first, because a pasted newline is a pressed return and
+outside bracketed paste the shell cannot tell the difference.
 
 ## Input
 
