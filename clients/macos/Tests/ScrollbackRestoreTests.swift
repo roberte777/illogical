@@ -203,7 +203,14 @@ final class ScrollbackRestoreTests: XCTestCase {
 
         let restored = try restore.ready()
         defer { ghostty_terminal_free(restored) }
-        XCTAssertTrue(try restore.restoreNextHistoryPage(), "expected history to restore")
+
+        // Every history byte is buffered and applicable: without the abandon
+        // below, the first call in the loop returns true. That is what makes
+        // this test fail if the abandon is removed — there is not much history
+        // to work with, because `ghostty_terminal_new` builds its terminal
+        // with libghostty's default 10 KB scrollback limit and the C API
+        // exposes no way to raise it.
+        XCTAssertGreaterThan(stream.pending, 0, "expected buffered history to apply")
 
         // The connection drops here.
         stream.abandon()
@@ -215,7 +222,7 @@ final class ScrollbackRestoreTests: XCTestCase {
             if !more { break }
             pages += 1
         }
-        XCTAssertLessThan(pages, 64, "history loop did not terminate after abandon")
+        XCTAssertEqual(pages, 0, "abandon should stop the history loop at once")
     }
 
     /// A snapshot that stops short does not hang: the pipe reports end of file

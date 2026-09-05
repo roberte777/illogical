@@ -353,9 +353,14 @@ final class TerminalController {
             let restored = pages
             await MainActor.run {
                 self?.scrollbackRows = rows
-                // Drop the decoder and whatever the pipe still holds. Identity,
-                // not just non-nil: a re-attach may already have replaced it.
-                if self?.restore === restore { self?.restore = nil }
+                // Drop the decoder and whatever the pipe still holds — but only
+                // if this task is still the current one. A cancelled task runs
+                // its tail anyway, and comparing the restore alone is not
+                // enough to tell the two apart when a second `snapshot_end`
+                // re-entered `restoreHistory` with the same object: the loser
+                // would clear `restore` out from under the live decode, and
+                // the next disconnect would then not abandon its pipe.
+                if self?.historyToken === token { self?.restore = nil }
                 Trace.log(
                     "terminal \(terminalID): restored \(restored) history pages, "
                         + "\(rows) rows of scrollback")

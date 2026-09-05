@@ -337,6 +337,12 @@ fn attach(self: *Client, id: session.TerminalId, req: protocol.body.Attach) !voi
     try self.send(.snapshot_begin, id, begin);
 
     var chunker = SnapshotChunker.init(self, id);
+    // `Terminal.attach` drops any subscriber we already had before installing
+    // the new one, so from here on a failure means we are subscribed to
+    // nothing -- including on a re-attach, where we *were* subscribed on the
+    // way in. This errdefer is above the call for that reason: it has to undo
+    // the record of an attachment that no longer exists.
+    errdefer self.removeAttached(id);
     // Subscribe and snapshot under the terminal's lock, so the client gets
     // every byte after the snapshot and none from before it.
     try t.attach(.{
@@ -344,22 +350,19 @@ fn attach(self: *Client, id: session.TerminalId, req: protocol.body.Attach) !voi
         .writeFn = onOutput,
         .exitFn = onExit,
     }, &chunker.interface);
-    // We are a subscriber from here, and `detachAll` only knows about ids in
-    // `attached`. Record it before anything that can fail: a client that closes
-    // its socket during the two frames below makes those `send`s return EPIPE,
-    // and without this the subscriber outlives the connection -- fanned out to
-    // on every PTY read for the life of the daemon, and counted forever by
-    // `illogical list`. It also means `currentTerminal` is right for output the
-    // reader thread produces the moment `attach` releases the terminal lock.
-    errdefer {
-        t.unsubscribe(self);
-        self.removeAttached(id);
-    }
-    // Not `append` alone: a second `attach` for the same terminal on one
-    // connection is desync recovery, and it must replace this client's
-    // registration rather than add a second one.
-    self.removeAttached(id);
-    try self.attached.append(self.gpa, id);
+    errdefer t.unsubscribe(self);
+
+    // Record it before the frames below, because `detachAll` only knows about
+    // ids in `attached`: a client that closes its socket during them makes
+    // those `send`s return EPIPE, and without this the subscriber outlives the
+    // connection -- fanned out to on every PTY read for the life of the
+    // daemon, and counted forever by `illogical list`.
+    //
+    // Appending only when absent, rather than remove-then-append, because a
+    // re-attach must not leave `attached` momentarily empty: `currentTerminal`
+    // reads it from the terminal's reader thread, and would tag live output
+    // with the control session in that window.
+    if (!self.isAttached(id)) try self.attached.append(self.gpa, id);
 
     // The chunker sends `snapshot_ready` the moment the encoder passes READY.
     // If the scan never found it — a snapshot format change, a truncated park
@@ -396,6 +399,13 @@ fn detachAll(self: *Client) void {
         if (self.server.terminal(id)) |t| t.unsubscribe(self);
     }
     self.attached.clearRetainingCapacity();
+}
+
+fn isAttached(self: *Client, id: session.TerminalId) bool {
+    for (self.attached.items) |a| {
+        if (a == id) return true;
+    }
+    return false;
 }
 
 fn removeAttached(self: *Client, id: session.TerminalId) void {
@@ -683,7 +693,15 @@ test "the chunker frames ready between the right two chunks" {
     var header_buf: [protocol.header_len]u8 = undefined;
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(gpa);
+    // Bounded, because the write end is this same thread's `client` and stays
+    // open: a chunker that dropped a byte would leave `readAll` blocked on a
+    // socket that never reaches EOF, turning a failed assertion into a hung
+    // test run. One frame per ten-byte write plus the marker is the ceiling.
+    const max_frames = bytes.len / 10 + 8;
+    var frames: usize = 0;
     while (chunks.items.len < bytes.len or readies == 0) {
+        frames += 1;
+        if (frames > max_frames) break;
         try sys.readAll(reader_fd, &header_buf);
         const header = try protocol.Header.decode(&header_buf);
         try testing.expectEqual(@as(session.TerminalId, 7), header.session);
@@ -729,12 +747,13 @@ test "the READY prefix does not grow with scrollback" {
     // gate, and it is the only reason any of this scanning exists.
     try testing.expect(large.len > small.len * 5);
 
-    // An absolute bound, not a ratio. The prefix is the active screen plus
+    // An absolute bound, not a ratio: the prefix is the active screen plus
     // whatever of the page it sits in, so it moves by less than one page
-    // between any two terminals of the same geometry. A ratio would pass a
-    // regression that put two or three history pages ahead of READY, which is
-    // the realistic way this breaks -- and it is what a partial revert of the
-    // scanner would look like.
+    // between two terminals of the same geometry, no matter how much history
+    // is behind them. The largest post-READY page record these inputs produce
+    // is a little under 8 KiB, so 16 KiB is two pages of slack -- tight enough
+    // to catch a partial revert that leaves a page or two ahead of the marker,
+    // which is the realistic way this breaks. Observed drift is ~3 KiB.
     const drift = @max(large_ready, small_ready) - @min(large_ready, small_ready);
-    try testing.expect(drift < 64 * 1024);
+    try testing.expect(drift < 16 * 1024);
 }
