@@ -36,7 +36,21 @@ state="$(mktemp -d /tmp/illogical-launch.XXXXXX)"
 pids=()
 cleanup() {
   pkill -f "$app" 2>/dev/null || true
-  for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null || true; done
+
+  # Children first, then the daemon. A daemon holding a terminal sits in an
+  # uninterruptible PTY read and does not die on SIGTERM *or* SIGKILL until
+  # that read returns -- so killing it first leaves it around for as long as
+  # its child runs, which for our filler is ten minutes. Killing the child
+  # closes the other end, the read returns, and the pending signal lands.
+  for p in "${pids[@]:-}"; do
+    [ -n "$p" ] || continue
+    pkill -P "$p" 2>/dev/null || true
+  done
+  sleep 0.3
+  for p in "${pids[@]:-}"; do
+    [ -n "$p" ] || continue
+    kill -9 "$p" 2>/dev/null || true
+  done
   rm -rf "$state"
 }
 trap cleanup EXIT
@@ -56,7 +70,7 @@ start_daemon() {
 
   if [ "$fill" -gt 0 ]; then
     ILLOGICAL_SOCK="$sock" "$cli" new -s "$name" -n "$name" -- \
-      /bin/sh -c "awk 'BEGIN{for(i=0;i<$fill;i++) print \"line \" i \" ---- filler text to make this a realistic terminal line\"}'; sleep 600" \
+      /bin/sh -c "awk 'BEGIN{for(i=0;i<$fill;i++) print \"line \" i \" ---- filler text to make this a realistic terminal line\"}'; sleep 120" \
       >/dev/null
   else
     ILLOGICAL_SOCK="$sock" "$cli" new -s "$name" -n "$name" >/dev/null
