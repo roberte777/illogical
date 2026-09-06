@@ -1047,6 +1047,28 @@ test "the device attributes response encodes as a VT220 with color" {
     try testing.expectEqualStrings("\x1b[?62;22c", buf[0..writer.end]);
 }
 
+test "the secondary and tertiary responses are pinned too" {
+    const testing = std.testing;
+
+    // One effect answers all three request types, and everything we leave
+    // unset takes libghostty-vt's defaults -- so DA2 and DA3 are answers this
+    // daemon now gives and previously did not. A PR about unanswered queries
+    // should not leave its own new answers unpinned.
+    var buf: [64]u8 = undefined;
+
+    var secondary: std.Io.Writer = .fixed(&buf);
+    try deviceAttributesEffect(undefined).encode(.secondary, &secondary);
+    // VT220, firmware 0, no ROM cartridge. Ghostty reports firmware 10 here;
+    // the field is meaningless for an emulator and nothing reads it.
+    try testing.expectEqualStrings("\x1b[>1;0;0c", buf[0..secondary.end]);
+
+    var tertiary: std.Io.Writer = .fixed(&buf);
+    try deviceAttributesEffect(undefined).encode(.tertiary, &tertiary);
+    // DECRPTUI with a zero unit ID. Ghostty declines to answer DA3 at all;
+    // answering costs nothing and spares the caller another timeout.
+    try testing.expectEqualStrings("\x1bP!|00000000\x1b\\", buf[0..tertiary.end]);
+}
+
 test "a device attributes query is answered back through the pty" {
     const testing = std.testing;
     const gpa = testing.allocator;
@@ -1058,13 +1080,8 @@ test "a device attributes query is answered back through the pty" {
     // somewhere `plainText` can see. Raw mode because the reply carries no
     // newline, and a canonical-mode read would block waiting for one.
     //
-    // The watchdog is what makes a regression *fail* rather than hang: with no
-    // answer the `dd` below blocks forever, and closing the master does not
-    // reliably get the child killed. `childPreExec` puts every child in a fresh
-    // session, so `kill 0` reaches that child's group and nothing else.
     const script =
         \\stty raw -echo
-        \\{ sleep 3; kill -9 0; } &
         \\printf '\033[c'
         \\R=$(dd bs=1 count=9 2>/dev/null | od -An -c | tr -d ' \n')
         \\printf 'DA1<%s>' "$R"
@@ -1081,6 +1098,13 @@ test "a device attributes query is answered back through the pty" {
         .rows = 24,
     });
     defer t.destroy();
+    // Runs before `destroy` (defers unwind last-in-first-out), and has to:
+    // issue #28 means `stop()` blocks in `close()` on the pty master for as
+    // long as the reader thread is blocked in `read()` on it, and this child is
+    // quiet on both paths -- sitting in `sleep 10` when the test passes, and
+    // stuck forever in `dd` when it fails. SIGHUP ends the child either way, so
+    // a regression fails here in five seconds rather than hanging the suite.
+    defer t.hangup();
     try t.start();
 
     // Unanswered, the child stays blocked in `dd` and this loop runs out --
