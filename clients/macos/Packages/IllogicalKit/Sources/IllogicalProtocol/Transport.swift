@@ -295,15 +295,19 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         try? fromChild.close()
 
         // Stderr is ours to order, though: its drain thread is reading that
-        // descriptor. Left alone if it has not finished -- pulling a descriptor
-        // out from under a live read is the fd-recycling bug this whole
-        // shutdown/close split exists to prevent, and it is worse than waiting.
+        // descriptor, and closing a `FileHandle` out from under a live
+        // `readDataUpToLength:` is not a soft failure. Foundation raises an
+        // ObjC exception on the *reading* thread, which `try?` cannot catch,
+        // and the process aborts. Making this unconditional takes the test
+        // bundle down with SIGABRT inside
+        // `-[NSConcreteFileHandle readDataUpToLength:error:]` -- so this wait
+        // is load-bearing, not a tidiness measure.
         //
-        // Not a permanent leak when the wait times out: the drain closure
-        // holds the last reference to a `Pipe` handle, which closes on dealloc,
-        // so the descriptor comes back when the child finally goes and the
-        // read returns. This branch is what makes it prompt in the ordinary
-        // case, where the child is already gone.
+        // Not a permanent leak when it times out: the drain closure holds the
+        // last reference to a `Pipe` handle, which closes on dealloc, so the
+        // descriptor comes back when the child finally goes and the read
+        // returns. This branch is what makes it prompt in the ordinary case,
+        // where the child is already gone.
         if drainFinished.wait(timeout: .now() + Self.drainGrace) == .success {
             try? stderrHandle.close()
         }

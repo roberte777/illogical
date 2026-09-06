@@ -344,14 +344,13 @@ struct TransportTests {
     /// free the stderr descriptor with bytes still undrained, so the one thing
     /// this mechanism exists to capture was thrown away with it.
     ///
-    /// This is also the test that defends the *ordering*, which is not
-    /// obvious: make `close`'s `stderrHandle.close()` unconditional and this
-    /// one fails, because `close` runs a fraction of a millisecond after the
-    /// spawn — before `/bin/sh` has exec'd and echoed — so the pipe is torn
-    /// down before a byte of it is read and `failureDescription` stays nil.
-    /// `closeIsIdempotent` does *not* catch that mutation: closing the last
-    /// reference to a pipe wakes its blocked reader with end-of-file, not
-    /// `EBADF`, and the read is under `try?` besides.
+    /// This is also where the *ordering* is defended, and more sharply than
+    /// intended: make `close`'s `stderrHandle.close()` unconditional and the
+    /// whole bundle aborts with SIGABRT inside
+    /// `-[NSConcreteFileHandle readDataUpToLength:error:]`. Closing a handle a
+    /// thread is reading raises an ObjC exception on *that* thread, which no
+    /// `try?` on this side can catch. `close` runs a fraction of a millisecond
+    /// after the spawn, so the drain is reliably still inside its read.
     @Test("a failure message survives the close that follows it")
     func diagnosticsSurviveClose() throws {
         let transport = try CommandTransport(
