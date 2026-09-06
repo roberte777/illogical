@@ -124,6 +124,19 @@ final class TerminalController {
         connection?.close()
         connection = nil
 
+        // A new connection voids whatever the old one was streaming, so the
+        // pipe goes back now rather than whenever the next `snapshot_begin`
+        // gets round to it. `connectionClosed` cannot be relied on for this:
+        // its identity guard is what stops a replaced pump tearing down its
+        // successor, so on the Retry path the old pump's tail returns early
+        // and, if the `Connection(host:)` below throws, nothing else ever
+        // frees a half-delivered snapshot that may hold a whole session's
+        // scrollback.
+        stopHistoryRestore()
+        restore?.stream.abandon()
+        restore = nil
+        engine.clearPendingHistory()
+
         do {
             let connection = try Connection(host: host)
             self.connection = connection
@@ -142,7 +155,7 @@ final class TerminalController {
             pump = Task { [weak self] in
                 for await frame in connection.frames {
                     guard let self else { return }
-                    await self.handle(frame)
+                    await self.handle(frame, from: connection)
                 }
                 await self?.connectionClosed(connection)
             }
@@ -256,7 +269,26 @@ final class TerminalController {
 
     // MARK: - Frames
 
-    private func handle(_ frame: Frame) {
+    /// Takes the connection the frame arrived on, for the same reason
+    /// `connectionClosed` does — and it is the same hazard one frame earlier.
+    /// `close()` finishes the stream, but frames already buffered in it are
+    /// still delivered, so a pane that reattaches while the old connection had
+    /// an `exited` or an `err` in flight applies it to the new one: the
+    /// terminal is alive on the server and running, and the pane is
+    /// permanently dead with no retry, because `scheduleReconnect` refuses to
+    /// act on `.exited`. Output and snapshot chunks are worse still -- they
+    /// are another terminal's screen written into this one.
+    /// Feed a frame as though it had arrived on `source`. For tests: the frame
+    /// this guard exists for is one buffered on a *superseded* connection, and
+    /// arranging for a real one to be delivered after the swap is a race a test
+    /// cannot reliably win -- the pump and `openConnection` are on the same
+    /// actor, so which of them runs first is up to the scheduler.
+    func handleForTesting(_ frame: Frame, from source: Connection) {
+        handle(frame, from: source)
+    }
+
+    private func handle(_ frame: Frame, from source: Connection) {
+        guard connection === source else { return }
         switch frame.type {
         case .welcome:
             break

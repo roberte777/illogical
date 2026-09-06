@@ -51,12 +51,20 @@ final class HostConnection: Identifiable {
         /// Given up on. Reached only by asking.
         case failed(String)
 
-        /// What to put in front of a person.
+        /// The wording for a reconnect that has nothing better to say than the
+        /// attempt number. A sentence, capitalized: it is shown as a tooltip
+        /// and on the "no server" screen, both sentence-initial.
+        static func reconnectingMessage(attempt: Int) -> String {
+            "Reconnecting… (attempt \(attempt))"
+        }
+
+        /// What to put in front of a person. Nil only while there is nothing
+        /// worth saying.
         var message: String? {
             switch self {
             case .connecting, .connected: nil
             case .reconnecting(let attempt, let detail):
-                detail ?? "reconnecting… (attempt \(attempt))"
+                detail ?? Self.reconnectingMessage(attempt: attempt)
             case .failed(let message): message
             }
         }
@@ -84,6 +92,13 @@ final class HostConnection: Identifiable {
         setStatus(.connected)
         onListChanged?()
     }
+
+    /// How far into the backoff the *control* connection is. For tests: the
+    /// reset lives on the `session_list` path rather than on the connect, and
+    /// nothing else observes it -- the delay it produces is what a person
+    /// sees, and a test cannot wait thirty seconds to notice it was not
+    /// forgiven.
+    var backoffAttemptForTesting: Int { backoff.attempt }
 
     private(set) var status: Status = .connecting
     var sessions: [SessionSummary] = []
@@ -155,7 +170,7 @@ final class HostConnection: Identifiable {
             pump = Task { [weak self] in
                 for await frame in connection.frames {
                     guard let self else { return }
-                    await self.handle(frame)
+                    await self.handle(frame, from: connection)
                 }
                 await self?.controlClosed(connection)
             }
@@ -164,15 +179,23 @@ final class HostConnection: Identifiable {
         } catch let error as TransportError {
             Trace.log("connect to \(host.displayName) failed: \(error)")
             // Some failures are not worth retrying every thirty seconds for
-            // the life of the process. `ssh` missing from PATH, or a
-            // destination we cannot even spawn for, will not fix itself, and
-            // showing it as an amber "reconnecting…" forever -- while
+            // the life of the process. `ssh` missing from PATH, or a socket
+            // path that does not fit in `sockaddr_un`, will not fix itself,
+            // and showing it as an amber "reconnecting…" forever -- while
             // rescanning PATH on a timer -- tells the user nothing. This is
             // what makes `.failed` reachable; before it, nothing ever set it.
+            //
+            // `.spawnFailed` is *not* one of them, however much it reads like
+            // one: it is whatever `Process.run()` threw, and that is `EAGAIN`
+            // or `EMFILE` as readily as anything permanent. A window with
+            // enough panes open transiently runs out of descriptors -- three
+            // per remote connection -- and giving up for the life of the
+            // process on a condition that clears when one pane closes is the
+            // worst of the two mistakes.
             switch error {
-            case .notOnPath, .spawnFailed, .pathTooLong:
+            case .notOnPath, .pathTooLong:
                 setStatus(.failed(describe(error)))
-            case .socketFailed, .connectFailed:
+            case .socketFailed, .connectFailed, .spawnFailed:
                 scheduleReconnect(detail: describe(error))
             }
         } catch {
@@ -246,7 +269,13 @@ final class HostConnection: Identifiable {
     /// written yet at this point. That arrives later as
     /// `Connection.failureDescription`, and `controlClosed` is what carries it.
     private func describe(_ error: Error) -> String {
-        if case .local(let path) = host {
+        // The friendly wording is only right for the one failure it describes:
+        // a socket nothing is listening on. `connect` is what reports that.
+        // A path too long for `sockaddr_un`, or a socket we could not even
+        // allocate, is not fixed by starting a daemon, and telling somebody to
+        // start one sends them round in a circle -- so those keep the error's
+        // own wording, which says what actually happened.
+        if case .local(let path) = host, case .connectFailed = error as? TransportError {
             return "No illogicald at \(path). Start one with `illogicald`."
         }
         return "\(error)"
@@ -273,7 +302,14 @@ final class HostConnection: Identifiable {
         scheduleReconnect(detail: detail)
     }
 
-    private func handle(_ frame: Frame) {
+    /// Takes the connection the frame came in on, for the same reason
+    /// `controlClosed` does: a replaced connection's stream is drained to its
+    /// end, so a frame buffered on the old one before the swap is delivered
+    /// *after* it. Without this guard a stale `session_list` overwrites the
+    /// lists the new connection just published and reports `.connected` for a
+    /// machine we are in fact still connecting to.
+    private func handle(_ frame: Frame, from source: Connection) {
+        guard control === source else { return }
         switch frame.type {
         case .sessionList:
             guard let list = try? JSONDecoder().decode(SessionListBody.self, from: frame.payload)

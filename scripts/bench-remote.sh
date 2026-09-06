@@ -126,14 +126,38 @@ full_sock="$daemon_sock"
 # what the bridge costs. Without this the table below was timing the writer.
 wait_idle() {
   local sock="$1"
+  local rows idle empty=0
   for _ in $(seq 1 2400); do
-    local idle
-    idle=$(ILLOGICAL_SOCK="$sock" "$cli" list 2>/dev/null |
-      awk 'NR > 1 { gsub(/s$/, "", $NF); print $NF }' | sort -n | head -1)
+    # `|| true` on both: a bare `x=$(...)` takes the pipeline's exit status as
+    # its own, and under `set -euo pipefail` that ends the script -- silently,
+    # because the `2>/dev/null` here is exactly for the seconds while the
+    # daemon is still coming up and `list` cannot connect. The whole benchmark
+    # exited 1 with no output and looked like a build failure.
+    rows=$(ILLOGICAL_SOCK="$sock" "$cli" list 2>/dev/null | awk 'NR > 1') || true
+    if [ -z "$rows" ]; then
+      # Answered, but with nothing on it. Ten seconds of that is not a slow
+      # filler, it is a daemon that never got a terminal -- and waiting the
+      # full twenty minutes to say so wastes the run. The long ceiling is for
+      # a genuinely large scrollback, which only applies once one exists.
+      empty=$((empty + 1))
+      if [ "$empty" -ge 20 ]; then
+        echo "no terminals on $sock after 10s; the daemon never got one" >&2
+        exit 1
+      fi
+      sleep 0.5
+      continue
+    fi
+    empty=0
+    idle=$(printf '%s\n' "$rows" |
+      awk '{ gsub(/s$/, "", $NF); print $NF }' | sort -n | head -1) || true
     [ -n "$idle" ] && [ "$idle" -ge 2 ] 2>/dev/null && return 0
     sleep 0.5
   done
-  echo "warning: terminals on $sock never went idle" >&2
+  # Not a warning. Attaching to a terminal that is still a firehose measures
+  # the filler, so carrying on here prints a table of numbers that mean
+  # something other than what its heading says.
+  echo "terminals on $sock never went idle; refusing to measure" >&2
+  exit 1
 }
 wait_idle "$full_sock"
 

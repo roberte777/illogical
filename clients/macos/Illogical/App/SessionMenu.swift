@@ -268,13 +268,13 @@ struct HostHeader: View {
         case .connected: nil
         // Amber rather than red: nothing has been given up on, and a machine
         // asleep behind a network that will come back is the ordinary case.
-        case .reconnecting:
+        case .reconnecting(let attempt, let detail):
             (
                 "arrow.triangle.2.circlepath", .orange,
-                // The status renders its own wording, so the dropdown and the
-                // "no server" screen cannot drift apart in capitalization or
-                // anything else.
-                host.status.message ?? "Reconnecting…"
+                // `ssh`'s own complaint where there is one, and otherwise the
+                // wording `Status` uses, so this tooltip and the "no server"
+                // screen cannot drift apart.
+                detail ?? HostConnection.Status.reconnectingMessage(attempt: attempt)
             )
         case .failed(let message): ("exclamationmark.triangle.fill", .red, message)
         }
