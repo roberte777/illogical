@@ -283,7 +283,9 @@ final class ReconnectTests: XCTestCase {
         host.handleForTesting(
             Frame(
                 type: .sessionList, terminal: Protocol.controlSession,
-                payload: Data(#"{"sessions":[{"id":1,"name":"ghost","terminals":[]}],"terminals":[]}"#.utf8)
+                payload: Data(
+                    #"{"sessions":[{"id":1,"name":"ghost","terminals":[]}],"terminals":[]}"#
+                        .utf8)
             ),
             from: stale)
 
