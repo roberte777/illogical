@@ -519,6 +519,17 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     const secret_fd = try sys.openAppend(secret.ptr);
     defer sys.closeFd(secret_fd);
 
+    // ...but the check below only discriminates for 2 < fd < 10, so skip
+    // rather than report the wrong thing. Above 9 the `/bin/sh` running the
+    // script has its own descriptor there: both dash and bash save a
+    // redirected fd with `F_DUPFD` from 10 upward for the length of a compound
+    // command, and the script's `> marker` and `2>/dev/null` are two of those
+    // -- so `: <&10` succeeds and the test reads LEAKED however well
+    // `closeFrom` worked. At or below 2, the grandchild's own stdio answers,
+    // which `detachStdio` has just pointed at /dev/null and the log. Neither
+    // is reachable in an ordinary run; both would be a false failure.
+    if (secret_fd < 3 or secret_fd > 9) return error.SkipZigTest;
+
     // Stands in for the daemon: slow enough to still be running when
     // `spawnDetached` returns, so the marker proves the grandchild survived
     // the intermediate child's exit. It also reports what it inherited, and
@@ -601,4 +612,41 @@ test "dialling waits for a daemon that is still coming up" {
     const fd = connectWithin(path, 5 * std.time.ns_per_s, 10 * std.time.ns_per_ms) orelse
         return error.NeverConnected;
     sys.closeFd(fd);
+}
+
+test "auto-start makes the daemon's state directory before it forks" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Two levels that do not exist yet, which is the first-auto-start case.
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrint(
+        &root_buf,
+        "/tmp/illogical-spawndir-{d}",
+        .{std.c.getpid()},
+    );
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var sock_buf: [160]u8 = undefined;
+    const sock = try std.fmt.bufPrint(&sock_buf, "{s}/state/server.sock", .{root});
+
+    // `/usr/bin/true` stands in for the daemon: `spawnDaemon` only has to
+    // reach its fork, and what it execs is not what is under test.
+    //
+    // `Server.init` creates this directory too, but not until the daemon is
+    // already running -- so on the first auto-start the log open inside it
+    // failed with ENOENT and the daemon fell back to /dev/null, which is
+    // exactly the run where a park-key failure matters most. Nothing else
+    // covers this: `spawnDaemon` is reachable only from `dial` with
+    // `.spawn = true`, and every other test here passes false.
+    try spawnDaemon(sock, "/usr/bin/true");
+
+    // Made before the fork, so it is there the moment the call returns --
+    // no waiting on a grandchild we deliberately do not parent.
+    var dir_buf: [160]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, "{s}/state", .{root});
+    try std.Io.Dir.cwd().access(io, dir, .{});
 }
