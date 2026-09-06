@@ -499,6 +499,15 @@ pub fn signal(pid: pid_t, sig: c_int) void {
     _ = kill(pid, sig);
 }
 
+/// Whether `pid` still exists. Signal 0 checks without sending anything.
+///
+/// Only meaningful for a child this process has not yet reaped: once `wait`
+/// has collected it the pid is free to be reused, so a `true` from a stale pid
+/// means nothing. Used by a test that has just reaped, to assert it did.
+pub fn processExists(pid: pid_t) bool {
+    return kill(pid, 0) == 0;
+}
+
 /// Signal a whole process group. The child is a session leader (we call
 /// `setsid` before exec), so this reaches the jobs it started too -- which is
 /// what closing a terminal window does.

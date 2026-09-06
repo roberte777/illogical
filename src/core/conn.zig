@@ -522,29 +522,40 @@ test "deinit gives up on a child that never stops writing" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Unbounded, unlike the drain test above: `yes` never reaches end of
-    // stream and, because we are draining it, never blocks either. So
-    // `readFdOnce` returns neither 0 nor `WouldBlock` and the only thing that
-    // can end `drainRead` is its deadline. Without one the loop is `while
-    // (true)` and `deinit` never returns at all -- `illogical --host box list`
-    // hangs having already printed its answer. The shape is real: a remote
-    // login shell whose rc file writes in a loop reaches our `read_fd`,
-    // because `-T` makes the remote command's stdout the channel itself.
+    // A child that never ends and never stops writing. Two things are pinned,
+    // and it is worth being exact about which, because the obvious third is
+    // not one of them:
+    //
+    //   * `deinit` is *bounded*. Its outer loop must stop at the grace; give
+    //     that loop a minute instead and this never returns in time.
+    //   * the SIGTERM fallback actually runs. Without it `deinit` still
+    //     returns on time and leaves `yes` running forever with nobody to
+    //     reap it, which the pid check below is what notices.
+    //
+    // It does *not* pin `drainRead`'s own deadline. Measured: with this child
+    // the drain leaves via `WouldBlock` every time -- 688 times over one grace
+    // period -- because a 4 KiB read loop outpaces `yes`. That deadline guards
+    // a producer fast enough to keep the pipe continuously non-empty, which a
+    // shell child cannot be made to be reliably. It is defence in depth, and
+    // is not claimed here as covered.
     const argv = try arena.allocSentinel(?[*:0]const u8, 3, null);
     argv[0] = "/bin/sh";
     argv[1] = "-c";
     argv[2] = "yes";
 
     var conn = try Conn.spawn(gpa, argv);
+    const pid = conn.child.?;
     const before = sys.monotonicNs();
     conn.deinit();
     const elapsed = sys.monotonicNs() - before;
 
-    // It must cost the grace and then signal -- not less, which would mean the
-    // drain gave up early on a child that was merely busy, and not more, which
-    // is the hang.
+    // The grace, and then the signal. Not less, which would mean giving up on
+    // a child that was merely busy; not more, which is the hang.
     try testing.expect(elapsed >= Conn.child_exit_grace_ns);
     try testing.expect(elapsed < 2 * Conn.child_exit_grace_ns);
+    // And it is really gone, rather than left running with nobody to reap it.
+    // `deinit` returns on time either way; only this notices the difference.
+    try testing.expect(!sys.processExists(pid));
 }
 
 test "a command connection speaks frames over its child's pipes" {
