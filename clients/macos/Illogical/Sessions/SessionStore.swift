@@ -63,9 +63,6 @@ final class SessionStore {
     /// A plain new terminal waiting for the same, so its tab can be selected
     /// once the list arrives.
     private var pendingTab: TerminalRef?
-    /// The session in front before the last reconcile, so selection repair can
-    /// stay on the same machine rather than jumping to whichever tab is first.
-    private var lastSelectedSession: SessionRef?
     /// Terminals we have asked a server to kill. Their panes are already gone
     /// from the layout, so the reconcile must not put them back while the
     /// server still lists them.
@@ -77,11 +74,11 @@ final class SessionStore {
     /// two of them did, and also spawned a real `ssh build-box` per run, which
     /// is the opposite of what this file's own header claims ("driven without
     /// a socket").
-    private let defaults: UserDefaults
+    private let defaults: HostDefaults
 
     init(
         hosts: [ServerHost] = SessionStore.startingHosts(),
-        defaults: UserDefaults = .standard
+        defaults: HostDefaults = UserDefaults.standard
     ) {
         self.defaults = defaults
         for host in hosts { adopt(HostConnection(host: host)) }
@@ -130,7 +127,15 @@ final class SessionStore {
     /// is the opposite of what it and the docs promise.
     private var hostsToRemember: [ServerHost] {
         let injected = Set(Self.environmentHosts())
-        return hosts.map(\.host).filter { $0.isRemote && !injected.contains($0) }
+        // Anything already on disk stays on disk. `startingHosts` dedupes the
+        // injected list against the saved one, so provenance is otherwise
+        // lost: a host the user added last week and that ILLOGICAL_HOSTS also
+        // names today would be classed as injected and silently dropped the
+        // next time anything else was added or forgotten.
+        let saved = Set(RemoteHostStore.load(defaults))
+        return hosts.map(\.host).filter {
+            $0.isRemote && (!injected.contains($0) || saved.contains($0))
+        }
     }
 
     // MARK: - Hosts
@@ -354,8 +359,9 @@ final class SessionStore {
             tabs[index].root = root
             tabs[index].repairFocus()
         } else {
+            let wasInFront = selectedTab?.session
             tabs.remove(at: index)
-            if selectedTabID == tabID { selectedTabID = tabs.first?.id }
+            repairSelection(preferring: wasInFront)
         }
     }
 
@@ -363,8 +369,9 @@ final class SessionStore {
     func closeTab(_ tabID: TabLayout.ID) {
         guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
         for pane in tabs[index].panes { kill(pane.terminal) }
+        let wasInFront = selectedTab?.session
         tabs.remove(at: index)
-        if selectedTabID == tabID { selectedTabID = tabs.first?.id }
+        repairSelection(preferring: wasInFront)
     }
 
     func closeFocusedPane() {
@@ -412,15 +419,20 @@ final class SessionStore {
         // The oldest split still waiting on *this* host whose tab is still
         // here. Matching the host matters: two machines answer independently,
         // and a reply from one must not consume the other's pending split.
-        let match = pendingSplits.firstIndex { pending in
-            pending.host == ref.host && tabs.contains { $0.id == pending.tab }
-        }
-        guard let index = match else {
+        // Matched on host alone, and always retired. Requiring the tab to
+        // still exist left dead entries in the queue forever -- `TabLayout.id`
+        // is a fresh UUID, so a closed tab can never come back to claim one --
+        // and worse, the reply that should have retired it was matched against
+        // the *next* entry instead, splicing a terminal created in one session
+        // into a tab belonging to another.
+        guard let index = pendingSplits.firstIndex(where: { $0.host == ref.host }) else {
             pendingTab = ref
             return
         }
         let pending = pendingSplits.remove(at: index)
         guard let tab = tabs.firstIndex(where: { $0.id == pending.tab }) else {
+            // Its tab closed while the server was answering. The terminal is
+            // real, so it gets a tab of its own rather than being dropped.
             pendingTab = ref
             return
         }
@@ -442,6 +454,9 @@ final class SessionStore {
     /// something. Across every host at once, because a pane and the tab it
     /// sits in are the window's, not a connection's.
     func reconcileTabs() {
+        // Read *before* the prune, so the repair below knows where the user
+        // actually was rather than where a previous reconcile left a cache.
+        let wasInFront = selectedTab?.session
         let live = Set(hosts.flatMap { host in host.terminals.map { host.ref($0.id) } })
         closing.formIntersection(live)
 
@@ -477,23 +492,28 @@ final class SessionStore {
             pendingTab = nil
         }
 
-        if selectedTabID == nil || !tabs.contains(where: { $0.id == selectedTabID }) {
-            // Prefer a tab in the session that was in front. Falling straight
-            // to `tabs.first` teleports the window to another *machine* when
-            // the closed tab happened to be first in its host's run -- the
-            // session button silently changes host and the sibling tabs
-            // disappear from the strip.
-            selectedTabID =
-                tabs.first { $0.session == lastSelectedSession }?.id
-                ?? tabs.first { $0.session.host == lastSelectedSession?.host }?.id
-                ?? tabs.first?.id
-        }
-        lastSelectedSession = selectedTab?.session
+        repairSelection(preferring: wasInFront)
 
         if let direction = pendingLaunchSplit, selectedTab != nil {
             pendingLaunchSplit = nil
             split(direction)
         }
+    }
+
+    /// Put the selection somewhere sensible after the tab list changed.
+    ///
+    /// The only place `selectedTabID` is repaired. `closePane` and `closeTab`
+    /// used to do their own `tabs.first?.id`, which is how closing the last tab
+    /// of a remote session teleported the window to the local machine: the
+    /// session button changed host and the strip's contents changed with it.
+    /// Prefer the session that was in front, then any tab on that machine,
+    /// then anything at all.
+    private func repairSelection(preferring wanted: SessionRef?) {
+        if let id = selectedTabID, tabs.contains(where: { $0.id == id }) { return }
+        selectedTabID =
+            tabs.first { $0.session == wanted }?.id
+            ?? tabs.first { $0.session.host == wanted?.host }?.id
+            ?? tabs.first?.id
     }
 
     // MARK: - Per-terminal connections
@@ -508,6 +528,20 @@ final class SessionStore {
     }
 }
 
+/// The little of `UserDefaults` that remembering hosts actually needs.
+///
+/// A protocol so the tests can hand over something in memory. Suites work, but
+/// `cfprefsd` writes their plists lazily, so removing one in `tearDown` races
+/// the write and leaves files in ~/Library/Preferences — which is how a change
+/// meant to stop tests touching the developer's preferences ended up creating
+/// twenty-seven files instead of polluting one domain.
+protocol HostDefaults: AnyObject {
+    func data(forKey defaultName: String) -> Data?
+    func set(_ value: Any?, forKey defaultName: String)
+}
+
+extension UserDefaults: HostDefaults {}
+
 /// The remote hosts this window remembers.
 ///
 /// A destination and the remote binary's name, and nothing else: no
@@ -516,14 +550,14 @@ final class SessionStore {
 enum RemoteHostStore {
     static let key = "remoteHosts"
 
-    static func load(_ defaults: UserDefaults = .standard) -> [ServerHost] {
+    static func load(_ defaults: HostDefaults = UserDefaults.standard) -> [ServerHost] {
         guard let data = defaults.data(forKey: key),
             let hosts = try? JSONDecoder().decode([ServerHost].self, from: data)
         else { return [] }
         return hosts.filter(\.isRemote)
     }
 
-    static func save(_ hosts: [ServerHost], to defaults: UserDefaults = .standard) {
+    static func save(_ hosts: [ServerHost], to defaults: HostDefaults = UserDefaults.standard) {
         guard let data = try? JSONEncoder().encode(hosts.filter(\.isRemote)) else { return }
         defaults.set(data, forKey: key)
     }

@@ -18,12 +18,20 @@ final class TabReconcileTests: XCTestCase {
     private static let local = ServerHost.local(socketPath: "/tmp/illogical-test.sock")
     private static let remote = ServerHost.ssh(destination: "build-box")
 
+    /// Nothing this suite does reaches the filesystem or the developer's real
+    /// preferences: `addHost`/`removeHost` persist, so the store is handed
+    /// somewhere in memory instead.
+    private final class InMemoryDefaults: HostDefaults {
+        private var values: [String: Data] = [:]
+        func data(forKey defaultName: String) -> Data? { values[defaultName] }
+        func set(_ value: Any?, forKey defaultName: String) {
+            values[defaultName] = value as? Data
+        }
+    }
+
     /// A store with one host and nothing on it.
     private func emptyStore(_ hosts: [ServerHost] = [local]) -> SessionStore {
-        // A throwaway defaults suite: `addHost`/`removeHost` persist, and a
-        // unit test must not write to the developer's real preferences.
-        let suite = UserDefaults(suiteName: "illogical-test-\(UUID().uuidString)") ?? .standard
-        return SessionStore(hosts: hosts, defaults: suite)
+        SessionStore(hosts: hosts, defaults: InMemoryDefaults())
     }
 
     private func store(_ ids: [UInt64], session: UInt64 = 1) -> SessionStore {
@@ -387,8 +395,7 @@ final class TabReconcileTests: XCTestCase {
 
     /// Persistence round-trips, and `ILLOGICAL_HOSTS` entries are not written.
     func testOnlyUserAddedHostsAreRemembered() throws {
-        let suite = try XCTUnwrap(UserDefaults(suiteName: "illogical-test-\(UUID().uuidString)"))
-        defer { suite.removePersistentDomain(forName: suite.description) }
+        let suite = InMemoryDefaults()
 
         let store = SessionStore(hosts: [Self.local], defaults: suite)
         store.addHost(Self.remote, connect: false)
@@ -400,20 +407,62 @@ final class TabReconcileTests: XCTestCase {
     }
 
     /// Two hosts number their sessions from 1 as well as their terminals, so a
-    /// split must not resolve the front session's *id* against another machine.
-    func testASplitStaysOnItsOwnHostsSession() {
+    /// reply from one machine must never be spliced into the other's tab.
+    ///
+    /// The previous version of this called `list` twice and compared two
+    /// `SessionRef`s — it passed with `split` and `terminalCreated` deleted
+    /// entirely, which is why the routing bugs survived a green run.
+    func testASplitLandsOnItsOwnHostsTab() {
         let store = emptyStore([Self.local, Self.remote])
-        list(store, host: Self.local, [1], session: 1, named: "here")
-        list(store, host: Self.remote, [1], session: 1, named: "there")
+        list(store, host: Self.local, [1], named: "here")
+        list(store, host: Self.remote, [1], named: "there")
 
-        let remoteTab = store.tabs.first { $0.session.host == Self.remote }
-        XCTAssertEqual(remoteTab?.session.session, 1)
-        XCTAssertEqual(remoteTab?.session.host, Self.remote)
-        // The two sessions share an id and differ only by host, which is the
-        // whole reason `SessionRef` exists.
-        XCTAssertNotEqual(
-            store.tabs[0].session, store.tabs[1].session,
-            "two hosts' session 1 compared equal")
+        guard let remoteTab = store.tabs.first(where: { $0.session.host == Self.remote })
+        else { return XCTFail("no remote tab") }
+        store.selectedTabID = remoteTab.id
+        store.split(.columns)
+
+        // The local machine answers first. It has no split pending, so this is
+        // a plain new terminal — it must not consume the remote's.
+        store.host(Self.local)?.onCreated?(9)
+        XCTAssertEqual(
+            store.tabs.first { $0.id == remoteTab.id }?.panes.count, 1,
+            "another host's reply was spliced into this tab")
+
+        // Now the machine that was actually asked.
+        store.host(Self.remote)?.onCreated?(7)
+        let after = store.tabs.first { $0.id == remoteTab.id }
+        XCTAssertEqual(after?.panes.count, 2)
+        XCTAssertEqual(after?.panes.last?.terminal, ref(7, on: Self.remote))
+        XCTAssertEqual(after?.session.host, Self.remote)
+    }
+
+    /// A split whose tab closes before the server answers must not leave an
+    /// entry in the queue: the next reply would match it instead and land a
+    /// terminal in a tab belonging to a different session.
+    func testASplitWhoseTabClosedDoesNotStrandTheNextOne() {
+        let store = emptyStore()
+        list(store, host: Self.local, [1, 2], session: 1)
+        XCTAssertEqual(store.tabs.count, 2)
+
+        let first = store.tabs[0]
+        let second = store.tabs[1]
+        store.split(pane: first.panes[0].id, in: first.id, direction: .columns)
+        store.split(pane: second.panes[0].id, in: second.id, direction: .columns)
+
+        // The first tab goes away while both replies are still outstanding.
+        store.closeTab(first.id)
+
+        // Reply one belongs to the tab that has gone: its own tab, not a
+        // splice into the survivor.
+        store.host(Self.local)?.onCreated?(10)
+        XCTAssertEqual(
+            store.tabs.first { $0.id == second.id }?.panes.count, 1,
+            "a dead split's reply was spliced into another tab")
+
+        // Reply two is the surviving tab's own, and still lands.
+        store.host(Self.local)?.onCreated?(11)
+        XCTAssertEqual(store.tabs.first { $0.id == second.id }?.panes.count, 2)
     }
 
 }
