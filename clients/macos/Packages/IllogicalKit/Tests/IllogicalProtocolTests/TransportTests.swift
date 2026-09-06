@@ -17,6 +17,7 @@ struct SSHCommandTests {
     private func argv(
         _ destination: String = "build-box",
         remoteBinary: String = "illogicald",
+        ssh: String = "ssh",
         controlDirectory: String? = "/tmp",
         multiplex: Bool = true
     ) -> [String] {
@@ -24,6 +25,7 @@ struct SSHCommandTests {
             SSHCommand.Options(
                 destination: destination,
                 remoteBinary: remoteBinary,
+                ssh: ssh,
                 controlDirectory: controlDirectory,
                 multiplex: multiplex))
     }
@@ -34,7 +36,7 @@ struct SSHCommandTests {
         #expect(args.first == "ssh")
         // ssh takes the first non-option as the host and everything after it
         // as the command, so these three are last and in this order.
-        #expect(args.suffix(3) == ["build-box", "illogicald", "--stdio"])
+        #expect(args.suffix(4) == ["--", "build-box", "illogicald", "--stdio"])
     }
 
     @Test("asks for no pty")
@@ -67,7 +69,7 @@ struct SSHCommandTests {
         let args = argv(multiplex: false)
         #expect(!args.contains("ControlMaster=auto"))
         #expect(args.filter { $0 == "-o" }.count == 2)
-        #expect(args.suffix(3) == ["build-box", "illogicald", "--stdio"])
+        #expect(args.suffix(4) == ["--", "build-box", "illogicald", "--stdio"])
     }
 
     @Test("a control path that would not fit a unix socket is not asked for")
@@ -78,23 +80,40 @@ struct SSHCommandTests {
         let deep = "/var/folders/2b/" + String(repeating: "x", count: 48) + "/T"
         let args = argv(controlDirectory: deep)
         #expect(!args.contains("ControlMaster=auto"))
-        #expect(args.suffix(3) == ["build-box", "illogicald", "--stdio"])
+        #expect(args.suffix(4) == ["--", "build-box", "illogicald", "--stdio"])
     }
 
     @Test("a remote binary somewhere else is respected")
     func remoteBinary() {
         let args = argv("me@host", remoteBinary: "/opt/illogical/bin/illogicald")
-        #expect(args.suffix(3) == ["me@host", "/opt/illogical/bin/illogicald", "--stdio"])
+        #expect(args.suffix(4) == ["--", "me@host", "/opt/illogical/bin/illogicald", "--stdio"])
     }
 
     /// The Zig CLI renders the same path, so `illogical --host` and the app
-    /// share one multiplexing master. Drifting apart would silently double the
-    /// SSH connections a machine holds.
+    /// share one multiplexing master. Drifting apart silently doubles the SSH
+    /// connections a machine holds.
+    ///
+    /// Asserted against `$HOME` explicitly, not against whatever API the
+    /// implementation happens to call. Computing the expectation the same way
+    /// the code does made this tautological: it stayed green while the two
+    /// languages derived home differently, which is exactly the bug it is named
+    /// for. `src/core/conn.zig` uses `getenv("HOME")`.
     @Test("the default control path is the one src/core/conn.zig renders")
-    func defaultControlPath() {
+    func defaultControlPath() throws {
+        let home = try #require(ProcessInfo.processInfo.environment["HOME"])
         let path = SSHCommand.controlPath(SSHCommand.Options(destination: "h"))
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
         #expect(path == home + "/.ssh/illogical-%C")
+        // And `homeDirectoryForCurrentUser` is *not* what we use: it reads the
+        // passwd entry and ignores the environment.
+        #expect(!home.isEmpty)
+    }
+
+    @Test("the ssh binary can be overridden")
+    func sshOverride() {
+        // ILLOGICAL_SSH rides through `ServerHost.sshOptions`; without this the
+        // override could be dropped from the argv with nothing failing, and a
+        // user with a second OpenSSH would silently get the first on PATH.
+        #expect(argv(ssh: "/usr/bin/ssh").first == "/usr/bin/ssh")
     }
 }
 
@@ -110,8 +129,10 @@ struct TransportTests {
         connection.start()
         defer { connection.close() }
 
-        // Bigger than the 64 KiB a pipe holds, so a transport that lost track
-        // of a partial write would truncate it.
+        // Bigger than the 64 KiB a pipe holds, so the *read* side has to
+        // reassemble across many `read` calls. It does not exercise a partial
+        // write: `write(2)` on a blocking pipe returns the full count or
+        // blocks, so `send`'s loop cannot come up short here.
         var payload = Data(count: 128 * 1024)
         for i in payload.indices { payload[i] = UInt8(truncatingIfNeeded: i &* 17) }
         try connection.send(.input, terminal: 42, payload: payload)
@@ -147,17 +168,98 @@ struct TransportTests {
         #expect(connection.failureDescription == "nope")
     }
 
-    @Test("closing a command transport is idempotent and stops the child")
+    /// A child that *ignores* stdin end-of-file, which is the case
+    /// `shutdown()`'s comment exists for: `ssh` holding a ControlPersist master
+    /// outlives its own session. Against `/bin/cat` this test could not fail —
+    /// cat exits on EOF whether or not anything terminates it — so the one
+    /// behaviour the comment justifies went unasserted.
+    @Test("shutdown stops a child that would not leave on end-of-file")
+    func shutdownStopsAStubbornChild() throws {
+        let transport = try CommandTransport(argv: ["/bin/sh", "-c", "trap '' HUP; sleep 30"])
+        #expect(transport.isRunning)
+        transport.shutdown()
+        for _ in 0..<300 where transport.isRunning { usleep(10_000) }
+        #expect(!transport.isRunning)
+        transport.close()
+    }
+
+    @Test("closing a command transport is idempotent")
     func closeIsIdempotent() throws {
         let transport = try CommandTransport(argv: ["/bin/cat"])
         #expect(transport.isRunning)
+        transport.shutdown()
+        transport.shutdown()
         transport.close()
         transport.close()
-
-        for _ in 0..<200 where transport.isRunning {
-            usleep(10_000)
-        }
         #expect(!transport.isRunning)
+    }
+
+    /// One descriptor per transport leaked, unconditionally, because nothing
+    /// held the stderr read end — the dispatch source behind
+    /// `readabilityHandler` keeps it alive past the object. One connection per
+    /// terminal means a window that opens and closes remote panes walks to
+    /// `EMFILE`, after which even a local socket stops connecting.
+    @Test("a transport gives every descriptor back")
+    func noDescriptorLeak() throws {
+        func openCount() -> Int {
+            (0..<256).filter { fcntl($0, F_GETFD) != -1 }.count
+        }
+        // One warm-up: the first Process/dispatch use allocates machinery that
+        // is not per-transport and would read as a leak.
+        let warm = try CommandTransport(argv: ["/bin/cat"])
+        warm.shutdown()
+        warm.close()
+
+        let before = openCount()
+        for _ in 0..<12 {
+            let t = try CommandTransport(argv: ["/bin/cat"])
+            t.shutdown()
+            t.close()
+        }
+        // Twelve cycles leaked twelve descriptors before the stderr handle was
+        // held and closed. A little slack for allocator noise, far below 12.
+        #expect(openCount() - before <= 2)
+    }
+
+    /// ssh writes to stderr on perfectly good connections — the known-hosts
+    /// warning on a first connect, banners, the remote daemon's own logging.
+    /// Reporting any of it made a healthy host render as the failed one.
+    @Test("a live child's chatter is not a failure")
+    func chatterIsNotFailure() async throws {
+        let transport = try CommandTransport(
+            argv: ["/bin/sh", "-c", "echo 'Warning: Permanently added host' >&2; sleep 30"])
+        defer {
+            transport.shutdown()
+            transport.close()
+        }
+        for _ in 0..<100 where transport.failureDescription == nil {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(transport.isRunning)
+        #expect(transport.failureDescription == nil)
+    }
+
+    @Test("the control directory is created when it is missing")
+    func controlDirectoryIsPrepared() throws {
+        // ssh creates the socket but not the directory above it, so on a
+        // machine whose owner never ran ssh multiplexing would fail on every
+        // connection with nothing to show for it.
+        // Short on purpose. A macOS temp directory is ~48 characters before the
+        // name, which puts the rendered ControlPath past the 104-byte socket
+        // budget — and `prepareControlDirectory` then correctly declines to
+        // create anything, so a long path here tests the wrong branch.
+        let base = "/tmp/il-\(getpid())-\(UInt32.random(in: 0..<100_000))"
+        defer { try? FileManager.default.removeItem(atPath: base) }
+        #expect(!FileManager.default.fileExists(atPath: base))
+
+        SSHCommand.prepareControlDirectory(
+            SSHCommand.Options(destination: "h", controlDirectory: base))
+
+        var isDir: ObjCBool = false
+        #expect(FileManager.default.fileExists(atPath: base, isDirectory: &isDir))
+        #expect(isDir.boolValue)
+        let mode = try FileManager.default.attributesOfItem(atPath: base)[.posixPermissions]
+        #expect((mode as? NSNumber)?.int16Value == 0o700)
     }
 
     /// `Process.executableURL` is a path, not a command: a bare `ssh` resolves
@@ -261,5 +363,22 @@ struct TransportTests {
         #expect(host.displayName == "me@build-box")
         #expect(host.isRemote)
         #expect(!ServerHost.local(socketPath: "/tmp/s").isRemote)
+
+        let local = ServerHost.local(socketPath: "/tmp/s.sock")
+        #expect(
+            try JSONDecoder().decode(ServerHost.self, from: JSONEncoder().encode(local))
+                == local)
+    }
+
+    /// Round-tripping our own encoder's output cannot see this: it always
+    /// writes the key. The synthesized `Codable` did *not* honour the case's
+    /// `= "illogicald"` default and threw `keyNotFound` — and since the whole
+    /// array decodes under one `try?`, a single such entry silently forgot
+    /// every remembered host rather than one field.
+    @Test("a stored host missing the optional key still decodes")
+    func hostCodingToleratesAMissingDefault() throws {
+        let json = Data(#"{"ssh":{"destination":"me@build-box"}}"#.utf8)
+        let decoded = try JSONDecoder().decode(ServerHost.self, from: json)
+        #expect(decoded == .ssh(destination: "me@build-box", remoteBinary: "illogicald"))
     }
 }

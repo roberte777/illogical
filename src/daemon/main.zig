@@ -40,11 +40,11 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     var stdout_buffer: [4096]u8 = undefined;
-    // `initStreaming`, not `init`. The default is positional writes at the
-    // writer's *own* offset, which starts at zero: redirect this to a file and
-    // the first line lands on top of whatever was already there, ignoring the
-    // file offset the shell and every other writer share. `illogical list >
-    // out` came out interleaved with itself.
+    // `initStreaming`, not `init`. The default writes positionally, at the
+    // writer's own offset starting from zero, ignoring the file offset the
+    // shell and every other writer share. Here that is the startup banner, so
+    // `illogicald >> log` would overwrite the head of the log rather than
+    // append to it. The CLI has the same line for a louder reason; see there.
     var stdout_file_writer: Io.File.Writer = .initStreaming(.stdout(), init.io, &stdout_buffer);
     const out = &stdout_file_writer.interface;
 

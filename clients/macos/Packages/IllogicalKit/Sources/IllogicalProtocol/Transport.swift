@@ -17,19 +17,32 @@ import Foundation
 
 /// A pair of descriptors carrying the wire protocol, and whatever is holding
 /// them open.
+///
+/// Teardown is deliberately two steps, and the split is the whole reason this
+/// is a protocol rather than a descriptor pair. Freeing a descriptor hands its
+/// *number* straight back to the kernel, and the next `socket()` or `pipe()` in
+/// the process gets it — so a reader still blocked on the old number, or a
+/// writer that raced the close, reads and writes some other connection's
+/// terminal. `shutdown()` breaks the connection while the numbers are still
+/// ours; `close()` frees them, and only once nothing is using them.
 public protocol Transport: AnyObject, Sendable {
     /// Frames are read from here.
     var readDescriptor: Int32 { get }
     /// Frames are written here. The same descriptor for a socket.
     var writeDescriptor: Int32 { get }
 
-    /// Break the connection. Idempotent, and safe to call while another thread
-    /// is blocked reading.
+    /// Break the connection so a blocked read returns, *without* freeing the
+    /// descriptors. Idempotent, and safe to call from another thread.
+    func shutdown()
+
+    /// Free the descriptors. The caller must have finished `shutdown()` and
+    /// established that nothing is still reading or writing them. Idempotent.
     func close()
 
     /// Why the transport died, when it died on its own — `ssh` refusing a host
     /// key, or a remote machine with no `illogicald` on its PATH. Nil for a
-    /// unix socket, which has nothing to say that `errno` did not.
+    /// unix socket, which has nothing to say that `errno` did not, and nil
+    /// while the connection is still up.
     var failureDescription: String? { get }
 }
 
@@ -58,6 +71,7 @@ public enum TransportError: Error, Equatable, CustomStringConvertible {
 /// A unix domain socket. One descriptor, both directions.
 public final class UnixSocketTransport: Transport, @unchecked Sendable {
     private let fd: Int32
+    private let shutdownFlag = ManagedAtomicFlag()
     private let closedFlag = ManagedAtomicFlag()
 
     public var readDescriptor: Int32 { fd }
@@ -103,15 +117,19 @@ public final class UnixSocketTransport: Transport, @unchecked Sendable {
         self.fd = fd
     }
 
-    deinit { close() }
+    deinit {
+        shutdown()
+        close()
+    }
+
+    /// Wakes a blocked reader while the descriptor number is still ours.
+    public func shutdown() {
+        guard shutdownFlag.testAndSet() == false else { return }
+        Darwin.shutdown(fd, SHUT_RDWR)
+    }
 
     public func close() {
         guard closedFlag.testAndSet() == false else { return }
-        // `shutdown` before `close`: it wakes the reader thread while the
-        // descriptor number is still ours. Closing alone leaves that thread in
-        // a `read` on a number the kernel is free to hand to the next file
-        // this process opens.
-        Darwin.shutdown(fd, SHUT_RDWR)
         Darwin.close(fd)
     }
 }
@@ -124,6 +142,15 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     private let process: Process
     private let toChild: FileHandle
     private let fromChild: FileHandle
+    /// Held so `close` can free it. Without this the read end of the child's
+    /// stderr leaked one descriptor per transport, permanently: the dispatch
+    /// source behind `readabilityHandler` keeps the `FileHandle` alive well
+    /// past this object, so nothing else ever closed it. One connection per
+    /// terminal means a window that opens and closes remote panes walks the
+    /// process to `EMFILE`, at which point even a local unix socket stops
+    /// connecting.
+    private let stderrHandle: FileHandle
+    private let shutdownFlag = ManagedAtomicFlag()
     private let closedFlag = ManagedAtomicFlag()
 
     /// The child's stderr, kept so a failure can say what the child said. SSH
@@ -134,7 +161,15 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     public let readDescriptor: Int32
     public let writeDescriptor: Int32
 
+    /// What the child said, but only once it has actually gone.
+    ///
+    /// Gated on the process, not merely on there being output: `ssh` writes
+    /// plenty to stderr on a perfectly good connection — "Permanently added
+    /// 'build-box' to the list of known hosts" on the first connect, banners,
+    /// and the remote daemon's own logging. Reporting any of that made a
+    /// healthy host render as the one that failed.
     public var failureDescription: String? {
+        guard !process.isRunning else { return nil }
         let text = diagnostics.text
         return text.isEmpty ? nil : text
     }
@@ -180,6 +215,7 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         self.process = process
         self.toChild = stdinPipe.fileHandleForWriting
         self.fromChild = stdoutPipe.fileHandleForReading
+        self.stderrHandle = stderrPipe.fileHandleForReading
         self.readDescriptor = stdoutPipe.fileHandleForReading.fileDescriptor
         self.writeDescriptor = stdinPipe.fileHandleForWriting.fileDescriptor
 
@@ -218,17 +254,44 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         throw TransportError.notOnPath(command)
     }
 
-    deinit { close() }
+    deinit {
+        shutdown()
+        close()
+    }
+
+    /// How long the child gets to go on its own after `terminate()` before the
+    /// descriptors are freed regardless. Bounded because `close()` must not be
+    /// able to hang a window that is shutting down.
+    private static let exitGrace: TimeInterval = 2
+
+    /// A pipe has no `shutdown(2)`, so the equivalent is to stop the thing on
+    /// the other end of it: the child exiting closes its ends, our reader sees
+    /// end-of-file, and the descriptor numbers stay ours throughout.
+    ///
+    /// `ssh` holding a control master can outlive its own session, so
+    /// end-of-file on its stdin is not enough to be sure it goes.
+    public func shutdown() {
+        guard shutdownFlag.testAndSet() == false else { return }
+        if process.isRunning { process.terminate() }
+    }
 
     public func close() {
         guard closedFlag.testAndSet() == false else { return }
-        // Terminate first. The child's own read then ends, so the descriptors
-        // below are closed with nothing left using them — and `ssh` holding a
-        // control master can outlive its session, so end-of-file alone is not
-        // enough to be sure it goes.
-        if process.isRunning { process.terminate() }
+        // Wait for the child before freeing anything. Its exit is what closes
+        // the far ends, and a descriptor freed while the child still holds its
+        // twin is a number the kernel can hand to the next connection.
+        if process.isRunning {
+            let deadline = Date().addingTimeInterval(Self.exitGrace)
+            while process.isRunning && Date() < deadline {
+                usleep(2000)
+            }
+        }
+        // The handler is cleared explicitly: it holds a dispatch source on the
+        // descriptor about to be freed.
+        stderrHandle.readabilityHandler = nil
         try? toChild.close()
         try? fromChild.close()
+        try? stderrHandle.close()
     }
 }
 
@@ -327,6 +390,12 @@ public enum SSHCommand {
             argv += ["-o", "ControlPersist=\(controlPersist)"]
         }
 
+        // `--` first. Without it a destination beginning with `-` is parsed by
+        // ssh as an option: `-weirdhost` becomes `-w eirdhost` and fails with
+        // "Bad tun device". Nothing reachable gets further than a usage dump
+        // today, but a destination is user input in an option slot, and
+        // `-oProxyCommand=` is what that slot is one argument away from.
+        argv.append("--")
         argv.append(options.destination)
         // ssh joins what follows with spaces and hands it to the login shell,
         // which is what resolves `illogicald` on the far side.
@@ -337,10 +406,22 @@ public enum SSHCommand {
 
     /// The `ControlPath` template, or nil when there is nowhere short enough to
     /// put it.
+    ///
+    /// `$HOME`, not `homeDirectoryForCurrentUser` — the latter reads the passwd
+    /// entry and ignores the environment, so the two disagree whenever `$HOME`
+    /// is overridden. `src/core/conn.zig` uses `getenv("HOME")`, and the pairing
+    /// only buys anything if both render the *same* path: disagree and the app
+    /// and `illogical --host` bind different control sockets and hold two ssh
+    /// masters, which is precisely what this exists to avoid. Nil when `$HOME`
+    /// is unset, which is what the Zig side does too.
     static func controlPath(_ options: Options) -> String? {
-        let directory =
-            options.controlDirectory
-            ?? FileManager.default.homeDirectoryForCurrentUser.appending(path: ".ssh").path
+        let directory: String
+        if let explicit = options.controlDirectory {
+            directory = explicit
+        } else {
+            guard let home = ProcessInfo.processInfo.environment["HOME"] else { return nil }
+            directory = home + "/.ssh"
+        }
         let path = directory + "/illogical-%C"
         // `%C` is two characters here and forty at render time.
         guard path.utf8.count - 2 + 40 <= controlBudget else { return nil }

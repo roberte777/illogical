@@ -165,9 +165,95 @@ final class ReconnectTests: XCTestCase {
 
         XCTAssertEqual(store.tabs.count, 1, "a dropped packet closed a tab")
         XCTAssertEqual(host.terminals.count, 1)
-        // And the window is not taken over: this is the only host, but it is
-        // trying, and the screen it last drew is still the best thing to show.
+        // `connectionError` *is* set -- this is the only host and it is not
+        // connected. What stops the window being taken over is that a tab wins
+        // over the error in `ContentView`, which this test cannot reach; the
+        // property asserted here is that the tab is still there to win.
         XCTAssertNotNil(store.connectionError)
+        XCTAssertNotNil(store.selectedTab)
+    }
+
+    /// A pump belonging to a *replaced* connection must not tear down its
+    /// successor. Reachable without any network fault: the server answers
+    /// `no_such_terminal` and keeps the connection, so a pane sits in `.failed`
+    /// with a live pump, and pressing Retry used to open a connection and then
+    /// let the old pump abort its snapshot and close it.
+    func testARetryIsNotUndoneByThePreviousConnection() async throws {
+        let server = try HangUpServer()
+        defer { server.stop() }
+
+        let controller = try TerminalController(
+            terminalID: 1, host: .local(socketPath: server.path), cols: 80, rows: 24)
+        defer { controller.disconnect() }
+        controller.connect(cols: 80, rows: 24)
+        try await waitFor("the first reconnect") { controller.state.isReconnecting }
+
+        let before = server.accepted
+        controller.retryNow()
+        // The retry must reach the socket and then *stay*: if the superseded
+        // pump's tail still spoke for the controller it would close this one
+        // and drop back into the backoff without another accept.
+        try await waitFor("the retry to connect") { server.accepted > before }
+        let afterRetry = server.accepted
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(
+            server.accepted, afterRetry,
+            "a superseded pump tore down the connection its retry had just made")
+    }
+
+    /// A host that recovers must start its next outage at the bottom of the
+    /// backoff, not where the last one left off. Without the reset, eight flaky
+    /// drops left the dropdown pinned at the 30-second ceiling for the life of
+    /// the process while the panes came back in 250ms.
+    func testAHostsBackoffIsForgivenOnceItIsListed() async throws {
+        let server = try HangUpServer()
+        defer { server.stop() }
+
+        let store = SessionStore(hosts: [.local(socketPath: server.path)])
+        guard let host = store.host(.local(socketPath: server.path)) else {
+            return XCTFail("no host")
+        }
+        host.connect()
+        try await waitFor("a few failed attempts") {
+            if case .reconnecting(let attempt, _) = host.status { return attempt >= 3 }
+            return false
+        }
+
+        // A `session_list` is what proves the connection works, and it is where
+        // the backoff is forgiven.
+        host.setStatusForTesting(.connected)
+        host.applyListForTesting(sessions: [], terminals: [])
+        XCTAssertEqual(Backoff.delay(forAttempt: 0), Backoff.initial)
+
+        host.connect()
+        try await waitFor("a first attempt again") {
+            if case .reconnecting(let attempt, _) = host.status { return attempt == 1 }
+            return false
+        }
+    }
+
+    /// Not every failure is worth retrying every thirty seconds forever. `ssh`
+    /// missing from PATH will not fix itself, and before this nothing ever
+    /// assigned `.failed`, so it showed an amber "reconnecting…" indefinitely
+    /// and rescanned PATH on a timer.
+    func testAnUnrecoverableFailureIsTerminal() async throws {
+        let store = SessionStore(hosts: [.ssh(destination: "nowhere")])
+        guard let host = store.host(.ssh(destination: "nowhere")) else {
+            return XCTFail("no host")
+        }
+        // `ILLOGICAL_SSH` is read by `sshOptions`, so pointing it at something
+        // that is not on PATH reaches `TransportError.notOnPath`.
+        setenv("ILLOGICAL_SSH", "illogical-no-such-ssh-binary", 1)
+        defer { unsetenv("ILLOGICAL_SSH") }
+
+        host.connect()
+        try await waitFor("a terminal failure") {
+            if case .failed = host.status { return true }
+            return false
+        }
+        // ...and it stays failed rather than sliding back into the backoff.
+        try await Task.sleep(for: .milliseconds(400))
+        if case .failed = host.status {} else { XCTFail("a hopeless host went back to retrying") }
     }
 }
 

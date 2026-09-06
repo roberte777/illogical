@@ -67,6 +67,24 @@ final class HostConnection: Identifiable {
         }
     }
 
+    /// Drive the status directly. Only for tests: the interesting states are
+    /// otherwise reached by a connection actually failing, which needs a
+    /// socket.
+    func setStatusForTesting(_ next: Status) {
+        setStatus(next)
+    }
+
+    /// Apply a session list as though one had arrived on the wire — including
+    /// the backoff reset a real `session_list` carries. For tests, which have
+    /// no daemon to send one.
+    func applyListForTesting(sessions: [SessionSummary], terminals: [TerminalSummary]) {
+        self.sessions = sessions
+        self.terminals = terminals
+        backoff.reset()
+        setStatus(.connected)
+        onListChanged?()
+    }
+
     private(set) var status: Status = .connecting
     var sessions: [SessionSummary] = []
     var terminals: [TerminalSummary] = []
@@ -83,7 +101,7 @@ final class HostConnection: Identifiable {
     /// not something to recover from.
     private var closedByUs = false
 
-    // -- events, for the store that owns the layout --------------------------
+    // MARK: - Events, for the store that owns the layout
     //
     // The host knows what exists; the window knows where it is drawn. Keeping
     // that split is what lets the reconcile stay in one place across every
@@ -139,10 +157,21 @@ final class HostConnection: Identifiable {
             }
             refresh()
             Trace.log("control connection to \(host.displayName) open")
+        } catch let error as TransportError {
+            Trace.log("connect to \(host.displayName) failed: \(error)")
+            // Some failures are not worth retrying every thirty seconds for
+            // the life of the process. `ssh` missing from PATH, or a
+            // destination we cannot even spawn for, will not fix itself, and
+            // showing it as an amber "reconnecting…" forever -- while
+            // rescanning PATH on a timer -- tells the user nothing. This is
+            // what makes `.failed` reachable; before it, nothing ever set it.
+            switch error {
+            case .notOnPath, .spawnFailed, .pathTooLong:
+                setStatus(.failed(describe(error)))
+            case .socketFailed, .connectFailed:
+                scheduleReconnect(detail: describe(error))
+            }
         } catch {
-            // A host that is not there yet is a host to try again. `ssh` not
-            // being on PATH is the one exception worth reporting as final, and
-            // it reports itself: the message rides along in the status.
             Trace.log("connect to \(host.displayName) failed: \(error)")
             scheduleReconnect(detail: describe(error))
         }
@@ -206,14 +235,12 @@ final class HostConnection: Identifiable {
         closeController(id)
     }
 
-    /// Whether a terminal on this host should be drawn as reachable.
-    var isReachable: Bool { status.isConnected }
-
-    /// A message worth putting in front of somebody.
+    /// Why a connection could not be *opened*, phrased for a person.
     ///
-    /// For a remote host that is `ssh`'s own complaint where there is one:
-    /// "could not resolve hostname" is the answer, and "connection closed" is
-    /// not.
+    /// This is the throw out of `Connection(host:)` -- ssh not on PATH, a
+    /// socket that is not there -- and not ssh's own stderr, which has not been
+    /// written yet at this point. That arrives later as
+    /// `Connection.failureDescription`, and `controlClosed` is what carries it.
     private func describe(_ error: Error) -> String {
         if case .local(let path) = host {
             return "No illogicald at \(path). Start one with `illogicald`."
@@ -270,6 +297,14 @@ final class HostConnection: Identifiable {
                     ptyReadIdleNanoseconds: $0.ptyReadIdleNanoseconds,
                     exitCode: $0.exitCode)
             }
+            // Where the backoff is forgiven, and on the *list* rather than on
+            // the connect: a host whose daemon has died accepts a connection
+            // and drops it, so resetting on a socket opening would turn the
+            // backoff into a tight loop against exactly the machine that needs
+            // one. Without this, eight flaky drops left the dropdown stuck at
+            // the 30-second ceiling for the life of the process while the
+            // panes -- which do reset -- came back in 250ms.
+            backoff.reset()
             setStatus(.connected)
             onListChanged?()
 

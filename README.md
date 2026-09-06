@@ -20,6 +20,28 @@ Mac client attaches to them — on this machine or on another one over SSH,
 several at a time in one window. What is measured and what is not is in
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
+## Remote hosts
+
+```bash
+illogical --host build-box list          # the same CLI, another machine
+illogical --host build-box new -s api
+```
+
+The client runs `ssh <dest> illogicald --stdio` and speaks the same frames over
+the pipe. Your existing SSH config, keys, jump hosts and agent forwarding apply;
+there is no listening socket, no TLS, and no credential of ours to configure —
+the app remembers a destination and the remote binary's name, and nothing else.
+
+`--stdio` is a **bridge**, not a server. The process SSH starts owns no
+terminals: it connects to that host's own long-lived daemon, starting one
+detached if there is none, and splices bytes between it and the pipe. A server
+started by SSH would die with the session and take its terminals with it.
+
+The Mac app holds as many hosts at once as you add, and gets them back on its
+own when a network goes away. That recovery is the desync path with a new socket
+in front of it: the same `attach`, because the terminal on the far side never
+stopped.
+
 ## Getting started
 
 Requires [Nix](https://nixos.org/download) with flakes, and Xcode for the macOS
@@ -70,26 +92,6 @@ server is doing.
 A **session** is a named container of **terminals**. Each terminal is 1:1 with a
 PTY and gets its own connection; splits and tabs are native widgets in the
 client, not something the server draws.
-
-## Remote hosts
-
-```bash
-illogical --host build-box list          # the same CLI, another machine
-illogical --host build-box new -s api
-```
-
-The client runs `ssh <dest> illogicald --stdio` and speaks the same frames over
-the pipe. Your existing SSH config, keys, jump hosts and agent forwarding apply;
-there is no listening socket, no TLS, and nothing of ours to configure — the app
-stores a destination string and nothing else.
-
-`--stdio` is a **bridge**, not a server. The process SSH starts owns no
-terminals: it connects to that host's own long-lived daemon, starting one
-detached if there is none, and splices bytes between it and the pipe. A server
-started by SSH would die with the session and take its terminals with it.
-
-The Mac app holds as many hosts at once as you add, and gets them back on its
-own when a network goes away — which is the same code path as any other desync.
 
 Read in this order:
 

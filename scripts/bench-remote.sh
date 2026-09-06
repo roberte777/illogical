@@ -7,7 +7,7 @@
 # directly costs, plus one copy in each direction — and if it does not, the
 # bridge is doing something it should not be.
 #
-# Two columns, from the same daemon and the same terminal:
+# Two rows, from the same daemon and the same terminal:
 #
 #   direct    the app on the unix socket, as it has always been
 #   bridged   the app on `ssh <dest> illogicald --stdio`, which lands on
@@ -28,11 +28,12 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 app="$root/clients/macos/.build/xcode/Build/Products/Debug/Illogical.app/Contents/MacOS/Illogical"
 daemon="$root/zig-out/bin/illogicald"
 cli="$root/zig-out/bin/illogical"
-state="$(mktemp -d /tmp/illogical-remote.XXXXXX)"
-
 [ -x "$app" ] || { echo "build first: just app" >&2; exit 1; }
 [ -x "$daemon" ] || { echo "build first: zig build" >&2; exit 1; }
 
+# After the guards above, so a missing binary does not leave a temp directory
+# behind, and before anything that needs cleaning up.
+state="$(mktemp -d /tmp/illogical-remote.XXXXXX)"
 pids=()
 cleanup() {
   pkill -f "$app" 2>/dev/null || true
@@ -102,8 +103,14 @@ run() { # trace-file, then the environment already exported by the caller
   done
   kill "$app_pid" 2>/dev/null || true
   wait "$app_pid" 2>/dev/null || true
-  echo "$(since_attach 'milestone snapshot-ready' "$trace" || echo nan)" \
-    "$(since_attach 'milestone snapshot-end' "$trace" || echo nan)"
+  local ready done_
+  ready=$(since_attach 'milestone snapshot-ready' "$trace")
+  done_=$(since_attach 'milestone snapshot-end' "$trace")
+  # `${x:-nan}`, not `|| echo nan`: `since_attach` is a bare awk, which exits 0
+  # whether or not it matched, so the `||` never fired. A run that never
+  # reached the milestone printed an empty first field and `read -r r e` then
+  # put the *second* number in the first column.
+  echo "${ready:-nan} ${done_:-nan}"
 }
 
 echo "runs=$runs scrollback=$lines lines"
@@ -111,6 +118,33 @@ echo
 
 start_daemon full "$lines"
 full_sock="$daemon_sock"
+
+# Wait for the filler to stop writing before anything attaches. Not politeness,
+# and the reason is the same one bench-attach.sh gives: the reader thread holds
+# the terminal lock while it applies PTY output, so attaching to a terminal that
+# is still a firehose measures how long the filler has left to run rather than
+# what the bridge costs. Without this the table below was timing the writer.
+wait_idle() {
+  local sock="$1"
+  for _ in $(seq 1 2400); do
+    local idle
+    idle=$(ILLOGICAL_SOCK="$sock" "$cli" list 2>/dev/null |
+      awk 'NR > 1 { gsub(/s$/, "", $NF); print $NF }' | sort -n | head -1)
+    [ -n "$idle" ] && [ "$idle" -ge 2 ] 2>/dev/null && return 0
+    sleep 0.5
+  done
+  echo "warning: terminals on $sock never went idle" >&2
+}
+wait_idle "$full_sock"
+
+# And that it is `live`: attaching to a parked terminal serves a compressed
+# park file off disk instead of encoding, which is a different code path with
+# different numbers and no hint in the table which one it timed.
+residency=$(ILLOGICAL_SOCK="$full_sock" "$cli" list | awk 'NR > 1 { print $4 }' | sort -u)
+[ "$residency" = "live" ] || {
+  echo "refusing to measure: terminal is '$residency', not live" >&2
+  exit 1
+}
 # An empty daemon for the local host in the bridged case, so the *front* tab
 # is the remote terminal. The client attaches to whatever is in front.
 start_daemon empty 0
@@ -147,6 +181,6 @@ printf '| %-9s | %11s ms | %10s ms |\n' \
 printf '| %-9s | %11s ms | %10s ms |\n' \
   "bridged" "$(echo "$bridged_ready" | median)" "$(echo "$bridged_end" | median)"
 echo
-echo "The first column is the gate: a splice that parses nothing should not"
-echo "move it. The second carries the whole snapshot and is where a per-frame"
-echo "cost in the bridge would show up."
+echo "The attach-to-ready column is the gate: a splice that parses nothing"
+echo "should not move it between the two rows. attach-to-end carries the whole"
+echo "snapshot, and is where a per-frame cost in the bridge would show up."

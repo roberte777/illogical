@@ -144,7 +144,7 @@ final class TerminalController {
                     guard let self else { return }
                     await self.handle(frame)
                 }
-                await self?.connectionClosed()
+                await self?.connectionClosed(connection)
             }
         } catch {
             // Not fatal, and not different from the connection dying a moment
@@ -546,7 +546,19 @@ final class TerminalController {
         backoff.reset()
     }
 
-    private func connectionClosed() {
+    /// The stream for `connection` has finished.
+    ///
+    /// Takes the connection it is speaking for, and ignores anything that is
+    /// not the current one. Without that check a *replaced* pump's tail tears
+    /// down its successor: a pane sitting in `.failed` with its socket open --
+    /// which the server produces by answering `no_such_terminal` and keeping
+    /// the connection -- has a live pump, so pressing Retry opens connection B
+    /// and then lets A's tail abort B's in-flight snapshot, close it, and
+    /// schedule a fresh backoff. Every Retry threw away a just-negotiated
+    /// channel. `HostConnection.controlClosed(_:)` has had this guard all
+    /// along; this is the same hazard.
+    private func connectionClosed(_ closing: Connection) {
+        guard connection === closing else { return }
         // Whatever the pipe still holds is a snapshot that will never be
         // completed, and it may be a session's whole scrollback.
         stopHistoryRestore()

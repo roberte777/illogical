@@ -116,10 +116,12 @@ is one call). And the client decodes history once it has all arrived rather
 than page by page, because the decoder reads inside `next()`, under the
 engine's lock; the reasoning is in [CLIENT.md](CLIENT.md#the-attach-path-and-the-launch-budget).
 
-## M3 — The renderer (in progress)
+## M3 — The renderer ✅
 
 **Ends at:** the Mac app is a terminal you would actually use. See
-[CLIENT.md](CLIENT.md).
+[CLIENT.md](CLIENT.md). Its gate is met and measured below; the open items it
+spawned — IME, search, links, Kitty graphics — are tracked as issues rather
+than as an unfinished milestone.
 
 Landed so far: the Metal renderer described in [CLIENT.md](CLIENT.md), ported
 from libghostty's own; the Superlogical-style chrome (session button,
@@ -215,9 +217,13 @@ caused rather than only here:
 
 ## M5 — Remote ✅
 
-**Ends at:** the dropdown lists terminals on other machines. **Done** — verified
-against two daemons that both number their terminals from 1, one of them reached
-through the bridge.
+**Ends at:** the dropdown lists terminals on other machines. **Done.**
+
+The id-collision case — two daemons that both number their terminals from 1 —
+is covered by `TabReconcileTests`, and the bridge by `stdio.zig`'s own tests.
+Both running *at once*, with one reached through the bridge, was checked by
+hand and is not reproducible from the repo; `scripts/bench-remote.sh` starts two
+daemons but gives the second no terminals.
 
 | | Work |
 | --- | --- |
@@ -243,15 +249,23 @@ M-series, median of 9:
 
 | transport | attach → ready | attach → end |
 | --- | --- | --- |
-| direct, unix socket | 34.1 ms | 150.0 ms |
-| through the bridge | 34.2 ms | 165.3 ms |
+| direct, unix socket | 33.7 ms | 148.1 ms |
+| through the bridge | 34.1 ms | 162.4 ms |
 
-The first column is the M2 gate seen from the far side of an SSH pipe, and it
-does not move: 0.1 ms on a number that varies by more than that between runs.
-The second is the whole 20,000-line snapshot, and it costs 10% more — that is
-the copy, and it is the only thing the bridge adds. At 200 lines the two
-columns collapse into each other (34.0 against 34.4 ms) because there is
-nothing left to copy.
+`attach → ready` is the M2 gate seen from the far side of an SSH pipe, and it
+does not move between the rows: 0.4 ms on a number that varies by more than
+that between runs. `attach → end` carries the whole 20,000-line snapshot and
+costs 10% more — that is the copy, and it is the only thing the bridge adds. At
+200 lines the two columns collapse into each other (33.0 against 34.5 ms)
+because there is nothing left to copy.
+
+The script waits for the filler to go idle and refuses to run against a
+terminal that is not `live`, for the reason `bench-attach.sh` gives: the reader
+thread holds the terminal lock while it applies output, so attaching to a
+terminal that is still writing measures the writer. Review caught that this one
+did neither; re-measuring with the check in place moved the numbers by less
+than the run-to-run spread, so the earlier table was right by luck rather than
+by construction.
 
 ⚠ **`ssh` itself is stood in for.** The benchmark runs the bridge over a local
 pipe, so what it says is "the bridge is not the bottleneck" and *nothing* about
@@ -276,7 +290,7 @@ Three things the work turned up that the milestone did not anticipate:
   terminates the process, and a daemon going away with a keystroke in flight is
   the ordinary case — so the recovery path was the one that crashed. It predates
   this milestone; reconnecting made it reachable every time rather than rarely.
-  Found by a test that hung the runner instead of failing.
+  Found by a test that took the runner down instead of failing.
 
 `illogical --host <dest>` runs the same transport from the CLI. Not a
 convenience: it is what makes the remote path testable from a shell rather than
@@ -357,8 +371,8 @@ Also measure, where no reference number exists:
   one of them is hot. `scripts/bench-pty.sh`, measured in M4.
 - p99 input latency at 200 attachments.
 - Client cold launch to window. **148 ms**, Debug, measured above.
-- What the remote transport costs. **Nothing on the gate** — 34.1 against
-  34.2 ms to `snapshot_ready` — and 10% on the whole snapshot, which is the
+- What the remote transport costs. **Nothing on the gate** — 33.7 against
+  34.1 ms to `snapshot_ready` — and 10% on the whole snapshot, which is the
   copy. `scripts/bench-remote.sh`, measured in M5. It stands `ssh` in for
   itself, so it bounds the bridge and says nothing about a real network.
 
