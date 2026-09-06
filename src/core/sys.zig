@@ -156,6 +156,13 @@ pub fn clearCloexec(fd: fd_t) void {
 /// For a caller that needs a descriptor in a *particular range* rather than
 /// wherever `open` happened to put it, without `dup2`'s habit of silently
 /// closing whatever was already on the target.
+///
+/// Deliberately not close-on-exec: `F_DUPFD` clears `FD_CLOEXEC` on the new
+/// descriptor, and the one caller is a test that needs it inherited in order
+/// to observe whether `closeFrom` closed it. Anything that duplicates a
+/// descriptor the daemon keeps -- a listening socket, a park file -- wants
+/// `setCloexec` on the result, or it is handed to every shell the daemon ever
+/// spawns.
 pub fn dupFrom(fd: fd_t, lowest: fd_t) Error!fd_t {
     const next = fcntl(fd, F_DUPFD, lowest);
     if (next < 0) return error.OpenFailed;

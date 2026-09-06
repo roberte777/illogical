@@ -532,12 +532,19 @@ test "deinit gives up on a child that never stops writing" {
     //     returns on time and leaves `yes` running forever with nobody to
     //     reap it, which the pid check below is what notices.
     //
-    // It does *not* pin `drainRead`'s own deadline. Measured: with this child
-    // the drain leaves via `WouldBlock` every time -- 688 times over one grace
-    // period -- because a 4 KiB read loop outpaces `yes`. That deadline guards
-    // a producer fast enough to keep the pipe continuously non-empty, which a
-    // shell child cannot be made to be reliably. It is defence in depth, and
-    // is not claimed here as covered.
+    // It does *not* pin `drainRead`'s own deadline -- at least not here.
+    // Measured on macOS/aarch64: the drain leaves via `WouldBlock` every time,
+    // 688 times over one grace period, because a 4 KiB read outpaces the small
+    // stdio writes BSD `yes` makes. That is a race between two processes'
+    // syscall throughput rather than a property of the shapes, and it may well
+    // go the other way elsewhere -- GNU coreutils `yes` writes a prefilled
+    // buffer of at least 8 KiB per `write`, twice what this reads per `read`,
+    // which could keep the pipe continuously non-empty and reach the deadline.
+    //
+    // So: do not read this test as licence to delete that deadline. On the
+    // platform where it is genuinely unreached the suite stays green without
+    // it; on one where it is not, `deinit` never returns and `zig build test`
+    // hangs with nothing printed.
     const argv = try arena.allocSentinel(?[*:0]const u8, 3, null);
     argv[0] = "/bin/sh";
     argv[1] = "-c";
@@ -550,9 +557,14 @@ test "deinit gives up on a child that never stops writing" {
     const elapsed = sys.monotonicNs() - before;
 
     // The grace, and then the signal. Not less, which would mean giving up on
-    // a child that was merely busy; not more, which is the hang.
+    // a child that was merely busy.
     try testing.expect(elapsed >= Conn.child_exit_grace_ns);
-    try testing.expect(elapsed < 2 * Conn.child_exit_grace_ns);
+    // And bounded -- generously, because the failure this catches is an
+    // unbounded loop rather than a slow one, so a wide ceiling costs no
+    // detection power and buys immunity to a loaded machine. A 2x margin here
+    // is the sort of thing that fails once in fifty runs and gets rerun rather
+    // than read.
+    try testing.expect(elapsed < 5 * Conn.child_exit_grace_ns);
     // And it is really gone, rather than left running with nobody to reap it.
     // `deinit` returns on time either way; only this notices the difference.
     try testing.expect(!sys.processExists(pid));

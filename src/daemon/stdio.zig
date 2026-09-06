@@ -544,8 +544,20 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     var script_buf: [512]u8 = undefined;
     const script = try std.fmt.bufPrintZ(
         &script_buf,
+        // `true`, not `:`. `:` is a POSIX *special* built-in, and a
+        // redirection error on one of those "shall cause the shell to exit" --
+        // so on dash, which is /bin/sh on Debian and Ubuntu, a correctly
+        // closed descriptor exits the shell at status 2 before the `else`
+        // branch can write CLEAN. The test would then fail on exactly the
+        // platforms where the code works. `true` is a regular built-in and
+        // merely returns non-zero. Checked on sh, dash, bash, zsh and ksh.
+        //
+        // The `2>/dev/null` suppresses nothing, incidentally: redirections
+        // apply left to right, so `<&{d}` has already failed and printed by
+        // the time it is applied. It is left because the daemon log is
+        // asserted with `indexOf`, and one more line in it costs nothing.
         "sleep 0.2; echo DAEMON_COMPLAINT >&2; " ++
-            "if : <&{d} 2>/dev/null; then echo LEAKED; else echo CLEAN; fi > {s}",
+            "if true <&{d} 2>/dev/null; then echo LEAKED; else echo CLEAN; fi > {s}",
         .{ placed, marker },
     );
     const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", @ptrCast(script.ptr) };
