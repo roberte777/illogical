@@ -295,7 +295,7 @@ final class ReconnectTests: XCTestCase {
         }
         // ...and it stays failed rather than sliding back into the backoff.
         try await Task.sleep(for: .milliseconds(400))
-        if case .failed = host.status { } else { XCTFail("a hopeless host went back to retrying") }
+        if case .failed = host.status {} else { XCTFail("a hopeless host went back to retrying") }
     }
 
     /// The other half of that judgement, and the one that is easy to get
