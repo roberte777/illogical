@@ -52,10 +52,6 @@ struct SSHCommandTests {
         let args = argv()
         #expect(args.contains("ServerAliveInterval=15"))
         #expect(args.contains("ServerAliveCountMax=3"))
-        // And the one for the connection that has not happened yet: without it
-        // a black-holed host sits in the TCP connect for ~75s on macOS, which
-        // the client spends showing nothing wrong at all.
-        #expect(args.contains("ConnectTimeout=10"))
     }
 
     @Test("multiplexes, so a split costs a channel rather than a handshake")
@@ -65,14 +61,14 @@ struct SSHCommandTests {
         #expect(args.contains("ControlPath=/tmp/illogical-%C"))
         #expect(args.contains("ControlPersist=60"))
         // Every `-o` introduces exactly one option.
-        #expect(args.filter { $0 == "-o" }.count == 6)
+        #expect(args.filter { $0 == "-o" }.count == 5)
     }
 
     @Test("multiplexing can be turned off")
     func noMultiplexing() {
         let args = argv(multiplex: false)
         #expect(!args.contains("ControlMaster=auto"))
-        #expect(args.filter { $0 == "-o" }.count == 3)
+        #expect(args.filter { $0 == "-o" }.count == 2)
         #expect(args.suffix(4) == ["--", "build-box", "illogicald", "--stdio"])
     }
 

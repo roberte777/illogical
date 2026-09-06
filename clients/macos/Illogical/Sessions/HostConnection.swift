@@ -144,8 +144,9 @@ final class HostConnection: Identifiable {
     var onListChanged: (() -> Void)?
     /// The server made a terminal, in reply to our `create`.
     var onCreated: ((UInt64) -> Void)?
-    /// Every `create` we are still waiting on has become unanswerable. See
-    /// `voidPendingCreates`.
+    /// Give up on every `create` outstanding for this host. See
+    /// `voidPendingCreates`, which is exact about when that is a fact and when
+    /// it is the safe assumption.
     var onCreatesVoided: (() -> Void)?
 
     init(host: ServerHost) {
@@ -255,10 +256,12 @@ final class HostConnection: Identifiable {
     /// the queue by one for the life of the process, which shows up as splits
     /// landing in the tab before last and the window jumping to it.
     ///
-    /// "Unanswerable" is exact for the two teardown callers and deliberately
-    /// approximate for the third: an `err` on the control session means *one*
-    /// request failed, and this abandons the lot because the frame does not
-    /// say which. See the `.error` case for why that is the safe direction.
+    /// Two of the three callers know this for a fact, because they are the
+    /// teardown: the connection that would have answered is going. The third
+    /// is an assumption -- an `err` on the control session means *one* request
+    /// failed, and this abandons the lot because the frame does not say which.
+    /// See the `.error` case for why that is the safe direction to be wrong
+    /// in.
     private func voidPendingCreates() {
         onCreatesVoided?()
     }
