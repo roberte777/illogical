@@ -243,10 +243,10 @@ macOS, `phys_footprint`, same terminal shapes — and report losses honestly.
 
 | Benchmark | Superlogical | tmux 3.5a | ours | status |
 | --- | --- | --- | --- | --- |
-| Server start, no terminals | 10.6 MiB | 2.50 MiB | **1.27 MiB** | measured |
+| Server start, no terminals | 10.6 MiB | 2.50 MiB | **1.23 MiB** | measured |
 | Per terminal, 10,000 lines, settled | 407 KiB | 4.89 MiB | **390 KiB** | measured |
-| Per empty 80×24 terminal | 68 KiB | **15 KiB** | 90 KiB | measured |
-| Per client connection (50 filled) | 85 KiB | 157 KiB | **46 KiB** | measured |
+| Per empty 80×24 terminal | 68 KiB | **15 KiB** | 94 KiB | measured |
+| Per client connection (50 filled) | 85 KiB | 157 KiB | **45 KiB** | measured |
 | Unpark, 64 MB scrollback | ~200 µs (excl. disk) | — | — | not measured |
 | Parked-PTY throughput cost | 5–10% | — | **+0.2%** one PTY, **+98%** eight at once | measured |
 

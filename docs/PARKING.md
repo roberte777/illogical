@@ -430,11 +430,15 @@ against the reference figures in [RESEARCH.md](RESEARCH.md#7-numbers):
 
 | | ours | Superlogical | tmux 3.5a |
 | --- | --- | --- | --- |
-| Server start, no terminals | **1.27 MiB** | 10.6 MiB | 2.50 MiB |
-| Per empty 80×24 terminal | 90 KiB | 68 KiB | **15 KiB** |
-| Per client connection, idle | **46 KiB** | 85 KiB | 157 KiB |
+| Server start, no terminals | **1.23 MiB** | 10.6 MiB | 2.50 MiB |
+| Per empty 80×24 terminal | 94 KiB | 68 KiB | **15 KiB** |
+| Per client connection, idle | **45 KiB** | 85 KiB | 157 KiB |
 | Per filled 10,000-line terminal, settled | **390 KiB** | 407 KiB | 4.89 MiB |
 | Snapshot on disk | 32 KiB | — | — |
+
+The filled row moves a few percent between runs — 380 to 407 across two — because
+where compression has got to when the footprint settles is not deterministic.
+The others are stable to a kilobyte.
 
 The two rows Superlogical loses are the two that scale, which is the same shape
 their own numbers have. We lose the empty-terminal row to tmux by 6×, and most
