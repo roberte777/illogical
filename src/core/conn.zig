@@ -78,8 +78,22 @@ pub const Conn = struct {
         if (self.write_fd != self.read_fd) sys.closeFd(self.write_fd);
 
         if (self.child) |pid| {
+            // Keep reading while we wait, and throw it away.
+            //
+            // Not optional. The child is often mid-write to us -- `attach`
+            // breaks its read loop on `exited` with up to the daemon's 1 MiB
+            // client queue still in flight, and a failed `peek` leaves a whole
+            // `screen` frame behind. A child blocked writing into a pipe
+            // nobody is draining never gets back to reading its stdin, so it
+            // never sees the end-of-file above, and every such exit burned the
+            // full grace and then got signalled anyway: `illogical --host box
+            // list` took 2.34 s instead of returning at once.
+            sys.setNonblock(self.read_fd, true);
+            defer sys.setNonblock(self.read_fd, false);
+
             const deadline = sys.monotonicNs() + child_exit_grace_ns;
             const reaped = while (sys.monotonicNs() < deadline) {
+                self.drainRead();
                 switch (sys.tryWait(pid)) {
                     .running => sys.sleepNs(child_exit_poll_ns),
                     .exited, .gone => break true,
@@ -98,6 +112,21 @@ pub const Conn = struct {
 
         sys.closeFd(self.read_fd);
         self.read_buf.deinit(self.gpa);
+    }
+
+    /// Read and discard whatever is waiting, without blocking.
+    ///
+    /// `read_fd` must be non-blocking. Bounded by the loop's own exit
+    /// conditions rather than by a count: a child that can produce bytes
+    /// faster than this drains them is still making progress towards its own
+    /// exit, and `deinit`'s deadline is what stops us either way.
+    fn drainRead(self: *Conn) void {
+        var scratch: [4096]u8 = undefined;
+        while (true) {
+            const n = sys.readFdOnce(self.read_fd, &scratch) catch return;
+            // End of stream, or nothing more for now.
+            if (n == 0) return;
+        }
     }
 
     pub fn send(
