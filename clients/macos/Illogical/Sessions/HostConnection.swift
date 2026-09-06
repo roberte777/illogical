@@ -51,6 +51,14 @@ final class HostConnection: Identifiable {
             return false
         }
 
+        /// Still trying, and nothing has gone wrong yet. Over SSH this covers
+        /// the whole handshake — authentication, the remote spawn, the first
+        /// list — which is a second or more, and much longer behind 2FA.
+        var isConnecting: Bool {
+            if case .connecting = self { return true }
+            return false
+        }
+
         /// What to put in front of a person, or nil when there is nothing to
         /// say yet.
         var message: String? {
@@ -63,6 +71,13 @@ final class HostConnection: Identifiable {
     /// reached by a connection actually failing, which needs a socket.
     func setStatusForTesting(_ next: Status) {
         setStatus(next)
+    }
+
+    /// Feed a frame as though the daemon had sent it. For tests, which have no
+    /// daemon — and which otherwise end up pinning a hand-written stand-in
+    /// rather than the code that runs.
+    func handleForTesting(_ frame: Frame) {
+        handle(frame)
     }
 
     private(set) var status: Status = .connecting
@@ -85,6 +100,9 @@ final class HostConnection: Identifiable {
     var onListChanged: (() -> Void)?
     /// The server made a terminal, in reply to our `create`.
     var onCreated: ((UInt64) -> Void)?
+    /// Every `create` we are still waiting on has become unanswerable. See
+    /// `voidPendingCreates`.
+    var onCreatesVoided: (() -> Void)?
 
     init(host: ServerHost) {
         self.host = host
@@ -136,7 +154,20 @@ final class HostConnection: Identifiable {
         pump = nil
         control?.close()
         control = nil
+        voidPendingCreates()
         for id in controllers.keys { closeController(id) }
+    }
+
+    /// Every `create` still outstanding on this host is now unanswerable.
+    ///
+    /// `created` carries a terminal id and nothing else -- no request id -- so
+    /// the client can only match replies to requests by position. That holds
+    /// exactly as long as every request produces exactly one reply, and a
+    /// request whose connection died produces none. One stranded entry shifts
+    /// the queue by one for the life of the process, which shows up as splits
+    /// landing in the tab before last and the window jumping to it.
+    private func voidPendingCreates() {
+        onCreatesVoided?()
     }
 
     func refresh() {
@@ -179,6 +210,7 @@ final class HostConnection: Identifiable {
         control = nil
         sessions = []
         terminals = []
+        voidPendingCreates()
         setStatus(.failed(detail ?? "disconnected"))
         onListChanged?()
     }
@@ -221,6 +253,24 @@ final class HostConnection: Identifiable {
 
         case .sessionsChanged:
             refresh()
+
+        case .error:
+            // Only the ones addressed to the control session. The daemon
+            // answers a bad `kill` or `input` on the terminal's own id, and
+            // those say nothing about a `create`.
+            //
+            // Which control request failed is not knowable -- `hello`, `list`
+            // and `create` all carry the control session, and the error names
+            // none of them -- so this voids *every* outstanding create rather
+            // than guessing at one. Erring the other way silently shifts the
+            // split queue for the life of the process; erring this way means a
+            // create that did succeed opens a tab of its own instead of a
+            // pane, which is visible and recoverable.
+            guard frame.terminal == Protocol.controlSession else { break }
+            let body = try? JSONDecoder().decode(ErrBody.self, from: frame.payload)
+            Trace.log(
+                "\(host.displayName): control error: " + (body?.message ?? "unknown"))
+            voidPendingCreates()
 
         default:
             break
