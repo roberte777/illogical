@@ -293,6 +293,53 @@ struct TransportTests {
         #expect(String(describing: TransportError.pathTooLong) == "the socket path is too long")
     }
 
+    /// `close()` is called from the main actor, once per pane. Blocking there
+    /// while a wedged child fails to die froze the window for seconds when
+    /// closing a split tab — up to four seconds per connection, and a four-pane
+    /// tab closes four of them.
+    @Test("closing does not block the caller on a child that ignores SIGTERM")
+    func closeDoesNotBlockTheCaller() async throws {
+        // `trap` without `exec`: the shell keeps ignoring SIGTERM, so
+        // `shutdown()` cannot end it and the reader never sees end-of-file.
+        let transport = try CommandTransport(
+            argv: ["/bin/sh", "-c", "trap '' TERM; sleep 2"])
+        let connection = Connection(transport: transport)
+        connection.start()
+
+        // Let the reader actually reach its `read`. Without this it is still
+        // at the loop's `closed` guard when `close` runs, exits immediately,
+        // and the wait this test is about succeeds at once — which is how an
+        // earlier version of it passed with the fix removed.
+        try await Task.sleep(for: .milliseconds(200))
+
+        let start = Date()
+        connection.close()
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(elapsed < 0.5, "close() blocked its caller for \(elapsed)s")
+    }
+
+    /// The message must survive the close that follows it. Closing used to
+    /// free the stderr descriptor with bytes still undrained, so the one thing
+    /// this mechanism exists to capture was thrown away with it.
+    ///
+    /// This does not defend the *ordering* — removing `close`'s wait on the
+    /// drain is caught by `closeIsIdempotent`, which trips on the handle being
+    /// pulled out from under a live read. It defends the outcome.
+    @Test("a failure message survives the close that follows it")
+    func diagnosticsSurviveClose() throws {
+        let transport = try CommandTransport(
+            argv: ["/bin/sh", "-c", "echo 'could not resolve hostname' >&2; exit 1"])
+        // No `shutdown()` first: this child exits on its own, and terminating
+        // it would race SIGTERM against its own `echo`. What is under test is
+        // that `close` does not free the descriptor until the drain has read
+        // to end-of-file.
+        transport.close()
+
+        // Only the process reaping is raced; the bytes are already in hand.
+        for _ in 0..<200 where transport.isRunning { usleep(5000) }
+        #expect(transport.failureDescription == "could not resolve hostname")
+    }
+
     @Test("a unix socket transport reports a path that is not there")
     func missingSocket() {
         #expect(throws: TransportError.self) {

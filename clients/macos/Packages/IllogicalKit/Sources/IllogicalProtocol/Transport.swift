@@ -152,6 +152,9 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     private let stderrHandle: FileHandle
     private let shutdownFlag = ManagedAtomicFlag()
     private let closedFlag = ManagedAtomicFlag()
+    /// Signalled when the stderr drain thread reaches end-of-file, so `close`
+    /// frees that descriptor only once nothing is reading it.
+    private let drainFinished = DispatchSemaphore(value: 0)
 
     /// The child's stderr, kept so a failure can say what the child said. SSH
     /// reports a bad host key, an unreachable host and a missing binary there,
@@ -222,15 +225,29 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         // Drained rather than merely captured. An undrained stderr pipe fills
         // at 64 KiB and blocks the child inside a write, and a wedged `ssh` is
         // indistinguishable from a slow network.
+        //
+        // A thread rather than a `readabilityHandler`, for the same reason the
+        // frame reader is one: a dispatch source cannot be *joined*. Clearing
+        // the handler does not wait for a block already running, so closing
+        // the descriptor under it either raised an uncatchable ObjC exception
+        // or -- once the number was recycled -- appended another connection's
+        // bytes to this one's diagnostics. It also read to EOF only when it
+        // felt like it, so closing could discard the very message this exists
+        // to capture.
         let sink = diagnostics
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-                return
+        let handle = stderrPipe.fileHandleForReading
+        let finished = drainFinished
+        let drain = Thread {
+            while true {
+                let data = handle.availableData
+                if data.isEmpty { break }
+                sink.append(data)
             }
-            sink.append(data)
+            finished.signal()
         }
+        drain.name = "illogical.stderr"
+        drain.stackSize = 128 * 1024
+        drain.start()
     }
 
     /// Find `command` the way a shell would.
@@ -259,10 +276,11 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         close()
     }
 
-    /// How long the child gets to go on its own after `terminate()` before the
-    /// descriptors are freed regardless. Bounded because `close()` must not be
-    /// able to hang a window that is shutting down.
-    private static let exitGrace: TimeInterval = 2
+    /// How long the stderr drain gets to reach end-of-file before its
+    /// descriptor is left alone. `shutdown` has already ended the child, so
+    /// this is the time for one thread to notice EOF, not for a process to
+    /// die.
+    private static let drainGrace: TimeInterval = 1
 
     /// A pipe has no `shutdown(2)`, so the equivalent is to stop the thing on
     /// the other end of it: the child exiting closes its ends, our reader sees
@@ -277,21 +295,19 @@ public final class CommandTransport: Transport, @unchecked Sendable {
 
     public func close() {
         guard closedFlag.testAndSet() == false else { return }
-        // Wait for the child before freeing anything. Its exit is what closes
-        // the far ends, and a descriptor freed while the child still holds its
-        // twin is a number the kernel can hand to the next connection.
-        if process.isRunning {
-            let deadline = Date().addingTimeInterval(Self.exitGrace)
-            while process.isRunning && Date() < deadline {
-                usleep(2000)
-            }
-        }
-        // The handler is cleared explicitly: it holds a dispatch source on the
-        // descriptor about to be freed.
-        stderrHandle.readabilityHandler = nil
+        // No wait for the child. Closing *our* end frees *our* descriptor
+        // number; whether the child still holds its twin is the kernel's
+        // business, not ours. The only thing that must be ordered is our own
+        // threads, and the caller has already seen the frame reader out.
         try? toChild.close()
         try? fromChild.close()
-        try? stderrHandle.close()
+
+        // Stderr is ours to order, though: its drain thread is reading that
+        // descriptor. Left open if it has not finished -- a leaked descriptor
+        // beats pulling one out from under a live read.
+        if drainFinished.wait(timeout: .now() + Self.drainGrace) == .success {
+            try? stderrHandle.close()
+        }
     }
 }
 

@@ -111,8 +111,6 @@ final class HostConnection: Identifiable {
     var onListChanged: (() -> Void)?
     /// The server made a terminal, in reply to our `create`.
     var onCreated: ((UInt64) -> Void)?
-    /// `status` changed.
-    var onStatusChanged: (() -> Void)?
 
     init(host: ServerHost) {
         self.host = host
@@ -147,6 +145,12 @@ final class HostConnection: Identifiable {
             control = connection
             connection.start()
             try connection.send(.hello, json: HelloBody(client: "Illogical.app"))
+            // Not `.connected` yet. For an ssh host `CommandTransport` has
+            // only *spawned* the process at this point -- nothing about
+            // authentication or reachability is known, and the write above
+            // lands in a pipe. The `session_list` below is the first thing
+            // that proves the far end is really there, and `selectedHost`
+            // routes new terminals on this.
 
             pump = Task { [weak self] in
                 for await frame in connection.frames {
@@ -251,7 +255,6 @@ final class HostConnection: Identifiable {
     private func setStatus(_ next: Status) {
         guard status != next else { return }
         status = next
-        onStatusChanged?()
     }
 
     private func controlClosed(_ connection: Connection) {

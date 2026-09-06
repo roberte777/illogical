@@ -45,6 +45,7 @@ extern "c" fn unlink(path: [*:0]const u8) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn pipe(fds: *[2]fd_t) c_int;
 extern "c" fn getdtablesize() c_int;
+extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, size: usize) isize;
 extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
@@ -161,9 +162,44 @@ pub fn clearCloexec(fd: fd_t) void {
 /// and Linux and by version. `close` is async-signal-safe, which is what makes
 /// this legal between `fork` and `exec`.
 pub fn closeFrom(lowest: fd_t) void {
+    // Clamped, because `getdtablesize` is the *soft* `RLIMIT_NOFILE` and that
+    // is the caller's environment to set: it reads 138,240 on an ordinary mac
+    // and can be 2^30 under a service manager, where the loop would run for
+    // minutes between `fork` and `exec` and the bridge would give up waiting
+    // for a daemon that eventually turns up anyway. Best-effort by the same
+    // token -- a descriptor above the current soft limit survives, which is
+    // only reachable if the limit was lowered after it was opened.
+    const limit = @min(getdtablesize(), 4096);
     var fd = lowest;
-    const limit = getdtablesize();
     while (fd < limit) : (fd += 1) _ = close(fd);
+}
+
+/// Create `path` and any missing parents, like `mkdir -p`. Best effort.
+///
+/// `std.Io.Dir.createDirPath` needs an `Io`, and the one caller is about to
+/// `fork`: the bridge has to make the daemon's state directory *before* the
+/// grandchild tries to open a log inside it, because the daemon does not
+/// create that directory until it is already running.
+///
+/// 0700, because what ends up in there is the park store -- a terminal's
+/// scrollback and the key it is encrypted with.
+pub fn makeDirPath(path: []const u8) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len == 0 or path.len >= buf.len) return;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+
+    // Each prefix in turn, so missing intermediates are created too. Failures
+    // are ignored: the usual one is EEXIST, and a real one surfaces when the
+    // caller opens the file.
+    var i: usize = 1;
+    while (i <= path.len) : (i += 1) {
+        if (i != path.len and buf[i] != '/') continue;
+        const saved = buf[i];
+        buf[i] = 0;
+        _ = mkdir(@ptrCast(&buf), 0o700);
+        buf[i] = saved;
+    }
 }
 
 /// Turn non-blocking mode on or off.
