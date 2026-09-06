@@ -1079,7 +1079,6 @@ test "a device attributes query is answered back through the pty" {
     // Ask for DA1, read back exactly the 9 bytes of the reply, and print them
     // somewhere `plainText` can see. Raw mode because the reply carries no
     // newline, and a canonical-mode read would block waiting for one.
-    //
     const script =
         \\stty raw -echo
         \\printf '\033[c'
