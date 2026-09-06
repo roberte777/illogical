@@ -90,49 +90,51 @@ public final class Connection: @unchecked Sendable {
         let thread = Thread { [weak self] in self?.readLoop() }
         thread.name = "illogical.connection"
         thread.stackSize = 512 * 1024
-        thread.start()
+        // Recorded *before* the thread runs. Assigned after `start()`, a
+        // `close()` racing this read nil, skipped the wait entirely, and freed
+        // the descriptors with the reader already inside `read`.
         readerThread = thread
+        thread.start()
     }
 
     /// Tear the connection down, in the one order that is safe.
     ///
-    /// `shutdown` wakes the reader while the descriptor numbers are still
-    /// ours, then we wait for it to leave, then we free them. Closing first —
-    /// which is what this used to do — hands the numbers back to the kernel
-    /// with a thread still blocked on them, and the next connection in the
-    /// process is handed the same number: one terminal's keystrokes arriving
-    /// in another's PTY, which is a good deal worse than a dropped frame.
+    /// `shutdown` breaks the connection while the descriptor numbers are still
+    /// ours; they are freed only once the reader has left. Freeing first hands
+    /// the number back with a thread still blocked on it, and the next
+    /// connection in the process is handed the same number -- one terminal's
+    /// keystrokes arriving in another's PTY.
+    ///
+    /// The waiting happens *off* the caller's thread. `close()` is called from
+    /// the main actor, once per pane, and blocking there for a wedged child
+    /// froze the window for seconds while closing a split tab. Nothing above
+    /// needs to observe the free: `closed` is set synchronously, so every
+    /// later `send` already fails.
     public func close() {
         guard closed.testAndSet() == false else { return }
         transport.shutdown()
         continuation.finish()
 
-        // Only if a reader was ever started; `start()` is not mandatory.
-        var readerLeft = true
-        if readerThread != nil {
-            // Bounded: a child wedged in an uninterruptible read must not hang
-            // a window that is closing.
-            readerLeft = readerFinished.wait(timeout: .now() + 2) == .success
-            readerThread = nil
+        let thread = readerThread
+        readerThread = nil
+        let transport = self.transport
+        let finished = readerFinished
+        let lock = writeLock
+
+        DispatchQueue.global(qos: .utility).async {
+            // Deliberately leaked if the reader never comes back: a child that
+            // ignores SIGTERM and keeps its inherited write end open means we
+            // never see end-of-file, and freeing the number then is the bug
+            // this ordering exists to prevent. `shutdown` has already made the
+            // descriptor inert.
+            if thread != nil, finished.wait(timeout: .now() + 2) != .success { return }
+
+            // Under the write lock, so a `send` that was already inside it has
+            // finished with the descriptor before the number goes back.
+            lock.lock()
+            defer { lock.unlock() }
+            transport.close()
         }
-
-        // And if it did *not* leave, the descriptors stay. Freeing them here
-        // would be the very bug this ordering exists to prevent: the number
-        // goes back to the kernel, the next connection is handed it, and the
-        // thread still parked in `read` starts consuming that connection's
-        // frames. A leaked descriptor is the lesser failure by a wide margin,
-        // and `shutdown` has already made this one inert.
-        //
-        // Reachable: an `ssh` wrapper that does not `exec`, so SIGTERM kills
-        // the wrapper while the real ssh keeps the inherited write end open
-        // and we never see end-of-file.
-        guard readerLeft else { return }
-
-        // Under the write lock, so a `send` that was already inside it has
-        // finished with the descriptor before the number goes back.
-        writeLock.lock()
-        defer { writeLock.unlock() }
-        transport.close()
     }
 
     // MARK: - Sending

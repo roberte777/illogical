@@ -125,8 +125,15 @@ fn spawnDaemon(socket_path: []const u8, exe_override: ?[]const u8) !void {
     // Where the daemon's stderr goes. Beside the socket, which is also where
     // the park store lives, so a daemon nobody started by hand still has one
     // place to complain -- see `spawnDetached`.
+    //
+    // Created here, before the fork. `Server.init` creates this directory too,
+    // but not until the daemon is already running -- so on the *first*
+    // auto-start the open below failed with ENOENT and the daemon silently
+    // fell back to /dev/null, which is exactly the run where a park-key
+    // failure matters most.
     var log_z: [std.fs.max_path_bytes]u8 = undefined;
     const dir = std.fs.path.dirname(socket_path) orelse ".";
+    sys.makeDirPath(dir);
     const log_path = std.fmt.bufPrintZ(&log_z, "{s}/daemon.log", .{dir}) catch
         return error.PathTooLong;
 
@@ -501,14 +508,16 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     const secret = try std.fmt.bufPrintZ(&secret_buf, "/tmp/illogical-secret-{d}", .{pid});
     defer sys.unlinkPath(secret.ptr);
 
-    // A descriptor the daemon has no business seeing, in the slot an
-    // `~/.ssh/rc` wrapper's own log or credential file would occupy. Without
+    // A descriptor the daemon has no business seeing, standing in for the
+    // credential file an `~/.ssh/rc` wrapper might have open. Without
     // `closeFrom` the grandchild inherits it and hands it to every shell it
     // ever spawns -- for days.
+    //
+    // Whatever number `open` gives us, rather than a hard-coded one: this is a
+    // thirty-test binary and dup2'ing onto a fixed slot would silently smash
+    // whatever another test had there.
     const secret_fd = try sys.openAppend(secret.ptr);
-    sys.dup2Fd(secret_fd, 9);
-    if (secret_fd != 9) sys.closeFd(secret_fd);
-    defer sys.closeFd(9);
+    defer sys.closeFd(secret_fd);
 
     // Stands in for the daemon: slow enough to still be running when
     // `spawnDetached` returns, so the marker proves the grandchild survived
@@ -518,8 +527,8 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     const script = try std.fmt.bufPrintZ(
         &script_buf,
         "sleep 0.2; echo DAEMON_COMPLAINT >&2; " ++
-            "if : <&9 2>/dev/null; then echo LEAKED; else echo CLEAN; fi > {s}",
-        .{marker},
+            "if : <&{d} 2>/dev/null; then echo LEAKED; else echo CLEAN; fi > {s}",
+        .{ secret_fd, marker },
     );
     const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", @ptrCast(script.ptr) };
 
