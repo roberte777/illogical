@@ -223,6 +223,26 @@ handshake [ARCH t=356].
 user's existing SSH config, keys, jump hosts and agent forwarding work, and there
 is no listening socket to secure.
 
+```
+   Mac client                    ssh                    host
+  ┌──────────┐          ┌──────────────────┐    ┌──────────────────┐
+  │ terminal ├─ pipe ──►│ illogicald       ├───►│ illogicald       │
+  │ terminal ├─ pipe ──►│   --stdio        │    │  (unix socket)   │
+  └──────────┘          │  one per session │    │  one per host    │
+                        └──────────────────┘    └──────────────────┘
+```
+
+**`--stdio` is a bridge, not a server.** The process SSH starts owns no
+terminals: it connects to the host's own daemon, starting one detached if there
+is none, and splices bytes between that socket and the SSH pipe. A server
+started by SSH would die with the session and take its terminals with it. The
+mechanism, and what it means for the daemon's standard streams, is in
+[PROTOCOL.md](PROTOCOL.md#stdio-is-a-bridge-not-a-server).
+
+Both clients speak it. `illogical --host <dest>` is the same transport from the
+CLI — useful because it makes the whole remote path testable from a shell,
+without a window.
+
 Superlogical's deployment story is the same shape — self-hosted, embedded in the
 app, runnable anywhere, *"on every Kubernetes pod potentially"* [MEM t=46].
 

@@ -44,6 +44,9 @@ extern "c" fn fcntl(fd: fd_t, cmd: c_int, ...) c_int;
 extern "c" fn unlink(path: [*:0]const u8) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn pipe(fds: *[2]fd_t) c_int;
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, size: usize) isize;
+extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
 
 pub const Error = error{
     SocketFailed,
@@ -61,6 +64,9 @@ pub const Error = error{
     /// Nothing to read on a non-blocking descriptor.
     WouldBlock,
     PipeFailed,
+    OpenFailed,
+    /// This process cannot say where its own executable is. See `selfExePath`.
+    NoSelfExe,
 };
 
 pub fn errno() c_int {
@@ -155,6 +161,44 @@ pub fn pipeFds() Error![2]fd_t {
     setCloexec(fds[0]);
     setCloexec(fds[1]);
     return fds;
+}
+
+const O_RDWR: c_int = 2;
+
+/// `/dev/null`, opened read-write.
+///
+/// Deliberately not close-on-exec: the one caller is a forked child about to
+/// `dup2` this over its standard streams and then exec, and the whole point is
+/// that the streams survive.
+pub fn openDevNull() Error!fd_t {
+    const fd = open("/dev/null", O_RDWR);
+    if (fd < 0) return error.OpenFailed;
+    return fd;
+}
+
+/// Path to this executable, written into `buf`.
+///
+/// `std.fs.selfExePath` went away in Zig 0.16, and the stdio bridge needs it:
+/// starting the host's daemon means starting *this* binary again. Resolving it
+/// by name through `PATH` instead would be a different question with a
+/// different answer, since the SSH command that started us was resolved
+/// against a login shell's `PATH` and the daemon it starts outlives that shell.
+pub fn selfExePath(buf: []u8) Error![]const u8 {
+    if (builtin.os.tag.isDarwin()) {
+        // On success the path is NUL-terminated and `size` is left alone; on
+        // failure it is set to the length required, which is a bigger buffer
+        // than `std.fs.max_path_bytes` and so not worth retrying for.
+        var size: u32 = @intCast(@min(buf.len, std.math.maxInt(u32)));
+        if (_NSGetExecutablePath(buf.ptr, &size) != 0) return error.NoSelfExe;
+        return std.mem.sliceTo(buf, 0);
+    }
+    const n = readlink("/proc/self/exe", buf.ptr, buf.len);
+    if (n <= 0) return error.NoSelfExe;
+    const len: usize = @intCast(n);
+    // `readlink` does not terminate, and it truncates silently rather than
+    // failing -- a path that exactly filled the buffer may have been cut.
+    if (len >= buf.len) return error.NoSelfExe;
+    return buf[0..len];
 }
 
 // -- unix sockets ----------------------------------------------------------
@@ -260,6 +304,51 @@ pub fn forkProcess() Error!pid_t {
 
 pub fn exec(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) void {
     _ = execvp(file, argv);
+}
+
+pub const PipedChild = struct {
+    pid: pid_t,
+    /// Write here to reach the child's stdin.
+    stdin: fd_t,
+    /// Read here for the child's stdout.
+    stdout: fd_t,
+};
+
+/// Run `argv` with pipes on its standard input and output.
+///
+/// Used for exactly one thing: `ssh <dest> illogicald --stdio`, where the two
+/// pipes carry the wire protocol. The child keeps *our* stderr, so ssh's own
+/// diagnostics -- a bad host key, a missing binary -- reach a person instead of
+/// being decoded as frames.
+///
+/// `pipeFds` marks both ends close-on-exec, which is what makes the child's
+/// side of this correct without any closing: `dup2` clears the flag on the
+/// descriptor it creates, so 0 and 1 survive the exec and the four originals do
+/// not.
+pub fn spawnPiped(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) Error!PipedChild {
+    const to_child = try pipeFds();
+    errdefer {
+        closeFd(to_child[0]);
+        closeFd(to_child[1]);
+    }
+    const from_child = try pipeFds();
+    errdefer {
+        closeFd(from_child[0]);
+        closeFd(from_child[1]);
+    }
+
+    const pid = try forkProcess();
+    if (pid == 0) {
+        // Child. Nothing here may allocate or return.
+        dup2Fd(to_child[0], STDIN);
+        dup2Fd(from_child[1], STDOUT);
+        exec(file, argv);
+        exitProcess(127);
+    }
+
+    closeFd(to_child[0]);
+    closeFd(from_child[1]);
+    return .{ .pid = pid, .stdin = to_child[1], .stdout = from_child[0] };
 }
 
 pub fn exitProcess(code: u8) noreturn {
@@ -398,6 +487,20 @@ test "monotonic clock advances" {
     while (spin < 100_000) : (spin += 1) std.mem.doNotOptimizeAway(spin);
     const b = monotonicNs();
     try std.testing.expect(b >= a);
+}
+
+test "this process can say where its own executable is" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try selfExePath(&buf);
+    try testing.expect(path.len > 0);
+    // The stdio bridge execs this, so a name is not enough: it has to be a
+    // path that resolves without a `PATH` search, and it has to be there.
+    try testing.expectEqual(@as(u8, '/'), path[0]);
+    try std.Io.Dir.cwd().access(threaded.io(), path, .{});
 }
 
 test "unix address rejects an over-long path" {

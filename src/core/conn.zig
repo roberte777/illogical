@@ -3,6 +3,18 @@
 //! Shared by the CLI and by anything else that speaks to illogicald. Frames are
 //! read and written synchronously; callers that want concurrency give the read
 //! and write halves to different threads and serialize writes themselves.
+//!
+//! Two transports, and the frames above them do not know which one they are on:
+//!
+//! | | |
+//! | --- | --- |
+//! | local | a unix socket, one descriptor for both directions |
+//! | remote | `ssh <dest> illogicald --stdio`, a pipe each way |
+//!
+//! That is the whole of the remote story on this side. There is no TLS, no
+//! listening TCP socket and no credential handling of our own: SSH decides who
+//! may connect, and the far end is `src/daemon/stdio.zig` splicing the pipe onto
+//! the host's own unix socket. See docs/PROTOCOL.md, "Transport".
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -17,17 +29,56 @@ pub const Frame = struct {
 };
 
 pub const Conn = struct {
-    fd: sys.fd_t,
+    /// Reads come from here, writes go there. The same descriptor for a socket;
+    /// two ends of two pipes for a command.
+    read_fd: sys.fd_t,
+    write_fd: sys.fd_t,
+    /// The process carrying this connection, when it is a command. Signalled
+    /// and reaped by `deinit`.
+    child: ?sys.pid_t = null,
     gpa: Allocator,
     read_buf: std.ArrayList(u8) = .empty,
     write_mutex: thread.Mutex = .{},
 
     pub fn connect(gpa: Allocator, path: []const u8) !Conn {
-        return .{ .fd = try sys.connectUnix(path), .gpa = gpa };
+        const fd = try sys.connectUnix(path);
+        return .{ .read_fd = fd, .write_fd = fd, .gpa = gpa };
+    }
+
+    /// Run `argv` and speak the protocol over its stdin and stdout.
+    ///
+    /// The child keeps our stderr, so `ssh` can report a bad host key or a
+    /// missing binary where a person will see it.
+    pub fn spawn(gpa: Allocator, argv: [:null]const ?[*:0]const u8) !Conn {
+        const child = try sys.spawnPiped(argv[0].?, argv.ptr);
+        return .{
+            .read_fd = child.stdout,
+            .write_fd = child.stdin,
+            .child = child.pid,
+            .gpa = gpa,
+        };
+    }
+
+    /// Connect through `ssh` to a remote daemon. Caller owns `arena` only for
+    /// the duration of this call; the connection itself holds no memory from it.
+    pub fn connectSsh(gpa: Allocator, arena: Allocator, opts: Ssh) !Conn {
+        const argv = try opts.argv(arena);
+        return spawn(gpa, argv);
     }
 
     pub fn deinit(self: *Conn) void {
-        sys.closeFd(self.fd);
+        // The write end first: the far end of a command connection reads
+        // end-of-file from it and unwinds, which is how `ssh` learns to exit.
+        if (self.write_fd != self.read_fd) sys.closeFd(self.write_fd);
+        sys.closeFd(self.read_fd);
+        if (self.child) |pid| {
+            // Not only end-of-file. `ssh` with a control master can outlive its
+            // own session, and a CLI that waited for it would appear to hang
+            // after printing its answer.
+            sys.signal(pid, sys.SIGTERM);
+            _ = sys.wait(pid);
+            self.child = null;
+        }
         self.read_buf.deinit(self.gpa);
     }
 
@@ -47,8 +98,8 @@ pub const Conn = struct {
             .len = @intCast(payload.len),
         };
         header.encode(&header_buf);
-        try sys.writeAll(self.fd, &header_buf);
-        if (payload.len > 0) try sys.writeAll(self.fd, payload);
+        try sys.writeAll(self.write_fd, &header_buf);
+        if (payload.len > 0) try sys.writeAll(self.write_fd, payload);
     }
 
     pub fn sendJson(
@@ -65,12 +116,12 @@ pub const Conn = struct {
     /// Read one frame. The payload is only valid until the next call.
     pub fn recv(self: *Conn) !Frame {
         var header_buf: [protocol.header_len]u8 = undefined;
-        try sys.readAll(self.fd, &header_buf);
+        try sys.readAll(self.read_fd, &header_buf);
         const header = try protocol.Header.decode(&header_buf);
 
         self.read_buf.clearRetainingCapacity();
         try self.read_buf.resize(self.gpa, header.len);
-        if (header.len > 0) try sys.readAll(self.fd, self.read_buf.items);
+        if (header.len > 0) try sys.readAll(self.read_fd, self.read_buf.items);
         return .{ .header = header, .payload = self.read_buf.items };
     }
 
@@ -86,3 +137,221 @@ pub const Conn = struct {
         return parsed.value.server;
     }
 };
+
+// -- the ssh transport -----------------------------------------------------
+
+/// How to reach a remote daemon.
+///
+/// Everything about *authentication* is deliberately absent: `ssh` is run as
+/// the user runs it, so `~/.ssh/config`, keys, jump hosts and agent forwarding
+/// all apply and there is nothing of ours to configure or store.
+pub const Ssh = struct {
+    /// Anything `ssh` accepts: `host`, `user@host`, or a `Host` alias from the
+    /// user's config.
+    destination: []const u8,
+    /// The daemon to run on the far side. Resolved by the login shell's PATH.
+    remote_binary: []const u8 = "illogicald",
+    /// The `ssh` to run. A field rather than a constant so a test can stand in
+    /// for it, and so someone with a second OpenSSH can say which.
+    ssh: []const u8 = "ssh",
+    /// Where to keep the multiplexing socket. Null asks for `~/.ssh`; see
+    /// `controlPath`.
+    control_dir: ?[]const u8 = null,
+    /// Turn connection multiplexing off. One SSH connection per terminal is
+    /// what this avoids, and a window with four splits opens five.
+    multiplex: bool = true,
+
+    /// Seconds between keepalives, and how many may go unanswered. Together
+    /// they are how long a dead network takes to become a closed connection,
+    /// which is what the client turns into a reconnect — 45 seconds here.
+    const alive_interval = "15";
+    const alive_count = "3";
+    /// How long the multiplexing master lingers after the last connection, so
+    /// closing a window and opening another does not re-authenticate.
+    const persist = "60";
+
+    /// A unix socket path has about 104 bytes, and OpenSSH renders `%C` as a
+    /// 40-character hash. Refuse to ask for multiplexing rather than have ssh
+    /// warn about a path it cannot bind on every single connection.
+    const control_budget = 100;
+
+    pub fn argv(self: Ssh, arena: Allocator) ![:null]?[*:0]const u8 {
+        var parts: std.ArrayList([]const u8) = .empty;
+        try parts.appendSlice(arena, &.{
+            self.ssh,
+            // No pty. A pty would put a line discipline in the middle of a
+            // binary frame stream and translate every 0x0a it carried.
+            "-T",
+            "-o",
+            "ServerAliveInterval=" ++ alive_interval,
+            "-o",
+            "ServerAliveCountMax=" ++ alive_count,
+        });
+
+        // One connection per terminal is the client's model, so a window with
+        // four splits is five SSH connections. Multiplexing makes the four
+        // after the first cost a channel rather than a handshake.
+        if (self.multiplex) {
+            if (try self.controlPath(arena)) |path| {
+                const control = try std.fmt.allocPrint(arena, "ControlPath={s}", .{path});
+                try parts.appendSlice(arena, &.{ "-o", "ControlMaster=auto" });
+                try parts.appendSlice(arena, &.{ "-o", control });
+                try parts.appendSlice(arena, &.{ "-o", "ControlPersist=" ++ persist });
+            }
+        }
+
+        try parts.append(arena, self.destination);
+        // `ssh` joins what follows with spaces and hands it to the login shell,
+        // which is what resolves `illogicald` on the far side.
+        try parts.append(arena, self.remote_binary);
+        try parts.append(arena, "--stdio");
+
+        const out = try arena.allocSentinel(?[*:0]const u8, parts.items.len, null);
+        for (parts.items, 0..) |part, i| out[i] = (try arena.dupeZ(u8, part)).ptr;
+        return out;
+    }
+
+    /// The `ControlPath` template, or null when there is nowhere short enough
+    /// to put it.
+    fn controlPath(self: Ssh, arena: Allocator) !?[]const u8 {
+        const dir = self.control_dir orelse blk: {
+            const home = sys.getenv("HOME") orelse return null;
+            break :blk try std.fmt.allocPrint(arena, "{s}/.ssh", .{home});
+        };
+        const path = try std.fmt.allocPrint(arena, "{s}/illogical-%C", .{dir});
+        // `%C` is forty characters at render time and two here.
+        if (path.len - 2 + 40 > control_budget) return null;
+        return path;
+    }
+};
+
+// -- tests -----------------------------------------------------------------
+
+fn argvStrings(arena: Allocator, opts: Ssh) ![]const []const u8 {
+    const raw = try opts.argv(arena);
+    var out: std.ArrayList([]const u8) = .empty;
+    for (raw) |item| try out.append(arena, std.mem.span(item.?));
+    return out.items;
+}
+
+fn indexOfArg(args: []const []const u8, want: []const u8) ?usize {
+    for (args, 0..) |a, i| {
+        if (std.mem.eql(u8, a, want)) return i;
+    }
+    return null;
+}
+
+test "the ssh command ends in the remote daemon, in stdio mode" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try argvStrings(arena, .{
+        .destination = "build-box",
+        .control_dir = "/tmp",
+    });
+
+    try testing.expectEqualStrings("ssh", args[0]);
+    // The destination and the command, in that order and last: everything
+    // before them is an option, and `ssh` treats the first non-option as the
+    // host and the rest as the command.
+    try testing.expectEqualStrings("build-box", args[args.len - 3]);
+    try testing.expectEqualStrings("illogicald", args[args.len - 2]);
+    try testing.expectEqualStrings("--stdio", args[args.len - 1]);
+
+    // No pty. This is not a preference: a line discipline in the middle of the
+    // frame stream would rewrite every 0x0a byte a snapshot chunk carried.
+    try testing.expect(indexOfArg(args, "-T") != null);
+
+    // A dead network has to become a closed connection, or the client never
+    // learns to reconnect.
+    try testing.expect(indexOfArg(args, "ServerAliveInterval=15") != null);
+    try testing.expect(indexOfArg(args, "ServerAliveCountMax=3") != null);
+
+    // Multiplexing, so the second terminal on a host costs a channel.
+    try testing.expect(indexOfArg(args, "ControlMaster=auto") != null);
+    try testing.expect(indexOfArg(args, "ControlPath=/tmp/illogical-%C") != null);
+    try testing.expect(indexOfArg(args, "ControlPersist=60") != null);
+
+    // Every `-o` introduces exactly one option, so the count has to match.
+    var options: usize = 0;
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "-o")) options += 1;
+    }
+    try testing.expectEqual(@as(usize, 5), options);
+}
+
+test "a remote binary somewhere else is respected" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const args = try argvStrings(arena, .{
+        .destination = "me@host",
+        .remote_binary = "/opt/illogical/bin/illogicald",
+        .ssh = "/usr/bin/ssh",
+        .multiplex = false,
+    });
+    try testing.expectEqualStrings("/usr/bin/ssh", args[0]);
+    try testing.expectEqualStrings("me@host", args[args.len - 3]);
+    try testing.expectEqualStrings("/opt/illogical/bin/illogicald", args[args.len - 2]);
+    try testing.expect(indexOfArg(args, "ControlMaster=auto") == null);
+}
+
+test "a control path that would not fit in a unix socket is not asked for" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The shape macOS `TMPDIR` has: deep enough that the rendered hash pushes
+    // it past what `bind` accepts. ssh would warn about this on every
+    // connection and fall back anyway, so ask for the fallback directly.
+    const args = try argvStrings(arena, .{
+        .destination = "host",
+        .control_dir = "/var/folders/2b/" ++ "x" ** 48 ++ "/T",
+    });
+    try testing.expect(indexOfArg(args, "ControlMaster=auto") == null);
+    // ...and the rest of the command is unaffected.
+    try testing.expectEqualStrings("--stdio", args[args.len - 1]);
+}
+
+test "a command connection speaks frames over its child's pipes" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `cat` is the smallest thing that behaves like the far end of an SSH
+    // pipe: whatever we write comes back, framed exactly as it was sent. What
+    // is under test is the transport, not the server.
+    const argv = try arena.allocSentinel(?[*:0]const u8, 1, null);
+    argv[0] = "/bin/cat";
+
+    var conn = try Conn.spawn(gpa, argv);
+    defer conn.deinit();
+
+    // Large enough to cross a pipe buffer, so a transport that lost track of a
+    // partial write would truncate it.
+    const payload = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i *% 17);
+
+    const Writer = struct {
+        fn go(c: *Conn, bytes: []const u8) void {
+            c.send(.input, 42, bytes) catch {};
+        }
+    };
+    // On a thread: 128 KiB is more than a pipe holds, so the write blocks
+    // until this thread has read some of it back.
+    const writing = try std.Thread.spawn(.{}, Writer.go, .{ &conn, payload });
+    defer writing.join();
+
+    const frame = try conn.recv();
+    try testing.expectEqual(protocol.FrameType.input, frame.header.type);
+    try testing.expectEqual(@as(u64, 42), frame.header.session);
+    try testing.expectEqualSlices(u8, payload, frame.payload);
+}
