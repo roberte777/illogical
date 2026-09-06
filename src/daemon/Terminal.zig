@@ -841,7 +841,14 @@ pub fn park(self: *Terminal) !void {
 
         const window = try self.gpa.alloc(u8, illogical.park.Store.window_len);
         defer self.gpa.free(window);
-        var compress = try flate.Compress.init(
+
+        // Heap, and not as a matter of taste: `flate.Compress` is 224 KiB of
+        // hash tables, and this runs on the maintenance thread. On the stack
+        // it overflowed a 512 KiB one and took the daemon down with a bus
+        // error the moment anything parked.
+        const compress = try self.gpa.create(flate.Compress);
+        defer self.gpa.destroy(compress);
+        compress.* = try .init(
             &file_writer.interface,
             window,
             illogical.park.Store.Container,
@@ -1519,6 +1526,74 @@ test "idle clock tracks PTY reads, not wall time" {
     // even though it was just created and its child is running.
     try testing.expect(t.ptyReadIdleNs() >= 40 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u32, 0), t.attachedCount());
+}
+
+/// Runs `park` on a thread with the stack the daemon actually gives its
+/// maintenance thread, and reports what happened.
+const Parker = struct {
+    terminal: *Terminal,
+    result: anyerror!void = {},
+
+    fn run(self: *Parker) void {
+        self.result = self.terminal.park();
+    }
+
+    fn parkOnDaemonStack(t: *Terminal) !void {
+        var self: Parker = .{ .terminal = t };
+        const thread = try std.Thread.spawn(
+            .{ .stack_size = thread_stack_size },
+            run,
+            .{&self},
+        );
+        thread.join();
+        return self.result;
+    }
+};
+
+test "parking fits in the stack the daemon gives it" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-parkstack-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const marker = "STACK_BOUND_PARK";
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = root },
+        .id = 1,
+        .session_id = 1,
+        .name = "parkstack",
+        .argv = &.{ "/bin/sh", "-c", "printf '" ++ marker ++ "\\n'; sleep 10" },
+    });
+    defer t.destroy();
+    defer t.hangup();
+    try t.start();
+
+    var waited: usize = 0;
+    while (waited < 3000) : (waited += 10) {
+        const text = t.plainText(gpa) catch {
+            sys.sleepNs(10 * std.time.ns_per_ms);
+            continue;
+        };
+        defer gpa.free(text);
+        if (std.mem.indexOf(u8, text, marker) != null) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.MarkerNeverArrived;
+
+    // On the daemon's stack, not the test runner's. Every other park test runs
+    // on this thread, which has megabytes, so none of them could see that
+    // `flate.Compress` is 224 KiB and used to live on the stack: the daemon
+    // died with a bus error the first time anything parked, and the suite
+    // stayed green. This is the only test that runs park where park runs.
+    try Parker.parkOnDaemonStack(t);
+    try testing.expectEqual(session.Residency.parked, t.summary().residency);
+    try testing.expect((t.store.snapshotSize(io, t.id) orelse 0) > 0);
 }
 
 test "park writes a snapshot, unpark restores the screen" {
