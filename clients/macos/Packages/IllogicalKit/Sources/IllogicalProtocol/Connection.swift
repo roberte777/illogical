@@ -6,6 +6,10 @@
 //  user input come from different threads.
 //
 //  One connection per terminal, per docs/PROTOCOL.md.
+//
+//  Nothing here knows whether the daemon is on this machine or another one.
+//  That is a `Transport`: a unix socket locally, `ssh <dest> illogicald
+//  --stdio` remotely, with the same frames on a pipe. See Transport.swift.
 
 import Darwin
 import Foundation
@@ -32,7 +36,9 @@ public enum ConnectionError: Error, Equatable {
 }
 
 public final class Connection: @unchecked Sendable {
-    private let fd: Int32
+    private let transport: Transport
+    private let readFD: Int32
+    private let writeFD: Int32
     private let writeLock = NSLock()
     private var readerThread: Thread?
     private let closed = ManagedAtomicFlag()
@@ -41,35 +47,14 @@ public final class Connection: @unchecked Sendable {
     public let frames: AsyncStream<Frame>
     private let continuation: AsyncStream<Frame>.Continuation
 
-    public init(socketPath: String) throws {
-        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw ConnectionError.socketFailed(errno) }
+    /// Why the connection died, when the transport can say — `ssh`'s own
+    /// complaint about a host it could not reach. Nil for a unix socket.
+    public var failureDescription: String? { transport.failureDescription }
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(socketPath.utf8)
-        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
-        guard pathBytes.count < capacity else {
-            Darwin.close(fd)
-            throw ConnectionError.pathTooLong
-        }
-        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
-            raw.copyBytes(from: pathBytes)
-        }
-        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-
-        let result = withUnsafePointer(to: &addr) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard result == 0 else {
-            let code = errno
-            Darwin.close(fd)
-            throw ConnectionError.connectFailed(code)
-        }
-
-        self.fd = fd
+    public init(transport: Transport) {
+        self.transport = transport
+        self.readFD = transport.readDescriptor
+        self.writeFD = transport.writeDescriptor
         var captured: AsyncStream<Frame>.Continuation?
         self.frames = AsyncStream(bufferingPolicy: .unbounded) { captured = $0 }
         // AsyncStream runs its build closure synchronously, so this is set.
@@ -77,6 +62,16 @@ public final class Connection: @unchecked Sendable {
             preconditionFailure("AsyncStream did not provide a continuation")
         }
         self.continuation = continuation
+    }
+
+    public convenience init(socketPath: String) throws {
+        self.init(transport: try UnixSocketTransport(path: socketPath))
+    }
+
+    /// Connect to whichever machine `host` names. This is the only line in the
+    /// client that has an opinion about local versus remote.
+    public convenience init(host: ServerHost) throws {
+        self.init(transport: try host.makeTransport())
     }
 
     deinit {
@@ -93,7 +88,7 @@ public final class Connection: @unchecked Sendable {
 
     public func close() {
         guard closed.testAndSet() == false else { return }
-        Darwin.close(fd)
+        transport.close()
         continuation.finish()
     }
 
@@ -114,7 +109,8 @@ public final class Connection: @unchecked Sendable {
         try frame.withUnsafeBytes { raw in
             var offset = 0
             while offset < raw.count {
-                let n = Darwin.write(fd, raw.baseAddress!.advanced(by: offset), raw.count - offset)
+                let n = Darwin.write(
+                    writeFD, raw.baseAddress!.advanced(by: offset), raw.count - offset)
                 if n < 0 {
                     if errno == EINTR { continue }
                     throw ConnectionError.closed
@@ -157,7 +153,7 @@ public final class Connection: @unchecked Sendable {
         var offset = 0
         while offset < count {
             let n = buf.withUnsafeMutableBytes { raw in
-                Darwin.read(fd, raw.baseAddress!.advanced(by: offset), count - offset)
+                Darwin.read(readFD, raw.baseAddress!.advanced(by: offset), count - offset)
             }
             if n < 0 {
                 if errno == EINTR { continue }

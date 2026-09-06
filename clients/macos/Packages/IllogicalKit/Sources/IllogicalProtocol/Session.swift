@@ -76,7 +76,10 @@ public struct SessionSummary: Identifiable, Equatable, Codable, Sendable {
 
 /// Where a client connects. Local is a unix socket; remote is the same
 /// protocol tunnelled over `ssh <host> illogicald --stdio`.
-public enum ServerHost: Hashable, Sendable {
+///
+/// `Codable` because the window remembers which remote hosts you added. The
+/// local one is never stored: it is wherever this machine puts its socket.
+public enum ServerHost: Hashable, Sendable, Codable {
     case local(socketPath: String)
     case ssh(destination: String, remoteBinary: String = "illogicald")
 
@@ -84,6 +87,41 @@ public enum ServerHost: Hashable, Sendable {
         switch self {
         case .local: "Local"
         case .ssh(let destination, _): destination
+        }
+    }
+
+    public var isRemote: Bool {
+        if case .ssh = self { return true }
+        return false
+    }
+
+    /// The `ssh` this host would run. Nil for a local one.
+    public var sshOptions: SSHCommand.Options? {
+        guard case .ssh(let destination, let remoteBinary) = self else { return nil }
+        return SSHCommand.Options(
+            destination: destination,
+            remoteBinary: remoteBinary,
+            // For a second OpenSSH, and so a test can stand something else in
+            // its place. The same variable the Zig CLI reads.
+            ssh: ProcessInfo.processInfo.environment["ILLOGICAL_SSH"] ?? "ssh")
+    }
+
+    /// Open a transport to this host.
+    ///
+    /// The only place in the client with an opinion about local versus remote.
+    /// Everything above it sees frames and cannot tell the difference — which
+    /// is what makes "the dropdown lists terminals on other machines" a change
+    /// to the session store rather than to the terminal.
+    public func makeTransport() throws -> Transport {
+        switch self {
+        case .local(let path):
+            return try UnixSocketTransport(path: path)
+        case .ssh:
+            guard let options = sshOptions else {
+                preconditionFailure("an ssh host always has ssh options")
+            }
+            SSHCommand.prepareControlDirectory(options)
+            return try CommandTransport(argv: SSHCommand.argv(options))
         }
     }
 }

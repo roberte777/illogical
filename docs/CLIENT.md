@@ -21,11 +21,18 @@ Illogical.app
 │   ├── TerminalController.swift one connection, one terminal
 │   ├── TerminalSurfaceView.swift  NSView host, layer, input
 │   └── Renderer/                Metal renderer, atlases, fonts, sprites
-└── Transport/      unix socket, ssh stdio, framing
 
 Packages/IllogicalKit/
 └── IllogicalProtocol           pure Swift, no libghostty — testable alone
+    ├── Frame.swift             the wire header
+    ├── Connection.swift        reader thread, frame stream, serialized writes
+    ├── Transport.swift         unix socket, or `ssh <dest> illogicald --stdio`
+    └── Session.swift           sessions, terminals, hosts
 ```
+
+Transport is in the package rather than the app on purpose: it is the half of
+remote support that can be tested without a window, a GPU or a daemon, and
+`just test-swift` runs it in under a second.
 
 ## One connection per terminal
 
@@ -373,7 +380,34 @@ the point. Do not add a spinner for it.
 
 `ssh <dest> illogicald --stdio`, with the frame stream on the pipe. The user's
 existing SSH config, keys, jump hosts and agent forwarding apply. No credential
-handling of our own, and nothing to store.
+handling of our own, and nothing to store but the destination string.
+
+A **`Transport`** is a pair of descriptors and whatever holds them open — one
+socket for a local host, two pipe ends and a child process for a remote one.
+`Connection` reads and writes those descriptors and knows nothing else, so
+`TerminalController`, the snapshot decode and the renderer are all identical
+either way. The only line in the client with an opinion is
+`ServerHost.makeTransport()`.
+
+```
+ServerHost.local ──► UnixSocketTransport ──┐
+                                           ├──► Connection ──► frames
+ServerHost.ssh   ──► CommandTransport ─────┘
+                     ssh -T … dest illogicald --stdio
+```
+
+Two details that are not decoration:
+
+- **`-T`.** A pty in the middle would put a line discipline on a binary frame
+  stream and rewrite every `0x0a` byte a snapshot chunk carried.
+- **`ControlMaster=auto`.** One connection per terminal means four splits on one
+  host open five SSH connections; multiplexing makes the four after the first
+  cost a channel rather than a handshake. The `ControlPath` is the one
+  `src/core/conn.zig` renders, so the app and `illogical --host` share a master.
+
+The child's stderr is drained and kept — an undrained pipe fills at 64 KiB and
+wedges `ssh` — so "could not resolve hostname" reaches the user as itself rather
+than as a closed connection.
 
 Superlogical's server additionally has built-in Tailscale/Headscale support and
 acts as a node ([MASTO]). Out of scope for us; SSH first.
