@@ -142,9 +142,45 @@ zstd would be this project's first non-ghostty native dependency. It sits behind
 one constant (`park.Store.Container`) so swapping it later is a local change.
 Measured: a filled 10,000-line terminal parks to **32 KiB** on disk.
 
-**Encryption is not implemented.** Scrollback holds secrets and the park file is
-plaintext on disk today. This is the one part of parking that is a genuine gap
-rather than a deferred refinement — see [ROADMAP.md](ROADMAP.md).
+**Encryption is XChaCha20-Poly1305, chunked** (`src/core/crypt.zig`). Compress
+first, then encrypt: ciphertext does not compress.
+
+```
+"ILGPARK1" | nonce prefix (16B) | chunk | chunk | ... | terminator
+
+chunk      = u32 LE length | ciphertext | tag (16B)
+terminator = u32 LE 0      |            | tag (16B)
+```
+
+Chunked because both directions have to stay streaming. A terminal becomes
+usable at READY, long before the last byte is read, and one AEAD over the whole
+file would mean buffering all of it to check a single tag. At 32 KiB the
+overhead is 0.05%.
+
+Three properties, each of them something this kind of construction gets wrong
+if nobody says it out loud:
+
+- **Ordering.** A chunk's index is part of its nonce, so a chunk moved to
+  another position decrypts under a different one and fails.
+- **Truncation.** The terminator is an empty chunk authenticated under a
+  "final" marker. A file that stops early has no valid final chunk and is
+  rejected, rather than handed back as a plausible-looking shorter scrollback.
+  A park that died halfway through is unreadable, which is the correct outcome.
+- **Nonce reuse.** A fresh random 16-byte prefix per file. Repeating one under
+  the same key is the failure that loses the plaintext outright.
+
+The key is `park.key`, beside the store, mode 0600, generated on first run.
+
+⚠ **What this does not buy.** Anyone who can read the store as this user can
+read the key, so it is no defence against local compromise — that is the same
+trust boundary the control socket already has, and not one a file mode can
+move. What it buys is everything that *leaves* that boundary: backups, disk
+images, a state directory in a container layer, a laptop passed on. Those stop
+being plaintext, which is the whole of [MEM t=278]'s concern.
+
+A park file written before this landed is still read: the magic decides, not
+the presence of a key, so upgrading does not silently discard everybody's
+parked terminals. They turn encrypted the next time they park.
 
 ⚠ Do not use LZ4 here by analogy with level-1.5 below. That is a different
 problem: in-memory pages need infallible, instant decompression; on-disk

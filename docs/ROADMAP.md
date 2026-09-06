@@ -175,7 +175,7 @@ utility priority, one page at a time under the engine's lock.
 
 Launch to window is a Debug build; treat 148 ms as a ceiling.
 
-## M4 — Parking and the memory work (core landed)
+## M4 — Parking and the memory work ✅
 
 **Ends at:** 10,000 idle terminals on a laptop, and you cannot tell. This is the
 milestone the whole architecture exists for. See [PARKING.md](PARKING.md).
@@ -187,17 +187,31 @@ milestone the whole architecture exists for. See [PARKING.md](PARKING.md).
 | ✅ | Streaming unpark: `ready()` on the hot path, history on a background thread |
 | ✅ | **A2** — attach to a parked terminal streams from disk and does **not** unpark |
 | ✅ | **A5** — live scrollback compression: activity token, incremental steps on idle, never `MODE_FULL` on a hot path |
-| ✅ | The benchmark, as `scripts/bench-memory.sh` (not yet in CI — there is no CI) |
+| ✅ | The benchmark, as `scripts/bench-memory.sh` and `scripts/bench-pty.sh` (not in CI — there is no CI) |
 | ✅ | **F2** — flow control: bounded per-client queue, overflow ⇒ forced re-attach |
 | ✅ | **A3** (second half) — PTY fd migration between dedicated thread and shared poller, with hysteresis |
 | ✅ | **A4** — client buffer parking |
 | ✅ | **A6** — per-terminal fixed costs: zero-init, lazy allocation, shared palette |
-| | **F3** — snapshot **encryption**. Compression landed; encryption did not, so park files are plaintext on disk and scrollback holds secrets. This is a real gap, not a refinement |
+| ✅ | **F3** — snapshot **encryption**. Chunked XChaCha20-Poly1305 over the compressed stream, so unpark stays streaming |
 
-**Gate:** the benchmark table. Partially met — see below.
+**Gate: the benchmark table. Met**, with two of its four memory rows now better
+than the reference implementation and one worse than tmux. The numbers and what
+they do and do not say are below.
 
 Deflate is used rather than zstd: Zig 0.16 ships a zstd decompressor only, and a
 C zstd would be the first non-ghostty native dependency. One constant to change.
+
+Two things this milestone learned the hard way, both recorded where they were
+caused rather than only here:
+
+- **Every memory number was a debug build**, and a debug build is off by an
+  order of magnitude — Zig writes `0xAA` into every `undefined` buffer,
+  including the demand-paged pages libghostty preheats per terminal. An empty
+  terminal reads 1743 KiB debug against 90 KiB release. The benchmark builds
+  release now.
+- **Shrinking thread stacks broke parking**, and the test suite could not see
+  it, because every park test called `park` from the test runner's own thread.
+  One of them now runs it on the stack the daemon actually gives it.
 
 ## M5 — Remote
 
@@ -303,5 +317,8 @@ Also measure, where no reference number exists:
 - **Resize with disagreeing clients.** One terminal, many window sizes.
 - **Alternate screen and parking.** A terminal sitting in a full-screen TUI is
   idle by the PTY-read definition but expensive to restore. Different threshold?
-- **Encryption scheme** for parked snapshots. Mitchell deferred it publicly; we
-  have to pick something.
+- **Where the park key should live.** The scheme is settled — chunked
+  XChaCha20-Poly1305, see [PARKING.md](PARKING.md) — but the key sits beside the
+  data at mode 0600, so it protects backups and disk images and not a local
+  compromise. The Keychain, or a passphrase, or an agent, is a different answer
+  and a platform-specific one.

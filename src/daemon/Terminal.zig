@@ -810,6 +810,11 @@ const Rehydration = struct {
     terminal: *Terminal,
     file: std.Io.File,
     file_reader: std.Io.File.Reader,
+    /// In place here for the same reason as everything else in this struct:
+    /// the decompressor holds a pointer to whichever reader feeds it, and that
+    /// reader has to outlive the history restore. Null for a park file written
+    /// before F3, or by a store with no key.
+    decryptor: ?illogical.crypt.Decryptor,
     decompress: flate.Decompress,
     decoder: ghostty.snapshot.Decoder,
     file_buf: []u8,
@@ -851,6 +856,21 @@ pub fn park(self: *Terminal) !void {
         defer self.gpa.free(out_buf);
         var file_writer = file.writer(self.io, out_buf);
 
+        // encode -> compress -> encrypt -> file. Compress *before* encrypting:
+        // ciphertext does not compress. See docs/PARKING.md.
+        //
+        // Heap for the same reason as everything else here -- it carries two
+        // chunk buffers and this is the maintenance thread.
+        const encryptor = if (store.key) |key| enc: {
+            const e = try self.gpa.create(illogical.crypt.Encryptor);
+            errdefer self.gpa.destroy(e);
+            try e.initRandom(self.io, &file_writer.interface, key.*);
+            try e.writeHeader();
+            break :enc e;
+        } else null;
+        defer if (encryptor) |e| self.gpa.destroy(e);
+        const sink: *std.Io.Writer = if (encryptor) |e| &e.writer else &file_writer.interface;
+
         const window = try self.gpa.alloc(u8, illogical.park.Store.window_len);
         defer self.gpa.free(window);
 
@@ -860,7 +880,7 @@ pub fn park(self: *Terminal) !void {
         // rather than the small one every other thread here uses. See
         // `maintenance_stack_size`.
         var compress = try flate.Compress.init(
-            &file_writer.interface,
+            sink,
             window,
             illogical.park.Store.Container,
             illogical.park.Store.compression_level,
@@ -868,6 +888,12 @@ pub fn park(self: *Terminal) !void {
 
         try self.encodeSnapshotLocked(&compress.writer);
         try compress.finish();
+        if (encryptor) |e| {
+            try e.writer.flush();
+            // The terminator: it is what makes a park that died halfway
+            // through unreadable, rather than quietly short.
+            try e.finish();
+        }
         try file_writer.interface.flush();
 
         // Durable before the rename, so a crash leaves either the previous
@@ -916,6 +942,7 @@ fn unparkLocked(self: *Terminal) !void {
         .terminal = self,
         .file = file,
         .file_reader = undefined,
+        .decryptor = null,
         .decompress = undefined,
         .decoder = undefined,
         .file_buf = file_buf,
@@ -924,8 +951,18 @@ fn unparkLocked(self: *Terminal) !void {
     // Each of these retains a pointer to the previous, so they must be built
     // in place at their final addresses.
     rehydration.file_reader = file.reader(self.io, rehydration.file_buf);
+
+    // file -> decrypt -> decompress -> decode, undoing the park in reverse.
+    // Still streaming, which is the whole point: `ready` returns as soon as
+    // the renderable prefix has come through, and that is why the file is
+    // chunked rather than sealed once end to end.
+    var source: *std.Io.Reader = &rehydration.file_reader.interface;
+    if (try self.openDecryptorInto(&rehydration.decryptor, store, source)) {
+        source = &rehydration.decryptor.?.reader;
+    }
+
     rehydration.decompress = .init(
-        &rehydration.file_reader.interface,
+        source,
         illogical.park.Store.Container,
         rehydration.window,
     );
@@ -998,6 +1035,40 @@ fn restoreHistory(r: *Rehydration) void {
     r.destroy();
 }
 
+/// Build a decryptor for `source` into `slot`, and say whether there is one.
+///
+/// False happens two ways, and both are wanted. A store with no key wrote
+/// plaintext, which is what the tests do. And a store *with* a key can still
+/// meet a file written before F3 landed -- upgrading must not silently throw
+/// away everybody's parked terminals -- so the magic decides rather than the
+/// presence of a key. New files are always encrypted; old ones are read as
+/// they are, and turn encrypted the next time they park.
+///
+/// Written into a caller-provided slot because the decompressor downstream
+/// keeps a pointer to whatever reader feeds it, so it has to be at its final
+/// address before it is used.
+fn openDecryptorInto(
+    self: *Terminal,
+    slot: *?illogical.crypt.Decryptor,
+    store: illogical.park.Store,
+    source: *std.Io.Reader,
+) !bool {
+    slot.* = null;
+    const key = store.key orelse return false;
+
+    // Peeked, not taken: if this turns out to be a legacy file, the bytes have
+    // to still be there for the decompressor.
+    const head = source.peek(illogical.crypt.magic.len) catch return false;
+    if (!illogical.crypt.isEncrypted(head)) {
+        log.warn("terminal {d}: park file is not encrypted, reading it as legacy", .{self.id});
+        return false;
+    }
+
+    slot.* = undefined;
+    try slot.*.?.init(source, key.*);
+    return true;
+}
+
 /// Write this terminal's snapshot to `writer` for an attaching client.
 ///
 /// A parked terminal is served straight from disk and stays parked, so a client
@@ -1029,10 +1100,20 @@ fn streamParkFileLocked(
     defer self.gpa.free(file_buf);
     var file_reader = file.reader(self.io, file_buf);
 
+    // Heap: it carries a chunk buffer, and this runs on a client's reader
+    // thread whose stack A6 just spent effort shrinking.
+    const decryptor = try self.gpa.create(?illogical.crypt.Decryptor);
+    defer self.gpa.destroy(decryptor);
+    decryptor.* = null;
+    var source: *std.Io.Reader = &file_reader.interface;
+    if (try self.openDecryptorInto(decryptor, store, source)) {
+        source = &decryptor.*.?.reader;
+    }
+
     const window = try self.gpa.alloc(u8, illogical.park.Store.window_len);
     defer self.gpa.free(window);
     var decompress: flate.Decompress = .init(
-        &file_reader.interface,
+        source,
         illogical.park.Store.Container,
         window,
     );
@@ -1537,6 +1618,213 @@ test "idle clock tracks PTY reads, not wall time" {
     // even though it was just created and its child is running.
     try testing.expect(t.ptyReadIdleNs() >= 40 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u32, 0), t.attachedCount());
+}
+
+/// Read a whole park file. Caller owns the bytes.
+fn readParkFile(gpa: Allocator, io: std.Io, store: illogical.park.Store, id: session.TerminalId) ![]u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try store.snapshotPath(&path_buf, id);
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &out);
+    _ = try reader.interface.streamRemaining(&aw.writer);
+    try aw.writer.flush();
+    out = aw.toArrayList();
+    return out.toOwnedSlice(gpa);
+}
+
+/// Wait until the child's output shows up on the terminal's own screen.
+fn awaitMarker(t: *Terminal, gpa: Allocator, marker: []const u8) !void {
+    var waited: usize = 0;
+    while (waited < 5000) : (waited += 10) {
+        const text = t.plainText(gpa) catch {
+            sys.sleepNs(10 * std.time.ns_per_ms);
+            continue;
+        };
+        defer gpa.free(text);
+        if (std.mem.indexOf(u8, text, marker) != null) return;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    }
+    return error.MarkerNeverArrived;
+}
+
+test "a parked terminal's scrollback is not on disk in the clear" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-sealed-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const key: illogical.crypt.Key = @splat(0x42);
+    const store: illogical.park.Store = .{ .root = root, .key = &key };
+
+    // The shape of the thing this is for: a credential echoed into a terminal
+    // and then left sitting there.
+    const secret = "AKIAIOSFODNN7EXAMPLE";
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = store,
+        .id = 1,
+        .session_id = 1,
+        .name = "sealed",
+        .argv = &.{ "/bin/sh", "-c", "printf 'export AWS_ACCESS_KEY_ID=" ++ secret ++ "\\n'; sleep 10" },
+    });
+    defer t.destroy();
+    defer t.hangup();
+    try t.start();
+    try awaitMarker(t, gpa, secret);
+
+    try t.park();
+    try testing.expectEqual(session.Residency.parked, t.summary().residency);
+
+    const on_disk = try readParkFile(gpa, io, store, t.id);
+    defer gpa.free(on_disk);
+
+    // It is one of ours...
+    try testing.expect(illogical.crypt.isEncrypted(on_disk));
+    // ...it is not a bare snapshot...
+    try testing.expect(!std.mem.startsWith(u8, on_disk, "GHOSTSNP"));
+    // ...and the thing that mattered is not in it. Compression alone would not
+    // have guaranteed that: one distinctive string in an otherwise repetitive
+    // screen survives deflate as a literal often enough to matter.
+    try testing.expect(std.mem.indexOf(u8, on_disk, secret) == null);
+    try testing.expect(std.mem.indexOf(u8, on_disk, "AWS_ACCESS") == null);
+
+    // And it still round trips.
+    try t.unpark();
+    var settle: usize = 0;
+    while (settle < 3000) : (settle += 10) {
+        if (t.summary().residency == .live) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    }
+    const text = try t.plainText(gpa);
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, secret) != null);
+}
+
+test "an encrypted park file is served to an attaching client" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-sealed-attach-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const key: illogical.crypt.Key = @splat(0x11);
+    const marker = "SEALED_AND_SERVED";
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = root, .key = &key },
+        .id = 2,
+        .session_id = 1,
+        .name = "sealed-attach",
+        .argv = &.{ "/bin/sh", "-c", "printf '" ++ marker ++ "\\n'; sleep 10" },
+    });
+    defer t.destroy();
+    defer t.hangup();
+    try t.start();
+    try awaitMarker(t, gpa, marker);
+    try t.park();
+
+    // All of A2 still holds with encryption in the way: a client is served
+    // from disk, and the terminal does not wake up to do it.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    try t.serveSnapshot(&aw.writer);
+    try aw.writer.flush();
+    buf = aw.toArrayList();
+
+    try testing.expectEqualStrings("GHOSTSNP", buf.items[0..8]);
+    try testing.expectEqual(session.Residency.parked, t.summary().residency);
+    try testing.expect(t.vt == null);
+
+    var tiny: ghostty.TinyIo = .init;
+    var reader: std.Io.Reader = .fixed(buf.items);
+    var decoder: ghostty.snapshot.Decoder = .init(&reader);
+    var decoded = try decoder.ready(gpa, tiny.io(), .{
+        .max_continuation_bytes = max_continuation_bytes,
+    });
+    defer decoded.deinit(gpa);
+    const restored = &(decoded.terminal orelse return error.NoTerminal);
+    const text = try restored.plainString(gpa);
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, marker) != null);
+}
+
+test "a park file written before F3 is still readable" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-legacy-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const marker = "WRITTEN_BEFORE_F3";
+    const argv = [_][]const u8{ "/bin/sh", "-c", "printf '" ++ marker ++ "\\n'; sleep 10" };
+
+    // Park with no key, which is exactly what the previous release wrote.
+    {
+        const old = try Terminal.create(gpa, .{
+            .io = io,
+            .store = .{ .root = root },
+            .id = 3,
+            .session_id = 1,
+            .name = "legacy",
+            .argv = &argv,
+        });
+        defer old.destroy();
+        defer old.hangup();
+        try old.start();
+        try awaitMarker(old, gpa, marker);
+        try old.park();
+    }
+
+    const plain = try readParkFile(gpa, io, .{ .root = root }, 3);
+    defer gpa.free(plain);
+    try testing.expect(!illogical.crypt.isEncrypted(plain));
+
+    // Now a daemon that has a key meets it. Upgrading must not throw away
+    // everybody's parked terminals, so the magic decides and not the presence
+    // of a key.
+    const key: illogical.crypt.Key = @splat(0x77);
+    const upgraded = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = root, .key = &key },
+        .id = 3,
+        .session_id = 1,
+        .name = "legacy",
+        .argv = &argv,
+    });
+    defer upgraded.destroy();
+    defer upgraded.hangup();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &out);
+    upgraded.residency = .parked;
+    try upgraded.serveSnapshot(&aw.writer);
+    try aw.writer.flush();
+    out = aw.toArrayList();
+    try testing.expectEqualStrings("GHOSTSNP", out.items[0..8]);
 }
 
 /// Runs `park` on a thread with the stack the daemon actually gives its
