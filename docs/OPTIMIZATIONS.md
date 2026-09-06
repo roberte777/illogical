@@ -414,10 +414,30 @@ Provisionally the session's own configured size, not any client's.
 
 ### F2. Flow control
 
-Never addressed in any source. Our intent is a bounded per-client queue where
-overflow drops the client back to a fresh attach — a client that has fallen far
-enough behind is better served by a new snapshot than a long replay. Given C2,
-this costs nothing architecturally: reset-and-reattach is already the desync path.
+**Status: Done.** Landed in M4.
+
+Never addressed in any source. A bounded per-client queue where overflow drops
+the client back to a fresh attach — a client that has fallen far enough behind
+is better served by a new snapshot than a long replay. Given C2 this costs
+nothing architecturally: reset-and-reattach is already the desync path, so the
+only new thing on the wire is an error code that names it.
+
+The bound is not the interesting part. The interesting part is that fan-out
+stopped writing to sockets at all. It runs on a terminal's reader thread under
+that terminal's lock, so a blocking `write` to one client that had stopped
+reading stalled the terminal itself — its PTY, its state, and every other client
+attached to it. Each client now has a queue and a thread of its own, and the
+fan-out only ever copies into it.
+
+The lock order that falls out is worth stating, because it decides the shape of
+the code: **terminal lock, then client queue lock, never the reverse.** That is
+why an overflowing subscriber is pruned by the terminal, from inside its own
+fan-out loop, rather than unsubscribing itself from its writer thread.
+
+One case is deliberately not covered: `attach` holds the terminal lock across
+the encode, so a client that stops reading *mid-attach* still stalls that
+terminal. Splitting that needs a two-phase encoder libghostty-vt does not
+expose. See [PROTOCOL.md](PROTOCOL.md#flow-control).
 
 ### F3. Snapshot compression and encryption
 

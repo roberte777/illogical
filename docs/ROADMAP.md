@@ -188,10 +188,10 @@ milestone the whole architecture exists for. See [PARKING.md](PARKING.md).
 | ✅ | **A2** — attach to a parked terminal streams from disk and does **not** unpark |
 | ✅ | **A5** — live scrollback compression: activity token, incremental steps on idle, never `MODE_FULL` on a hot path |
 | ✅ | The benchmark, as `scripts/bench-memory.sh` (not yet in CI — there is no CI) |
+| ✅ | **F2** — flow control: bounded per-client queue, overflow ⇒ forced re-attach |
 | | **A3** (second half) — PTY fd migration between dedicated thread and shared poller, with hysteresis |
 | | **A4** — client buffer parking |
 | | **A6** — per-terminal fixed costs: zero-init, lazy allocation, shared palette |
-| | **F2** — flow control: bounded per-client queue, overflow ⇒ forced re-attach |
 | | **F3** — snapshot **encryption**. Compression landed; encryption did not, so park files are plaintext on disk and scrollback holds secrets. This is a real gap, not a refinement |
 
 **Gate:** the benchmark table. Partially met — see below.

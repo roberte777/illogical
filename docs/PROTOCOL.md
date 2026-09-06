@@ -74,7 +74,7 @@ no parser.
 | `0x88` | `output` | unprocessed PTY bytes |
 | `0x89` | `exited` | exit status |
 | `0x8a` | `sessions_changed` | — (client re-issues `list`) |
-| `0x8b` | `err` | code, message |
+| `0x8b` | `err` | code, message. Code 7, `desync`, means "re-attach" — see below |
 | `0x8c` | `pong` | echoed token |
 | `0x8d` | `screen` | plain-text rendering, in reply to `peek` |
 
@@ -176,8 +176,48 @@ There is no reconciliation. If a client detects it is wrong — CRC failure, a
 snapshot it cannot decode, a gap in the stream — it discards its terminal and
 re-attaches from scratch [ARCH t=356]. Cheap, because attach is O(screen).
 
-This is also the flow-control escape hatch: a client too far behind is dropped
-back to a fresh attach rather than served an unbounded replay.
+This is also the flow-control escape hatch, and the server uses it.
+
+## Flow control
+
+Every client has a bounded queue of framed bytes waiting for its socket,
+drained by a thread of its own. Fan-out never writes to a socket: it copies
+into that queue and returns.
+
+That indirection is the whole mechanism, and it exists because of who runs the
+fan-out. Output is teed on the terminal's own reader thread, under the terminal's
+lock. A `write` to a client that has stopped reading blocks until the kernel
+buffer drains, so one wedged client used to stall the terminal itself — its PTY,
+its state, and every other client attached to it.
+
+When the queue would overflow:
+
+1. Everything queued is dropped. It is a prefix of a stream the client is about
+   to throw away with its terminal, and dropping it makes room for step 2.
+2. `err` with code `desync` goes out in its place.
+3. The **terminal** unsubscribes the client, from inside its own fan-out loop.
+   Not the writer thread: that would take the terminal's lock from the far side
+   of the lock order and deadlock against an attach in flight.
+4. The client re-attaches. Nothing else is coming until it does.
+
+| | |
+| --- | --- |
+| Queue bound | 1 MiB, sixteen PTY reads |
+| Fan-out (`output`, `exited`, `sessions_changed`) | never blocks; overflow ⇒ desync |
+| The client's own replies and snapshot chunks | wait for room; backpressure, not loss |
+
+The second row is the one that matters for the architecture. The third is
+ordinary blocking on the client's own thread, and it is bounded by that client
+alone: a frame larger than the whole queue still goes out, because the wait is
+only ever for a queue with something in it to drain.
+
+⚠ One case is not covered. `attach` holds the terminal's lock across the encode,
+so a client that stops reading *mid-attach* still stalls that terminal until it
+resumes or disconnects. It is the same lock the encode has always held —
+splitting it needs the two-phase encoder libghostty-vt does not expose (see the
+attach handshake above) — so F2 leaves it exactly where it was and fixes the
+live path, which is the one a client reaches by being slow rather than by being
+broken.
 
 ## Version negotiation
 
@@ -205,8 +245,6 @@ socket is filesystem permissions; remote access is whatever SSH decided.
 - **Resize with disagreeing clients.** The terminal has one size; clients may
   have different window sizes. Provisionally the session's configured size wins
   and clients letterbox. Superlogical has never said.
-- **Flow control.** Bounded per-client queue, overflow ⇒ forced re-attach. Never
-  addressed in any source; see [OPTIMIZATIONS.md §F2](OPTIMIZATIONS.md#f2-flow-control).
 - **Terminal queries.** The server always answers; see
   [ARCHITECTURE.md](ARCHITECTURE.md#terminal-queries).
 - **Session sharing.** Superlogical ships live sharing from day one [ANN]. Our

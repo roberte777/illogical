@@ -1,12 +1,27 @@
 //! One client connection.
 //!
-//! Reads frames on a dedicated thread and dispatches them. Output flows the
-//! other way, pushed by whichever terminal reader thread produced it, so the
-//! socket write path is guarded by its own lock.
+//! Two threads. The *reader* reads frames off the socket and dispatches them.
+//! The *writer* drains a bounded queue of already-framed bytes to the socket.
+//! Nothing else ever touches the socket.
+//!
+//! The writer exists because of where output comes from. Fan-out runs on a
+//! terminal's reader thread, under that terminal's lock, and a `write` to a
+//! client that has stopped reading blocks until the kernel buffer drains. One
+//! such client used to stall the terminal itself -- its PTY, its state, and
+//! every other client attached to it. So `onOutput` copies into the queue and
+//! returns, and if the queue is full the client is dropped back to a fresh
+//! attach rather than served an unbounded replay (docs/OPTIMIZATIONS.md F2).
+//!
+//! **Lock order: a terminal's lock, then this client's queue lock.** Fan-out
+//! and `attach` both hold a terminal lock while enqueuing. Nothing may take a
+//! terminal lock while holding `queue_mutex` -- which is why an overflowing
+//! subscriber is pruned by the terminal itself, from inside its own fan-out
+//! loop, rather than by the writer thread.
 
 const Client = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sys = illogical.sys;
 const Allocator = std.mem.Allocator;
 const ghostty = @import("ghostty-vt");
@@ -18,42 +33,131 @@ const Terminal = @import("Terminal.zig");
 
 const log = std.log.scoped(.client);
 
+/// Default bound on a client's queued, not-yet-written output.
+///
+/// Sixteen PTY reads' worth. Big enough that an ordinary scheduling hiccup on
+/// the client is absorbed rather than punished, small enough that a thousand
+/// stalled clients cannot cost more than the machine has. A client that falls
+/// this far behind is better served by a new snapshot than by a long replay --
+/// which is the whole argument of docs/OPTIMIZATIONS.md F2.
+pub const default_queue_bytes: usize = 1 << 20;
+
 server: *Server,
 fd: sys.fd_t,
 gpa: Allocator,
 
-/// Serializes socket writes: terminal reader threads push output through here.
-write_mutex: illogical.thread.Mutex = .{},
 attached: std.ArrayList(session.TerminalId) = .empty,
-thread: ?std.Thread = null,
+
+// -- the output queue ------------------------------------------------------
+
+/// Guards everything in this block. Never held across a socket write, and
+/// never held while taking a terminal's lock.
+queue_mutex: illogical.thread.Mutex = .{},
+/// Framed bytes waiting to go out. Producers append here.
+queue: std.ArrayList(u8) = .empty,
+/// The writer swaps `queue` into this and writes it with the lock dropped, so
+/// producers keep filling one buffer while the other is in a syscall. The two
+/// trade places rather than reallocating.
+outgoing: std.ArrayList(u8) = .empty,
+/// Bound on `queue`. Set from `Server.client_queue_bytes`.
+queue_cap: usize,
+/// Signalled when `queue` gains bytes, or when the writer should give up.
+queue_ready: illogical.thread.Condition = .{},
+/// Signalled when the writer has taken the queue, so a producer waiting for
+/// room can try again.
+queue_drained: illogical.thread.Condition = .{},
+/// Set when the queue overflowed. The client has missed output and has been
+/// unsubscribed; it is told so and must re-attach.
+desynced: bool = false,
+
+reader: ?std.Thread = null,
+writer: ?std.Thread = null,
+/// The socket is still usable. Cleared once either end has gone away.
 alive: std.atomic.Value(bool) = .init(true),
+/// The writer should stop once it has drained what it has.
+draining: std.atomic.Value(bool) = .init(false),
+/// The reader thread has left `run`. The maintenance tick retires the client;
+/// the thread cannot destroy itself, because destroying joins it.
+finished: std.atomic.Value(bool) = .init(false),
 
 pub fn create(server: *Server, fd: sys.fd_t) !*Client {
     const self = try server.gpa.create(Client);
-    self.* = .{ .server = server, .fd = fd, .gpa = server.gpa };
+    self.* = .{
+        .server = server,
+        .fd = fd,
+        .gpa = server.gpa,
+        .queue_cap = server.client_queue_bytes,
+    };
     return self;
 }
 
+/// Tear the connection down and free it. Both threads are joined, so no part
+/// of this client is in use when it returns.
+///
+/// The caller must not hold `Server.clients_mutex`: the reader thread reaches
+/// into the server as it unwinds.
 pub fn destroy(self: *Client) void {
     self.detachAll();
-    if (self.alive.swap(false, .acq_rel)) sys.closeFd(self.fd);
-    if (self.thread) |t| {
-        t.detach();
-        self.thread = null;
+    // Before the joins. A reader blocked in `read` and a writer blocked in
+    // `write` both need the socket broken under them to come back, and
+    // `close` would not do it -- see `sys.shutdownFd`.
+    self.alive.store(false, .release);
+    sys.shutdownFd(self.fd);
+
+    if (self.reader) |t| {
+        t.join();
+        self.reader = null;
     }
+    self.stopWriter();
+
+    sys.closeFd(self.fd);
+    self.queue.deinit(self.gpa);
+    self.outgoing.deinit(self.gpa);
     self.attached.deinit(self.gpa);
     self.gpa.destroy(self);
 }
 
 pub fn start(self: *Client) !void {
-    self.thread = try std.Thread.spawn(.{}, run, .{self});
+    try self.startWriter();
+    errdefer self.stopWriter();
+    self.reader = try std.Thread.spawn(.{}, run, .{self});
+}
+
+fn startWriter(self: *Client) !void {
+    self.writer = try std.Thread.spawn(.{}, writeLoop, .{self});
+}
+
+/// Let the writer finish what it has, then join it.
+///
+/// `draining` rather than `alive`: on an orderly disconnect the last `exited`
+/// frame is usually still queued, and it is worth the microsecond. When the
+/// socket is already broken `writeAll` fails and the writer leaves anyway.
+fn stopWriter(self: *Client) void {
+    {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+        self.draining.store(true, .release);
+        self.queue_ready.signal();
+        self.queue_drained.broadcast();
+    }
+    if (self.writer) |t| {
+        t.join();
+        self.writer = null;
+    }
 }
 
 fn run(self: *Client) void {
     defer {
+        // Unsubscribe before anything else: from here on no terminal holds a
+        // pointer to this client, so the retirement below cannot race a
+        // fan-out.
         self.detachAll();
-        self.server.removeClient(self);
-        if (self.alive.swap(false, .acq_rel)) sys.closeFd(self.fd);
+        // Not `stopWriter`: joining the writer from here would be fine, but
+        // the flush is worth nothing if the far end has already gone, and
+        // `destroy` joins it on the maintenance tick either way.
+        self.draining.store(true, .release);
+        self.wakeQueue();
+        self.finished.store(true, .release);
     }
 
     var header_buf: [protocol.header_len]u8 = undefined;
@@ -71,9 +175,15 @@ fn run(self: *Client) void {
         payload.resize(self.gpa, header.len) catch break;
         if (header.len > 0) self.readExact(payload.items) catch break;
 
-        self.dispatch(header, payload.items) catch |err| {
-            log.warn("frame {t} failed: {t}", .{ header.type, err });
-            self.sendError(header.session, .unknown, @errorName(err)) catch break;
+        self.dispatch(header, payload.items) catch |err| switch (err) {
+            // The queue overflowed underneath this frame. The client has
+            // already been sent `desync` and unsubscribed; another `err` on
+            // top of it would say nothing new.
+            error.ClientBehind => continue,
+            else => {
+                log.warn("frame {t} failed: {t}", .{ header.type, err });
+                self.sendError(header.session, .unknown, @errorName(err)) catch break;
+            },
         };
     }
 }
@@ -126,6 +236,9 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
         .attach => {
             const req = try protocol.body.decode(protocol.body.Attach, arena, payload);
             defer req.deinit();
+            // Everything the client missed is about to be in the snapshot it
+            // asked for, so whatever it was told to recover from is over.
+            self.clearDesync();
             try self.attach(header.session, req.value);
         },
 
@@ -354,19 +467,16 @@ fn attach(self: *Client, id: session.TerminalId, req: protocol.body.Attach) !voi
 
     // Record it before the frames below, because `detachAll` only knows about
     // ids in `attached`: a client that closes its socket during them makes
-    // those `send`s return EPIPE, and without this the subscriber outlives the
+    // those `send`s fail, and without this the subscriber outlives the
     // connection -- fanned out to on every PTY read for the life of the
     // daemon, and counted forever by `illogical list`.
     //
-    // Appending only when absent, rather than remove-then-append, so a
-    // re-attach does not leave `attached` momentarily empty. That window would
-    // be new; the one below it is not. `currentTerminal` still reads this list
-    // from the terminal's reader thread while this thread appends -- unlocked,
-    // and on a first attach still empty between `t.attach` returning and the
-    // append, so output produced in that gap is tagged with the control
-    // session. Harmless today because no client reads the session id on an
-    // `output` frame, and pre-existing, but it belongs with F2's rework of
-    // this path rather than to another round of patching around it.
+    // Only this thread reads `attached` now. It used to be read from the
+    // terminal's reader thread too, to work out which terminal an `output`
+    // frame belonged to, which meant output produced between `t.attach`
+    // returning and this append was tagged with the control session. The
+    // terminal passes its own id to `onOutput` instead, so the list is no
+    // longer part of the fan-out path and that window is gone.
     if (!self.isAttached(id)) try self.attached.append(self.gpa, id);
 
     // The chunker sends `snapshot_ready` the moment the encoder passes READY.
@@ -377,26 +487,27 @@ fn attach(self: *Client, id: session.TerminalId, req: protocol.body.Attach) !voi
     try self.send(.snapshot_end, id, &.{});
 }
 
-fn onOutput(ctx: *anyopaque, bytes: []const u8) void {
+/// Fan-out, on a terminal's reader thread and under that terminal's lock.
+///
+/// Returns false to be dropped from the terminal's subscriber list. That is
+/// how an overflowing client is unsubscribed: by the terminal, inside its own
+/// fan-out loop, where the list is already locked and this client's queue lock
+/// is the only other one held. Doing it from the writer thread instead would
+/// invert the lock order and deadlock against an attach in flight.
+fn onOutput(ctx: *anyopaque, terminal: session.TerminalId, bytes: []const u8) bool {
     const self: *Client = @ptrCast(@alignCast(ctx));
-    // TODO(M4): bounded queue + drop-to-reattach instead of a blocking write.
-    self.sendRaw(.output, self.currentTerminal(), bytes) catch {};
+    self.enqueue(.output, terminal, bytes, .drop) catch |err| switch (err) {
+        error.ClientBehind => return false,
+        else => {},
+    };
+    return true;
 }
 
-fn onExit(ctx: *anyopaque, code: i32) void {
+fn onExit(ctx: *anyopaque, terminal: session.TerminalId, code: i32) void {
     const self: *Client = @ptrCast(@alignCast(ctx));
     var buf: [64]u8 = undefined;
     const body = std.fmt.bufPrint(&buf, "{{\"code\":{d}}}", .{code}) catch return;
-    self.sendRaw(.exited, self.currentTerminal(), body) catch {};
-}
-
-/// A client attached to exactly one terminal per connection (one connection per
-/// terminal, per docs/PROTOCOL.md). This returns that terminal.
-fn currentTerminal(self: *Client) session.TerminalId {
-    return if (self.attached.items.len > 0)
-        self.attached.items[self.attached.items.len - 1]
-    else
-        protocol.control_session;
+    self.enqueue(.exited, terminal, body, .drop) catch {};
 }
 
 fn detachAll(self: *Client) void {
@@ -423,30 +534,80 @@ fn removeAttached(self: *Client, id: session.TerminalId) void {
 }
 
 /// Push a `sessions_changed` so this client re-issues `list`.
+///
+/// Called from the server with `clients_mutex` held, so it must not block:
+/// `.drop` it is. A client too far behind to take a four-byte notification is
+/// already being told to re-attach, and re-attaching re-reads the list anyway.
 pub fn notifySessionsChanged(self: *Client) void {
-    self.sendRaw(.sessions_changed, protocol.control_session, &.{}) catch {};
+    self.enqueue(.sessions_changed, protocol.control_session, &.{}, .drop) catch {};
 }
 
 // -- frame output ----------------------------------------------------------
 
+/// What to do when a frame does not fit in the queue.
+const Backpressure = enum {
+    /// Wait for room. For this client's own reader thread, which is the only
+    /// thread that may block on this client: a reply or a snapshot chunk is
+    /// not something we can drop and stay correct.
+    wait,
+    /// Give up and desync. For terminal reader threads, which must never block
+    /// on any one client.
+    drop,
+};
+
+/// Queue a frame for this client. The client's own thread waits for room;
+/// everyone else gets `error.ClientBehind` instead of blocking.
 fn send(self: *Client, t: protocol.FrameType, id: session.TerminalId, payload: []const u8) !void {
-    return self.sendRaw(t, id, payload);
+    return self.enqueue(t, id, payload, .wait);
 }
 
-fn sendRaw(
+fn enqueue(
     self: *Client,
     frame_type: protocol.FrameType,
     id: session.TerminalId,
     payload: []const u8,
+    backpressure: Backpressure,
 ) !void {
     if (!self.alive.load(.acquire)) return error.ClientGone;
 
-    self.write_mutex.lock();
-    defer self.write_mutex.unlock();
+    self.queue_mutex.lock();
+    defer self.queue_mutex.unlock();
 
     var offset: usize = 0;
-    while (offset < payload.len or offset == 0) {
+    while (true) {
         const take = @min(payload.len - offset, protocol.max_payload_len);
+        const need = protocol.header_len + take;
+
+        // Once desynced, everything queued behind the error frame is bytes the
+        // client will throw away with the terminal it belongs to.
+        if (self.desynced) return error.ClientBehind;
+
+        switch (backpressure) {
+            .wait => while (self.queue.items.len > 0 and
+                self.queue.items.len + need > self.queue_cap)
+            {
+                self.queue_drained.wait(&self.queue_mutex);
+                if (!self.alive.load(.acquire)) return error.ClientGone;
+                if (self.desynced) return error.ClientBehind;
+                // Only waits while there is something to drain, so a frame
+                // larger than the whole queue still goes out on its own.
+            },
+            .drop => if (self.queue.items.len + need > self.queue_cap) {
+                self.desyncLocked(id);
+                return error.ClientBehind;
+            },
+        }
+
+        // Header and payload go in together or not at all: the writer swaps
+        // the whole queue out, and half a frame on the wire is unrecoverable.
+        self.queue.ensureUnusedCapacity(self.gpa, need) catch {
+            // Out of memory partway through a payload. What is queued is a
+            // stream with a hole in it, and a client that renders past the
+            // hole is wrong rather than merely behind, so treat it the same
+            // as an overflow.
+            self.desyncLocked(id);
+            return error.ClientBehind;
+        };
         var header_buf: [protocol.header_len]u8 = undefined;
         const header: protocol.Header = .{
             .type = frame_type,
@@ -454,11 +615,108 @@ fn sendRaw(
             .len = @intCast(take),
         };
         header.encode(&header_buf);
-        try sys.writeAll(self.fd, &header_buf);
-        if (take > 0) try sys.writeAll(self.fd, payload[offset..][0..take]);
+        self.queue.appendSliceAssumeCapacity(&header_buf);
+        self.queue.appendSliceAssumeCapacity(payload[offset..][0..take]);
+
         offset += take;
+        // A zero-length payload is one frame, not none.
         if (offset >= payload.len) break;
     }
+
+    self.queue_ready.signal();
+}
+
+/// The queue overflowed: tell the client, and drop everything behind it.
+///
+/// Caller holds `queue_mutex`. The subscription itself is dropped by the
+/// terminal, from `onOutput`'s return value.
+fn desyncLocked(self: *Client, id: session.TerminalId) void {
+    if (self.desynced) return;
+    self.desynced = true;
+
+    // What is queued is a prefix of a byte stream the client is about to
+    // discard along with its terminal. Dropping it is not a loss, and it is
+    // what makes room for the frame that says so.
+    self.queue.clearRetainingCapacity();
+    // Worth a line in the daemon's log, and worth suppressing in the tests
+    // that provoke it on purpose: the build runner surfaces a test step's
+    // stderr under a heading that reads like a failure. The tests assert on
+    // the frame the client receives, not on this.
+    if (!builtin.is_test) {
+        log.warn("client fell behind on terminal {d}; forcing a re-attach", .{id});
+    }
+
+    var body_buf: [96]u8 = undefined;
+    const body = std.fmt.bufPrint(
+        &body_buf,
+        "{{\"code\":{d},\"message\":\"output queue overflow\"}}",
+        .{@intFromEnum(protocol.ErrorCode.desync)},
+    ) catch return;
+
+    var header_buf: [protocol.header_len]u8 = undefined;
+    const header: protocol.Header = .{
+        .type = .err,
+        .session = id,
+        .len = @intCast(body.len),
+    };
+    header.encode(&header_buf);
+    self.queue.ensureUnusedCapacity(self.gpa, header_buf.len + body.len) catch return;
+    self.queue.appendSliceAssumeCapacity(&header_buf);
+    self.queue.appendSliceAssumeCapacity(body);
+    self.queue_ready.signal();
+    // Producers waiting for room are waiting for a stream that no longer
+    // exists; the `desynced` check above sends them home.
+    self.queue_drained.broadcast();
+}
+
+/// Drain the queue to the socket. One thread, so frames leave in the order
+/// they were queued no matter which thread queued them.
+fn writeLoop(self: *Client) void {
+    while (true) {
+        {
+            self.queue_mutex.lock();
+            defer self.queue_mutex.unlock();
+            while (self.queue.items.len == 0) {
+                if (!self.alive.load(.acquire)) return;
+                if (self.draining.load(.acquire)) return;
+                self.queue_ready.wait(&self.queue_mutex);
+            }
+            std.mem.swap(std.ArrayList(u8), &self.queue, &self.outgoing);
+            // `queue` is now the buffer the last round wrote from, already
+            // cleared, so its capacity is reused rather than reallocated.
+            self.queue_drained.broadcast();
+        }
+
+        sys.writeAll(self.fd, self.outgoing.items) catch {
+            // The far end is gone. Waking the producers matters more than the
+            // bytes: they are blocked on room that will never come.
+            self.alive.store(false, .release);
+            self.wakeQueue();
+            return;
+        };
+        self.outgoing.clearRetainingCapacity();
+    }
+}
+
+/// A fresh attach starts a fresh stream, so the desync is over.
+///
+/// Without this a client is told to re-attach once and then never heard from
+/// again: `desynced` short-circuits every later enqueue, including the
+/// snapshot it just asked for. There is no race with the error frame it is
+/// reacting to -- a client cannot answer a frame it has not received, so by
+/// the time the `attach` arrives that frame is long written.
+fn clearDesync(self: *Client) void {
+    self.queue_mutex.lock();
+    defer self.queue_mutex.unlock();
+    self.desynced = false;
+}
+
+/// Wake both ends of the queue, for a state change they are waiting on.
+fn wakeQueue(self: *Client) void {
+    self.queue_mutex.lock();
+    defer self.queue_mutex.unlock();
+    self.queue_ready.signal();
+    self.queue_drained.broadcast();
 }
 
 fn sendError(
@@ -473,7 +731,7 @@ fn sendError(
         "{{\"code\":{d},\"message\":\"{s}\"}}",
         .{ @intFromEnum(code), message },
     ) catch return;
-    try self.sendRaw(.err, id, body);
+    try self.send(.err, id, body);
 }
 
 // -- tests -----------------------------------------------------------------
@@ -655,12 +913,15 @@ test "the chunker frames ready between the right two chunks" {
     defer server.deinit();
     const client = try Client.create(server, writer_fd);
     defer client.destroy();
+    // The writer, but not the reader: nothing is going to send this client a
+    // frame, and a reader thread would only have to be woken again to join.
+    try client.startWriter();
 
-    // A synthetic stream, not a real snapshot. `send` writes to the socket
-    // synchronously and nothing is draining the far end until this thread
-    // finishes writing, so the whole exchange has to fit inside the socket
-    // buffer -- a real snapshot is tens of kilobytes and deadlocks here. The
-    // framing is what is under test, and these are the same records.
+    // A synthetic stream, not a real snapshot. Nothing drains the far end
+    // until this thread finishes writing, so the whole exchange has to fit
+    // inside the socket buffer -- a real snapshot is tens of kilobytes and
+    // stalls the writer here. The framing is what is under test, and these are
+    // the same records.
     const ready_tag = @intFromEnum(ghostty.snapshot.record.Tag.ready);
     const page_tag = @intFromEnum(ghostty.snapshot.record.Tag.page);
 
@@ -687,6 +948,11 @@ test "the chunker frames ready between the right two chunks" {
     }
     try chunker.interface.flush();
     try testing.expect(chunker.sent_ready);
+
+    // `flush` only means the frames are queued; the writer thread puts them on
+    // the socket. Join it before the half-close below, or the shutdown races
+    // the writes it is supposed to follow.
+    client.stopWriter();
 
     // Half-close, so the reader below cannot outlive the frames. Without this
     // a chunker that dropped a byte would leave `readAll` blocked forever on a
@@ -761,4 +1027,329 @@ test "the READY prefix does not grow with scrollback" {
     // which is the realistic way this breaks. Observed drift is ~3 KiB.
     const drift = @max(large_ready, small_ready) - @min(large_ready, small_ready);
     try testing.expect(drift < 16 * 1024);
+}
+
+// -- flow control ----------------------------------------------------------
+
+/// A connected pair of unix stream sockets, and the paperwork to unlink the
+/// path afterwards. `socketpair` would be shorter, but the daemon's socket
+/// helpers are what everything else here is built on.
+const SocketPair = struct {
+    listener: sys.fd_t,
+    /// The end a `Client` writes to.
+    server_end: sys.fd_t,
+    /// The end a test reads frames from.
+    client_end: sys.fd_t,
+    path_buf: [64]u8 = undefined,
+    path_len: usize = 0,
+
+    fn open(tag: []const u8) !SocketPair {
+        var self: SocketPair = .{ .listener = -1, .server_end = -1, .client_end = -1 };
+        const path = try std.fmt.bufPrintZ(
+            &self.path_buf,
+            "/tmp/illogical-{s}-{d}.sock",
+            .{ tag, std.c.getpid() },
+        );
+        self.path_len = path.len;
+        sys.unlinkPath(path.ptr);
+
+        const addr = try sys.unixAddr(path);
+        self.listener = try sys.unixSocket();
+        errdefer sys.closeFd(self.listener);
+        try sys.bindUnix(self.listener, &addr);
+        try sys.listenFd(self.listener, 1);
+        self.client_end = try sys.connectUnix(path);
+        errdefer sys.closeFd(self.client_end);
+        self.server_end = try sys.acceptFd(self.listener);
+        return self;
+    }
+
+    /// Does not close `server_end`: whichever `Client` was handed it owns it.
+    fn close(self: *SocketPair) void {
+        sys.closeFd(self.client_end);
+        sys.closeFd(self.listener);
+        self.path_buf[self.path_len] = 0;
+        sys.unlinkPath(@ptrCast(&self.path_buf));
+    }
+};
+
+/// Read one frame off `fd` into `payload`. Blocks.
+fn readFrame(fd: sys.fd_t, gpa: Allocator, payload: *std.ArrayList(u8)) !protocol.Header {
+    var header_buf: [protocol.header_len]u8 = undefined;
+    try sys.readAll(fd, &header_buf);
+    const header = try protocol.Header.decode(&header_buf);
+    try payload.resize(gpa, header.len);
+    if (header.len > 0) try sys.readAll(fd, payload.items);
+    return header;
+}
+
+test "fan-out that does not fit is refused, not buffered" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var pair = try SocketPair.open("flow-unit");
+    defer pair.close();
+
+    const server = try Server.init(gpa, threaded.io(), "/tmp/illogical-unused.sock", "/tmp/illogical-unused");
+    defer server.deinit();
+    // Small enough that one ordinary PTY read overflows it.
+    server.client_queue_bytes = 256;
+
+    const client = try Client.create(server, pair.server_end);
+    defer client.destroy();
+    // No writer thread: nothing drains, so the queue is exactly what the
+    // producers put there, which is what this test is about.
+
+    // Under the cap, so it is queued whole.
+    const small: [100]u8 = @splat('a');
+    try client.enqueue(.output, 7, &small, .drop);
+    try testing.expectEqual(protocol.header_len + small.len, client.queue.items.len);
+    try testing.expect(!client.desynced);
+
+    // Over it. The queue does not grow to fit -- that is the entire point --
+    // and what is left is the frame telling the client to start again.
+    const rest: [200]u8 = @splat('b');
+    try testing.expectError(error.ClientBehind, client.enqueue(.output, 7, &rest, .drop));
+    try testing.expect(client.desynced);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    var reader: std.Io.Reader = .fixed(client.queue.items);
+
+    var header_buf: [protocol.header_len]u8 = undefined;
+    @memcpy(&header_buf, try reader.take(protocol.header_len));
+    const header = try protocol.Header.decode(&header_buf);
+    try testing.expectEqual(protocol.FrameType.err, header.type);
+    try testing.expectEqual(@as(session.TerminalId, 7), header.session);
+
+    const body = try reader.take(header.len);
+    const parsed = try protocol.body.decode(protocol.body.Err, gpa, body);
+    defer parsed.deinit();
+    try testing.expectEqual(@intFromEnum(protocol.ErrorCode.desync), parsed.value.code);
+
+    // The error frame is the whole queue: everything the client had not read
+    // belongs to a terminal it is about to throw away.
+    try testing.expectEqual(client.queue.items.len, protocol.header_len + header.len);
+
+    // And once desynced it stays that way, rather than accumulating a second
+    // stream behind the first...
+    try testing.expectError(error.ClientBehind, client.enqueue(.output, 7, &small, .drop));
+
+    // ...until the client does what it was told and attaches again. Driven
+    // through `dispatch` rather than by setting the flag, because the whole
+    // point is that this is on the path a real client takes: without it a
+    // client is told to re-attach once and then goes permanently quiet, its
+    // own snapshot short-circuited by the flag it is trying to clear.
+    client.queue.clearRetainingCapacity();
+    const attach_body = try protocol.body.encode(gpa, protocol.body.Attach{});
+    defer gpa.free(attach_body);
+    try client.dispatch(
+        .{ .type = .attach, .session = 4242, .len = @intCast(attach_body.len) },
+        attach_body,
+    );
+    try testing.expect(!client.desynced);
+
+    // 4242 is not a terminal, so what came back is `no_such_session` -- but it
+    // came back, which is the assertion: the queue is live again.
+    try testing.expect(client.queue.items.len > 0);
+    try client.enqueue(.output, 7, &small, .drop);
+}
+
+/// A second subscriber that just records what the terminal fanned out.
+///
+/// Lets a test compare what a client received against what was sent, which is
+/// the only part of the path this file is responsible for. Whether the PTY
+/// itself delivered every byte the child wrote is a different question, and one
+/// a flow-control test should not be asserting.
+const Tee = struct {
+    mutex: illogical.thread.Mutex = .{},
+    bytes: std.ArrayList(u8) = .empty,
+    gpa: Allocator,
+
+    fn subscriber(self: *Tee) Terminal.Subscriber {
+        return .{ .ctx = self, .writeFn = write, .exitFn = exited };
+    }
+
+    fn write(ctx: *anyopaque, _: session.TerminalId, bytes: []const u8) bool {
+        const self: *Tee = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.bytes.appendSlice(self.gpa, bytes) catch return false;
+        return true;
+    }
+
+    fn exited(_: *anyopaque, _: session.TerminalId, _: i32) void {}
+
+    /// A copy of what has been recorded so far. Caller owns it.
+    fn snapshot(self: *Tee, gpa: Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return gpa.dupe(u8, self.bytes.items);
+    }
+};
+
+test "a client that keeps up gets the byte stream whole and in order" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try SocketPair.open("flow-ok");
+    defer pair.close();
+
+    const server = try Server.init(gpa, io, "/tmp/illogical-unused.sock", "/tmp/illogical-unused");
+    defer server.deinit();
+
+    const client = try Client.create(server, pair.server_end);
+    defer client.destroy();
+    try client.startWriter();
+
+    const lines = 1000;
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = "/tmp/illogical-unused" },
+        .id = 3,
+        .session_id = 1,
+        .name = "steady",
+        .argv = &.{
+            "/bin/sh",                                                       "-c",
+            "awk 'BEGIN{for(i=0;i<1000;i++) print \"F2_OK \" i}'; sleep 30",
+        },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    defer t.hangup();
+
+    // Recorded from inside the same fan-out loop, so the comparison below is
+    // exactly "what was sent" against "what arrived".
+    var tee: Tee = .{ .gpa = gpa };
+    defer tee.bytes.deinit(gpa);
+    try t.subscribe(tee.subscriber());
+    try t.subscribe(.{ .ctx = client, .writeFn = onOutput, .exitFn = onExit });
+    try t.start();
+
+    // Drain as fast as the terminal produces, which is what a real client
+    // does. Nothing here should overflow, so nothing should desync.
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(gpa);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+
+    var frames: usize = 0;
+    while (frames < 100_000) : (frames += 1) {
+        const header = try readFrame(pair.client_end, gpa, &payload);
+        // An `err` here would mean the queue overflowed on a client that was
+        // never behind, which is the regression this test exists to catch.
+        try testing.expectEqual(protocol.FrameType.output, header.type);
+        try testing.expectEqual(@as(session.TerminalId, 3), header.session);
+        try received.appendSlice(gpa, payload.items);
+        if (std.mem.indexOf(u8, received.items, "F2_OK 999") != null) break;
+    } else return error.OutputNeverArrived;
+
+    try testing.expect(!client.desynced);
+    try testing.expectEqual(@as(u32, 2), t.attachedCount());
+    // Enough traffic to have crossed many frames and several queue swaps.
+    try testing.expect(received.items.len > lines * 8);
+
+    // What the client got is an exact prefix of what the terminal sent:
+    // nothing dropped, nothing duplicated, nothing reordered, no torn frame.
+    // A prefix rather than the whole recording because the loop above stops at
+    // the last line while the child is still running.
+    //
+    // Against the fan-out, not against the child's output, and that is not
+    // laziness. An earlier version of this test looked for `F2_OK <i>\r\n` a
+    // thousand times and failed about one run in five, because a macOS pty
+    // whose output queue fills mid-write restarts its `\n` -> `\r\n`
+    // expansion and emits `\r\r\n`. Nothing is lost -- the byte counts come
+    // out *above* what the child wrote, not below -- and forwarding it
+    // verbatim is exactly right for a server that never re-encodes what the
+    // program wrote (docs/PROTOCOL.md, rule 1). The property this file owns is
+    // that the queue does not change the stream, so that is what it asserts.
+    const sent = try tee.snapshot(gpa);
+    defer gpa.free(sent);
+    try testing.expect(sent.len >= received.items.len);
+    try testing.expectEqualSlices(u8, sent[0..received.items.len], received.items);
+}
+
+test "a client that stops reading is unsubscribed, not allowed to stall the terminal" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try SocketPair.open("flow-stall");
+    defer pair.close();
+
+    const server = try Server.init(gpa, io, "/tmp/illogical-unused.sock", "/tmp/illogical-unused");
+    defer server.deinit();
+    server.client_queue_bytes = 16 * 1024;
+
+    const client = try Client.create(server, pair.server_end);
+    defer client.destroy();
+    try client.startWriter();
+
+    // A child that writes far more than the socket buffer and the queue put
+    // together, so the writer thread ends up blocked in `write` with the queue
+    // filling behind it -- which is the case this whole change is about.
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = "/tmp/illogical-unused" },
+        .id = 7,
+        .session_id = 1,
+        .name = "spew",
+        .argv = &.{
+            "/bin/sh",                                                                                                                "-c",
+            "awk 'BEGIN{for(i=0;i<200000;i++) print \"line \" i \" ---- filler to make this a realistic terminal line\"}'; sleep 30",
+        },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    defer t.hangup();
+
+    try t.subscribe(.{ .ctx = client, .writeFn = onOutput, .exitFn = onExit });
+    try testing.expectEqual(@as(u32, 1), t.attachedCount());
+    try t.start();
+
+    // The terminal drops the subscriber itself, from inside its fan-out loop.
+    // Nothing here reads the socket, so this only happens if the fan-out
+    // refused to wait on it.
+    var waited: usize = 0;
+    while (waited < 10_000) : (waited += 10) {
+        if (t.attachedCount() == 0) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.SubscriberNeverDropped;
+
+    // And the terminal is unharmed: still live, still reading, still holding
+    // the screen the child has been writing to all along.
+    const before = t.summary().pty_read_idle_ns;
+    _ = before;
+    try testing.expectEqual(session.Residency.live, t.summary().residency);
+    const text = try t.plainText(gpa);
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "line ") != null);
+
+    // Drain the socket until the desync frame turns up. Everything ahead of it
+    // is output the client was sent before it fell behind.
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    var frames: usize = 0;
+    const desync = while (frames < 100_000) : (frames += 1) {
+        const header = try readFrame(pair.client_end, gpa, &payload);
+        if (header.type == .err) break header;
+        try testing.expectEqual(protocol.FrameType.output, header.type);
+    } else return error.NoDesyncFrame;
+
+    const parsed = try protocol.body.decode(protocol.body.Err, gpa, payload.items);
+    defer parsed.deinit();
+    try testing.expectEqual(@intFromEnum(protocol.ErrorCode.desync), parsed.value.code);
+    try testing.expectEqual(@as(session.TerminalId, 7), desync.session);
 }
