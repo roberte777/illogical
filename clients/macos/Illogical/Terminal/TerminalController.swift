@@ -31,8 +31,18 @@ final class TerminalController {
         case connecting
         case attaching
         case live
+        /// The connection went away and is being made again. The screen
+        /// underneath stays: the last thing the terminal showed is still the
+        /// best guess at what it shows, and throwing it away would make a
+        /// dropped wifi packet look like a crash.
+        case reconnecting(attempt: Int)
         case exited(Int32)
         case failed(String)
+
+        var isReconnecting: Bool {
+            if case .reconnecting = self { return true }
+            return false
+        }
     }
 
     let terminalID: UInt64
@@ -55,6 +65,17 @@ final class TerminalController {
     private var historyTask: Task<Void, Never>?
     private var historyToken: HistoryToken?
 
+    /// The grid the surface last asked for, so a reconnect attaches at the
+    /// size the window is now rather than the size it was when it opened.
+    private var cols: UInt16
+    private var rows: UInt16
+    /// The retry in flight, and how far into the backoff we are.
+    private var retry: Task<Void, Never>?
+    private var backoff = Backoff()
+    /// Set by `disconnect()`. A connection that closed because we closed it is
+    /// not something to recover from.
+    private var closedByUs = false
+
     /// The attach in flight: the GHOSTSNP byte pipe and the decoder pulling
     /// from it, live from `snapshot_begin` until history has been restored.
     /// Nothing accumulates a copy of the stream — chunks go into the pipe and
@@ -76,6 +97,8 @@ final class TerminalController {
     init(terminalID: UInt64, host: ServerHost, cols: UInt16, rows: UInt16) throws {
         self.terminalID = terminalID
         self.host = host
+        self.cols = cols
+        self.rows = rows
         self.engine = try TerminalEngine(cols: cols, rows: rows)
     }
 
@@ -88,6 +111,19 @@ final class TerminalController {
     /// Which machine that is does not appear below this line: a remote host is
     /// `ssh <dest> illogicald --stdio` and the frames on it are the same ones.
     func connect(cols: UInt16, rows: UInt16) {
+        self.cols = cols
+        self.rows = rows
+        openConnection()
+    }
+
+    private func openConnection() {
+        // Whatever was there is not coming back; a second pump over a dead
+        // stream would report a close we already handled.
+        pump?.cancel()
+        pump = nil
+        connection?.close()
+        connection = nil
+
         do {
             let connection = try Connection(host: host)
             self.connection = connection
@@ -111,7 +147,10 @@ final class TerminalController {
                 await self?.connectionClosed()
             }
         } catch {
-            state = .failed("\(error)")
+            // Not fatal, and not different from the connection dying a moment
+            // later: a host that is not there yet is a host to try again.
+            Trace.log("terminal \(terminalID): connect failed: \(error)")
+            scheduleReconnect()
         }
     }
 
@@ -150,6 +189,10 @@ final class TerminalController {
 
     func resize(cols: UInt16, rows: UInt16) {
         guard cols > 0, rows > 0 else { return }
+        // Remembered even while disconnected, so a window resized during an
+        // outage reattaches at the size it is now rather than the size it was.
+        self.cols = cols
+        self.rows = rows
         engine.resize(cols: cols, rows: rows, cellWidth: 0, cellHeight: 0)
         guard let connection else { return }
         try? connection.send(
@@ -157,6 +200,9 @@ final class TerminalController {
     }
 
     func disconnect() {
+        closedByUs = true
+        retry?.cancel()
+        retry = nil
         stopHistoryRestore()
         // A half-delivered snapshot is worth nothing now, and the pipe may be
         // holding a whole session's scrollback.
@@ -167,6 +213,45 @@ final class TerminalController {
         pump?.cancel()
         connection?.close()
         connection = nil
+    }
+
+    /// Try again now, rather than when the backoff says to. What the pane's
+    /// "Retry" button does.
+    func retryNow() {
+        guard !closedByUs else { return }
+        retry?.cancel()
+        retry = nil
+        backoff.reset()
+        openConnection()
+    }
+
+    // MARK: - Reconnecting
+    //
+    // A connection that goes away is a client that has missed output, and the
+    // protocol already has a recovery for that: throw the terminal state away
+    // and replay the attach handshake. So there is nothing here but *when* —
+    // `openConnection` sends the same `attach` it sends the first time, and
+    // `snapshot_begin` does the tearing down, exactly as it does for a desync.
+    // See docs/PROTOCOL.md, "Desync".
+
+    private func scheduleReconnect() {
+        guard !closedByUs, retry == nil else { return }
+        // An exited child is not a lost connection. Nothing is coming back.
+        if case .exited = state { return }
+
+        let delay = backoff.next()
+        state = .reconnecting(attempt: backoff.attempt)
+        Trace.log(
+            "terminal \(terminalID) on \(host.displayName): reconnecting in "
+                + String(format: "%.2fs", delay) + " (attempt \(backoff.attempt))")
+
+        retry = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self else { return }
+            self.retry = nil
+            guard !self.closedByUs else { return }
+            self.openConnection()
+        }
     }
 
     // MARK: - Frames
@@ -269,7 +354,7 @@ final class TerminalController {
             )
         }
         guard let restore, snapshotBytes > 0 else {
-            state = .live
+            becameLive()
             return
         }
         do {
@@ -284,7 +369,7 @@ final class TerminalController {
             engine.declarePendingHistory(rows: restore.declaredHistoryRows)
             // We can paint now. Everything below is scrollback catching up.
             readyDecoded = true
-            state = .live
+            becameLive()
             // Split out from `ready -> first frame` on purpose: if that total
             // moves with scrollback size, this is where it moved. It should
             // not: the decoder stops at READY, and the bytes past it are still
@@ -300,7 +385,7 @@ final class TerminalController {
             self.restore?.stream.abandon()
             self.restore = nil
             engine.clearPendingHistory()
-            state = .live
+            becameLive()
         }
     }
 
@@ -450,6 +535,17 @@ final class TerminalController {
         }
     }
 
+    /// The attach finished and the terminal is on screen.
+    ///
+    /// Also where the backoff is forgiven. On the *attach* rather than on the
+    /// connect, because a host whose daemon has died accepts a connection and
+    /// drops it: resetting on a socket opening would turn the backoff into a
+    /// tight loop against exactly the machine that needs one.
+    private func becameLive() {
+        state = .live
+        backoff.reset()
+    }
+
     private func connectionClosed() {
         // Whatever the pipe still holds is a snapshot that will never be
         // completed, and it may be a session's whole scrollback.
@@ -460,7 +556,28 @@ final class TerminalController {
         // is, so the bar has to stop claiming there is more above it.
         engine.clearPendingHistory()
         if case .exited = state { return }
-        if case .failed = state { return }
-        state = .failed("disconnected")
+
+        // Everything else is worth trying again. A network that went away is
+        // not a different kind of failure from a client that fell behind its
+        // output queue -- both mean "you have missed something, start over" --
+        // and the server keeps the terminal running either way. That is the
+        // whole reason this is three lines: `openConnection` sends the same
+        // `attach` it sent the first time.
+        //
+        // The screen is deliberately left alone. It is the last thing the
+        // terminal showed and still the best guess at what it shows; blanking
+        // it would make a dropped packet look like a crash, and the snapshot
+        // that arrives on reconnect replaces it wholesale anyway.
+        // Nothing may write to it again. `send` and `resize` both check, and a
+        // write to a socket whose peer has gone is an EPIPE at best -- the
+        // transport turns off the signal that would otherwise be a SIGPIPE,
+        // but there is no reason to reach for it.
+        let detail = connection?.failureDescription
+        Trace.log(
+            "terminal \(terminalID) on \(host.displayName): connection closed"
+                + (detail.map { " (\($0))" } ?? ""))
+        connection?.close()
+        connection = nil
+        scheduleReconnect()
     }
 }

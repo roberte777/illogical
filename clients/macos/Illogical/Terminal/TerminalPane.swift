@@ -25,9 +25,69 @@ struct TerminalPane: View {
             TerminalSurface(pane: pane, tab: tab)
                 .environment(store)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // Over the terminal, not instead of it. The screen underneath
+                // is the last thing this terminal showed and still the best
+                // guess at what it shows — the far side never stopped.
+                .overlay(alignment: .top) {
+                    if let controller = store.existingController(for: pane.terminal) {
+                        ConnectionBanner(
+                            state: controller.state,
+                            host: pane.terminal.host,
+                            retry: { controller.retryNow() })
+                    }
+                }
         }
         .background(Palette.background)
         .traceFrame("pane-\(pane.terminal.terminal)")
+    }
+}
+
+/// A pill over the terminal while its connection is being made again.
+///
+/// Not an error sheet, and not a blank screen. A network that went away comes
+/// back; the terminal on the far side never stopped, and re-attaching is
+/// O(screen). The right shape for that is a note, not an interruption.
+struct ConnectionBanner: View {
+    let state: TerminalController.State
+    let host: ServerHost
+    let retry: () -> Void
+
+    private var text: String? {
+        switch state {
+        case .reconnecting:
+            host.isRemote ? "Reconnecting to \(host.displayName)…" : "Reconnecting…"
+        case .failed(let message): message
+        case .connecting, .attaching, .live, .exited: nil
+        }
+    }
+
+    var body: some View {
+        if let text {
+            HStack(spacing: 8) {
+                if state.isReconnecting {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.7)
+                }
+                Text(text)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.textBright)
+                    .lineLimit(1)
+                Button("Retry", action: retry)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Palette.menuHighlight)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                Capsule().fill(Palette.toolbar)
+                    .overlay(Capsule().strokeBorder(Palette.divider, lineWidth: 1))
+                    .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+            )
+            .padding(.top, 10)
+            .accessibilityLabel(Text(text))
+        }
     }
 }
 

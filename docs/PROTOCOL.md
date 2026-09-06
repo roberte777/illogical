@@ -178,6 +178,13 @@ re-attaches from scratch [ARCH t=356]. Cheap, because attach is O(screen).
 
 This is also the flow-control escape hatch, and the server uses it.
 
+**And it is the whole of network-loss recovery.** A connection that goes away is
+a client that has missed output — the case above with a longer gap. The terminal
+on the far side never stopped, so reconnecting is a new socket, the same
+`attach`, and nothing else. Nothing in the protocol distinguishes the two and
+nothing needs to; the client's part is only deciding *when* to try again. See
+[CLIENT.md](CLIENT.md#losing-the-network-and-getting-it-back).
+
 ## Flow control
 
 Every client has a bounded queue of framed bytes waiting for its socket,

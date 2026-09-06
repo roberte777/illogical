@@ -100,7 +100,9 @@ final class SessionStore {
     /// selected rather than duplicated.
     func addHost(_ host: ServerHost) {
         if let existing = self.host(host) {
-            if case .failed = existing.status { existing.connect() }
+            // Already here. Adding it again is somebody asking for it to work,
+            // so take the retry rather than the duplicate.
+            if !existing.status.isConnected { existing.connect() }
             return
         }
         let connection = HostConnection(host: host)
@@ -156,18 +158,17 @@ final class SessionStore {
 
     /// Whether nothing at all is reachable, and the message to show if so.
     ///
-    /// A single failed remote host is not this: the window still works, and
-    /// the menu marks that host. Only every host being down is worth taking
+    /// One unreachable machine is not this: the window still works, and the
+    /// dropdown marks that host. Only *every* host being down is worth taking
     /// the terminal area over for.
+    ///
+    /// A host that has not answered yet says nothing, so the first moments of
+    /// a launch do not flash a failure at somebody.
     var connectionError: String? {
         _ = hostStatusRevision
         guard !hosts.isEmpty else { return nil }
-        let failures = hosts.compactMap { host -> String? in
-            if case .failed(let message) = host.status { return message }
-            return nil
-        }
-        guard failures.count == hosts.count else { return nil }
-        return failures.first
+        guard !hosts.contains(where: { $0.status.isConnected }) else { return nil }
+        return hosts.compactMap(\.status.message).first
     }
 
     // MARK: - The window's view of what exists
@@ -434,6 +435,12 @@ final class SessionStore {
     /// The controller for a terminal, creating and attaching one if needed.
     func controller(for ref: TerminalRef, cols: UInt16, rows: UInt16) -> TerminalController? {
         host(ref.host)?.controller(for: ref.terminal, cols: cols, rows: rows)
+    }
+
+    /// The controller for a terminal, if one is open. For views, which must
+    /// not attach one as a side effect of being drawn.
+    func existingController(for ref: TerminalRef) -> TerminalController? {
+        host(ref.host)?.existingController(ref.terminal)
     }
 
     func closeController(_ ref: TerminalRef) {

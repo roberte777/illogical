@@ -83,6 +83,7 @@ targets:
       # worth testing across hosts and not only across sessions.
       - path: Illogical/Sessions/SessionStore.swift
       - path: Illogical/Sessions/HostConnection.swift
+      - path: Illogical/Sessions/Reconnect.swift
       - path: Illogical/Terminal/TerminalController.swift
       # The renderer and the controller both emit launch signposts.
       - path: Illogical/App/Signposts.swift

@@ -248,7 +248,14 @@ struct HostHeader: View {
         switch host.status {
         case .connecting: ("arrow.clockwise", Palette.menuShortcut, "Connecting…")
         case .connected: nil
-        case .failed(let message): ("exclamationmark.triangle.fill", .orange, message)
+        // Amber rather than red: nothing has been given up on, and a machine
+        // asleep behind a network that will come back is the ordinary case.
+        case .reconnecting(let attempt, let detail):
+            (
+                "arrow.triangle.2.circlepath", .orange,
+                detail ?? "Reconnecting… (attempt \(attempt))"
+            )
+        case .failed(let message): ("exclamationmark.triangle.fill", .red, message)
         }
     }
 

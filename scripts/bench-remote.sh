@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# What the remote transport costs.
+#
+# This is the M5 gate's number (docs/ROADMAP.md). `illogicald --stdio` is a
+# splice: it copies bytes between an SSH pipe and the host's own unix socket
+# and parses nothing. So attaching *through* it should cost what attaching
+# directly costs, plus one copy in each direction — and if it does not, the
+# bridge is doing something it should not be.
+#
+# Two columns, from the same daemon and the same terminal:
+#
+#   direct    the app on the unix socket, as it has always been
+#   bridged   the app on `ssh <dest> illogicald --stdio`, which lands on
+#             that same socket at the far end
+#
+# `ssh` itself is stood in for. A real one measures a network, which is a
+# different question with no reference number and no repeatable answer; this
+# measures the bridge, which is the part we wrote. Point ILLOGICAL_SSH at a
+# real ssh and pass a real destination if you want the other one.
+#
+# Usage: scripts/bench-remote.sh [runs] [scrollback-lines]
+set -euo pipefail
+
+runs="${1:-5}"
+lines="${2:-20000}"
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+app="$root/clients/macos/.build/xcode/Build/Products/Debug/Illogical.app/Contents/MacOS/Illogical"
+daemon="$root/zig-out/bin/illogicald"
+cli="$root/zig-out/bin/illogical"
+state="$(mktemp -d /tmp/illogical-remote.XXXXXX)"
+
+[ -x "$app" ] || { echo "build first: just app" >&2; exit 1; }
+[ -x "$daemon" ] || { echo "build first: zig build" >&2; exit 1; }
+
+pids=()
+cleanup() {
+  pkill -f "$app" 2>/dev/null || true
+  pkill -f "illogicald --stdio --socket $state" 2>/dev/null || true
+  # Children first: a daemon sitting in a PTY read does not die until that
+  # read returns. Same note as bench-attach.sh.
+  for p in "${pids[@]:-}"; do
+    [ -n "$p" ] || continue
+    pkill -9 -P "$p" 2>/dev/null || true
+  done
+  sleep 0.3
+  for p in "${pids[@]:-}"; do
+    [ -n "$p" ] || continue
+    kill -9 "$p" 2>/dev/null || true
+  done
+  rm -rf "$state"
+}
+trap cleanup EXIT
+
+start_daemon() { # name -> socket path on stdout
+  local name="$1" fill="$2"
+  local sock="$state/$name.sock"
+  # Parking pushed out of reach: attaching to a parked terminal serves the
+  # compressed park file off disk instead of encoding a live one, and timing
+  # one path against the other would call the difference "the bridge".
+  "$daemon" --socket "$sock" --park-after 86400 >"$state/$name-daemon.log" 2>&1 &
+  pids+=("$!")
+  for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.1; done
+  if [ "$fill" -gt 0 ]; then
+    ILLOGICAL_SOCK="$sock" "$cli" new -s "$name" -n "$name" -- \
+      /bin/sh -c "awk 'BEGIN{for(i=0;i<$fill;i++) print \"line \" i \" ---- filler text to make this a realistic terminal line\"}'; sleep 86400" \
+      >/dev/null
+  fi
+  echo "$sock"
+}
+
+# The `since-attach=NNms` field of the first line matching $1.
+since_attach() {
+  awk -v want="$1" '$0 ~ want {
+      for (i = 1; i <= NF; i++) if ($i ~ /^since-attach=/) {
+        sub(/since-attach=/, "", $i); sub(/ms$/, "", $i); print $i; exit
+      }
+    }' "$2"
+}
+
+median() {
+  tr ' ' '\n' | grep -v '^$' | sort -n | awk '{ v[NR] = $1 } END {
+    if (NR == 0) { print "nan"; exit }
+    printf "%.1f", (NR % 2) ? v[(NR + 1) / 2] : (v[NR / 2] + v[NR / 2 + 1]) / 2
+  }'
+}
+
+# One launch. Prints "<attach->ready ms> <attach->end ms>".
+run() { # trace-file, then the environment already exported by the caller
+  local trace="$1"
+  : >"$trace"
+  ILLOGICAL_TRACE="$trace" "$app" >/dev/null 2>&1 &
+  local app_pid=$!
+  for _ in $(seq 1 300); do
+    grep -q "milestone snapshot-end" "$trace" 2>/dev/null && break
+    sleep 0.1
+  done
+  kill "$app_pid" 2>/dev/null || true
+  wait "$app_pid" 2>/dev/null || true
+  echo "$(since_attach 'milestone snapshot-ready' "$trace" || echo nan)" \
+    "$(since_attach 'milestone snapshot-end' "$trace" || echo nan)"
+}
+
+echo "runs=$runs scrollback=$lines lines"
+echo
+
+full_sock="$(start_daemon full "$lines")"
+# An empty daemon for the local host in the bridged case, so the *front* tab
+# is the remote terminal. The client attaches to whatever is in front.
+empty_sock="$(start_daemon empty 0)"
+
+# A stand-in for ssh: ignores every option and runs the bridge against the
+# daemon above, which is what `ssh <dest> illogicald --stdio` lands on.
+cat >"$state/ssh" <<EOF
+#!/bin/sh
+exec $daemon --stdio --socket "$full_sock"
+EOF
+chmod +x "$state/ssh"
+
+direct_ready="" direct_end="" bridged_ready="" bridged_end=""
+for i in $(seq 1 "$runs"); do
+  read -r r e < <(ILLOGICAL_SOCK="$full_sock" run "$state/direct-$i.log")
+  direct_ready+="$r "
+  direct_end+="$e "
+
+  read -r r e < <(
+    ILLOGICAL_SOCK="$empty_sock" \
+    ILLOGICAL_SSH="$state/ssh" \
+    ILLOGICAL_HOSTS="bench-host" \
+      run "$state/bridged-$i.log"
+  )
+  bridged_ready+="$r "
+  bridged_end+="$e "
+done
+
+printf '| %-9s | %14s | %13s |\n' "transport" "attach → ready" "attach → end"
+printf '| %-9s | %14s | %13s |\n' "---" "---" "---"
+printf '| %-9s | %11s ms | %10s ms |\n' \
+  "direct" "$(echo "$direct_ready" | median)" "$(echo "$direct_end" | median)"
+printf '| %-9s | %11s ms | %10s ms |\n' \
+  "bridged" "$(echo "$bridged_ready" | median)" "$(echo "$bridged_end" | median)"
+echo
+echo "The first column is the gate: a splice that parses nothing should not"
+echo "move it. The second carries the whole snapshot and is where a per-frame"
+echo "cost in the bridge would show up."

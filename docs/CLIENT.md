@@ -453,6 +453,53 @@ than as a closed connection.
 Superlogical's server additionally has built-in Tailscale/Headscale support and
 acts as a node ([MASTO]). Out of scope for us; SSH first.
 
+## Losing the network, and getting it back
+
+**Reconnecting needed almost no new machinery, and that is the point.** A
+connection that goes away is a client that has missed output; the protocol
+already recovers from that by throwing the terminal state away and replaying
+the attach handshake, which is O(screen). So the only new question is *when* —
+an exponential backoff from 250 ms to a 30-second ceiling, retried forever. A
+laptop closed overnight should find its terminals in the morning, and "give up
+after five minutes" is exactly the case where that fails; the ceiling is what
+makes forever cheap.
+
+```
+connection closes ─► .reconnecting ─► attach ─► snapshot_begin ─► PAINT
+                       (backoff)                 tears down the old terminal,
+                                                 the same way a desync does
+```
+
+Three things this deliberately does **not** do:
+
+- **It does not blank the screen.** The last thing a terminal showed is still
+  the best guess at what it shows, and the far side never stopped. A dropped
+  packet should not look like a crash. A pill over the terminal says what is
+  happening, with a Retry that skips the backoff.
+- **It does not drop the host's session list.** Clearing it when a control
+  connection closes would take every tab on that machine with it through the
+  reconcile — closing panes and their connections over a blip. The `list` after
+  the reconnect corrects it, because the *server* is what remembers. Which is
+  the premise of the whole project.
+- **It does not treat a first failure differently from a later one.** A host
+  that was never reachable and one that went away are the same question.
+
+A resize during an outage is remembered and carried into the re-attach, so a
+window resized while disconnected comes back at the size it is now.
+
+Over SSH the control connection and every terminal's share one TCP connection
+underneath, so a network coming back recovers them together and only whichever
+gets there first pays for a handshake. `ServerAliveInterval` is what makes a
+dead network *become* a closed connection at all — without it a laptop that
+changed networks waits indefinitely on a socket with nobody behind it.
+
+One thing that had to be fixed before any of this worked: a write to a socket
+or pipe whose far end has gone raises `SIGPIPE`, and the default disposition is
+to kill the process. A daemon going away with a keystroke in flight is the
+ordinary case here, so the recovery path was the one that killed the app.
+`SO_NOSIGPIPE` on the socket; the process-wide disposition for the pipe, which
+has no per-descriptor equivalent.
+
 ## Not sandboxed
 
 The client talks to a unix socket outside a container and spawns `ssh`, so
