@@ -486,6 +486,17 @@ final class TabReconcileTests: XCTestCase {
 
         // A later split in a different tab must be the next reply's match.
         store.split(pane: second.panes[0].id, in: second.id, direction: .columns)
+
+        // An error about a *terminal* says nothing about a create. The daemon
+        // answers a failed `kill` on the terminal's own id, and ⌘W on a pane
+        // whose process already exited produces exactly that -- so without the
+        // control-session guard, closing one pane cancels an in-flight split
+        // and its terminal opens as a tab of its own.
+        store.host(Self.local)?.handleForTesting(
+            Frame(
+                type: .error, terminal: 7,
+                payload: Data(#"{"code":2,"message":"no such terminal"}"#.utf8)))
+
         store.host(Self.local)?.onCreated?(12)
         XCTAssertEqual(
             store.tabs.first { $0.id == second.id }?.panes.count, 2,
@@ -547,5 +558,22 @@ final class TabReconcileTests: XCTestCase {
         let other = ServerHost.ssh(destination: "other-box")
         let store2 = SessionStore(hosts: [Self.local, other], defaults: suite)
         XCTAssertEqual(store2.hostsToRemember(injected: [other]), [])
+    }
+
+    /// `SessionStore(defaults:)` must read the defaults it is handed. It used
+    /// to take `startingHosts()` as the value for `hosts:`, which reads
+    /// `UserDefaults.standard` whatever `defaults:` says — so a test written
+    /// the obvious way would have loaded the developer's own remembered hosts
+    /// and, on `connect()`, spawned real `ssh` processes. Half a seam reads as
+    /// isolated and is not.
+    func testAStoreWithNoHostsReadsTheDefaultsItWasGiven() {
+        let suite = InMemoryDefaults()
+        RemoteHostStore.save([Self.remote], to: suite)
+
+        // No `hosts:`. Construction does not connect, so nothing is dialled.
+        let store = SessionStore(defaults: suite)
+        XCTAssertNotNil(
+            store.host(Self.remote),
+            "the injected defaults were ignored in favour of the real ones")
     }
 }
