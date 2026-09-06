@@ -52,7 +52,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-start_daemon() { # name -> socket path on stdout
+# Sets `daemon_sock`. Deliberately not printed on stdout and read back with
+# `$(...)`: that runs the function in a subshell, where the `pids+=` below
+# would be appended to a copy and the cleanup trap would find nothing to kill.
+# A daemon holding a terminal does not die on its own.
+daemon_sock=""
+start_daemon() {
   local name="$1" fill="$2"
   local sock="$state/$name.sock"
   # Parking pushed out of reach: attaching to a parked terminal serves the
@@ -66,7 +71,7 @@ start_daemon() { # name -> socket path on stdout
       /bin/sh -c "awk 'BEGIN{for(i=0;i<$fill;i++) print \"line \" i \" ---- filler text to make this a realistic terminal line\"}'; sleep 86400" \
       >/dev/null
   fi
-  echo "$sock"
+  daemon_sock="$sock"
 }
 
 # The `since-attach=NNms` field of the first line matching $1.
@@ -104,10 +109,12 @@ run() { # trace-file, then the environment already exported by the caller
 echo "runs=$runs scrollback=$lines lines"
 echo
 
-full_sock="$(start_daemon full "$lines")"
+start_daemon full "$lines"
+full_sock="$daemon_sock"
 # An empty daemon for the local host in the bridged case, so the *front* tab
 # is the remote terminal. The client attaches to whatever is in front.
-empty_sock="$(start_daemon empty 0)"
+start_daemon empty 0
+empty_sock="$daemon_sock"
 
 # A stand-in for ssh: ignores every option and runs the bridge against the
 # daemon above, which is what `ssh <dest> illogicald --stdio` lands on.

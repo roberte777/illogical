@@ -238,19 +238,20 @@ matter what the two ends say to each other, and a `snapshot_chunk` crossing it
 costs one copy rather than a decode and a re-encode.
 
 **Gate: the dropdown lists terminals on other machines. Met**, and the transport
-costs what a splice should — `scripts/bench-remote.sh 5 20000`, Debug build,
-M-series, median of 5:
+costs what a splice should — `scripts/bench-remote.sh 9 20000`, Debug build,
+M-series, median of 9:
 
 | transport | attach → ready | attach → end |
 | --- | --- | --- |
-| direct, unix socket | 34.2 ms | 146.4 ms |
-| through the bridge | 34.2 ms | 160.6 ms |
+| direct, unix socket | 34.1 ms | 150.0 ms |
+| through the bridge | 34.2 ms | 165.3 ms |
 
 The first column is the M2 gate seen from the far side of an SSH pipe, and it
-does not move at all. The second is the whole 20,000-line snapshot, and it costs
-10% more — that is the copy, and it is the only thing the bridge adds. At 200
-lines the two columns collapse into each other (33.1 vs 33.7 ms) because there
-is nothing left to copy.
+does not move: 0.1 ms on a number that varies by more than that between runs.
+The second is the whole 20,000-line snapshot, and it costs 10% more — that is
+the copy, and it is the only thing the bridge adds. At 200 lines the two
+columns collapse into each other (34.0 against 34.4 ms) because there is
+nothing left to copy.
 
 ⚠ **`ssh` itself is stood in for.** The benchmark runs the bridge over a local
 pipe, so what it says is "the bridge is not the bottleneck" and *nothing* about
@@ -356,8 +357,8 @@ Also measure, where no reference number exists:
   one of them is hot. `scripts/bench-pty.sh`, measured in M4.
 - p99 input latency at 200 attachments.
 - Client cold launch to window. **148 ms**, Debug, measured above.
-- What the remote transport costs. **Nothing on the gate** — 34.2 ms to
-  `snapshot_ready` either way — and 10% on the whole snapshot, which is the
+- What the remote transport costs. **Nothing on the gate** — 34.1 against
+  34.2 ms to `snapshot_ready` — and 10% on the whole snapshot, which is the
   copy. `scripts/bench-remote.sh`, measured in M5. It stands `ssh` in for
   itself, so it bounds the bridge and says nothing about a real network.
 
