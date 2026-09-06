@@ -126,6 +126,12 @@ pub const ErrorCode = enum(u16) {
     spawn_failed = 4,
     unpark_failed = 5,
     malformed_frame = 6,
+    /// The client fell far enough behind that the server dropped its bounded
+    /// output queue rather than buffer without limit. Output after this frame
+    /// is missing, and the server has already unsubscribed the client, so the
+    /// only recovery is a fresh `attach` -- which is the same path as any
+    /// other desync. See docs/PROTOCOL.md.
+    desync = 7,
     _,
 };
 

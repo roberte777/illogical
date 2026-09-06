@@ -44,6 +44,10 @@ next_terminal_id: session.TerminalId = 1,
 
 clients_mutex: illogical.thread.Mutex = .{},
 clients: std.ArrayList(*Client) = .empty,
+/// Bound on one client's queued, not-yet-written output. A field rather than a
+/// constant so tests can make overflow reachable without shipping a megabyte
+/// at it.
+client_queue_bytes: usize = Client.default_queue_bytes,
 
 running: std.atomic.Value(bool) = .init(false),
 maintenance: ?std.Thread = null,
@@ -66,10 +70,16 @@ pub fn deinit(self: *Server) void {
         self.maintenance = null;
     }
 
+    // Take the list out from under the lock before destroying anything.
+    // `Client.destroy` joins the client's reader thread, and that thread
+    // reaches back into the server as it unwinds -- holding `clients_mutex`
+    // across the join would have the two wait on each other.
     self.clients_mutex.lock();
-    for (self.clients.items) |c| c.destroy();
-    self.clients.deinit(self.gpa);
+    var clients = self.clients;
+    self.clients = .empty;
     self.clients_mutex.unlock();
+    for (clients.items) |c| c.destroy();
+    clients.deinit(self.gpa);
 
     self.mutex.lock();
     for (self.terminals.values()) |t| t.destroy();
@@ -109,6 +119,7 @@ pub fn listen(self: *Server) !void {
 /// slice of scrollback compression. See docs/PARKING.md.
 pub fn maintenanceTick(self: *Server) void {
     self.retireExited();
+    self.retireClients();
 
     // Copy the terminal list so the registry lock is not held across the work.
     var ids: std.ArrayList(session.TerminalId) = .empty;
@@ -152,7 +163,8 @@ pub fn stop(self: *Server) void {
     cwd.deleteFile(self.io, self.socket_path) catch {};
 }
 
-/// Accept connections until stopped. Each client gets its own thread.
+/// Accept connections until stopped. Each client gets a reader and a writer
+/// thread of its own; see `Client`.
 pub fn run(self: *Server) !void {
     while (self.running.load(.acquire)) {
         const fd = sys.acceptFd(self.listener) catch break;
@@ -161,10 +173,25 @@ pub fn run(self: *Server) !void {
             sys.closeFd(fd);
             continue;
         };
+
         self.clients_mutex.lock();
-        self.clients.append(self.gpa, client) catch {};
+        const tracked = if (self.clients.append(self.gpa, client)) true else |_| false;
         self.clients_mutex.unlock();
-        client.start() catch |err| log.err("failed to start client: {t}", .{err});
+        if (!tracked) {
+            // Untracked means nothing would ever retire it. Better to refuse
+            // the connection than to leak the socket and the client with it.
+            log.err("out of memory registering a client; dropping the connection", .{});
+            client.destroy();
+            continue;
+        }
+
+        client.start() catch |err| {
+            log.err("failed to start client: {t}", .{err});
+            // Nothing will set this from the inside: the reader thread that
+            // normally does is the one that failed to start. Without it the
+            // client sits in the list until the daemon exits.
+            client.finished.store(true, .release);
+        };
     }
 }
 
@@ -232,6 +259,37 @@ fn retireExited(self: *Server) void {
         t.destroy();
     }
     self.notifySessionsChanged();
+}
+
+/// Retire clients whose reader thread has finished: unregister, then destroy.
+///
+/// Like `retireExited`, this runs on the maintenance tick rather than on the
+/// thread that noticed, because destroying a client joins that very thread.
+/// Before this existed nothing freed a disconnected client at all: it removed
+/// itself from the list and left the object, its buffers and its detached
+/// thread behind -- a leak per connection, and a thread still using memory
+/// `Server.deinit` would later free.
+fn retireClients(self: *Server) void {
+    var retired: std.ArrayList(*Client) = .empty;
+    defer retired.deinit(self.gpa);
+
+    {
+        self.clients_mutex.lock();
+        defer self.clients_mutex.unlock();
+        var i: usize = 0;
+        while (i < self.clients.items.len) {
+            const c = self.clients.items[i];
+            if (!c.finished.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            _ = self.clients.swapRemove(i);
+            retired.append(self.gpa, c) catch {};
+        }
+    }
+
+    // Outside the lock: destroying joins threads that take it.
+    for (retired.items) |c| c.destroy();
 }
 
 pub fn removeClient(self: *Server, client: *Client) void {

@@ -106,6 +106,34 @@ final class TerminalController {
         }
     }
 
+    /// Ask for the whole terminal again, on the connection we already have.
+    ///
+    /// This is the recovery path for every kind of desync, and the server asks
+    /// for it by name when a client falls behind its output queue: it has
+    /// already unsubscribed us, so nothing more is coming until we attach
+    /// again. Attach is O(screen), which is what makes throwing the state away
+    /// and starting over the cheap option rather than the drastic one — see
+    /// docs/PROTOCOL.md, "Desync".
+    ///
+    /// `snapshot_begin` does the tearing down. It stops the history restore,
+    /// abandons the half-delivered snapshot and clears the pending region,
+    /// because a second snapshot arriving on one connection is exactly this.
+    private func reattach() {
+        guard let connection else { return }
+        state = .attaching
+        attachSentAt = Date()
+        Signposts.milestone(
+            "reattach-sent", seconds: Signposts.sinceLaunch(),
+            detail: "terminal=\(terminalID) reason=desync")
+        do {
+            try connection.send(
+                .attach, terminal: terminalID,
+                json: AttachBody(cols: engine.cols, rows: engine.rows))
+        } catch {
+            state = .failed("\(error)")
+        }
+    }
+
     func send(_ bytes: [UInt8]) {
         guard let connection else { return }
         try? connection.send(.input, terminal: terminalID, payload: Data(bytes))
@@ -172,10 +200,12 @@ final class TerminalController {
             state = .exited(code)
 
         case .error:
-            let message =
-                (try? JSONDecoder().decode(ErrBody.self, from: frame.payload))?.message
-                ?? "server error"
-            state = .failed(message)
+            let body = try? JSONDecoder().decode(ErrBody.self, from: frame.payload)
+            if body.map({ ProtocolErrorCode(rawValue: $0.code) == .desync }) ?? false {
+                reattach()
+                return
+            }
+            state = .failed(body?.message ?? "server error")
 
         default:
             break

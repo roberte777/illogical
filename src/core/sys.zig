@@ -24,6 +24,7 @@ extern "c" fn bind(sockfd: fd_t, addr: *const sockaddr, len: socklen_t) c_int;
 extern "c" fn listen(sockfd: fd_t, backlog: c_uint) c_int;
 extern "c" fn accept(sockfd: fd_t, addr: ?*sockaddr, len: ?*socklen_t) c_int;
 extern "c" fn connect(sockfd: fd_t, addr: *const sockaddr, len: socklen_t) c_int;
+extern "c" fn shutdown(sockfd: fd_t, how: c_int) c_int;
 extern "c" fn close(fd: fd_t) c_int;
 extern "c" fn read(fd: fd_t, buf: [*]u8, n: usize) isize;
 extern "c" fn write(fd: fd_t, buf: [*]const u8, n: usize) isize;
@@ -151,6 +152,21 @@ pub fn connectUnix(path: []const u8) Error!fd_t {
 
 pub fn unlinkPath(path: [*:0]const u8) void {
     _ = unlink(path);
+}
+
+/// Both directions, for `shutdownFd`.
+const SHUT_RDWR: c_int = 2;
+
+/// Break both directions of a socket without closing the descriptor.
+///
+/// This is how a thread blocked in `read()` on a socket is woken so it can be
+/// joined. `close` is not: on macOS it does not return while another thread
+/// holds the same descriptor inside a blocking syscall, so joining after a bare
+/// `close` deadlocks the two against each other -- the shape of issue #28, on
+/// the PTY side. `shutdown` makes the pending read return zero and every later
+/// write fail, and leaves the descriptor valid until its owner closes it.
+pub fn shutdownFd(fd: fd_t) void {
+    _ = shutdown(fd, SHUT_RDWR);
 }
 
 // -- time ------------------------------------------------------------------

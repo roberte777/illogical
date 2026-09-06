@@ -33,14 +33,24 @@ const max_continuation_bytes = 65 * 1024 * 1024;
 
 pub const Subscriber = struct {
     ctx: *anyopaque,
-    /// Deliver raw PTY bytes. Must not block for long and must not call back
-    /// into this terminal.
-    writeFn: *const fn (ctx: *anyopaque, bytes: []const u8) void,
+    /// Deliver raw PTY bytes. Runs on this terminal's reader thread with
+    /// `mutex` held, so it must not block and must not call back into this
+    /// terminal.
+    ///
+    /// Returns false to be unsubscribed. That is the only way out for a
+    /// subscriber that cannot keep up: it cannot call `unsubscribe` itself
+    /// from in here -- the lock is already held and the list is mid-iteration
+    /// -- so it says so and the fan-out drops it. See docs/OPTIMIZATIONS.md F2.
+    ///
+    /// `terminal` is passed rather than left for the subscriber to recall,
+    /// because the subscriber's own idea of which terminal it is attached to
+    /// is written by a different thread than the one calling this.
+    writeFn: *const fn (ctx: *anyopaque, terminal: session.TerminalId, bytes: []const u8) bool,
     /// The child exited.
-    exitFn: *const fn (ctx: *anyopaque, code: i32) void,
+    exitFn: *const fn (ctx: *anyopaque, terminal: session.TerminalId, code: i32) void,
 
-    fn write(self: Subscriber, bytes: []const u8) void {
-        self.writeFn(self.ctx, bytes);
+    fn write(self: Subscriber, terminal: session.TerminalId, bytes: []const u8) bool {
+        return self.writeFn(self.ctx, terminal, bytes);
     }
 };
 
@@ -250,11 +260,30 @@ fn readLoop(self: *Terminal) void {
         }
         if (self.stream) |*stream| stream.nextSlice(bytes);
         self.last_read_ns = sys.monotonicNs();
-        // The exact same bytes, to everyone. No re-encoding. (G2)
-        for (self.subscribers.items) |sub| sub.write(bytes);
+        self.fanOutLocked(bytes);
         self.mutex.unlock();
     }
     self.reap();
+}
+
+/// The exact same bytes, to everyone. No re-encoding. (G2)
+///
+/// A subscriber that returns false has fallen too far behind to be worth
+/// feeding and is dropped here, under the lock that owns the list. This is the
+/// server half of docs/OPTIMIZATIONS.md F2: the alternative -- letting the
+/// subscriber unsubscribe itself from its own writer thread -- takes this same
+/// lock from the far side and deadlocks against an attach in flight.
+fn fanOutLocked(self: *Terminal, bytes: []const u8) void {
+    var i: usize = 0;
+    while (i < self.subscribers.items.len) {
+        if (self.subscribers.items[i].write(self.id, bytes)) {
+            i += 1;
+            continue;
+        }
+        // Not `swapRemove`: subscribers are fed in order, and reordering them
+        // mid-fan-out would skip whoever was moved into this slot.
+        _ = self.subscribers.orderedRemove(i);
+    }
 }
 
 fn reap(self: *Terminal) void {
@@ -264,7 +293,7 @@ fn reap(self: *Terminal) void {
         defer self.mutex.unlock();
         self.residency = .exited;
         self.exit_code = code;
-        for (self.subscribers.items) |s| s.exitFn(s.ctx, code);
+        for (self.subscribers.items) |s| s.exitFn(s.ctx, self.id, code);
     }
     // Last, so the server never sees `finished` before the exit has been
     // reported to everyone watching.

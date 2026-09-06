@@ -112,4 +112,9 @@ public enum ProtocolErrorCode: UInt16, Sendable {
     case spawnFailed = 4
     case unparkFailed = 5
     case malformedFrame = 6
+    /// This client fell far enough behind that the server dropped its bounded
+    /// output queue rather than buffer without limit. Output after this frame
+    /// is missing and the server has already unsubscribed us, so the only
+    /// recovery is a fresh `attach`. See docs/PROTOCOL.md.
+    case desync = 7
 }
