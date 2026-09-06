@@ -118,7 +118,17 @@ struct SessionMenu: View {
             }
 
             ForEach(store.hosts) { host in
-                if showsHosts && !matches(host).isEmpty {
+                // Hidden only when a *filter* is excluding this machine's
+                // sessions, never merely because it has none.
+                //
+                // The header is the only place `removeHost` and `reconnect`
+                // are reachable from, and a host with no sessions is precisely
+                // the one that needs them: a host that failed to connect has
+                // an empty list, so gating on emptiness made an unreachable
+                // `build-box` disappear from the dropdown while staying in
+                // `UserDefaults` — back on every launch and impossible to
+                // forget — and left a restarted local daemon with no retry.
+                if showsHosts && (filter.isEmpty || !matches(host).isEmpty) {
                     HostHeader(
                         host: host,
                         isHovered: hovered == "h\(host.id)",
