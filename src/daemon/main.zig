@@ -19,6 +19,8 @@ const usage =
     \\  --park-after <s>         PTY-read idle time before a terminal parks to disk (default: 60)
     \\  --pty-park-after <s>     Unobserved time before a PTY leaves its dedicated
     \\                           thread for the shared poller (default: 5)
+    \\  --client-park-after <s>  Quiet time before a client's pipeline buffers are
+    \\                           freed (default: 10)
     \\  --version                Print version and exit
     \\  --help                   Print this help and exit
     \\
@@ -38,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
     var socket_path: ?[]const u8 = null;
     var park_after_s: ?u64 = null;
     var pty_park_after_s: ?u64 = null;
+    var client_park_after_s: ?u64 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -77,6 +80,20 @@ pub fn main(init: std.process.Init) !void {
             };
             continue;
         }
+        if (std.mem.eql(u8, arg, "--client-park-after")) {
+            i += 1;
+            if (i >= args.len) {
+                try out.writeAll("error: --client-park-after needs a number of seconds\n");
+                try out.flush();
+                return error.InvalidArgs;
+            }
+            client_park_after_s = std.fmt.parseInt(u64, args[i], 10) catch {
+                try out.print("error: bad --client-park-after value '{s}'\n", .{args[i]});
+                try out.flush();
+                return error.InvalidArgs;
+            };
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--socket")) {
             i += 1;
             if (i >= args.len) {
@@ -107,6 +124,9 @@ pub fn main(init: std.process.Init) !void {
     }
     if (pty_park_after_s) |seconds| {
         server.park_config.pty_park_unobserved_after_ns = seconds * std.time.ns_per_s;
+    }
+    if (client_park_after_s) |seconds| {
+        server.park_config.client_park_after_ns = seconds * std.time.ns_per_s;
     }
     global_server = server;
 

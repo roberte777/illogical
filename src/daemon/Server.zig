@@ -143,6 +143,7 @@ pub fn listen(self: *Server) !void {
 pub fn maintenanceTick(self: *Server) void {
     self.retireExited();
     self.retireClients();
+    self.parkClientBuffers();
 
     // Copy the terminal list so the registry lock is not held across the work.
     var ids: std.ArrayList(session.TerminalId) = .empty;
@@ -343,6 +344,18 @@ fn retireClients(self: *Server) void {
 
     // Outside the lock: destroying joins threads that take it.
     for (retired.items) |c| c.destroy();
+}
+
+/// Free the pipeline buffers of clients that have gone quiet. Level 3 of
+/// docs/PARKING.md; the work itself is in `Client.parkBuffers`.
+///
+/// Under `clients_mutex`, which is only safe because `parkBuffers` never
+/// blocks: it sets a flag for the writer thread and tries the read lock. One
+/// busy connection must not hold up the tick for every other client.
+fn parkClientBuffers(self: *Server) void {
+    self.clients_mutex.lock();
+    defer self.clients_mutex.unlock();
+    for (self.clients.items) |c| c.parkBuffers(self.park_config);
 }
 
 pub fn removeClient(self: *Server, client: *Client) void {

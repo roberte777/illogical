@@ -147,13 +147,43 @@ Measured, Debug, M-series, `scripts/bench-pty.sh`:
 | Eight PTYs, same total | 10,111 ms | 20,051 ms | +98% |
 | Threads for 32 terminals | 38 | **7** | flat |
 
+It shows up in memory too, and by more than the fd accounting suggests. A
+parked terminal cost **356 KiB** before this and **192 KiB** after, same
+machine — the difference is the reader thread's touched stack, which a parked
+terminal no longer has.
+
 ### A4. Client buffer parking
 
-**Status: Adopt.** Milestone M4.
+**Status: Done.** Landed in M4.
 
 Per-client pipeline buffers are kilobyte-scale but multiply by client count. Free
 them once a client has been idle past its initial sync; reallocate on activity
 [MEM t=551].
+
+Two per connection: the queue F2 drains to the socket, and the frame body the
+reader fills. Both grow to the largest thing that connection ever carried and
+then hold it — a pane that streamed a build log keeps that queue capacity for as
+long as the window stays open.
+
+Each is freed by the thread that owns it, which is the only part with any
+subtlety to it. `parkBuffers` sets a flag and the *writer* frees the queue the
+next time it finds it empty; freeing it from the maintenance thread would mean
+freeing a buffer that is inside a `write` syscall. The read buffer goes under a
+`tryLock` the reader holds only between a frame's header and its dispatch — so
+an idle connection, which is one blocked waiting for its next header, is never
+holding it.
+
+Measured with `scripts/bench-memory.sh 20 10000 50`: 50 clients attached to a
+parked terminal, Debug, M-series.
+
+| | |
+| --- | --- |
+| Just after attach, snapshot still in the pipeline | 1091 KiB/client |
+| Idle, buffers parked | **180 KiB/client** |
+| Reclaimed | 83% |
+
+Still twice Superlogical's 85 KiB. What is left is not buffers — it is the two
+thread stacks a connection owns, which is A6's problem rather than this one's.
 
 ### A5. Scrollback page compression (LZ4, in memory)
 
