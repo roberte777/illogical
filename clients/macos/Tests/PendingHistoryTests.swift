@@ -85,7 +85,17 @@ final class PendingHistoryTests: XCTestCase {
     /// wrap a UInt64 into a scrollbar 18 quintillion rows tall.
     func testDeclaringLessThanIsResidentOwesNothing() throws {
         let engine = try TerminalEngine(cols: 80, rows: 24)
-        engine.write(Data(Array("hello\r\n".utf8)))
+        engine.write(Data(Array((0..<200).map { "line \($0)\r\n" }.joined().utf8)))
+
+        // Real scrollback, so `declared > resident` is actually false rather
+        // than the trivial 0 > 0. Without the rows above, this test passes
+        // whether or not the guard exists.
+        let resident = engine.scrollbar.total - engine.scrollbar.length
+        XCTAssertGreaterThan(resident, 1, "the fixture needs history to under-declare against")
+
+        engine.declarePendingHistory(rows: 1)
+        XCTAssertEqual(engine.scrollbar.pending, 0, "saturates, never wraps")
+
         engine.declarePendingHistory(rows: 0)
         XCTAssertEqual(engine.scrollbar.pending, 0)
     }
