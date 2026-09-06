@@ -179,11 +179,13 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// means a window that opens and closes remote panes walks to `EMFILE`, at
     /// which point even a local unix socket stops connecting.
     ///
-    /// The drain closure retains this handle too, and `Pipe` builds its
-    /// handles with `closeOnDealloc`, so the descriptor does come back on its
-    /// own once the drain ends. That is the safety net under `close`'s
-    /// timeout, not the mechanism: a finished drain is what makes closing here
-    /// *safe*, and closing here is what makes it *prompt*.
+    /// When `close`'s wait times out this descriptor is left alone, and what
+    /// eventually frees it is `closeOnDealloc` -- but on *this* object's
+    /// deallocation, not the drain's. Three things hold the handle: this
+    /// property, the `Pipe` reachable through `process.standardError`, and the
+    /// drain closure. So the bound is "when the caller lets go of the
+    /// transport", which for a failed one is as long as it wants to keep
+    /// reading `failureDescription`.
     private let stderrHandle: FileHandle
     private let shutdownFlag = ManagedAtomicFlag()
     private let closedFlag = ManagedAtomicFlag()
@@ -343,12 +345,15 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// How long the stderr drain gets to reach end-of-file before its
     /// descriptor is left to `closeOnDealloc`.
     ///
-    /// Long enough to be a process's exit rather than a thread's wakeup, which
-    /// is what it has to cover: `shutdown` only sends SIGTERM, and the case it
-    /// exists for is precisely a child that does not take it — `ssh` holding a
-    /// ControlPersist master, or anything with a `trap`. EOF on this pipe
-    /// needs every copy of its write end closed, so it waits on the child, not
-    /// on the reader.
+    /// This is a bound on how long `close` may block, not a prediction of when
+    /// the child dies -- and the difference matters, because it cannot be the
+    /// latter. EOF here needs every copy of the write end closed, so it waits
+    /// on the *process*; `shutdown` only sends SIGTERM; and the cases that
+    /// motivated the wait are a `ControlPersist` master (60s) and a child with
+    /// a `trap` (this suite's is 2s). One second covers neither, deliberately.
+    /// It buys the common case -- a child already gone, needing only the
+    /// drain's wakeup -- and gives up rather than hanging the caller for the
+    /// uncommon one.
     private static let drainGrace: TimeInterval = 1
 
     /// A pipe has no `shutdown(2)`, so the equivalent is to stop the thing on
@@ -373,12 +378,16 @@ public final class CommandTransport: Transport, @unchecked Sendable {
 
         // Stderr is ours to order, though: its drain thread is reading that
         // descriptor, and closing a `FileHandle` out from under a live
-        // `readDataUpToLength:` is not a soft failure. Foundation raises an
-        // ObjC exception on the *reading* thread, which `try?` cannot catch,
-        // and the process aborts. Making this unconditional takes the test
-        // bundle down with SIGABRT inside
-        // `-[NSConcreteFileHandle readDataUpToLength:error:]` -- so this wait
-        // is load-bearing, not a tidiness measure.
+        // `readDataUpToLength:` has two outcomes, both bad. If the number is
+        // still free the next read raises an ObjC exception on the *reading*
+        // thread, which no `try?` here can catch, and the process aborts --
+        // making this unconditional takes the test bundle down with SIGABRT
+        // inside `-[NSConcreteFileHandle readDataUpToLength:error:]`. If
+        // another pane's `Pipe` has taken the number first, the read simply
+        // succeeds and appends that pane's stderr to this one's diagnostics,
+        // which is the same fd-recycling hazard the whole shutdown/close split
+        // exists for. The loud one is what a test sees; the quiet one is what
+        // a user sees.
         //
         // Not a permanent leak when it times out: the drain closure holds the
         // last reference to a `Pipe` handle, which closes on dealloc, so the
@@ -433,6 +442,21 @@ public enum SSHCommand {
     /// that changed networks waits forever on a socket with nobody behind it.
     static let aliveInterval = "15"
     static let aliveCountMax = "3"
+    /// The same argument, for the connection that has not happened *yet*.
+    ///
+    /// `ServerAlive*` applies only once a session is up, so without this a
+    /// black-holed host sits in the TCP connect for the platform default --
+    /// about 75 seconds on macOS. Not merely slow: a host that has not
+    /// finished dialling is deliberately treated as "no news yet", which is
+    /// what stops an ordinary handshake flashing a failure screen, so those 75
+    /// seconds are spent showing nothing wrong at all -- while the message the
+    /// user may actually need, about some *other* host, is suppressed with it.
+    /// Ten seconds is far longer than a reachable host needs and short enough
+    /// to become a message.
+    ///
+    /// It does not bound every wait, and should not: a key on a hardware token
+    /// blocks until somebody touches it, and that is worth waiting for.
+    static let connectTimeout = "10"
     /// How long the multiplexing master lingers after the last connection, so
     /// closing a window and opening another does not re-authenticate.
     static let controlPersist = "60"
@@ -478,6 +502,7 @@ public enum SSHCommand {
             "-T",
             "-o", "ServerAliveInterval=\(aliveInterval)",
             "-o", "ServerAliveCountMax=\(aliveCountMax)",
+            "-o", "ConnectTimeout=\(connectTimeout)",
         ]
 
         if options.multiplex, let path = controlPath(options) {

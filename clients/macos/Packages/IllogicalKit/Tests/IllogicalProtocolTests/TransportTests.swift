@@ -52,6 +52,10 @@ struct SSHCommandTests {
         let args = argv()
         #expect(args.contains("ServerAliveInterval=15"))
         #expect(args.contains("ServerAliveCountMax=3"))
+        // And the one for the connection that has not happened yet: without it
+        // a black-holed host sits in the TCP connect for ~75s on macOS, which
+        // the client spends showing nothing wrong at all.
+        #expect(args.contains("ConnectTimeout=10"))
     }
 
     @Test("multiplexes, so a split costs a channel rather than a handshake")
@@ -61,14 +65,14 @@ struct SSHCommandTests {
         #expect(args.contains("ControlPath=/tmp/illogical-%C"))
         #expect(args.contains("ControlPersist=60"))
         // Every `-o` introduces exactly one option.
-        #expect(args.filter { $0 == "-o" }.count == 5)
+        #expect(args.filter { $0 == "-o" }.count == 6)
     }
 
     @Test("multiplexing can be turned off")
     func noMultiplexing() {
         let args = argv(multiplex: false)
         #expect(!args.contains("ControlMaster=auto"))
-        #expect(args.filter { $0 == "-o" }.count == 2)
+        #expect(args.filter { $0 == "-o" }.count == 3)
         #expect(args.suffix(4) == ["--", "build-box", "illogicald", "--stdio"])
     }
 
@@ -117,7 +121,14 @@ struct SSHCommandTests {
     }
 }
 
-@Suite("Transports")
+/// Serialized, because three of these hold a child process — and its three
+/// descriptors — across an `await`, and `noDescriptorLeak` counts descriptors
+/// *process-wide*. Run concurrently, a spawn landing inside its five-millisecond
+/// sampling window is a +3 it reads as a leak. Waiting the children out at the
+/// end of their own tests does not fix that: the descriptors are freed
+/// asynchronously when the child exits, so the overlap is with the spawn, not
+/// with the teardown.
+@Suite("Transports", .serialized)
 struct TransportTests {
     /// `cat` is the smallest thing that behaves like the far end of an SSH
     /// pipe: what goes in comes back, framed exactly as it was sent. The
@@ -191,7 +202,17 @@ struct TransportTests {
         transport.shutdown()
         transport.shutdown()
         transport.close()
+        // The second one must be a no-op rather than the same work again. It
+        // is not merely wasteful: the drain semaphore has already been
+        // consumed, so an unguarded second `close` waits out the whole
+        // `drainGrace` before giving up -- a second of it, per pane, on the
+        // main actor's teardown path.
+        let start = Date()
         transport.close()
+        #expect(
+            Date().timeIntervalSince(start) < 0.2,
+            "a second close did the work again")
+
         // Polled, like every other `isRunning` assertion in this file. `close`
         // used to spin on this itself, which is the only reason a bare read
         // was ever safe; it now waits on the stderr drain instead. EOF on that
@@ -377,13 +398,6 @@ struct TransportTests {
         connection.close()
         let elapsed = Date().timeIntervalSince(start)
         #expect(elapsed < 0.5, "close() blocked its caller for \(elapsed)s")
-
-        // The point of this test is that `close` returns before the child
-        // does, so on the way out it is still alive and holding three
-        // descriptors. This suite runs in parallel and `noDescriptorLeak`
-        // counts descriptors process-wide with a slack of two, so leaving them
-        // to expire in their own time hands that test a spurious +3.
-        for _ in 0..<300 where transport.isRunning { usleep(10_000) }
     }
 
     /// The message must survive the close that follows it. Closing used to

@@ -519,16 +519,23 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     const secret_fd = try sys.openAppend(secret.ptr);
     defer sys.closeFd(secret_fd);
 
-    // ...but the check below only discriminates for 2 < fd < 10, so skip
-    // rather than report the wrong thing. Above 9 the `/bin/sh` running the
-    // script has its own descriptor there: both dash and bash save a
+    // ...but placed into 3..9 rather than left where `open` put it, because
+    // the check below only discriminates there. Above 9 the `/bin/sh` running
+    // the script has its own descriptor in the way: both dash and bash save a
     // redirected fd with `F_DUPFD` from 10 upward for the length of a compound
-    // command, and the script's `> marker` and `2>/dev/null` are two of those
-    // -- so `: <&10` succeeds and the test reads LEAKED however well
-    // `closeFrom` worked. At or below 2, the grandchild's own stdio answers,
-    // which `detachStdio` has just pointed at /dev/null and the log. Neither
-    // is reachable in an ordinary run; both would be a false failure.
-    if (secret_fd < 3 or secret_fd > 9) return error.SkipZigTest;
+    // command, and the script's `> marker` and `2>/dev/null` are two of those,
+    // so `: <&10` succeeds and the test reads LEAKED however well `closeFrom`
+    // worked. At or below 2 the grandchild's own stdio answers, which
+    // `detachStdio` has just pointed at /dev/null and the log.
+    //
+    // A skip was the obvious answer and the wrong one: seven descriptors
+    // leaked into this binary by anything upstream would turn the only
+    // regression test for `closeFrom` into a silent pass, and `spawnDetached`
+    // could then lose its `closeFrom` call with the suite still green.
+    // `F_DUPFD` places it deterministically, and failing to is an error.
+    const placed = try sys.dupFrom(secret_fd, 3);
+    defer sys.closeFd(placed);
+    if (placed > 9) return error.NoRoomForSecretDescriptor;
 
     // Stands in for the daemon: slow enough to still be running when
     // `spawnDetached` returns, so the marker proves the grandchild survived
@@ -539,7 +546,7 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
         &script_buf,
         "sleep 0.2; echo DAEMON_COMPLAINT >&2; " ++
             "if : <&{d} 2>/dev/null; then echo LEAKED; else echo CLEAN; fi > {s}",
-        .{ secret_fd, marker },
+        .{ placed, marker },
     );
     const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", @ptrCast(script.ptr) };
 
