@@ -44,6 +44,7 @@ extern "c" fn fcntl(fd: fd_t, cmd: c_int, ...) c_int;
 extern "c" fn unlink(path: [*:0]const u8) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn pipe(fds: *[2]fd_t) c_int;
+extern "c" fn getdtablesize() c_int;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, size: usize) isize;
 extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
@@ -141,6 +142,30 @@ pub fn setCloexec(fd: fd_t) void {
     _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
+pub fn clearCloexec(fd: fd_t) void {
+    const flags = fcntl(fd, F_GETFD);
+    if (flags == -1) return;
+    _ = fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+}
+
+/// Close every descriptor from `lowest` upward.
+///
+/// For a forked child that is about to become a long-lived daemon: it inherits
+/// everything its parent had open that was not marked close-on-exec, and a
+/// daemon started by `illogicald --stdio` outlives the SSH session by days,
+/// handing each one on to every shell it ever spawns. `~/.ssh/rc` or an
+/// `authorized_keys command=` wrapper that opens a log or a credential file
+/// before exec'ing us is enough to leak one.
+///
+/// A loop rather than `closefrom`/`close_range`, which differ between macOS
+/// and Linux and by version. `close` is async-signal-safe, which is what makes
+/// this legal between `fork` and `exec`.
+pub fn closeFrom(lowest: fd_t) void {
+    var fd = lowest;
+    const limit = getdtablesize();
+    while (fd < limit) : (fd += 1) _ = close(fd);
+}
+
 /// Turn non-blocking mode on or off.
 ///
 /// A PTY toggles this as it migrates between IO regimes: blocking while a
@@ -172,6 +197,18 @@ const O_RDWR: c_int = 2;
 /// that the streams survive.
 pub fn openDevNull() Error!fd_t {
     const fd = open("/dev/null", O_RDWR);
+    if (fd < 0) return error.OpenFailed;
+    return fd;
+}
+
+const O_WRONLY: c_int = 1;
+const O_CREAT: c_int = if (builtin.os.tag == .linux) 0o100 else 0x0200;
+const O_APPEND: c_int = if (builtin.os.tag == .linux) 0o2000 else 0x0008;
+
+/// Open `path` for appending, creating it 0600. Not close-on-exec, for the
+/// same reason as `openDevNull`.
+pub fn openAppend(path: [*:0]const u8) Error!fd_t {
+    const fd = open(path, O_WRONLY | O_CREAT | O_APPEND, @as(c_uint, 0o600));
     if (fd < 0) return error.OpenFailed;
     return fd;
 }
@@ -321,10 +358,11 @@ pub const PipedChild = struct {
 /// diagnostics -- a bad host key, a missing binary -- reach a person instead of
 /// being decoded as frames.
 ///
-/// `pipeFds` marks both ends close-on-exec, which is what makes the child's
-/// side of this correct without any closing: `dup2` clears the flag on the
-/// descriptor it creates, so 0 and 1 survive the exec and the four originals do
-/// not.
+/// `pipeFds` marks both ends close-on-exec, so the four originals do not
+/// survive the exec. The two the child keeps are cleared explicitly below --
+/// `dup2` clears the flag on the descriptor it *creates*, but `dup2(fd, fd)` is
+/// a no-op and clears nothing, which is reachable whenever the caller was
+/// started without a standard stream and `pipe` handed back fd 0 or 1.
 pub fn spawnPiped(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) Error!PipedChild {
     const to_child = try pipeFds();
     errdefer {
@@ -342,6 +380,12 @@ pub fn spawnPiped(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) Error
         // Child. Nothing here may allocate or return.
         dup2Fd(to_child[0], STDIN);
         dup2Fd(from_child[1], STDOUT);
+        // Unconditional, and load-bearing when `dup2` above was a no-op: run
+        // `illogical --host …` with stdin closed and `pipe` hands back fd 0,
+        // so the child would exec with its stdin closed-on-exec and fail with
+        // "Bad file descriptor" -- reported as the *remote* being unreachable.
+        clearCloexec(STDIN);
+        clearCloexec(STDOUT);
         exec(file, argv);
         exitProcess(127);
     }

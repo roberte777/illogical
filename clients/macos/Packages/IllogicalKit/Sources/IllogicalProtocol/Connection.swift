@@ -108,13 +108,25 @@ public final class Connection: @unchecked Sendable {
         continuation.finish()
 
         // Only if a reader was ever started; `start()` is not mandatory.
+        var readerLeft = true
         if readerThread != nil {
             // Bounded: a child wedged in an uninterruptible read must not hang
-            // a window that is closing. Leaking a descriptor is the lesser
-            // failure, and `shutdown` has already made it inert.
-            _ = readerFinished.wait(timeout: .now() + 2)
+            // a window that is closing.
+            readerLeft = readerFinished.wait(timeout: .now() + 2) == .success
             readerThread = nil
         }
+
+        // And if it did *not* leave, the descriptors stay. Freeing them here
+        // would be the very bug this ordering exists to prevent: the number
+        // goes back to the kernel, the next connection is handed it, and the
+        // thread still parked in `read` starts consuming that connection's
+        // frames. A leaked descriptor is the lesser failure by a wide margin,
+        // and `shutdown` has already made this one inert.
+        //
+        // Reachable: an `ssh` wrapper that does not `exec`, so SIGTERM kills
+        // the wrapper while the real ssh keeps the inherited write end open
+        // and we never see end-of-file.
+        guard readerLeft else { return }
 
         // Under the write lock, so a `send` that was already inside it has
         // finished with the descriptor before the number goes back.

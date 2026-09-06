@@ -106,11 +106,12 @@ pub fn main(init: std.process.Init) !void {
     // there is no "remote mode", only a different transport.
     var conn = if (host) |dest| conn: {
         // `--socket` still means something remotely: it is the path the far
-        // side's bridge dials, on that machine. Left null it uses that
-        // machine's default rather than this one's.
+        // side's bridge dials, on that machine. Left unset it uses that
+        // machine's default rather than imposing this one's.
         const remote_argv = try (illogical.conn.Ssh{
             .destination = dest,
             .remote_binary = remote_bin,
+            .socket = socket_path,
             // For a second OpenSSH, and for the tests that stand something
             // else in its place.
             .ssh = sys.getenv("ILLOGICAL_SSH") orelse "ssh",
