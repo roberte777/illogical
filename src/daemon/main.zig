@@ -15,9 +15,12 @@ const usage =
     \\Usage: illogicald [options]
     \\
     \\Options:
-    \\  --socket <path>   Control socket (default: $XDG_STATE_HOME/illogical/server.sock)
-    \\  --version         Print version and exit
-    \\  --help            Print this help and exit
+    \\  --socket <path>          Control socket (default: $XDG_STATE_HOME/illogical/server.sock)
+    \\  --park-after <s>         PTY-read idle time before a terminal parks to disk (default: 60)
+    \\  --pty-park-after <s>     Unobserved time before a PTY leaves its dedicated
+    \\                           thread for the shared poller (default: 5)
+    \\  --version                Print version and exit
+    \\  --help                   Print this help and exit
     \\
 ;
 
@@ -34,6 +37,7 @@ pub fn main(init: std.process.Init) !void {
 
     var socket_path: ?[]const u8 = null;
     var park_after_s: ?u64 = null;
+    var pty_park_after_s: ?u64 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -54,6 +58,20 @@ pub fn main(init: std.process.Init) !void {
             }
             park_after_s = std.fmt.parseInt(u64, args[i], 10) catch {
                 try out.print("error: bad --park-after value '{s}'\n", .{args[i]});
+                try out.flush();
+                return error.InvalidArgs;
+            };
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pty-park-after")) {
+            i += 1;
+            if (i >= args.len) {
+                try out.writeAll("error: --pty-park-after needs a number of seconds\n");
+                try out.flush();
+                return error.InvalidArgs;
+            }
+            pty_park_after_s = std.fmt.parseInt(u64, args[i], 10) catch {
+                try out.print("error: bad --pty-park-after value '{s}'\n", .{args[i]});
                 try out.flush();
                 return error.InvalidArgs;
             };
@@ -87,6 +105,9 @@ pub fn main(init: std.process.Init) !void {
     if (park_after_s) |seconds| {
         server.park_config.park_after_ns = seconds * std.time.ns_per_s;
     }
+    if (pty_park_after_s) |seconds| {
+        server.park_config.pty_park_unobserved_after_ns = seconds * std.time.ns_per_s;
+    }
     global_server = server;
 
     // A client disconnecting mid-write must not take the daemon down.
@@ -107,8 +128,13 @@ pub fn main(init: std.process.Init) !void {
 
     try server.listen();
     try out.print(
-        "illogicald {s} listening on {s} (park after {d}s)\n",
-        .{ illogical.version, path, server.park_config.park_after_ns / std.time.ns_per_s },
+        "illogicald {s} listening on {s} (park after {d}s, {d} poller threads)\n",
+        .{
+            illogical.version,
+            path,
+            server.park_config.park_after_ns / std.time.ns_per_s,
+            server.pty_poller.threadCount(),
+        },
     );
     try out.flush();
 

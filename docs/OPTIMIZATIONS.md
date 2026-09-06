@@ -68,7 +68,7 @@ for attach, and it falls out for free if you do not.
 
 ### A3. PTY parking — migrate fds between a thread and a poller
 
-**Status: Adopt.** Milestone M1 (thread-per-PTY) and M4 (migration).
+**Status: Done.** Thread-per-PTY landed in M1, migration in M4.
 
 Counter-intuitive and load-bearing:
 
@@ -92,8 +92,60 @@ judging it" [MEM t=504].
 
 > **This invalidates the obvious design.** Our first architecture draft had a
 > single libxev loop owning every PTY. That is exactly the configuration
-> Mitchell says he measured and rejected. libxev is still the right tool for the
-> *parked* poller and for the control socket; it must not be the hot path.
+> Mitchell says he measured and rejected. An event loop is still the right tool
+> for the *parked* poller and for the control socket; it must not be the hot
+> path.
+
+The awkward part is not deciding to migrate, it is getting the descriptor back.
+A hot reader is *inside* `read()`, and the obvious wake — close the descriptor —
+is both wrong (it is about to be handed to the poller, not thrown away) and
+broken: on macOS `close` does not return while another thread holds that same
+descriptor in a blocking call, so the two wait on each other in the kernel. That
+was issue #28, and it is why `illogicald` would not shut down while any terminal
+had a quiet child.
+
+The read is **interrupted** instead, by a signal whose handler does nothing at
+all. `EINTR` comes back, the loop checks why it was woken, and returns leaving
+the descriptor open with every byte still queued behind it. The signal is sent
+repeatedly rather than once, because delivery only interrupts whichever syscall
+the thread is in at that instant — one that lands while it is writing a query
+response back to the PTY is absorbed by that write's own retry.
+
+Nothing is dropped at a handover. The poller is level-triggered, so bytes that
+arrived while the descriptor was in flight are reported the moment it is
+registered; the reverse handover is a `read` on a descriptor the kernel has been
+filling all along.
+
+Two consequences worth stating:
+
+- **The hysteresis is one-sided.** Promotion happens on attach, synchronously,
+  in the same call that subscribes the client. Demotion waits out
+  `pty_park_unobserved_after`. Someone clicking between tabs must not spawn and
+  join a thread each time, and the side a person can feel is promotion.
+- **A parked terminal's child still gets reaped.** The poller thread is shared,
+  so it cannot sit in `waitpid`; it flags the hangup and the maintenance tick
+  collects it within a tick. Nobody is watching a polled terminal by definition.
+
+`illogical list` grew a `PTY` column reading `hot` or `polled`. "How many
+terminals still cost a thread" is the question this optimization exists to
+answer, and it should not need a debugger.
+
+**The poller is a small pool, not one thread**, and that was measured rather
+than assumed. The work a wake-up triggers is the VT parse, not the `read`, so
+one thread serialises it: eight busy terminals ran **7.8× slower** than eight
+dedicated readers, which is not a 5-10% trade, it is one core's worth of
+throughput. Four threads bring the same case to 2×, exactly `terminals / pool`.
+Thread count stays a constant either way, which is the property that matters —
+and above the core count the pool is the *better* regime anyway, since ten
+thousand runnable threads is worse than a bounded pool whatever the fd cost.
+
+Measured, Debug, M-series, `scripts/bench-pty.sh`:
+
+| | hot | polled | |
+| --- | --- | --- | --- |
+| One PTY, 100,000 lines | 999 ms | 1001 ms | +0.2% |
+| Eight PTYs, same total | 10,111 ms | 20,051 ms | +98% |
+| Threads for 32 terminals | 38 | **7** | flat |
 
 ### A4. Client buffer parking
 

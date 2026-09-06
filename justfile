@@ -44,6 +44,11 @@ fmt-check:
 bench-memory count="20" lines="10000": build
     ./scripts/bench-memory.sh {{count}} {{lines}}
 
+# What the two PTY IO regimes cost: throughput hot vs polled, and thread count
+# against terminal count, which must flatten rather than track.
+bench-pty lines="100000" count="32" repeats="3": build
+    ./scripts/bench-pty.sh {{lines}} {{count}} {{repeats}}
+
 # --- macOS client -----------------------------------------------------------
 
 # Build ghostty-vt.xcframework from vendor/ghostty and stage it for the client.

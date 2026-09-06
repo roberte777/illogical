@@ -188,13 +188,80 @@ The PTY file descriptor moves between two IO regimes. Full rationale in
 | Cost | kernel thread + stack | one fd registration |
 
 **Migrate to parked** when the terminal parks, or when no client is observing it.
-**Migrate to hot** when a client attaches to a live terminal producing output.
+**Migrate to hot** when a client attaches.
 
 > "that 5 to 10% speed isn't going to matter as much when a human isn't judging
 > it" — [MEM t=520]
 
 The hysteresis matters: a client that attaches and detaches repeatedly must not
-thrash threads. Migrate to hot on attach; migrate back on a delay.
+thrash threads. Promotion happens on attach, in the same call that subscribes
+the client; demotion waits out `pty_park_unobserved_after`. The asymmetry is the
+point — the side a person can feel is promotion.
+
+Note what does *not* appear in the rule: PTY-read idleness. A busy terminal
+nobody is watching still belongs in the poller. Ten thousand unwatched build
+logs should be ten thousand registrations, not ten thousand threads, which is
+why this is a separate decision from level 1's.
+
+### How a descriptor is taken back
+
+A hot reader is *inside* `read()`. The obvious way to wake it — close the
+descriptor — is both wrong and broken. Wrong because the descriptor is being
+handed to the poller, not discarded. Broken because on macOS `close` does not
+return while another thread holds that same descriptor in a blocking call, so
+the two wait on each other in the kernel: that was issue #28, and it is why the
+daemon would not shut down while any terminal had a quiet child.
+
+The read is interrupted instead, by a signal (`SIGUSR2`) whose handler does
+nothing at all. `EINTR` comes back, the loop asks why it was woken and returns,
+leaving the descriptor open with every queued byte still behind it. It is
+signalled repeatedly rather than once, because delivery only interrupts whatever
+syscall the thread is in at that instant — a signal arriving while it writes a
+query response back to the PTY is absorbed by that write's own retry.
+
+No byte is lost at a handover in either direction. The poller is
+level-triggered, so whatever arrived while the descriptor was in flight is
+reported as soon as it is registered; going the other way, the new thread's
+first `read` returns what the kernel buffered all along.
+
+### Reaping a polled child
+
+A `waitpid` on the poller thread would stall every parked terminal on the
+machine behind one child that closed its descriptors without exiting. So the
+poller flags the hangup and the maintenance tick reaps it, within a tick.
+Nobody is watching a polled terminal by definition, so nobody can see the delay.
+
+### What it costs
+
+`illogical list` has a `PTY` column: `hot` for a dedicated thread, `polled` for
+one registration in the shared poller. `scripts/bench-pty.sh 100000 32 3`,
+Debug build, M-series, 14 cores, median of 3:
+
+| | hot | polled | |
+| --- | --- | --- | --- |
+| One PTY, 100,000 lines | 999 ms | 1001 ms | **+0.2%** |
+| Eight PTYs at once, same total | 10,111 ms | 20,051 ms | **+98%** |
+| Threads, no terminals | 7 | 7 | |
+| Threads, 32 terminals | 38 | **7** | |
+
+The last row is the point of the whole optimization and it is exactly flat:
+thirty-two unwatched terminals cost the same seven threads as none.
+
+The two throughput rows want reading together. Alone, a polled PTY costs
+nothing measurable — well inside the 5-10% [MEM t=504] describes. Eight at once
+cost twice as much, and the reason is not the poller: it is that the work a
+wake-up triggers is the *VT parse*, not the `read`, and the pool has four
+threads to do it on where eight terminals had eight. The cost is
+`terminals / pool`, and it lands on terminals nobody is watching by definition.
+
+The pool is why it is 2x and not 8x — see `src/core/poller.zig`. One thread was
+the first shape and it pinned every unwatched terminal on the machine to a
+single core.
+
+⚠ Read the "eight at once" row carefully, because it is not only about regimes.
+Eight terminals sharing 100,000 lines take **ten times** as long as one terminal
+doing all of them, in *both* regimes and on the branch before this one. That is
+a separate scaling problem in the daemon and it is not measured here.
 
 ---
 

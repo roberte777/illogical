@@ -118,18 +118,23 @@ fn cmdList(conn: *Conn, arena: std.mem.Allocator, out: *Io.Writer) !void {
         return;
     }
 
-    try out.print("{s:<5} {s:<12} {s:<12} {s:<12} {s:>8} {s:>7}\n", .{
-        "ID", "SESSION", "NAME", "RESIDENCY", "ATTACHED", "IDLE",
+    // `PTY` is the IO regime: `hot` means this terminal owns an OS thread
+    // blocked on `read()`, `polled` means its descriptor is one of many in the
+    // server's shared poller. Worth showing, because "how many terminals still
+    // cost a thread" is the question A3 exists to answer.
+    try out.print("{s:<5} {s:<12} {s:<12} {s:<12} {s:<8} {s:>8} {s:>7}\n", .{
+        "ID", "SESSION", "NAME", "RESIDENCY", "PTY", "ATTACHED", "IDLE",
     });
     for (list.terminals) |t| {
         const session_name = for (list.sessions) |s| {
             if (s.id == t.session) break s.name;
         } else "?";
-        try out.print("{d:<5} {s:<12} {s:<12} {s:<12} {d:>8} {d:>6}s\n", .{
+        try out.print("{d:<5} {s:<12} {s:<12} {s:<12} {s:<8} {d:>8} {d:>6}s\n", .{
             t.id,
             session_name,
             t.name,
             t.residency,
+            t.regime,
             t.attached,
             t.pty_read_idle_ns / std.time.ns_per_s,
         });

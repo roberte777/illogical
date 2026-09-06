@@ -54,6 +54,22 @@ pub const Subscriber = struct {
     }
 };
 
+/// Where this terminal's PTY master is being read, and by what.
+///
+/// The two regimes are not an implementation detail, they are the shape of the
+/// server's IO. A hot PTY owns a whole OS thread because that is measurably
+/// the fastest way to move bytes; a parked one is a descriptor registration in
+/// a poller shared by every other parked PTY, which is ~5-10% slower and costs
+/// a rounding error. See docs/ARCHITECTURE.md and docs/OPTIMIZATIONS.md A3.
+pub const Regime = enum {
+    /// A dedicated OS thread blocked on `read()`.
+    hot,
+    /// A descriptor in the server's shared poller.
+    polled,
+    /// Nothing is reading it.
+    stopped,
+};
+
 gpa: Allocator,
 io: std.Io,
 /// Where this terminal's snapshot lives when parked.
@@ -90,15 +106,41 @@ exit_code: ?i32 = null,
 /// Monotonic timestamp of the last PTY *read*. This — not general activity —
 /// is what drives parking. See docs/PARKING.md.
 last_read_ns: u64,
+/// Monotonic timestamp at which the last subscriber went away, or zero while
+/// one is attached. Drives the demotion delay in `park.ptyRegime`. Guarded by
+/// `mutex`, like the list it is derived from.
+unobserved_since_ns: u64,
 
 subscribers: std.ArrayList(Subscriber) = .empty,
 
+// -- the PTY's IO regime ---------------------------------------------------
+//
+// See `Regime` and docs/OPTIMIZATIONS.md A3.
+
+/// Guards `regime` and whatever backs it -- the reader thread, or the
+/// registration in the shared poller.
+///
+/// Always taken *outside* `mutex`: leaving the hot regime joins a thread that
+/// takes `mutex`, so a caller holding it would wait on itself.
+regime_mutex: illogical.thread.Mutex = .{},
+regime: Regime = .stopped,
+/// The server's shared poller. Null in tests and anywhere else with no server,
+/// where a terminal can only ever be hot.
+poller: ?*illogical.poller.Poller = null,
 thread: ?std.Thread = null,
-running: std.atomic.Value(bool) = .init(false),
-/// Set once the reader thread has finished and the child has been reaped, so
-/// the server can retire this terminal. The reader thread cannot destroy its
-/// own terminal -- that would join itself -- so retiring happens on the
-/// maintenance tick.
+/// Asks the reader thread to return without reaping the child.
+reader_stop: std.atomic.Value(bool) = .init(false),
+/// Set by the reader thread as it leaves, so `stopReaderLocked` knows when to
+/// stop signalling it.
+reader_done: std.atomic.Value(bool) = .init(false),
+/// The PTY hung up while polled. `collectExit` reaps it on the next tick.
+exit_pending: std.atomic.Value(bool) = .init(false),
+/// The exit has been reported. Both regimes can notice a hangup, and
+/// subscribers must hear about it exactly once.
+exit_reported: std.atomic.Value(bool) = .init(false),
+/// Set once the child has been reaped and the exit reported, so the server can
+/// retire this terminal. The reader thread cannot destroy its own terminal --
+/// that would join itself -- so retiring happens on the maintenance tick.
 finished: std.atomic.Value(bool) = .init(false),
 
 pub const SpawnOptions = struct {
@@ -113,9 +155,19 @@ pub const SpawnOptions = struct {
     cols: u16 = 80,
     rows: u16 = 24,
     max_scrollback_bytes: ?usize = 50 * 1024 * 1024,
+    /// The server's shared poller. Without one this terminal is always hot,
+    /// which is what every test that does not care about regimes wants.
+    poller: ?*illogical.poller.Poller = null,
 };
 
 pub fn create(gpa: Allocator, opts: SpawnOptions) !*Terminal {
+    // Here rather than in `Server.init`, because this is the precondition:
+    // every terminal has a reader thread that may need interrupting, and
+    // nothing guarantees a `Server` was involved in making one. Unhandled,
+    // that signal's default disposition ends the process -- which is exactly
+    // what it did to five tests that build terminals directly.
+    sys.installThreadInterrupt();
+
     const self = try gpa.create(Terminal);
     errdefer gpa.destroy(self);
 
@@ -147,6 +199,10 @@ pub fn create(gpa: Allocator, opts: SpawnOptions) !*Terminal {
         .cols = opts.cols,
         .rows = opts.rows,
         .last_read_ns = sys.monotonicNs(),
+        // Nobody is watching a terminal that has just been created, and the
+        // clock starts now rather than at the first `unsubscribe`.
+        .unobserved_since_ns = sys.monotonicNs(),
+        .poller = opts.poller,
     };
 
     self.vt = try .init(self.tiny_io.io(), gpa, .{
@@ -206,8 +262,12 @@ fn spawnChild(self: *Terminal, opts: SpawnOptions) !sys.pid_t {
 }
 
 pub fn destroy(self: *Terminal) void {
-    self.stop();
-    if (!self.finished.load(.acquire)) self.pty_pair.deinit();
+    self.stopIo();
+    // Exactly once, and only now that nothing is reading it. This used to be
+    // two closes on most paths -- `stop` closed the master to wake the reader,
+    // then `deinit` closed it again -- which on a busy daemon is a close of
+    // whatever unrelated descriptor had taken the number in between.
+    self.pty_pair.deinit();
     self.mutex.lock();
     if (self.stream) |*stream| stream.deinit();
     if (self.vt) |*vt| vt.deinit(self.gpa);
@@ -221,49 +281,209 @@ pub fn destroy(self: *Terminal) void {
     self.gpa.destroy(self);
 }
 
-/// Start the dedicated reader thread. See docs/OPTIMIZATIONS.md A3.
+/// Start reading the PTY, hot: a thread of its own, blocked on `read()`.
 pub fn start(self: *Terminal) !void {
-    if (self.running.load(.acquire)) return;
-    self.running.store(true, .release);
-    self.thread = try std.Thread.spawn(.{}, readLoop, .{self});
+    self.regime_mutex.lock();
+    defer self.regime_mutex.unlock();
+    try self.setRegimeLocked(.hot);
 }
 
-pub fn stop(self: *Terminal) void {
-    if (self.running.swap(false, .acq_rel)) {
-        // Closing the master makes the blocking read return. Only do this if
-        // we were still running; a terminal whose child already exited has
-        // closed it in the reader thread.
-        sys.closeFd(self.pty_pair.master);
+/// Stop reading the PTY. Leaves the descriptor open for its owner to close.
+pub fn stopIo(self: *Terminal) void {
+    self.setRegime(.stopped);
+}
+
+pub fn currentRegime(self: *Terminal) Regime {
+    self.regime_mutex.lock();
+    defer self.regime_mutex.unlock();
+    return self.regime;
+}
+
+/// A client just attached: give this PTY a thread back, now rather than on the
+/// next maintenance tick. This is the promotion half of A3's hysteresis, and
+/// the reason it is asymmetric -- the side a person can feel is this one.
+///
+/// Except while parked, where the descriptor belongs in the poller whoever is
+/// watching: there is no terminal in memory for a thread to feed, the attach
+/// was served from disk, and promoting here would only have the next tick
+/// demote it again 250 ms later.
+///
+/// Must not be called holding `mutex`; see `setRegime`.
+pub fn observed(self: *Terminal) void {
+    self.mutex.lock();
+    const parked = self.residency == .parked;
+    self.mutex.unlock();
+    if (parked) return;
+    self.setRegime(.hot);
+}
+
+/// Move this terminal's PTY into `want`.
+///
+/// **Never call this holding `mutex`.** Leaving the hot regime joins the
+/// reader thread, and that thread takes `mutex` on every chunk it reads.
+pub fn setRegime(self: *Terminal, want: Regime) void {
+    self.regime_mutex.lock();
+    defer self.regime_mutex.unlock();
+    self.setRegimeLocked(want) catch |err| {
+        log.warn("terminal {d}: cannot move pty to {t}: {t}", .{ self.id, want, err });
+        // A terminal nobody is reading is a terminal that has silently
+        // stopped working, so fall back to the regime that needs nothing but
+        // a thread. Costs a thread; the alternative loses the session.
+        if (want != .hot) self.setRegimeLocked(.hot) catch {};
+    };
+}
+
+fn setRegimeLocked(self: *Terminal, want: Regime) !void {
+    if (self.regime == want) return;
+    // Nothing left to read. Stopping is still allowed -- `destroy` needs it.
+    if (want != .stopped and self.finished.load(.acquire)) return;
+
+    // Leave the current regime first: the descriptor belongs to exactly one.
+    switch (self.regime) {
+        .hot => self.stopReaderLocked(),
+        .polled => if (self.poller) |p| p.remove(self.pty_pair.master),
+        .stopped => {},
     }
-    if (self.thread) |t| {
-        t.join();
-        self.thread = null;
+    self.regime = .stopped;
+
+    switch (want) {
+        .stopped => {},
+        .hot => {
+            sys.setNonblock(self.pty_pair.master, false);
+            self.reader_stop.store(false, .release);
+            self.reader_done.store(false, .release);
+            self.thread = try std.Thread.spawn(.{}, readLoop, .{self});
+            self.regime = .hot;
+        },
+        .polled => {
+            const p = self.poller orelse return error.NoPoller;
+            // Non-blocking, because the thread on the other side of this is
+            // shared with every other parked terminal. A wake that turns out
+            // to have nothing behind it must not park that thread here.
+            sys.setNonblock(self.pty_pair.master, true);
+            errdefer sys.setNonblock(self.pty_pair.master, false);
+            try p.add(self.pty_pair.master, .{ .ctx = self, .readableFn = pollReadable });
+            self.regime = .polled;
+        },
     }
 }
+
+/// Bring the reader thread out of its blocking `read` and join it.
+///
+/// It is interrupted, not closed out. Closing is exactly what this must not
+/// do -- the descriptor is about to be handed to the poller -- and on macOS
+/// `close` does not return while another thread is blocked on the same
+/// descriptor anyway, which is issue #28: the daemon hung on shutdown with the
+/// two threads waiting on each other inside the kernel.
+///
+/// Signalled in a loop because delivery only interrupts whatever syscall the
+/// thread is in at that instant. A signal that lands while it is writing a
+/// query response back to the PTY is absorbed by that write's own retry and
+/// the thread goes straight back to sleep. Retrying costs nothing and ends on
+/// the first signal that finds it blocked in the read.
+fn stopReaderLocked(self: *Terminal) void {
+    const t = self.thread orelse return;
+    self.reader_stop.store(true, .release);
+
+    // Not bounded, because giving up would be worse than waiting: a thread
+    // that happened to be busy when the last signal arrived goes straight back
+    // to sleep in `read`, and if nothing wakes it again the join below never
+    // returns.
+    //
+    // Backed off instead. The common case -- a thread already parked in
+    // `read` -- ends on the first signal. Past that the thread is doing
+    // something else, and something else is exactly what a signal should not
+    // be interrupting fifty times a second: a burst of them lands inside the
+    // file reads of an unpark, which retry, but need not have been disturbed.
+    var attempts: usize = 0;
+    while (!self.reader_done.load(.acquire)) : (attempts += 1) {
+        sys.interruptThread(t.getHandle());
+        sys.sleepNs(if (attempts < interrupt_burst)
+            std.time.ns_per_ms
+        else
+            20 * std.time.ns_per_ms);
+    }
+
+    t.join();
+    self.thread = null;
+}
+
+/// Signals sent a millisecond apart before backing off to 50 Hz. Twenty is far
+/// more than a thread blocked in `read` ever needs.
+const interrupt_burst = 20;
 
 fn readLoop(self: *Terminal) void {
-    var buf: [read_buf_size]u8 = undefined;
-    while (self.running.load(.acquire)) {
-        const n = sys.readFd(self.pty_pair.master, &buf) catch break;
-        if (n == 0) break;
-        const bytes = buf[0..n];
+    defer self.reader_done.store(true, .release);
 
-        // Applying to our state and fanning out happen under one lock, so
-        // that `attach` can insert itself at an exact point in the byte stream
-        // and no client can miss or double-apply a chunk.
-        self.mutex.lock();
-        // A read is exactly what unparks a terminal. Do it before applying,
-        // or the bytes that woke us would be dropped on the floor.
-        if (self.residency == .parked) {
-            self.unparkLocked() catch |err|
-                log.err("terminal {d} failed to unpark: {t}", .{ self.id, err });
+    var buf: [read_buf_size]u8 = undefined;
+    var hung_up = false;
+    while (true) {
+        const n = sys.readFdOnce(self.pty_pair.master, &buf) catch |err| switch (err) {
+            // A signal, which here means one thing: somebody wants this
+            // descriptor back. Anything else is the child going away.
+            error.Interrupted => {
+                if (self.reader_stop.load(.acquire)) break;
+                continue;
+            },
+            // Only reachable if the descriptor was left non-blocking, which
+            // it is not in this regime. Treat it as spurious rather than as
+            // a hangup.
+            error.WouldBlock => continue,
+            else => {
+                hung_up = true;
+                break;
+            },
+        };
+        if (n == 0) {
+            hung_up = true;
+            break;
         }
-        if (self.stream) |*stream| stream.nextSlice(bytes);
-        self.last_read_ns = sys.monotonicNs();
-        self.fanOutLocked(bytes);
-        self.mutex.unlock();
+        self.ingest(buf[0..n]);
     }
-    self.reap();
+
+    if (hung_up) self.reap();
+}
+
+/// The shared poller has bytes for us.
+///
+/// One read per wake, not a drain loop: the poller is level-triggered, so
+/// whatever is left behind is reported again on the next turn, and draining
+/// here would let one busy terminal hold the thread that every other parked
+/// terminal is sharing.
+fn pollReadable(ctx: *anyopaque) bool {
+    const self: *Terminal = @ptrCast(@alignCast(ctx));
+    var buf: [read_buf_size]u8 = undefined;
+    const n = sys.readFdOnce(self.pty_pair.master, &buf) catch |err| switch (err) {
+        error.WouldBlock, error.Interrupted => return true,
+        else => {
+            self.exit_pending.store(true, .release);
+            return false;
+        },
+    };
+    if (n == 0) {
+        self.exit_pending.store(true, .release);
+        return false;
+    }
+    self.ingest(buf[0..n]);
+    return true;
+}
+
+/// Apply one chunk of PTY output and tee it to every subscriber.
+///
+/// Both under one lock, so that `attach` can insert itself at an exact point
+/// in the byte stream and no client can miss or double-apply a chunk.
+fn ingest(self: *Terminal, bytes: []const u8) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    // A read is exactly what unparks a terminal. Do it before applying, or
+    // the bytes that woke us would be dropped on the floor.
+    if (self.residency == .parked) {
+        self.unparkLocked() catch |err|
+            log.err("terminal {d} failed to unpark: {t}", .{ self.id, err });
+    }
+    if (self.stream) |*stream| stream.nextSlice(bytes);
+    self.last_read_ns = sys.monotonicNs();
+    self.fanOutLocked(bytes);
 }
 
 /// The exact same bytes, to everyone. No re-encoding. (G2)
@@ -284,10 +504,71 @@ fn fanOutLocked(self: *Terminal, bytes: []const u8) void {
         // mid-fan-out would skip whoever was moved into this slot.
         _ = self.subscribers.orderedRemove(i);
     }
+    self.noteObservationLocked();
 }
 
+/// Restart or clear the "nobody is watching" clock. Called under `mutex`
+/// wherever the subscriber list changes.
+fn noteObservationLocked(self: *Terminal) void {
+    const watched = self.subscribers.items.len > 0;
+    if (watched) {
+        self.unobserved_since_ns = 0;
+    } else if (self.unobserved_since_ns == 0) {
+        self.unobserved_since_ns = sys.monotonicNs();
+    }
+}
+
+/// How long nobody has been watching, in nanoseconds. Zero while a client is
+/// attached. Drives the demotion delay in `park.ptyRegime`.
+pub fn unobservedNs(self: *Terminal) u64 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    if (self.unobserved_since_ns == 0) return 0;
+    const now = sys.monotonicNs();
+    return if (now > self.unobserved_since_ns) now - self.unobserved_since_ns else 0;
+}
+
+/// Wait for the child and report its exit. Blocks, so this only ever runs on
+/// the terminal's own reader thread, which is about to end anyway.
 fn reap(self: *Terminal) void {
-    const code = sys.wait(self.child);
+    self.finishExit(sys.wait(self.child));
+}
+
+/// Reap a child whose PTY hung up while it was in the shared poller.
+///
+/// The poller thread cannot do this itself: `waitpid` blocks, and that thread
+/// is shared by every parked terminal on the machine, so one child that closed
+/// its descriptors without exiting would stop the rest from being watched at
+/// all. It flags the hangup instead and the maintenance tick collects it,
+/// within a tick. Nobody is watching a polled terminal by definition, so the
+/// delay is not something anyone can see.
+pub fn collectExit(self: *Terminal) void {
+    if (!self.exit_pending.load(.acquire)) return;
+    switch (sys.tryWait(self.child)) {
+        // Hung up but still alive. Ask again next tick.
+        .running => return,
+        .exited => |code| {
+            self.exit_pending.store(false, .release);
+            self.finishExit(code);
+        },
+        // Already reaped, by a reader thread that had the descriptor before
+        // it was polled. `finishExit` is idempotent, so this just tidies up.
+        .gone => {
+            self.exit_pending.store(false, .release);
+            self.finishExit(0);
+        },
+    }
+
+    self.regime_mutex.lock();
+    defer self.regime_mutex.unlock();
+    // The poller dropped the registration when the handler returned false.
+    if (self.regime == .polled) self.regime = .stopped;
+}
+
+/// Record the child's exit and tell everyone watching. At most once: both
+/// regimes can notice the same hangup, and a subscriber must not be told twice.
+fn finishExit(self: *Terminal, code: i32) void {
+    if (self.exit_reported.swap(true, .acq_rel)) return;
     {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -297,7 +578,6 @@ fn reap(self: *Terminal) void {
     }
     // Last, so the server never sees `finished` before the exit has been
     // reported to everyone watching.
-    self.running.store(false, .release);
     self.finished.store(true, .release);
 }
 
@@ -318,6 +598,7 @@ pub fn attach(self: *Terminal, sub: Subscriber, snapshot_writer: *std.Io.Writer)
     // byte in two `output` frames, doubling every character it renders.
     self.removeSubscriberLocked(sub.ctx);
     try self.subscribers.append(self.gpa, sub);
+    self.noteObservationLocked();
     errdefer self.removeSubscriberLocked(sub.ctx);
 
     // A parked terminal is served from disk and stays parked (docs/PARKING.md).
@@ -336,6 +617,7 @@ pub fn subscribe(self: *Terminal, sub: Subscriber) !void {
     self.mutex.lock();
     defer self.mutex.unlock();
     try self.subscribers.append(self.gpa, sub);
+    self.noteObservationLocked();
 }
 
 pub fn unsubscribe(self: *Terminal, ctx: *anyopaque) void {
@@ -353,6 +635,7 @@ fn removeSubscriberLocked(self: *Terminal, ctx: *anyopaque) void {
         }
         i += 1;
     }
+    self.noteObservationLocked();
 }
 
 pub fn attachedCount(self: *Terminal) u32 {
@@ -459,6 +742,7 @@ pub fn summary(self: *Terminal) session.TerminalSummary {
         .cols = cols,
         .rows = rows,
         .residency = residency,
+        .regime = @tagName(self.currentRegime()),
         .attached = self.attachedCount(),
         .pty_read_idle_ns = self.ptyReadIdleNs(),
         .exit_code = exit_code,
@@ -809,6 +1093,309 @@ fn sizeEffect(h: *ghostty.TerminalStream.Handler) ?ghostty.size_report.Size {
 }
 
 // -- tests -----------------------------------------------------------------
+
+/// A subscriber that counts chunks. One call means one PTY read reached the
+/// fan-out, which is how these tests tell "something is reading this
+/// descriptor" from "something is registered to".
+const Ticks = struct {
+    mutex: illogical.thread.Mutex = .{},
+    n: usize = 0,
+
+    fn subscriber(self: *Ticks) Subscriber {
+        return .{ .ctx = self, .writeFn = write, .exitFn = exited };
+    }
+
+    fn write(ctx: *anyopaque, _: session.TerminalId, _: []const u8) bool {
+        const self: *Ticks = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.n += 1;
+        return true;
+    }
+
+    fn exited(_: *anyopaque, _: session.TerminalId, _: i32) void {}
+
+    fn count(self: *Ticks) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.n;
+    }
+
+    /// Wait for the count to move past `from`. False on timeout.
+    fn advancedPast(self: *Ticks, from: usize) bool {
+        var waited: usize = 0;
+        while (waited < 5000) : (waited += 10) {
+            if (self.count() > from) return true;
+            sys.sleepNs(10 * std.time.ns_per_ms);
+        }
+        return false;
+    }
+};
+
+/// A child that keeps producing output forever, slowly enough not to swamp
+/// anything. `stdbuf` is not available everywhere, so the newline does the
+/// flushing.
+const ticker_argv = [_][]const u8{
+    "/bin/sh",                                                                   "-c",
+    "i=0; while :; do i=$((i+1)); printf 'TICK %d\\n' \"$i\"; sleep 0.05; done",
+};
+
+test "a pty migrates between a dedicated thread and the shared poller" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var poller: illogical.poller.Poller = try .init(gpa);
+    defer poller.deinit();
+    try poller.start();
+
+    const t = try Terminal.create(gpa, .{
+        .io = threaded.io(),
+        .store = .{ .root = "/tmp/illogical-unused" },
+        .id = 1,
+        .session_id = 1,
+        .name = "migrate",
+        .argv = &ticker_argv,
+        .poller = &poller,
+    });
+    defer t.destroy();
+    defer t.hangup();
+
+    var ticks: Ticks = .{};
+    try t.subscribe(ticks.subscriber());
+    try t.start();
+
+    // Hot: a thread of its own, nothing registered with the poller.
+    try testing.expectEqual(Regime.hot, t.currentRegime());
+    try testing.expectEqual(@as(usize, 0), poller.count());
+    try testing.expect(ticks.advancedPast(0));
+
+    // Demote. The reader thread is blocked in `read()` at this moment, so this
+    // only returns if the interrupt reached it -- and the descriptor must
+    // survive, because closing it is how the old code woke the thread.
+    const before_polled = ticks.count();
+    t.setRegime(.polled);
+    try testing.expectEqual(Regime.polled, t.currentRegime());
+    try testing.expectEqual(@as(usize, 1), poller.count());
+
+    // Still being read, now by the shared thread.
+    try testing.expect(ticks.advancedPast(before_polled));
+
+    // And back. This is the promotion an attach triggers.
+    const before_hot = ticks.count();
+    t.setRegime(.hot);
+    try testing.expectEqual(Regime.hot, t.currentRegime());
+    try testing.expectEqual(@as(usize, 0), poller.count());
+    try testing.expect(ticks.advancedPast(before_hot));
+
+    // The terminal state kept up across both migrations, which is the part
+    // that would break if a chunk were dropped at a handover.
+    const text = try t.plainText(gpa);
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "TICK ") != null);
+}
+
+test "many polled terminals share one thread" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var poller: illogical.poller.Poller = try .init(gpa);
+    defer poller.deinit();
+    try poller.start();
+
+    const count = 8;
+    var terminals: [count]*Terminal = undefined;
+    var ticks: [count]Ticks = undefined;
+    for (&terminals, 0..) |*slot, i| {
+        slot.* = try Terminal.create(gpa, .{
+            .io = threaded.io(),
+            .store = .{ .root = "/tmp/illogical-unused" },
+            .id = @intCast(i + 1),
+            .session_id = 1,
+            .name = "fleet",
+            .argv = &ticker_argv,
+            .poller = &poller,
+        });
+        ticks[i] = .{};
+        try slot.*.subscribe(ticks[i].subscriber());
+        try slot.*.start();
+    }
+    defer for (terminals) |t| {
+        t.hangup();
+        t.destroy();
+    };
+
+    for (terminals) |t| t.setRegime(.polled);
+
+    // The count that must not track terminal count is threads; the count that
+    // does is registrations. That is the trade this whole change makes.
+    try testing.expectEqual(@as(usize, count), poller.count());
+    for (terminals) |t| try testing.expectEqual(Regime.polled, t.currentRegime());
+
+    // All of them still being read, by that one thread.
+    for (&ticks) |*tick| try testing.expect(tick.advancedPast(0));
+}
+
+/// Runs `destroy` on a thread of its own so that a deadlock inside it fails
+/// the test instead of hanging the suite forever.
+const Destroyer = struct {
+    terminal: *Terminal,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *Destroyer) void {
+        self.terminal.destroy();
+        self.done.store(true, .release);
+    }
+
+    fn finishesWithin(self: *Destroyer, ms: usize) !bool {
+        var t = try std.Thread.spawn(.{}, run, .{self});
+        var waited: usize = 0;
+        while (waited < ms) : (waited += 10) {
+            if (self.done.load(.acquire)) {
+                t.join();
+                return true;
+            }
+            sys.sleepNs(10 * std.time.ns_per_ms);
+        }
+        // Deliberately not joined: the point is that it is stuck.
+        t.detach();
+        return false;
+    }
+};
+
+test "migrating mid-stream does not lose a byte" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var poller: illogical.poller.Poller = try .init(gpa);
+    defer poller.deinit();
+    try poller.start();
+
+    const lines = 3000;
+    const t = try Terminal.create(gpa, .{
+        .io = threaded.io(),
+        .store = .{ .root = "/tmp/illogical-unused" },
+        .id = 1,
+        .session_id = 1,
+        .name = "handover",
+        .argv = &.{
+            "/bin/sh",                                                      "-c",
+            "awk 'BEGIN{for(i=0;i<3000;i++) print \"MARK \" i}'; sleep 30",
+        },
+        .poller = &poller,
+    });
+    defer t.destroy();
+    defer t.hangup();
+
+    var sink: Recorder = .{ .gpa = gpa };
+    defer sink.bytes.deinit(gpa);
+    try t.subscribe(sink.subscriber());
+    try t.start();
+
+    // Flip regimes repeatedly while the child is still writing. Every switch
+    // interrupts a reader thread that may be mid-stream, or hands a descriptor
+    // to the poller with bytes already waiting behind it.
+    for (0..6) |i| {
+        t.setRegime(if (i % 2 == 0) .polled else .hot);
+        sys.sleepNs(15 * std.time.ns_per_ms);
+    }
+
+    var waited: usize = 0;
+    while (waited < 10_000) : (waited += 10) {
+        if (sink.contains("MARK 2999\r")) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.StreamNeverFinished;
+
+    const got = try sink.snapshot(gpa);
+    defer gpa.free(got);
+
+    // Every line, in order. The trailing `\r` rather than `\r\n` because a
+    // macOS pty whose output queue fills mid-write restarts its `\n` -> `\r\n`
+    // expansion and emits `\r\r\n`; the count of carriage returns is the tty's
+    // business, but no line may be missing or out of order.
+    var searched: usize = 0;
+    var needle_buf: [32]u8 = undefined;
+    for (0..lines) |i| {
+        const needle = try std.fmt.bufPrint(&needle_buf, "MARK {d}\r", .{i});
+        const at = std.mem.indexOfPos(u8, got, searched, needle) orelse
+            return error.LineLostAcrossMigration;
+        searched = at + needle.len;
+    }
+}
+
+/// Accumulates everything fanned out, for tests that care about the stream
+/// rather than about how often it arrived.
+const Recorder = struct {
+    gpa: Allocator,
+    mutex: illogical.thread.Mutex = .{},
+    bytes: std.ArrayList(u8) = .empty,
+
+    fn subscriber(self: *Recorder) Subscriber {
+        return .{ .ctx = self, .writeFn = write, .exitFn = exited };
+    }
+
+    fn write(ctx: *anyopaque, _: session.TerminalId, bytes: []const u8) bool {
+        const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.bytes.appendSlice(self.gpa, bytes) catch return false;
+        return true;
+    }
+
+    fn exited(_: *anyopaque, _: session.TerminalId, _: i32) void {}
+
+    fn contains(self: *Recorder, needle: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return std.mem.indexOf(u8, self.bytes.items, needle) != null;
+    }
+
+    fn snapshot(self: *Recorder, gpa: Allocator) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return gpa.dupe(u8, self.bytes.items);
+    }
+};
+
+test "a terminal with a quiet child tears down without deadlocking (#28)" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    // A shell sitting at a prompt: alive, and producing nothing. Its reader
+    // thread is parked in `read()` and will stay there.
+    const t = try Terminal.create(gpa, .{
+        .io = threaded.io(),
+        .store = .{ .root = "/tmp/illogical-unused" },
+        .id = 1,
+        .session_id = 1,
+        .name = "quiet",
+        .argv = &.{ "/bin/sh", "-c", "sleep 60" },
+    });
+    try t.start();
+    // Let the reader thread reach the read it is going to sit in.
+    sys.sleepNs(100 * std.time.ns_per_ms);
+
+    // This used to hang forever. `stop` closed the pty master to wake the
+    // reader, and on macOS `close` does not return while another thread holds
+    // that descriptor inside a blocking `read` -- so the two waited on each
+    // other in the kernel and `illogicald` had to be killed with SIGKILL.
+    // Interrupting the read instead is what makes this return.
+    var destroyer: Destroyer = .{ .terminal = t };
+    // No `hangup` first, on purpose: hanging the child up is what used to hide
+    // this, because the child exiting ended the read and let the close finish.
+    try testing.expect(try destroyer.finishesWithin(5000));
+}
 
 test "pty output reaches terminal state and survives a snapshot round trip" {
     const testing = std.testing;

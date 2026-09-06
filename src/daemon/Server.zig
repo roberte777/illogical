@@ -35,6 +35,14 @@ store: illogical.park.Store,
 park_config: illogical.park.Config = .{},
 listener: sys.fd_t = -1,
 
+/// One thread watching the descriptors of every terminal nobody is judging.
+///
+/// This is the cold half of docs/ARCHITECTURE.md's IO model, and it is what
+/// makes ten thousand terminals a count of file descriptors rather than a
+/// count of kernel threads. Terminals move in and out of it on the maintenance
+/// tick; see `applyRegime`.
+pty_poller: illogical.poller.Poller,
+
 /// Guards the session/terminal tables and the id counters.
 mutex: illogical.thread.Mutex = .{},
 sessions: std.AutoArrayHashMapUnmanaged(session.Id, Session) = .empty,
@@ -54,11 +62,13 @@ maintenance: ?std.Thread = null,
 
 pub fn init(gpa: Allocator, io: std.Io, socket_path: []const u8, state_root: []const u8) !*Server {
     const self = try gpa.create(Server);
+    errdefer gpa.destroy(self);
     self.* = .{
         .gpa = gpa,
         .io = io,
         .socket_path = try gpa.dupe(u8, socket_path),
         .store = .{ .root = try gpa.dupe(u8, state_root) },
+        .pty_poller = try .init(gpa),
     };
     return self;
 }
@@ -81,12 +91,23 @@ pub fn deinit(self: *Server) void {
     for (clients.items) |c| c.destroy();
     clients.deinit(self.gpa);
 
+    // Same reasoning as the clients above: `Terminal.destroy` takes the
+    // poller's dispatch lock to unregister, and a callback already running
+    // there wants this terminal's own lock.
     self.mutex.lock();
-    for (self.terminals.values()) |t| t.destroy();
-    self.terminals.deinit(self.gpa);
-    for (self.sessions.values()) |*s| s.deinit(self.gpa);
-    self.sessions.deinit(self.gpa);
+    var terminals = self.terminals;
+    self.terminals = .empty;
+    var sessions = self.sessions;
+    self.sessions = .empty;
     self.mutex.unlock();
+
+    for (terminals.values()) |t| t.destroy();
+    terminals.deinit(self.gpa);
+    for (sessions.values()) |*s| s.deinit(self.gpa);
+    sessions.deinit(self.gpa);
+
+    // After every terminal has left it, so nothing is mid-dispatch.
+    self.pty_poller.deinit();
 
     self.gpa.free(self.socket_path);
     self.gpa.free(self.store.root);
@@ -111,12 +132,14 @@ pub fn listen(self: *Server) !void {
     try sys.listenFd(fd, 64);
     self.listener = fd;
     self.running.store(true, .release);
+    try self.pty_poller.start();
     self.maintenance = try std.Thread.spawn(.{}, maintenanceLoop, .{self});
     log.info("listening on {s}", .{self.socket_path});
 }
 
-/// Periodic housekeeping: park idle terminals, and give live ones a bounded
-/// slice of scrollback compression. See docs/PARKING.md.
+/// Periodic housekeeping: park idle terminals, give live ones a bounded slice
+/// of scrollback compression, and move each PTY into the IO regime it now
+/// belongs in. See docs/PARKING.md.
 pub fn maintenanceTick(self: *Server) void {
     self.retireExited();
     self.retireClients();
@@ -132,7 +155,13 @@ pub fn maintenanceTick(self: *Server) void {
 
     for (ids.items) |id| {
         const t = self.terminal(id) orelse continue;
+        // First: a child that hung up while its PTY was polled is waiting for
+        // somebody with a thread to spare to reap it.
+        t.collectExit();
+
         const summary = t.summary();
+        if (summary.residency == .exited) continue;
+
         if (illogical.park.shouldPark(
             self.park_config,
             summary.residency,
@@ -143,7 +172,28 @@ pub fn maintenanceTick(self: *Server) void {
         } else if (summary.residency == .live) {
             t.compressStep();
         }
+
+        self.applyRegime(t);
     }
+}
+
+/// Put one terminal's PTY in the regime it belongs in now (A3, level 2).
+///
+/// Read after the parking above rather than from the summary taken before it:
+/// a terminal that just parked has no state left in memory to feed, and should
+/// give up its thread on this tick rather than the next.
+fn applyRegime(self: *Server, t: *Terminal) void {
+    const want: Terminal.Regime = switch (illogical.park.ptyRegime(
+        self.park_config,
+        t.summary().residency,
+        t.attachedCount(),
+        t.unobservedNs(),
+    )) {
+        .hot => .hot,
+        .polled => .polled,
+    };
+    if (t.currentRegime() == want) return;
+    t.setRegime(want);
 }
 
 fn maintenanceLoop(self: *Server) void {
@@ -155,6 +205,9 @@ fn maintenanceLoop(self: *Server) void {
 
 pub fn stop(self: *Server) void {
     if (!self.running.swap(false, .acq_rel)) return;
+    // Before the terminals are torn down, so no callback is in flight while
+    // one of them is unregistering.
+    self.pty_poller.stop();
     if (self.listener >= 0) {
         sys.closeFd(self.listener);
         self.listener = -1;
@@ -349,6 +402,7 @@ pub fn createTerminal(self: *Server, req: protocol.body.Create) !CreateResult {
         .io = self.io,
         .store = self.store,
         .park_config = self.park_config,
+        .poller = &self.pty_poller,
         .id = tid,
         .session_id = sid,
         .name = name,
@@ -407,6 +461,7 @@ pub fn listInto(self: *Server, arena: Allocator) !protocol.body.SessionList {
             .cols = sum.cols,
             .rows = sum.rows,
             .residency = @tagName(sum.residency),
+            .regime = sum.regime,
             .attached = sum.attached,
             .pty_read_idle_ns = sum.pty_read_idle_ns,
             .exit_code = sum.exit_code,

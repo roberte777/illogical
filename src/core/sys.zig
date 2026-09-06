@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const thread = @import("thread.zig");
 
 pub const fd_t = std.c.fd_t;
 pub const pid_t = std.c.pid_t;
@@ -17,7 +18,10 @@ pub const AF_UNIX: c_uint = 1;
 pub const SOCK_STREAM: c_uint = if (builtin.os.tag == .linux) 1 else 1;
 pub const F_GETFD: c_int = 1;
 pub const F_SETFD: c_int = 2;
+pub const F_GETFL: c_int = 3;
+pub const F_SETFL: c_int = 4;
 pub const FD_CLOEXEC: c_int = 1;
+pub const O_NONBLOCK: c_int = if (builtin.os.tag == .linux) 0o4000 else 4;
 
 extern "c" fn socket(domain: c_uint, sock_type: c_uint, protocol: c_uint) c_int;
 extern "c" fn bind(sockfd: fd_t, addr: *const sockaddr, len: socklen_t) c_int;
@@ -39,6 +43,7 @@ extern "c" fn _exit(code: c_int) noreturn;
 extern "c" fn fcntl(fd: fd_t, cmd: c_int, ...) c_int;
 extern "c" fn unlink(path: [*:0]const u8) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn pipe(fds: *[2]fd_t) c_int;
 
 pub const Error = error{
     SocketFailed,
@@ -50,11 +55,20 @@ pub const Error = error{
     WriteFailed,
     ForkFailed,
     NameTooLong,
+    /// A signal arrived while the call was blocked. Only `readFdOnce` reports
+    /// this; everything else retries.
+    Interrupted,
+    /// Nothing to read on a non-blocking descriptor.
+    WouldBlock,
+    PipeFailed,
 };
 
 pub fn errno() c_int {
     return std.c._errno().*;
 }
+
+const EINTR: c_int = 4;
+const EAGAIN: c_int = if (builtin.os.tag == .linux) 11 else 35;
 
 pub const STDIN = 0;
 pub const STDOUT = 1;
@@ -66,19 +80,36 @@ pub fn closeFd(fd: fd_t) void {
 
 pub fn readFd(fd: fd_t, buf: []u8) Error!usize {
     while (true) {
-        const n = read(fd, buf.ptr, buf.len);
-        if (n >= 0) return @intCast(n);
-        // EINTR: a signal arrived, not a failure.
-        if (errno() == 4) continue;
-        return error.ReadFailed;
+        return readFdOnce(fd, buf) catch |err| switch (err) {
+            // A signal arrived, not a failure.
+            error.Interrupted => continue,
+            else => return err,
+        };
     }
+}
+
+/// One `read`, reporting a signal rather than swallowing it.
+///
+/// This is what a hot PTY reader blocks in. The distinction matters there and
+/// nowhere else: interrupting that blocking read is the only way to get the
+/// descriptor back so it can migrate to the shared poller, and a retry loop
+/// inside here would hide the interruption and go straight back to sleep. See
+/// docs/OPTIMIZATIONS.md A3.
+pub fn readFdOnce(fd: fd_t, buf: []u8) Error!usize {
+    const n = read(fd, buf.ptr, buf.len);
+    if (n >= 0) return @intCast(n);
+    return switch (errno()) {
+        EINTR => error.Interrupted,
+        EAGAIN => error.WouldBlock,
+        else => error.ReadFailed,
+    };
 }
 
 pub fn writeFd(fd: fd_t, buf: []const u8) Error!usize {
     while (true) {
         const n = write(fd, buf.ptr, buf.len);
         if (n >= 0) return @intCast(n);
-        if (errno() == 4) continue;
+        if (errno() == EINTR) continue;
         return error.WriteFailed;
     }
 }
@@ -102,6 +133,28 @@ pub fn setCloexec(fd: fd_t) void {
     const flags = fcntl(fd, F_GETFD);
     if (flags == -1) return;
     _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+/// Turn non-blocking mode on or off.
+///
+/// A PTY toggles this as it migrates between IO regimes: blocking while a
+/// dedicated thread is parked in `read()` on it, non-blocking once it is one
+/// of many descriptors in the shared poller, where a `read` that turned out to
+/// have nothing behind it would stall every other terminal.
+pub fn setNonblock(fd: fd_t, on: bool) void {
+    const flags = fcntl(fd, F_GETFL);
+    if (flags == -1) return;
+    const next = if (on) flags | O_NONBLOCK else flags & ~O_NONBLOCK;
+    _ = fcntl(fd, F_SETFL, next);
+}
+
+/// A pipe, used only to wake a thread blocked in the poller.
+pub fn pipeFds() Error![2]fd_t {
+    var fds: [2]fd_t = undefined;
+    if (pipe(&fds) < 0) return error.PipeFailed;
+    setCloexec(fds[0]);
+    setCloexec(fds[1]);
+    return fds;
 }
 
 // -- unix sockets ----------------------------------------------------------
@@ -137,7 +190,7 @@ pub fn acceptFd(fd: fd_t) Error!fd_t {
             setCloexec(client);
             return client;
         }
-        if (errno() == 4) continue;
+        if (errno() == EINTR) continue;
         return error.AcceptFailed;
     }
 }
@@ -240,14 +293,92 @@ pub fn signalGroup(leader: pid_t, sig: c_int) void {
     _ = kill(-leader, sig);
 }
 
-/// Wait for `pid` and return its exit code.
+/// Wait for `pid` and return its exit code. Blocks.
 pub fn wait(pid: pid_t) i32 {
     var status: c_int = 0;
-    _ = waitpid(pid, &status, 0);
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno() != EINTR) return 0;
+    }
+    return exitCode(status);
+}
+
+const WNOHANG: c_int = 1;
+
+pub const WaitResult = union(enum) {
+    /// The child is still running.
+    running,
+    exited: i32,
+    /// No such child: already reaped, or never ours to reap.
+    gone,
+};
+
+/// Ask after `pid` without blocking.
+///
+/// The shared poller uses this. A child whose PTY hung up has almost always
+/// exited, but `waitpid` would block if it has not, and the poller thread is
+/// shared by every parked terminal on the machine -- one stuck child must not
+/// stop the rest from being watched.
+pub fn tryWait(pid: pid_t) WaitResult {
+    var status: c_int = 0;
+    while (true) {
+        const got = waitpid(pid, &status, WNOHANG);
+        if (got == 0) return .running;
+        if (got > 0) return .{ .exited = exitCode(status) };
+        if (errno() == EINTR) continue;
+        return .gone;
+    }
+}
+
+fn exitCode(status: c_int) i32 {
     // WIFEXITED / WEXITSTATUS
     if (status & 0x7f == 0) return @intCast((status >> 8) & 0xff);
     // Killed by a signal: report it the way a shell does.
     return 128 + @as(i32, @intCast(status & 0x7f));
+}
+
+// -- interrupting a blocked thread -----------------------------------------
+
+/// The signal used to make a thread's blocking `read()` return.
+///
+/// `SIGUSR2` rather than `SIGUSR1`, which profilers and debuggers are likelier
+/// to want for themselves. The handler does nothing at all: its only job is to
+/// exist, so that delivery makes the blocked syscall fail with `EINTR` instead
+/// of killing the process, which is what the default disposition would do.
+pub const interrupt_signal = std.posix.SIG.USR2;
+
+var interrupt_mutex: thread.Mutex = .{};
+var interrupt_installed: bool = false;
+
+/// Install the interrupt handler. Idempotent, and safe to call from anywhere.
+///
+/// Must happen before the first `interruptThread`, or the signal terminates
+/// the daemon. Process-wide, which is worth knowing if this code is ever
+/// embedded in something with its own opinion about `SIGUSR2`.
+pub fn installThreadInterrupt() void {
+    interrupt_mutex.lock();
+    defer interrupt_mutex.unlock();
+    if (interrupt_installed) return;
+
+    const action: std.posix.Sigaction = .{
+        .handler = .{ .handler = onInterrupt },
+        .mask = std.posix.sigemptyset(),
+        // Deliberately not `SA_RESTART`. Restarting the syscall is the one
+        // behaviour this must not have: the read has to come back so its
+        // thread can notice why it was woken.
+        .flags = 0,
+    };
+    std.posix.sigaction(interrupt_signal, &action, null);
+    interrupt_installed = true;
+}
+
+fn onInterrupt(_: std.c.SIG) callconv(.c) void {}
+
+/// Interrupt whatever blocking call `handle` is in.
+///
+/// The handle must not have been joined yet; a joinable thread's handle stays
+/// valid until it is, even after the thread has returned.
+pub fn interruptThread(handle: std.Thread.Handle) void {
+    _ = std.c.pthread_kill(handle, interrupt_signal);
 }
 
 /// Set an environment variable for the current process. Used in the forked

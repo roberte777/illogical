@@ -81,15 +81,35 @@ PTY sits in one of two regimes and migrates between them:
 | Mechanism | dedicated OS thread blocked on `read()` | fd in one shared kqueue/epoll poller |
 | Latency / throughput | baseline | 5–10% worse [MEM t=504] |
 | Cost per PTY | a kernel thread + stack | an fd registration |
-| When | a client is watching **and** it is producing output | terminal parked, **or** nobody watching |
+| When | a client is watching | terminal parked, **or** nobody watching |
 
 The migration rule, verbatim: *"if the terminal gets parked, we throw that into
 the centralized poller. Two, if there's no clients observing the terminal at that
 moment, we also move it because you get about a 5 to 10% hit in IO throughput,
 but that's worth it when you're not looking at it"* [MEM t=504].
 
-So libxev's role is the **parked** poller, the control socket, and timers — not
-the hot path. A hot PTY is a blocking `read()` on a dedicated thread.
+So an event loop's role is the **parked** poller, the control socket, and
+timers — not the hot path. A hot PTY is a blocking `read()` on a dedicated
+thread.
+
+Both regimes and the migration between them are implemented, in
+`src/core/poller.zig` and `Terminal.setRegime`. Three details decide whether it
+works at all:
+
+- **Getting the descriptor back.** A hot reader is inside `read()`, and closing
+  the descriptor to wake it is wrong — it is being handed over, not discarded —
+  and on macOS deadlocks, because `close` does not return while another thread
+  holds that same descriptor in a blocking call. That was issue #28. A signal
+  with an empty handler makes the read return `EINTR` and leaves the descriptor
+  and its queued bytes untouched.
+- **Hysteresis, one-sided.** Promotion is synchronous with the attach that
+  caused it; demotion waits out `pty_park_unobserved_after` (5 s). Clicking
+  between tabs must not spawn and join a thread each time.
+- **Nothing is dropped.** The poller is level-triggered, so bytes that arrived
+  mid-handover are reported the moment the descriptor is registered.
+
+`illogical list` reports which regime each terminal is in, and
+`scripts/bench-pty.sh` measures what the polled one costs.
 
 ## Components
 

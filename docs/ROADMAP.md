@@ -189,7 +189,7 @@ milestone the whole architecture exists for. See [PARKING.md](PARKING.md).
 | ✅ | **A5** — live scrollback compression: activity token, incremental steps on idle, never `MODE_FULL` on a hot path |
 | ✅ | The benchmark, as `scripts/bench-memory.sh` (not yet in CI — there is no CI) |
 | ✅ | **F2** — flow control: bounded per-client queue, overflow ⇒ forced re-attach |
-| | **A3** (second half) — PTY fd migration between dedicated thread and shared poller, with hysteresis |
+| ✅ | **A3** (second half) — PTY fd migration between dedicated thread and shared poller, with hysteresis |
 | | **A4** — client buffer parking |
 | | **A6** — per-terminal fixed costs: zero-init, lazy allocation, shared palette |
 | | **F3** — snapshot **encryption**. Compression landed; encryption did not, so park files are plaintext on disk and scrollback holds secrets. This is a real gap, not a refinement |
@@ -235,9 +235,17 @@ macOS, `phys_footprint`, same terminal shapes — and report losses honestly.
 | Per empty 80×24 terminal | 68 KiB | **15 KiB** | — | not measured |
 | Per client connection (50 filled) | **85 KiB** | 157 KiB | — | not measured |
 | Unpark, 64 MB scrollback | ~200 µs (excl. disk) | — | — | not measured |
-| Parked-PTY throughput cost | 5–10% | — | — | A3 not implemented |
+| Parked-PTY throughput cost | 5–10% | — | **+0.2%** one PTY, **+98%** eight at once | measured |
 
-Run it with `scripts/bench-memory.sh 20 10000`.
+Run it with `scripts/bench-memory.sh 20 10000`, and the last row with
+`scripts/bench-pty.sh 100000 32 3`.
+
+That last row needs its two halves read together. One parked PTY costs nothing
+measurable, comfortably inside the reference figure. Eight busy ones at the same
+time cost twice as much, because what a poller wake-up triggers is the VT parse
+rather than the `read`, and four pool threads are doing what eight dedicated
+readers would have. The cost is `terminals / pool`, it is paid only by terminals
+nobody is watching, and it buys the row below.
 
 Two things to be careful about when reading that table. First, it is
 `phys_footprint`, not RSS — with RSS the compression and parking wins are
@@ -257,7 +265,9 @@ Also measure, where no reference number exists:
   reachable: a terminal caps its scrollback at 50 MB.
 - Attach to parked: terminal stays parked, no allocation spike.
 - Full history restore time, in background, without regressing input latency.
-- Thread count vs terminal count — must flatten, not track.
+- Thread count vs terminal count — must flatten, not track. **Flat**: 32
+  unwatched terminals cost the same 7 threads as none, against 38 when every
+  one of them is hot. `scripts/bench-pty.sh`, measured in M4.
 - p99 input latency at 200 attachments.
 - Client cold launch to window. **148 ms**, Debug, measured above.
 
