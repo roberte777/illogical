@@ -49,6 +49,18 @@ const read_buf_size = 16 * 1024;
 /// use, measured at 32 KiB for a reader under load.
 pub const thread_stack_size = 512 * 1024;
 
+/// Stack for the maintenance thread, which is not like the others.
+///
+/// There is exactly one of it, and it does the heavy work: parking builds a
+/// `flate.Compress`, which is 224 KiB of hash tables and is *returned by
+/// value*, so it exists twice on the stack for a moment however carefully the
+/// destination is placed. Half a megabyte is not enough and the failure is a
+/// bus error rather than an error return.
+///
+/// Four megabytes is still a quarter of the default, and being a singleton it
+/// is not the cost A6 is about. The many-of-them threads keep the small one.
+pub const maintenance_stack_size = 4 * 1024 * 1024;
+
 /// Buffer between the park store and the compressor, in both directions.
 ///
 /// Heap-allocated for the duration of a park or an attach rather than sitting
@@ -842,13 +854,12 @@ pub fn park(self: *Terminal) !void {
         const window = try self.gpa.alloc(u8, illogical.park.Store.window_len);
         defer self.gpa.free(window);
 
-        // Heap, and not as a matter of taste: `flate.Compress` is 224 KiB of
-        // hash tables, and this runs on the maintenance thread. On the stack
-        // it overflowed a 512 KiB one and took the daemon down with a bus
-        // error the moment anything parked.
-        const compress = try self.gpa.create(flate.Compress);
-        defer self.gpa.destroy(compress);
-        compress.* = try .init(
+        // `flate.Compress` is 224 KiB of hash tables and `init` returns it by
+        // value, so it lands on this thread's stack whatever the destination
+        // is -- which is why the maintenance thread gets a stack sized for it
+        // rather than the small one every other thread here uses. See
+        // `maintenance_stack_size`.
+        var compress = try flate.Compress.init(
             &file_writer.interface,
             window,
             illogical.park.Store.Container,
@@ -1541,7 +1552,7 @@ const Parker = struct {
     fn parkOnDaemonStack(t: *Terminal) !void {
         var self: Parker = .{ .terminal = t };
         const thread = try std.Thread.spawn(
-            .{ .stack_size = thread_stack_size },
+            .{ .stack_size = maintenance_stack_size },
             run,
             .{&self},
         );
