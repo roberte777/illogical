@@ -37,13 +37,13 @@ final class TerminalController {
 
     let terminalID: UInt64
     private(set) var state: State = .connecting
-    /// Rows of scrollback available to scroll into, once the attach
-    /// snapshot's history has been restored.
-    ///
-    /// Rows, not pages. A page holds a variable number of rows, so a page
-    /// count is not rows scaled by a constant — it is a different quantity,
-    /// and only the scrollbar knows the one anybody wants.
-    private(set) var scrollbackRows = 0
+
+    // No `scrollbackRows` here. There was one, written once when the restore
+    // finished and read by nothing, and it could not have been the mechanism
+    // for a loading state even in principle: it is a final total, available
+    // only after the last thing anybody would want to draw a loading state
+    // for. What the scrollbar draws instead is the count the *engine* holds,
+    // declared at READY and counted down as pages land.
 
     let engine: TerminalEngine
     private var connection: Connection?
@@ -125,6 +125,8 @@ final class TerminalController {
         // holding a whole session's scrollback.
         restore?.stream.abandon()
         restore = nil
+        // History that will never arrive is not pending, it is gone.
+        engine.clearPendingHistory()
         pump?.cancel()
         connection?.close()
         connection = nil
@@ -206,6 +208,11 @@ final class TerminalController {
         // desync recovery looks like, and nothing upstream forbids it.
         stopHistoryRestore()
         restore?.stream.abandon()
+        // Whatever the last snapshot said it owed is now void, and the screen
+        // it described is still up until READY replaces it. Clearing here
+        // rather than leaving it to `adopt` keeps a stale pending region off
+        // that screen in the meantime.
+        engine.clearPendingHistory()
         restore = try? SnapshotRestore(stream: SnapshotStream())
         readyDecoded = false
         snapshotBytes = 0
@@ -229,6 +236,13 @@ final class TerminalController {
         do {
             let terminal = try restore.ready()
             engine.adopt(terminal: terminal, cols: engine.cols, rows: engine.rows)
+            // The snapshot knows how much history it is about to send, and
+            // says so at READY — before a byte of it has arrived. Declaring it
+            // now is what lets the scrollbar be the right size on the first
+            // frame and draw the part that has not landed as pending, rather
+            // than growing to meet it while the user scrolls. See
+            // docs/CLIENT.md, "The loading state".
+            engine.declarePendingHistory(rows: restore.declaredHistoryRows)
             // We can paint now. Everything below is scrollback catching up.
             readyDecoded = true
             state = .live
@@ -246,6 +260,7 @@ final class TerminalController {
             // renders, we just start from a blank screen.
             self.restore?.stream.abandon()
             self.restore = nil
+            engine.clearPendingHistory()
             state = .live
         }
     }
@@ -324,13 +339,22 @@ final class TerminalController {
         historyTask = Task.detached(priority: .utility) { [weak self] in
             var pages = 0
             while !Task.isCancelled {
-                // The cancellation check and the decode are one operation
-                // under the lock. Outside it, a task that had already passed
-                // the check could still call into a decoder whose terminal
-                // `adopt` has since freed.
+                // The cancellation check, the decode and the pending count are
+                // one operation under the lock. Outside it, a task that had
+                // already passed the check could still call into a decoder
+                // whose terminal `adopt` has since freed — and a frame could
+                // catch the rows a page added without the matching drop in
+                // what is still owed, which is the one thing that would make
+                // the knob jump.
                 let more = engine.withLock { () -> Bool in
                     guard !token.isCancelled else { return false }
-                    return (try? restore.restoreNextHistoryPage()) ?? false
+                    // Zero rows is not the end: a page that could not be
+                    // applied is still consumed, and history continues.
+                    guard let rows = (try? restore.restoreNextHistoryPage()) ?? nil else {
+                        return false
+                    }
+                    engine.historyPageRestoredLocked(rows: rows)
+                    return true
                 }
                 guard more else { break }
                 pages += 1
@@ -344,15 +368,18 @@ final class TerminalController {
                     break
                 }
             }
-            // How many *rows* those pages held, which is the quantity anyone
-            // wants and the only one the scrollbar can answer. Outside
+            // How many *rows* those pages held, for the log. Outside
             // `withLock`: `scrollbar` takes the same lock itself, and NSLock
             // is not recursive.
+            //
+            // Net of anything still pending, which is what makes this the
+            // rows that arrived rather than the rows the snapshot claimed. A
+            // restore that stopped early — the page backstop, a cancelled
+            // task — would otherwise log the promise as if it were delivery.
             let bar = engine.scrollbar
-            let rows = Int(bar.total) - Int(bar.length)
+            let rows = Int(bar.total - bar.pending) - Int(bar.length)
             let restored = pages
             await MainActor.run {
-                self?.scrollbackRows = rows
                 // Drop the decoder and whatever the pipe still holds — but only
                 // if this task is still the current one. A cancelled task runs
                 // its tail anyway, and comparing the restore alone is not
@@ -360,7 +387,20 @@ final class TerminalController {
                 // re-entered `restoreHistory` with the same object: the loser
                 // would clear `restore` out from under the live decode, and
                 // the next disconnect would then not abandon its pipe.
-                if self?.historyToken === token { self?.restore = nil }
+                //
+                // The pending count is dropped under that same guard, and for
+                // a sharper reason: it is the *loser* that must not touch it.
+                // Clearing it unconditionally here would wipe the count the
+                // winning restore is still counting down, and the pending
+                // region would vanish while history was still arriving.
+                if self?.historyToken === token {
+                    self?.restore = nil
+                    // Whatever the snapshot declared, this is what it sent.
+                    // The extent is advisory, so a snapshot whose pages
+                    // applied fewer rows than promised would otherwise leave a
+                    // sliver of the bar pending for the terminal's lifetime.
+                    self?.engine.clearPendingHistory()
+                }
                 Trace.log(
                     "terminal \(terminalID): restored \(restored) history pages, "
                         + "\(rows) rows of scrollback")
@@ -377,6 +417,9 @@ final class TerminalController {
         stopHistoryRestore()
         restore?.stream.abandon()
         restore = nil
+        // Nothing is coming down a closed connection. The screen stays as it
+        // is, so the bar has to stop claiming there is more above it.
+        engine.clearPendingHistory()
         if case .exited = state { return }
         if case .failed = state { return }
         state = .failed("disconnected")

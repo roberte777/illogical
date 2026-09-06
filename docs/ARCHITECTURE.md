@@ -174,11 +174,14 @@ session's configured size, not any client's.
 Steps 5 and 6 interleave safely: libghostty-vt explicitly permits rendering,
 resizing and live writes between history-page restores.
 
-⚠ That is the design, and steps 5 and 6 are not there yet. The server unpauses
-after FINISH rather than after READY, so history precedes all `output`; the Mac
-client decodes the pages at `snapshot_end` rather than as they arrive; and the
-loading state in step 6 is unbuilt. Step 4 — the one the M2 gate measures — is
-real. See [PROTOCOL.md](PROTOCOL.md#the-attach-handshake) for why each holds.
+⚠ That is the design, and steps 5 and 6 are only partly there. The server
+unpauses after FINISH rather than after READY, so history precedes all `output`,
+and the Mac client decodes the pages at `snapshot_end` rather than as they
+arrive. Step 4 — the one the M2 gate measures — is real, and so is the loading
+state in step 6: the snapshot declares its history extent at READY, so the
+client draws the undelivered part rather than growing the scrollbar to meet it.
+See [PROTOCOL.md](PROTOCOL.md#the-attach-handshake) for why the first two hold,
+and [CLIENT.md](CLIENT.md#the-loading-state) for how the third works.
 
 **If the terminal is parked, none of this wakes it.** The park file *is* the
 attach payload, so the server streams it from disk and the terminal stays parked

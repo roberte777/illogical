@@ -241,18 +241,36 @@ painting a terminal whose scrollback it does not have. At two hundred thousand
 lines that window is a third of a second on a unix socket, and it is the whole
 transfer over SSH.
 
-Nothing marks it, and nothing hides it either. The scrollbar overlay reads
-`engine.scrollbar` — libghostty's own extent on the adopted terminal — so it
-grows as pages land and the thumb moves under the user while they scroll.
-`TerminalController.scrollbackRows` is not the mechanism and never was: it is
-written once when the restore finishes and **read by nothing**, which is worth
-knowing before reaching for it.
+The scrollbar marks it. `ScrollbarState` describes the **declared** scrollable
+area rather than the delivered one: `pending` counts rows the snapshot has
+promised and not yet sent, and both `total` and `offset` include them. The
+overlay draws that region at the top of the track, dimmer than the knob.
 
-The state to build is a distinct treatment for rows the snapshot has declared
-and not yet delivered. `SCREEN` carries each screen's complete logical history
-extent at READY, so the full size is known before any page arrives — the
-scrollbar can be sized correctly from the first frame and the undelivered
-region drawn as pending, rather than the extent growing to meet it.
+The count comes from the decoder. `SCREEN` carries each screen's complete
+logical history extent and `ghostty_snapshot_decoder_get` reports it as
+`HISTORY_ROWS_PRIMARY` the moment READY validates — before a page has arrived —
+so `TerminalController` declares it there, minus the resident overlap READY
+already carried, and counts it down by each page's `PROGRESS_ROWS`.
+
+The decrement happens inside the same `withLock` as the decode that earned it.
+That is the whole trick and it is worth being explicit about: a page landing
+adds *n* rows to the terminal and removes *n* from what is owed, so the sum
+that positions the knob does not change. Split them across two lock
+acquisitions and a frame can catch one without the other, which is the jump
+this exists to prevent. It is also why the count is counted down rather than
+recomputed from the terminal — live output pushes rows into the same history
+and would otherwise be mistaken for scrollback arriving.
+
+Three things the mechanism deliberately does not do:
+
+- **The extent is advisory**, and `snapshot.h` says so. A page that can no longer be applied to a live terminal is still consumed and still reports zero rows, so the count is cleared outright when the restore ends rather than trusted to reach zero. Otherwise a snapshot whose pages delivered less than promised leaves a sliver of the bar pending for the terminal's lifetime.
+- **The alternate screen reports nothing pending.** It has no scrollback of its own, and `canScroll` gates whether the indicator is drawn at all, so folding the primary's owed rows in would put a scrollbar over vim. Nothing is forgotten — the count is still there when the program exits.
+- **A viewport scrolled to the very top still travels** as history lands, because libghostty's "top" is a position and not a pin: it means the oldest row there is, and it keeps meaning that as older rows arrive. The viewport really is moving there, and a bar that held still would be the one lying.
+
+There is no `TerminalController.scrollbackRows` any more. It was written once
+when the restore finished and read by nothing, and it could not have been the
+mechanism even in principle — it is a final total, available only after the
+last moment anyone would want a loading state for.
 
 ## Selection
 

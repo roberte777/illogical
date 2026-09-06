@@ -43,6 +43,15 @@ final class TerminalEngine: @unchecked Sendable {
     /// libghostty's per-row dirty flags say. Guarded by `lock`.
     private var forceFullRebuild = false
 
+    /// Rows of scrollback the attach snapshot declared and has not delivered.
+    ///
+    /// Guarded by `lock` rather than made atomic, because the history restore
+    /// already decrements it under that lock in the same breath as the decode
+    /// that earned the decrement, and `scrollbar` already holds it to read the
+    /// rows this is added to. An atomic would let those two drift apart for a
+    /// frame and buy nothing.
+    private var pendingHistoryRows: UInt64 = 0
+
     /// Set when bytes have been applied and a frame is owed. Read from the
     /// display link every tick, so it is an atomic rather than lock-guarded:
     /// an idle terminal must not cost a lock acquisition 120 times a second.
@@ -130,6 +139,10 @@ final class TerminalEngine: @unchecked Sendable {
         terminal = newTerminal
         self.cols = cols
         self.rows = rows
+        // A new terminal has whatever history READY brought with it and no
+        // more, so any count of what is still owed describes the terminal we
+        // just freed. The caller declares the new one's immediately below.
+        pendingHistoryRows = 0
         // A snapshot-decoded terminal carries libghostty's defaults, not ours.
         applyThemeLocked()
         lock.unlock()
@@ -213,15 +226,28 @@ final class TerminalEngine: @unchecked Sendable {
         case bottom
         /// Rows, negative for up.
         case delta(Int)
-        /// Absolute row, in the same space as `ScrollbarState.offset`.
+        /// Absolute row, in the same space as `ScrollbarState.offset` — which
+        /// includes any rows still pending, so this round-trips with what the
+        /// scrollbar reports rather than with the terminal's own row numbers.
         case row(UInt64)
     }
 
     /// The scrollable area, in rows.
+    ///
+    /// This is the *declared* area, not the delivered one: `total` and
+    /// `offset` both count the rows an attach snapshot has promised and not
+    /// yet sent, and `pending` says how many of them those are. The whole
+    /// point is that they move together — as history lands, `pending` falls by
+    /// exactly what `offset` gains, so a viewport parked in the scrollback
+    /// keeps the same position on the bar instead of sliding down it while the
+    /// extent grows underneath. See docs/CLIENT.md, "The loading state".
     struct ScrollbarState: Equatable {
         var total: UInt64 = 0
         var offset: UInt64 = 0
         var length: UInt64 = 0
+        /// Undelivered rows, at the top of the area. Drawn distinctly, and
+        /// not reachable by scrolling until they arrive.
+        var pending: UInt64 = 0
 
         /// True when the viewport is somewhere above the live output.
         var isScrolledBack: Bool { offset + length < total }
@@ -254,8 +280,14 @@ final class TerminalEngine: @unchecked Sendable {
             behavior.value.delta = rows
         case .row(let row):
             behavior.tag = GHOSTTY_SCROLL_VIEWPORT_ROW
+            // Back out of the scrollbar's space into the terminal's. Rows the
+            // snapshot still owes us are counted in the former and do not
+            // exist in the latter, so a drag into the pending region lands at
+            // the top of what has actually arrived — which is as far up as
+            // there is anything to show.
+            let pending = effectivePendingLocked(terminal)
             // size_t on the C side; the scrollbar reports UInt64.
-            behavior.value.row = Int(clamping: row)
+            behavior.value.row = Int(clamping: row > pending ? row - pending : 0)
         }
         ghostty_terminal_scroll_viewport(terminal, behavior)
 
@@ -278,7 +310,92 @@ final class TerminalEngine: @unchecked Sendable {
             ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &bar)
                 == GHOSTTY_SUCCESS
         else { return ScrollbarState() }
-        return ScrollbarState(total: bar.total, offset: bar.offset, length: bar.len)
+
+        // Pending rows sit above everything the terminal holds, so they extend
+        // the area at the top: the total grows by them and every position
+        // within it, the viewport's included, shifts down by the same amount.
+        let pending = effectivePendingLocked(terminal)
+        return ScrollbarState(
+            total: bar.total + pending,
+            offset: bar.offset + pending,
+            length: bar.len,
+            pending: pending)
+    }
+
+    // MARK: - Pending history
+
+    /// Owed rows, as they apply to the screen currently on display.
+    ///
+    /// Undelivered history belongs to the primary screen, so a terminal
+    /// sitting in a full-screen TUI reports none. The alternate screen has no
+    /// scrollback of its own, and adding the primary's owed rows to its bar
+    /// would invent a scrollable area where there is none. Nothing is
+    /// forgotten by doing so: the count is still there when the program exits
+    /// and the primary screen, with its history and whatever is still owed on
+    /// it, comes back.
+    private func effectivePendingLocked(_ terminal: GhosttyTerminal) -> UInt64 {
+        guard pendingHistoryRows > 0 else { return 0 }
+        var screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY
+        let known =
+            ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen)
+            == GHOSTTY_SUCCESS
+        guard !known || screen == GHOSTTY_TERMINAL_SCREEN_PRIMARY else { return 0 }
+        return pendingHistoryRows
+    }
+
+    /// Declare how much scrollback the attach snapshot still owes us.
+    ///
+    /// Takes the snapshot's own extent — every row above the active area,
+    /// which is what `SnapshotRestore.declaredHistoryRows` reports — and
+    /// subtracts what READY already handed over. The snapshot counts the
+    /// resident overlap it carries before READY in that extent, so passing the
+    /// declared figure straight through would draw the rows we are already
+    /// looking at as pending.
+    ///
+    /// Call after `adopt`, which clears whatever the previous terminal owed.
+    func declarePendingHistory(rows declared: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let terminal else { return }
+        var bar = GhosttyTerminalScrollbar()
+        guard
+            ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &bar)
+                == GHOSTTY_SUCCESS
+        else { return }
+        // Saturating, not because a viewport taller than its own scrollable
+        // area is expected, but because the alternative is a trap: these are
+        // unsigned, and Swift crashes rather than wrapping.
+        let resident = bar.total > bar.len ? bar.total - bar.len : 0
+        pendingHistoryRows = declared > resident ? declared - resident : 0
+    }
+
+    /// Account for a history page that has landed.
+    ///
+    /// **Call with the lock already held**, from inside the same `withLock` as
+    /// the decode that produced these rows. The lock is not recursive, so this
+    /// cannot take it — but that constraint is the correct one anyway: the
+    /// rows and the drop in what is owed have to reach the renderer together
+    /// or the knob moves by the difference.
+    ///
+    /// Counted down rather than recomputed from the terminal, because live
+    /// output pushes rows into the same history and would otherwise be
+    /// mistaken for scrollback arriving. Saturates at zero: the declared
+    /// extent is advisory and the pages are what actually happened.
+    func historyPageRestoredLocked(rows: Int) {
+        guard rows > 0 else { return }
+        let landed = UInt64(rows)
+        pendingHistoryRows = pendingHistoryRows > landed ? pendingHistoryRows - landed : 0
+    }
+
+    /// Nothing more is coming: drop whatever is still owed.
+    ///
+    /// The end of a restore, however it ended. The declared extent is
+    /// advisory, so a snapshot whose pages applied fewer rows than it promised
+    /// would otherwise leave a sliver of the bar pending forever.
+    func clearPendingHistory() {
+        lock.lock()
+        pendingHistoryRows = 0
+        lock.unlock()
     }
 
     /// Whether the program has asked to receive mouse events.
