@@ -341,9 +341,17 @@ struct TransportTests {
         #expect(classify(NSPOSIXErrorDomain, EINTR).isTransient)
 
         // And whichever it is, it reads like a sentence rather than a dump.
-        let described = String(describing: classify(NSCocoaErrorDomain, 4))
-        #expect(described.hasPrefix("cannot run ssh: "))
-        #expect(!described.contains("UserInfo="))
+        //
+        // The permanent case does not relay Foundation's wording at all: for
+        // the file it is actually about -- present, not executable -- that
+        // wording is "The file ... doesn't exist.", which sends somebody
+        // looking for an `ssh` that is sitting where they left it.
+        #expect(
+            String(describing: classify(NSCocoaErrorDomain, 4))
+                == "ssh is not an executable program")
+        let transient = String(describing: classify(NSPOSIXErrorDomain, EMFILE))
+        #expect(transient.hasPrefix("could not run ssh: "))
+        #expect(!transient.contains("UserInfo="))
     }
 
     /// `close()` is called from the main actor, once per pane. Blocking there
