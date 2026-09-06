@@ -515,6 +515,38 @@ test "deinit drains a child that is blocked writing at us" {
     try testing.expect(elapsed < 500 * std.time.ns_per_ms);
 }
 
+test "deinit gives up on a child that never stops writing" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Unbounded, unlike the drain test above: `yes` never reaches end of
+    // stream and, because we are draining it, never blocks either. So
+    // `readFdOnce` returns neither 0 nor `WouldBlock` and the only thing that
+    // can end `drainRead` is its deadline. Without one the loop is `while
+    // (true)` and `deinit` never returns at all -- `illogical --host box list`
+    // hangs having already printed its answer. The shape is real: a remote
+    // login shell whose rc file writes in a loop reaches our `read_fd`,
+    // because `-T` makes the remote command's stdout the channel itself.
+    const argv = try arena.allocSentinel(?[*:0]const u8, 3, null);
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "yes";
+
+    var conn = try Conn.spawn(gpa, argv);
+    const before = sys.monotonicNs();
+    conn.deinit();
+    const elapsed = sys.monotonicNs() - before;
+
+    // It must cost the grace and then signal -- not less, which would mean the
+    // drain gave up early on a child that was merely busy, and not more, which
+    // is the hang.
+    try testing.expect(elapsed >= Conn.child_exit_grace_ns);
+    try testing.expect(elapsed < 2 * Conn.child_exit_grace_ns);
+}
+
 test "a command connection speaks frames over its child's pipes" {
     const testing = std.testing;
     const gpa = testing.allocator;

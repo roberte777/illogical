@@ -20,6 +20,8 @@ pub const F_GETFD: c_int = 1;
 pub const F_SETFD: c_int = 2;
 pub const F_GETFL: c_int = 3;
 pub const F_SETFL: c_int = 4;
+/// Duplicate onto the lowest free descriptor at or above the argument.
+pub const F_DUPFD: c_int = 0;
 pub const FD_CLOEXEC: c_int = 1;
 pub const O_NONBLOCK: c_int = if (builtin.os.tag == .linux) 0o4000 else 4;
 
@@ -149,6 +151,17 @@ pub fn clearCloexec(fd: fd_t) void {
     _ = fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
 }
 
+/// Duplicate `fd` onto the lowest free descriptor at or above `lowest`.
+///
+/// For a caller that needs a descriptor in a *particular range* rather than
+/// wherever `open` happened to put it, without `dup2`'s habit of silently
+/// closing whatever was already on the target.
+pub fn dupFrom(fd: fd_t, lowest: fd_t) Error!fd_t {
+    const next = fcntl(fd, F_DUPFD, lowest);
+    if (next < 0) return error.OpenFailed;
+    return next;
+}
+
 /// Close every descriptor from `lowest` upward.
 ///
 /// For a forked child that is about to become a long-lived daemon: it inherits
@@ -167,14 +180,23 @@ pub fn closeFrom(lowest: fd_t) void {
     // manager, where the loop would run for minutes between `fork` and `exec`
     // and the bridge would give up waiting for a daemon that turns up anyway.
     //
-    // The ceiling is high enough that the clamp is only ever reached by that
-    // pathological case. An ordinary mac reads 138,240 here and a distro sshd
-    // is typically configured to 65,536, both well under; a `close` on an
-    // unused descriptor is tens of nanoseconds, so even the full million is
-    // some tens of milliseconds, once, when a daemon is started. It was 4096
-    // before, which is *below* both -- so on the systemd `LimitNOFILE=65536`
+    // An ordinary mac reads 138,240 here and a distro sshd is typically
+    // configured to 65,536, both well under the ceiling. It was 4096 before,
+    // which is *below* both -- so on the systemd `LimitNOFILE=65536`
     // configuration this function's own doc comment describes, anything the
     // ssh wrapper had parked at a high descriptor survived into the daemon.
+    //
+    // A failing `close` measured ~96ns here, so the full million is ~100ms on
+    // this machine and several times that on an x86-64 kernel with mitigations
+    // -- which a container reaches routinely rather than pathologically, since
+    // Docker's default is exactly 1,048,576. Nobody waits on it: this runs
+    // between `fork` and `exec` in a child, and the parent's own timeout for
+    // the daemon to appear is ten seconds.
+    //
+    // Still best-effort, and the clamp is not the only reason: `getdtablesize`
+    // is the soft limit *now*, so a wrapper that opens a descriptor and then
+    // lowers `ulimit -n` before exec'ing us leaves it above the limit and
+    // therefore untouched.
     const limit = @min(getdtablesize(), 1 << 20);
     var fd = lowest;
     while (fd < limit) : (fd += 1) _ = close(fd);
