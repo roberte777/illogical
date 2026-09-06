@@ -83,6 +83,44 @@ public enum ServerHost: Hashable, Sendable, Codable {
     case local(socketPath: String)
     case ssh(destination: String, remoteBinary: String = "illogicald")
 
+    // Hand-written rather than synthesized, for one reason: the synthesized
+    // `init(from:)` uses `decode(_:forKey:)`, which does *not* honour the
+    // `= "illogicald"` default above. A stored blob without that key threw
+    // `keyNotFound` — and because the whole array is decoded in one `try?`,
+    // one such entry silently forgot every remembered host, not one field.
+
+    private enum CodingKeys: String, CodingKey { case local, ssh }
+    private enum LocalKeys: String, CodingKey { case socketPath }
+    private enum SSHKeys: String, CodingKey { case destination, remoteBinary }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.local) {
+            let nested = try container.nestedContainer(keyedBy: LocalKeys.self, forKey: .local)
+            self = .local(socketPath: try nested.decode(String.self, forKey: .socketPath))
+            return
+        }
+        let nested = try container.nestedContainer(keyedBy: SSHKeys.self, forKey: .ssh)
+        self = .ssh(
+            destination: try nested.decode(String.self, forKey: .destination),
+            // The one line this whole override exists for.
+            remoteBinary: try nested.decodeIfPresent(String.self, forKey: .remoteBinary)
+                ?? "illogicald")
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .local(let socketPath):
+            var nested = container.nestedContainer(keyedBy: LocalKeys.self, forKey: .local)
+            try nested.encode(socketPath, forKey: .socketPath)
+        case .ssh(let destination, let remoteBinary):
+            var nested = container.nestedContainer(keyedBy: SSHKeys.self, forKey: .ssh)
+            try nested.encode(destination, forKey: .destination)
+            try nested.encode(remoteBinary, forKey: .remoteBinary)
+        }
+    }
+
     public var displayName: String {
         switch self {
         case .local: "Local"

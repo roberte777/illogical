@@ -447,8 +447,11 @@ Two details that are not decoration:
   `src/core/conn.zig` renders, so the app and `illogical --host` share a master.
 
 The child's stderr is drained and kept — an undrained pipe fills at 64 KiB and
-wedges `ssh` — so "could not resolve hostname" reaches the user as itself rather
-than as a closed connection.
+wedges `ssh` — so "could not resolve hostname" survives as itself rather than as
+a closed connection. It is reported only once the child has actually gone: `ssh`
+writes to stderr on perfectly good connections too (the known-hosts warning on a
+first connect, banners, the remote daemon's own logging), and treating any of
+that as a failure made a healthy host render as the broken one.
 
 Superlogical's server additionally has built-in Tailscale/Headscale support and
 acts as a node ([MASTO]). Out of scope for us; SSH first.

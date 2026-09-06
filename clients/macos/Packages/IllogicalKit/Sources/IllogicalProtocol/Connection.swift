@@ -26,10 +26,15 @@ public struct Frame: Sendable {
     }
 }
 
+/// What a *connection* can fail at, once it exists.
+///
+/// Connecting throws `TransportError` now, so the three cases that used to
+/// duplicate it — `socketFailed`, `connectFailed`, `pathTooLong` — became
+/// unreachable when the transport took over opening. They are gone rather than
+/// left to rot: a `catch ConnectionError.connectFailed` that silently stops
+/// matching is worse than one that stops compiling, and the two rendered
+/// differently anyway (`TransportError` describes itself; this did not).
 public enum ConnectionError: Error, Equatable {
-    case socketFailed(Int32)
-    case connectFailed(Int32)
-    case pathTooLong
     case closed
     case handshakeFailed(String)
     case unexpectedFrame(FrameType)
@@ -42,6 +47,9 @@ public final class Connection: @unchecked Sendable {
     private let writeLock = NSLock()
     private var readerThread: Thread?
     private let closed = ManagedAtomicFlag()
+    /// Signalled when `readLoop` leaves, so `close` can free the descriptors
+    /// only once nothing is on them. `Thread` has no join.
+    private let readerFinished = DispatchSemaphore(value: 0)
 
     /// Frames from the server. Finishes when the connection closes.
     public let frames: AsyncStream<Frame>
@@ -86,10 +94,33 @@ public final class Connection: @unchecked Sendable {
         readerThread = thread
     }
 
+    /// Tear the connection down, in the one order that is safe.
+    ///
+    /// `shutdown` wakes the reader while the descriptor numbers are still
+    /// ours, then we wait for it to leave, then we free them. Closing first —
+    /// which is what this used to do — hands the numbers back to the kernel
+    /// with a thread still blocked on them, and the next connection in the
+    /// process is handed the same number: one terminal's keystrokes arriving
+    /// in another's PTY, which is a good deal worse than a dropped frame.
     public func close() {
         guard closed.testAndSet() == false else { return }
-        transport.close()
+        transport.shutdown()
         continuation.finish()
+
+        // Only if a reader was ever started; `start()` is not mandatory.
+        if readerThread != nil {
+            // Bounded: a child wedged in an uninterruptible read must not hang
+            // a window that is closing. Leaking a descriptor is the lesser
+            // failure, and `shutdown` has already made it inert.
+            _ = readerFinished.wait(timeout: .now() + 2)
+            readerThread = nil
+        }
+
+        // Under the write lock, so a `send` that was already inside it has
+        // finished with the descriptor before the number goes back.
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        transport.close()
     }
 
     // MARK: - Sending
@@ -106,6 +137,11 @@ public final class Connection: @unchecked Sendable {
 
         writeLock.lock()
         defer { writeLock.unlock() }
+        // Under the lock, and re-checked here rather than at the top: `close`
+        // frees the descriptor while holding this same lock, so a `send` that
+        // passed an unlocked check could still be handed a number that now
+        // belongs to another connection.
+        guard !closed.isSet else { throw ConnectionError.closed }
         try frame.withUnsafeBytes { raw in
             var offset = 0
             while offset < raw.count {
@@ -132,9 +168,20 @@ public final class Connection: @unchecked Sendable {
     // MARK: - Reading
 
     private func readLoop() {
+        // Signalled last, and unconditionally: `close` waits on it before it
+        // frees the descriptors this loop is reading.
+        defer {
+            continuation.finish()
+            readerFinished.signal()
+        }
+
         var header = [UInt8](repeating: 0, count: Protocol.headerLength)
         while !closed.isSet {
             guard readExact(into: &header, count: Protocol.headerLength) else { break }
+            // A frame we cannot parse is not something to keep reading past --
+            // the stream is a byte stream, so one bad header means every later
+            // offset is wrong. It happens for real: a remote login shell that
+            // echoes a line from `.bashrc` puts it ahead of the first frame.
             guard let parsed = try? FrameHeader.decode(header) else { break }
 
             var payload = Data()
@@ -146,7 +193,13 @@ public final class Connection: @unchecked Sendable {
             continuation.yield(
                 Frame(type: parsed.type, terminal: parsed.session, payload: payload))
         }
-        continuation.finish()
+
+        // The far end went, or said something unparseable. Break the transport
+        // rather than leaving it: an `ssh` child whose stdin pipe we still hold
+        // stays alive, pinning its ControlPersist master and three descriptors,
+        // and every reconnect adds another. `shutdown` only -- freeing the
+        // numbers is `close`'s job, and this is the thread it waits for.
+        transport.shutdown()
     }
 
     private func readExact(into buf: inout [UInt8], count: Int) -> Bool {
