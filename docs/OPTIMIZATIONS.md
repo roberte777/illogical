@@ -570,10 +570,33 @@ expose. See [PROTOCOL.md](PROTOCOL.md#flow-control).
 
 ### F3. Snapshot compression and encryption
 
-Mitchell confirms parked snapshots are compressed and encrypted but names neither
-algorithm [MEM t=278, t=369]. We will start with **zstd** (which he has
-recommended for snapshots in a ghostty discussion) and leave encryption to M4,
-tracked as an open question in [ROADMAP.md](ROADMAP.md).
+**Status: Done.** Landed in M4.
+
+Mitchell confirms parked snapshots are compressed and encrypted but names
+neither algorithm [MEM t=278, t=369]. Compression is deflate rather than the
+zstd he has recommended, because Zig 0.16 ships a zstd *decompressor* only and
+a C zstd would be the project's first non-ghostty native dependency; it is one
+constant to change.
+
+Encryption is **XChaCha20-Poly1305, chunked**, over the compressed stream.
+Chunked and not sealed once, because parking is worth nothing if unparking
+stops being streaming: a terminal is usable at READY, long before the last byte
+is read, and one AEAD over the file would mean buffering all of it to check a
+single tag. 32 KiB chunks, 0.05% overhead.
+
+The three things this kind of construction gets wrong, and what stops each:
+
+| | |
+| --- | --- |
+| Chunks reordered | the chunk index is part of its nonce |
+| File truncated | an authenticated empty terminator; a short file has none |
+| Nonce reused | a fresh random 16-byte prefix per file |
+
+The key lives beside the store at mode 0600. Anyone who can read the store as
+this user can read the key, so this is not a defence against local compromise —
+it is the same trust boundary the socket already has. It defends what *leaves*
+that boundary: backups, disk images, container layers, a laptop passed on.
+Which is the case [MEM t=278] is about.
 
 Do not assume LZ4 here — that is Ghostty's *in-memory page* compression (A5),
 which is a different problem with different constraints.

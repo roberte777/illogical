@@ -38,6 +38,7 @@
 //! unparks. See docs/PARKING.md.
 
 const std = @import("std");
+const crypt = @import("crypt.zig");
 const session = @import("session.zig");
 
 /// PTY-read-idle time after which a live terminal is parked.
@@ -88,10 +89,17 @@ pub const Config = struct {
 ///       sessions/<id>/snapshot.gsnp.tmp      staged write, renamed on fsync
 pub const Store = struct {
     root: []const u8,
+    /// The key park files are encrypted with, owned by the server.
+    ///
+    /// A pointer, not the key itself: a `Store` is copied into every terminal,
+    /// and thirty-two bytes each is exactly the kind of per-terminal cost A6
+    /// exists to notice. Null means write plaintext, which only tests do.
+    key: ?*const crypt.Key = null,
 
     pub const snapshot_basename = "snapshot.gsnp";
     pub const staging_basename = "snapshot.gsnp.tmp";
     pub const meta_basename = "meta.json";
+    pub const key_basename = "park.key";
 
     /// Park files are deflate-compressed.
     ///
@@ -146,6 +154,10 @@ pub const Store = struct {
             "{s}/sessions/{d}/{s}",
             .{ self.root, id, staging_basename },
         );
+    }
+
+    pub fn keyPath(self: Store, buf: []u8) std.fmt.BufPrintError![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{ self.root, key_basename });
     }
 
     /// Bytes on disk for a parked terminal, or null if it is not parked.

@@ -32,6 +32,10 @@ gpa: Allocator,
 io: std.Io,
 socket_path: []const u8,
 store: illogical.park.Store,
+/// The park key, owned here so `store.key` can point at one copy instead of
+/// every terminal carrying thirty-two bytes of its own. Must not move: the
+/// store and every terminal's copy of it hold this address.
+park_key: illogical.crypt.Key = @splat(0),
 park_config: illogical.park.Config = .{},
 listener: sys.fd_t = -1,
 
@@ -70,6 +74,25 @@ pub fn init(gpa: Allocator, io: std.Io, socket_path: []const u8, state_root: []c
         .store = .{ .root = try gpa.dupe(u8, state_root) },
         .pty_poller = try .init(gpa),
     };
+
+    // The park key, generated on first run. Held here and pointed at by the
+    // store, so it is not thirty-two bytes per terminal.
+    //
+    // A failure is loud but not fatal. A daemon that refuses to start because
+    // it could not write a key file is worse than one that parks in plaintext
+    // and says so plainly -- but it does have to say so, because the whole
+    // reason F3 exists is that scrollback holds secrets.
+    std.Io.Dir.cwd().createDirPath(io, state_root) catch {};
+    var key_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (self.store.keyPath(&key_buf)) |key_path| {
+        if (illogical.crypt.loadOrCreateKey(io, key_path)) |key| {
+            self.park_key = key;
+            self.store.key = &self.park_key;
+        } else |err| {
+            log.err("no park key ({t}); park files will be plaintext", .{err});
+        }
+    } else |_| {}
+
     return self;
 }
 
