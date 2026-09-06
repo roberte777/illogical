@@ -205,6 +205,53 @@ struct TransportTests {
         }
     }
 
+    /// A write to a socket whose far end has gone raises SIGPIPE, and the
+    /// default disposition for that kills the process. A daemon going away
+    /// with a keystroke in flight is exactly what reconnecting is for, so
+    /// without `SO_NOSIGPIPE` the recovery path is the one that kills the app,
+    /// taking every other pane's window with it.
+    ///
+    /// This test passing at all is most of the assertion: a regression here
+    /// does not fail, it terminates the test runner.
+    @Test("a write to a socket whose peer has gone throws instead of killing us")
+    func writeAfterPeerHungUp() throws {
+        let path = "/tmp/illogical-sigpipe-\(getpid()).sock"
+        unlink(path)
+        defer { unlink(path) }
+
+        let listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        defer { Darwin.close(listener) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: Array(path.utf8)) }
+        let bound = withUnsafePointer(to: &addr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        try #require(bound == 0)
+        try #require(Darwin.listen(listener, 1) == 0)
+
+        let connection = Connection(transport: try UnixSocketTransport(path: path))
+        defer { connection.close() }
+        let accepted = Darwin.accept(listener, nil, nil)
+        try #require(accepted >= 0)
+        Darwin.close(accepted)
+
+        // The first write after the peer goes usually lands in the socket
+        // buffer and succeeds; EPIPE arrives on a later one.
+        var threw = false
+        for _ in 0..<64 where !threw {
+            do {
+                try connection.send(.input, terminal: 1, payload: Data(count: 64 * 1024))
+            } catch {
+                threw = true
+            }
+        }
+        #expect(threw, "a dead socket took four megabytes without complaint")
+    }
+
     /// A host round-trips through the defaults the window stores it in.
     @Test("a remote host survives being written down")
     func hostCoding() throws {

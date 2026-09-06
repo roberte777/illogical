@@ -91,6 +91,15 @@ public final class UnixSocketTransport: Transport, @unchecked Sendable {
             Darwin.close(fd)
             throw TransportError.connectFailed(code)
         }
+
+        // A write to a socket whose far end has gone raises SIGPIPE, and the
+        // default disposition for that is to kill the process. Not a
+        // theoretical hazard: a daemon going away with a keystroke in flight
+        // is exactly the case reconnecting exists for, and a client that dies
+        // on it takes every other pane in the window with it.
+        var on: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+
         self.fd = fd
     }
 
@@ -134,10 +143,22 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// still open means `ssh` gave up, and `failureDescription` says why.
     public var isRunning: Bool { process.isRunning }
 
+    /// Stop a write to a pipe whose reader has gone from killing the process.
+    ///
+    /// A socket has `SO_NOSIGPIPE`; a pipe has no per-descriptor equivalent,
+    /// so the process-wide disposition is the only answer — the same one every
+    /// server reaches for, `illogicald` included (src/daemon/main.zig). A
+    /// `static let` so it happens exactly once, whenever the first remote host
+    /// is opened and not before.
+    private static let sigpipeIgnored: Void = {
+        signal(SIGPIPE, SIG_IGN)
+    }()
+
     public init(argv: [String]) throws {
         guard let executable = argv.first else {
             throw TransportError.spawnFailed("no command")
         }
+        _ = Self.sigpipeIgnored
 
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
