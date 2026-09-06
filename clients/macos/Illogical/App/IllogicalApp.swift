@@ -35,7 +35,10 @@ struct IllogicalApp: App {
                 Button("New Terminal") { store.createTerminal() }
                     .keyboardShortcut("t", modifiers: .command)
                 Button("New Session") {
-                    store.createTerminal(sessionName: "session-\(store.sessions.count + 1)")
+                    // On the machine in front, which is where ⌘T would put a
+                    // terminal too.
+                    let count = store.selectedHost?.sessions.count ?? 0
+                    store.createTerminal(sessionName: "session-\(count + 1)")
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
             }

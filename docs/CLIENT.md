@@ -34,6 +34,43 @@ Transport is in the package rather than the app on purpose: it is the half of
 remote support that can be tested without a window, a GPU or a daemon, and
 `just test-swift` runs it in under a second.
 
+## Several machines in one window
+
+A window holds one `HostConnection` per machine: the local daemon, plus any
+number of remote ones. Each owns **what exists** on its machine — its control
+connection, its sessions, its terminals, its per-terminal controllers.
+`SessionStore` owns **where that is drawn**: the tabs, the split trees, the
+selection, across every host at once.
+
+```
+SessionStore                      tabs, splits, selection
+├── HostConnection  Local         sessions, terminals, controllers
+├── HostConnection  build-box     sessions, terminals, controllers
+└── HostConnection  gpu-01        sessions, terminals, controllers
+```
+
+That split is what makes the rest of the client indifferent to where a terminal
+is. The one thing it forces is that **a terminal is a `TerminalRef`, not an id**:
+every daemon numbers its terminals from 1, so two machines both have a terminal
+1, and a `UInt64` in a pane would draw one machine's terminal in the other's
+pane rather than merely losing a tab. The same goes for a `SessionRef`.
+
+A tab belongs to one session, and a session lives on one machine, so a tab never
+spans two hosts. Splitting inside it creates a terminal on that same machine.
+Which machine you are looking at is on the session button; which machine a
+*pane* is on is in its own header, because a tab has one strip entry and a split
+tab could otherwise say nothing about it.
+
+Hosts are remembered in `UserDefaults` as destination strings and nothing else.
+There is no credential to store: `ssh` reads the user's own config, so a `Host`
+alias out of it is a perfectly good answer.
+
+**One unreachable machine is not a broken window.** A failed host is a marker in
+the dropdown with `ssh`'s own complaint behind it and a button to try again; the
+"no server" screen only takes over when *every* host is down. `ILLOGICAL_HOSTS`
+adds destinations at launch without remembering them, so a two-machine window
+can be inspected without driving the mouse.
+
 ## One connection per terminal
 
 ⚠ A window showing four splits holds **four** protocol connections, each 1:1 with
@@ -370,6 +407,10 @@ invariant, which is what makes desync recovery trivial. Don't.
 The dropdown lists sessions; a session expands to its terminals. Each row shows
 residency — live, parked, rehydrating, exited — because parked is normal and
 should look normal, not like an error.
+
+With more than one machine connected it grows a header per host and the sessions
+under it are that machine's. One host is the common case, so the headers only
+appear when there is something to disambiguate.
 
 Switching to a parked terminal is **not** an unpark: the server streams its
 snapshot straight from disk and the terminal stays parked [MEM t=660]. From the

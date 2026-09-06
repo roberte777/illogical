@@ -1,9 +1,12 @@
 //  SessionStore.swift
-//  Connection state for a host: its sessions, its terminals, and which one is
-//  in front.
+//  The window: which hosts it is connected to, and which of their terminals
+//  are drawn where.
 //
-//  The control connection is separate from the per-terminal connections. It
-//  carries list/create/kill only; terminal traffic never touches it.
+//  A host owns what exists (HostConnection). The store owns where it is drawn.
+//  Keeping that split is what makes several machines in one window a change
+//  here and nowhere else: a `TerminalRef` carries its host, and every layer
+//  above the transport is identical whether a terminal's PTY is on this
+//  machine or another one.
 
 import AppKit
 import Foundation
@@ -13,14 +16,17 @@ import Observation
 @MainActor
 @Observable
 final class SessionStore {
-    var host: ServerHost = .local(socketPath: SessionStore.defaultSocketPath)
-    var sessions: [SessionSummary] = []
-    var terminals: [TerminalSummary] = []
+    /// Every machine this window is talking to. The first is always the local
+    /// daemon; the rest were added by the user and are remembered.
+    private(set) var hosts: [HostConnection] = []
+
     /// Tabs, each a layout of panes. A tab is not a terminal: splitting adds
-    /// a pane and a connection without adding a tab.
+    /// a pane and a connection without adding a tab. A tab belongs to one
+    /// session on one host — panes from two machines never share a tab,
+    /// because a session is a thing that lives on a machine.
     var tabs: [TabLayout] = []
     var selectedTabID: TabLayout.ID?
-    var connectionError: String?
+
     /// The toolbar lives in a title bar accessory and the menu lives in the
     /// content view, so the open/closed state has to be somewhere both can see.
     ///
@@ -40,52 +46,175 @@ final class SessionStore {
         }
     }()
 
-    /// Live controllers, one per open terminal.
-    private(set) var controllers: [UInt64: TerminalController] = [:]
-
-    private var control: Connection?
-    private var pump: Task<Void, Never>?
-
-    /// A split waiting for the server to say which terminal it made.
-    private var pendingSplit: (tab: TabLayout.ID, pane: UUID, direction: SplitNode.Direction)?
+    /// A split waiting for its host to say which terminal it made.
+    private var pendingSplit:
+        (
+            host: ServerHost, tab: TabLayout.ID, pane: UUID, direction: SplitNode.Direction
+        )?
     /// A plain new terminal waiting for the same, so its tab can be selected
     /// once the list arrives.
-    private var pendingTab: UInt64?
-    /// Terminals we have asked the server to kill. Their panes are already
-    /// gone from the layout, so the reconcile must not put them back while
-    /// the server still lists them.
-    private var closing: Set<UInt64> = []
+    private var pendingTab: TerminalRef?
+    /// Terminals we have asked a server to kill. Their panes are already gone
+    /// from the layout, so the reconcile must not put them back while the
+    /// server still lists them.
+    private var closing: Set<TerminalRef> = []
+
+    init(hosts: [ServerHost] = SessionStore.startingHosts()) {
+        for host in hosts { adopt(HostConnection(host: host)) }
+    }
+
+    /// The local daemon, plus whichever remote hosts were added last time.
+    ///
+    /// ILLOGICAL_HOSTS is a comma-separated list of SSH destinations added at
+    /// launch and not remembered. Same purpose as ILLOGICAL_SPLIT and
+    /// ILLOGICAL_OPEN_SESSION_MENU: a window with two machines in it can be
+    /// inspected — or screenshotted — without driving the mouse.
+    static func startingHosts() -> [ServerHost] {
+        var hosts: [ServerHost] = [.local(socketPath: defaultSocketPath)]
+        if let list = ProcessInfo.processInfo.environment["ILLOGICAL_HOSTS"] {
+            hosts += list.split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+                .map { ServerHost.ssh(destination: $0) }
+        }
+        for host in RemoteHostStore.load() where !hosts.contains(host) {
+            hosts.append(host)
+        }
+        return hosts
+    }
+
+    // MARK: - Hosts
+
+    func host(_ id: ServerHost) -> HostConnection? {
+        hosts.first { $0.host == id }
+    }
+
+    /// The host the next new terminal belongs on: whichever one the front tab
+    /// is looking at.
+    var selectedHost: HostConnection? {
+        if let ref = selectedTab?.session.host, let host = host(ref) { return host }
+        return hosts.first
+    }
+
+    /// Add a machine and connect to it. A destination already in the list is
+    /// selected rather than duplicated.
+    func addHost(_ host: ServerHost) {
+        if let existing = self.host(host) {
+            if case .failed = existing.status { existing.connect() }
+            return
+        }
+        let connection = HostConnection(host: host)
+        adopt(connection)
+        RemoteHostStore.save(hosts.map(\.host).filter(\.isRemote))
+        connection.connect()
+    }
+
+    /// Forget a machine: close everything of its, and take its tabs with it.
+    ///
+    /// The local host cannot be removed — there would be nothing left to make
+    /// a terminal on, and it is not something the user added.
+    func removeHost(_ host: ServerHost) {
+        guard host.isRemote, let index = hosts.firstIndex(where: { $0.host == host }) else {
+            return
+        }
+        hosts[index].disconnect()
+        hosts.remove(at: index)
+        RemoteHostStore.save(hosts.map(\.host).filter(\.isRemote))
+        reconcileTabs()
+    }
+
+    /// Try a host again after a failure.
+    func reconnect(_ host: ServerHost) {
+        self.host(host)?.connect()
+    }
+
+    private func adopt(_ connection: HostConnection) {
+        connection.onListChanged = { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            connection.pruneControllers()
+            self.reconcileTabs()
+        }
+        connection.onCreated = { [weak self, weak connection] terminal in
+            guard let self, let connection else { return }
+            self.terminalCreated(connection.ref(terminal))
+        }
+        connection.onStatusChanged = { [weak self] in
+            // Observation only tracks what a view read, and a view that read
+            // no host would not redraw on a status change it does not own.
+            self?.hostStatusRevision &+= 1
+        }
+        hosts.append(connection)
+    }
+
+    /// Bumped whenever any host's status changes, so a view showing the state
+    /// of the *set* of hosts has something of the store's own to observe.
+    private(set) var hostStatusRevision: UInt64 = 0
+
+    func connect() {
+        for host in hosts { host.connect() }
+    }
+
+    /// Whether nothing at all is reachable, and the message to show if so.
+    ///
+    /// A single failed remote host is not this: the window still works, and
+    /// the menu marks that host. Only every host being down is worth taking
+    /// the terminal area over for.
+    var connectionError: String? {
+        _ = hostStatusRevision
+        guard !hosts.isEmpty else { return nil }
+        let failures = hosts.compactMap { host -> String? in
+            if case .failed(let message) = host.status { return message }
+            return nil
+        }
+        guard failures.count == hosts.count else { return nil }
+        return failures.first
+    }
+
+    // MARK: - The window's view of what exists
 
     var selectedTab: TabLayout? {
         tabs.first { $0.id == selectedTabID }
     }
 
     /// The terminal in front: the focused pane of the front tab.
-    var selectedID: TerminalSummary.ID? { selectedTab?.focusedTerminal }
+    var selectedRef: TerminalRef? { selectedTab?.focusedTerminal }
 
     var selected: TerminalSummary? {
-        guard let selectedID else { return nil }
-        return terminals.first { $0.id == selectedID }
+        guard let ref = selectedRef else { return nil }
+        return terminal(ref)
     }
 
-    var selectedSession: SessionSummary? {
-        guard let tab = selectedTab else { return sessions.first }
-        return sessions.first { $0.id == tab.session }
+    var selectedSession: SessionRef? {
+        if let tab = selectedTab { return tab.session }
+        guard let host = hosts.first, let session = host.sessions.first else { return nil }
+        return SessionRef(host: host.host, session: session.id)
     }
 
-    /// Tabs in the session that is currently in front.
+    var selectedSessionSummary: SessionSummary? {
+        guard let ref = selectedSession else { return nil }
+        return host(ref.host)?.sessions.first { $0.id == ref.session }
+    }
+
+    /// Tabs in the session that is currently in front. A session lives on one
+    /// host, so this is also "tabs on the machine you are looking at".
     var visibleTabs: [TabLayout] {
         guard let session = selectedSession else { return tabs }
-        return tabs.filter { $0.session == session.id }
+        return tabs.filter { $0.session == session }
     }
 
-    func terminal(_ id: UInt64) -> TerminalSummary? {
-        terminals.first { $0.id == id }
+    func terminal(_ ref: TerminalRef) -> TerminalSummary? {
+        host(ref.host)?.terminal(ref.terminal)
     }
 
     /// The terminal whose name the tab carries.
     func label(for tab: TabLayout) -> TerminalSummary? {
         tab.focusedTerminal.flatMap { terminal($0) }
+    }
+
+    /// The machine a tab is on, for a label. Nil when it is the local one,
+    /// because "Local" in front of every tab on a laptop is noise.
+    func remoteName(for tab: TabLayout) -> String? {
+        tab.session.host.isRemote ? tab.session.host.displayName : nil
     }
 
     static var defaultSocketPath: String {
@@ -99,55 +228,38 @@ final class SessionStore {
         return state + "/illogical/server.sock"
     }
 
-    var socketPath: String {
-        switch host {
-        case .local(let path): path
-        case .ssh: SessionStore.defaultSocketPath
-        }
-    }
-
-    // MARK: - Control connection
-
-    func connect() {
-        Trace.log("connecting to \(socketPath)")
-        do {
-            let connection = try Connection(socketPath: socketPath)
-            control = connection
-            connection.start()
-            try connection.send(.hello, json: HelloBody(client: "Illogical.app"))
-            connectionError = nil
-
-            pump = Task { [weak self] in
-                for await frame in connection.frames {
-                    guard let self else { return }
-                    await self.handle(frame)
-                }
-            }
-            refresh()
-            Trace.log("control connection up")
-        } catch {
-            Trace.log("connect failed: \(error)")
-            connectionError =
-                "No illogicald at \(socketPath). Start one with `illogicald`."
-        }
-    }
+    // MARK: - Creating and killing
 
     func refresh() {
-        try? control?.send(.list)
+        for host in hosts { host.refresh() }
     }
 
-    func createTerminal(sessionName: String? = nil) {
-        let name = sessionName ?? selectedSession?.name ?? "default"
+    /// Make a terminal on a host. Defaults to the machine the front tab is on,
+    /// in the session it is in.
+    func createTerminal(sessionName: String? = nil, on host: ServerHost? = nil) {
+        let target = host.flatMap { self.host($0) } ?? selectedHost
+        guard let target else { return }
+        let name = sessionName ?? frontSessionName(on: target) ?? "default"
         pendingSplit = nil
-        try? control?.send(.create, json: CreateBody(sessionName: name, cols: 120, rows: 40))
+        target.createTerminal(sessionName: name)
     }
 
-    func kill(_ id: UInt64) {
+    /// The session a new terminal on `host` should join: the one in front if
+    /// it is on that machine, otherwise that machine's first.
+    private func frontSessionName(on host: HostConnection) -> String? {
+        if let ref = selectedSession, ref.host == host.host,
+            let match = host.sessions.first(where: { $0.id == ref.session })
+        {
+            return match.name
+        }
+        return host.sessions.first?.name
+    }
+
+    func kill(_ ref: TerminalRef) {
         // The server signals the child; the terminal is retired when it
         // actually exits, and we find out from `sessions_changed`.
-        closing.insert(id)
-        try? control?.send(.kill, terminal: id)
-        closeController(id)
+        closing.insert(ref)
+        host(ref.host)?.kill(ref.terminal)
     }
 
     // MARK: - Splits
@@ -163,13 +275,18 @@ final class SessionStore {
     }
 
     func split(pane paneID: UUID, in tabID: TabLayout.ID, direction: SplitNode.Direction) {
-        guard let tab = tabs.first(where: { $0.id == tabID }) else { return }
-        let name = sessions.first { $0.id == tab.session }?.name ?? "default"
+        guard let tab = tabs.first(where: { $0.id == tabID }),
+            let host = host(tab.session.host)
+        else { return }
+        let name =
+            host.sessions.first { $0.id == tab.session.session }?.name
+            ?? host.sessions.first?.name ?? "default"
         // The pane appears when the server answers with a terminal id. Over a
         // unix socket that is one round trip; a placeholder pane would be more
-        // machinery than the wait is worth.
-        pendingSplit = (tab: tabID, pane: paneID, direction: direction)
-        try? control?.send(.create, json: CreateBody(sessionName: name, cols: 120, rows: 40))
+        // machinery than the wait is worth. Over SSH it is a round trip on an
+        // already-open channel, which is the same order of magnitude.
+        pendingSplit = (host: host.host, tab: tabID, pane: paneID, direction: direction)
+        host.createTerminal(sessionName: name)
     }
 
     /// Close one pane. The last pane in a tab closes the tab.
@@ -178,7 +295,7 @@ final class SessionStore {
             let pane = tabs[index].root.pane(paneID)
         else { return }
 
-        kill(pane.terminalID)
+        kill(pane.terminal)
 
         // Take it out of the layout now rather than waiting for the server to
         // confirm: the connection is already closed, so the pane would render
@@ -195,7 +312,7 @@ final class SessionStore {
     /// Close a whole tab, and every terminal in it.
     func closeTab(_ tabID: TabLayout.ID) {
         guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
-        for pane in tabs[index].panes { kill(pane.terminalID) }
+        for pane in tabs[index].panes { kill(pane.terminal) }
         tabs.remove(at: index)
         if selectedTabID == tabID { selectedTabID = tabs.first?.id }
     }
@@ -239,83 +356,43 @@ final class SessionStore {
         tabs[index].root = tabs[index].root.settingRatio(ratio, forSplit: splitID)
     }
 
-    private func handle(_ frame: Frame) {
-        Trace.log("frame \(frame.type) payload=\(frame.payload.count)")
-        switch frame.type {
-        case .sessionList:
-            guard let list = try? JSONDecoder().decode(SessionListBody.self, from: frame.payload)
-            else {
-                Trace.log(
-                    "bad session list: \(String(data: frame.payload, encoding: .utf8) ?? "<binary>")"
-                )
-                return
-            }
-            Trace.log("\(list.sessions.count) sessions, \(list.terminals.count) terminals")
-            sessions = list.sessions.map {
-                SessionSummary(id: $0.id, name: $0.name, terminals: $0.terminals)
-            }
-            terminals = list.terminals.map {
-                TerminalSummary(
-                    id: $0.id,
-                    session: $0.session,
-                    name: $0.name,
-                    command: $0.command,
-                    cwd: $0.cwd,
-                    cols: $0.cols,
-                    rows: $0.rows,
-                    residency: Residency(rawValue: $0.residency) ?? .live,
-                    attached: $0.attached,
-                    ptyReadIdleNanoseconds: $0.ptyReadIdleNanoseconds,
-                    exitCode: $0.exitCode)
-            }
-            // Tear down connections for terminals the server has retired,
-            // otherwise their reader threads linger on a dead socket.
-            let live = Set(terminals.map(\.id))
-            for id in controllers.keys where !live.contains(id) {
-                closeController(id)
-            }
-            reconcileTabs(live: live)
+    // MARK: - Reconciling
 
-        case .created:
-            guard let created = try? JSONDecoder().decode(CreatedBody.self, from: frame.payload)
-            else { return }
-            if let pending = pendingSplit,
-                let index = tabs.firstIndex(where: { $0.id == pending.tab })
-            {
-                pendingSplit = nil
-                let pane = Pane(terminalID: created.terminal)
-                tabs[index].root = tabs[index].root.splitting(
-                    pending.pane, with: pane, direction: pending.direction)
-                tabs[index].focused = pane.id
-                selectedTabID = pending.tab
-            } else {
-                pendingTab = created.terminal
-            }
-            refresh()
-
-        case .sessionsChanged:
-            refresh()
-
-        default:
-            break
+    private func terminalCreated(_ ref: TerminalRef) {
+        if let pending = pendingSplit, pending.host == ref.host,
+            let index = tabs.firstIndex(where: { $0.id == pending.tab })
+        {
+            pendingSplit = nil
+            let pane = Pane(terminal: ref)
+            tabs[index].root = tabs[index].root.splitting(
+                pending.pane, with: pane, direction: pending.direction)
+            tabs[index].focused = pane.id
+            selectedTabID = pending.tab
+        } else {
+            pendingTab = ref
         }
     }
 
-    /// Bring the tab list back in line with what the server says exists.
+    /// Bring the tab list back in line with what every host says exists.
     ///
     /// Internal rather than private so the tests can drive it directly: it is
     /// the only place tabs are created or destroyed, and every interesting
-    /// case is a race between what the server lists and what we already did.
+    /// case is a race between what a server lists and what we already did.
     ///
     /// Three jobs: drop panes whose terminal is gone, give every terminal that
     /// is in no tab a tab of its own, and keep the selection pointing at
-    /// something.
-    func reconcileTabs(live: Set<UInt64>) {
+    /// something. Across every host at once, because a pane and the tab it
+    /// sits in are the window's, not a connection's.
+    func reconcileTabs() {
+        let live = Set(hosts.flatMap { host in host.terminals.map { host.ref($0.id) } })
         closing.formIntersection(live)
 
         tabs = tabs.compactMap { tab in
             var tab = tab
-            for pane in tab.panes where !live.contains(pane.terminalID) {
+            // A host that has been removed takes its tabs with it, even though
+            // it is no longer here to say its terminals are gone.
+            guard host(tab.session.host) != nil else { return nil }
+            for pane in tab.panes where !live.contains(pane.terminal) {
                 guard let root = tab.root.removing(pane.id) else { return nil }
                 tab.root = root
             }
@@ -323,14 +400,20 @@ final class SessionStore {
             return tab
         }
 
-        let shown = Set(tabs.flatMap { $0.panes.map(\.terminalID) })
-        for terminal in terminals
-        where !shown.contains(terminal.id) && !closing.contains(terminal.id) {
-            tabs.append(TabLayout(session: terminal.session, terminalID: terminal.id))
+        let shown = Set(tabs.flatMap { $0.panes.map(\.terminal) })
+        for host in hosts {
+            for terminal in host.terminals {
+                let ref = host.ref(terminal.id)
+                guard !shown.contains(ref), !closing.contains(ref) else { continue }
+                tabs.append(
+                    TabLayout(
+                        session: SessionRef(host: host.host, session: terminal.session),
+                        terminal: ref))
+            }
         }
 
         if let pending = pendingTab,
-            let tab = tabs.first(where: { $0.panes.contains { $0.terminalID == pending } })
+            let tab = tabs.first(where: { $0.panes.contains { $0.terminal == pending } })
         {
             selectedTabID = tab.id
             pendingTab = nil
@@ -349,17 +432,32 @@ final class SessionStore {
     // MARK: - Per-terminal connections
 
     /// The controller for a terminal, creating and attaching one if needed.
-    func controller(for id: UInt64, cols: UInt16, rows: UInt16) -> TerminalController? {
-        if let existing = controllers[id] { return existing }
-        guard let controller = try? TerminalController(terminalID: id, cols: cols, rows: rows)
-        else { return nil }
-        controller.connect(socketPath: socketPath, cols: cols, rows: rows)
-        controllers[id] = controller
-        return controller
+    func controller(for ref: TerminalRef, cols: UInt16, rows: UInt16) -> TerminalController? {
+        host(ref.host)?.controller(for: ref.terminal, cols: cols, rows: rows)
     }
 
-    func closeController(_ id: UInt64) {
-        controllers[id]?.disconnect()
-        controllers[id] = nil
+    func closeController(_ ref: TerminalRef) {
+        host(ref.host)?.closeController(ref.terminal)
+    }
+}
+
+/// The remote hosts this window remembers.
+///
+/// Only the destination is stored, because that is all there is: no
+/// credentials, no keys, no port — `ssh` reads the user's own config, and a
+/// `Host` alias from it is a perfectly good destination.
+enum RemoteHostStore {
+    static let key = "remoteHosts"
+
+    static func load(_ defaults: UserDefaults = .standard) -> [ServerHost] {
+        guard let data = defaults.data(forKey: key),
+            let hosts = try? JSONDecoder().decode([ServerHost].self, from: data)
+        else { return [] }
+        return hosts.filter(\.isRemote)
+    }
+
+    static func save(_ hosts: [ServerHost], to defaults: UserDefaults = .standard) {
+        guard let data = try? JSONEncoder().encode(hosts.filter(\.isRemote)) else { return }
+        defaults.set(data, forKey: key)
     }
 }

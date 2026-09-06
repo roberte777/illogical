@@ -36,6 +36,10 @@ final class TerminalController {
     }
 
     let terminalID: UInt64
+    /// The machine this terminal's PTY is on. Held rather than passed in,
+    /// because the connection may have to be made more than once and nothing
+    /// above here should have to remember where a terminal was.
+    let host: ServerHost
     private(set) var state: State = .connecting
 
     // No `scrollbackRows` here. There was one, written once when the restore
@@ -69,8 +73,9 @@ final class TerminalController {
     private var attachInterval: OSSignpostIntervalState?
     private var snapshotBytes = 0
 
-    init(terminalID: UInt64, cols: UInt16, rows: UInt16) throws {
+    init(terminalID: UInt64, host: ServerHost, cols: UInt16, rows: UInt16) throws {
         self.terminalID = terminalID
+        self.host = host
         self.engine = try TerminalEngine(cols: cols, rows: rows)
     }
 
@@ -78,9 +83,13 @@ final class TerminalController {
     // deinit is nonisolated. Callers use `disconnect()`, which SessionStore
     // does when a terminal closes.
 
-    func connect(socketPath: String, cols: UInt16, rows: UInt16) {
+    /// Open a connection to this terminal's host and attach.
+    ///
+    /// Which machine that is does not appear below this line: a remote host is
+    /// `ssh <dest> illogicald --stdio` and the frames on it are the same ones.
+    func connect(cols: UInt16, rows: UInt16) {
         do {
-            let connection = try Connection(socketPath: socketPath)
+            let connection = try Connection(host: host)
             self.connection = connection
             connection.start()
 

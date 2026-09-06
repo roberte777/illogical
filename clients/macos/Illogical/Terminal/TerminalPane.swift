@@ -27,7 +27,7 @@ struct TerminalPane: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Palette.background)
-        .traceFrame("pane-\(pane.terminalID)")
+        .traceFrame("pane-\(pane.terminal.terminal)")
     }
 }
 
@@ -37,7 +37,7 @@ struct TerminalSurface: NSViewRepresentable {
     let tab: TabLayout.ID
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(store: store, terminalID: pane.terminalID, pane: pane.id, tab: tab)
+        Coordinator(store: store, terminal: pane.terminal, pane: pane.id, tab: tab)
     }
 
     func makeNSView(context: Context) -> TerminalSurfaceView {
@@ -63,15 +63,15 @@ struct TerminalSurface: NSViewRepresentable {
     @MainActor
     final class Coordinator: TerminalSurfaceDelegate {
         var store: SessionStore
-        private let terminalID: UInt64
+        private let terminal: TerminalRef
         private let pane: UUID
         private let tab: TabLayout.ID
         weak var view: TerminalSurfaceView?
         private var controller: TerminalController?
 
-        init(store: SessionStore, terminalID: UInt64, pane: UUID, tab: TabLayout.ID) {
+        init(store: SessionStore, terminal: TerminalRef, pane: UUID, tab: TabLayout.ID) {
             self.store = store
-            self.terminalID = terminalID
+            self.terminal = terminal
             self.pane = pane
             self.tab = tab
         }
@@ -85,7 +85,7 @@ struct TerminalSurface: NSViewRepresentable {
             let size = view.gridSize
             guard
                 let controller = store.controller(
-                    for: terminalID, cols: size.cols, rows: size.rows)
+                    for: terminal, cols: size.cols, rows: size.rows)
             else {
                 view.statusText = "could not attach"
                 return
@@ -94,7 +94,9 @@ struct TerminalSurface: NSViewRepresentable {
             view.engine = controller.engine
             view.statusText = nil
             view.needsDisplay = true
-            Trace.log("attached to terminal \(terminalID) at \(size.cols)x\(size.rows)")
+            Trace.log(
+                "attached to \(terminal.host.displayName) terminal \(terminal.terminal) "
+                    + "at \(size.cols)x\(size.rows)")
         }
 
         func surface(_ surface: TerminalSurfaceView, send bytes: [UInt8]) {
