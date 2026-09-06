@@ -51,7 +51,7 @@ Also landed: `illogical peek`, which returns the server's rendered screen as
 plain text without attaching. It was pulled forward from M6 because it is how
 the whole stack gets tested.
 
-## M2 — Attach ✅ (gate met), loading state outstanding
+## M2 — Attach ✅
 
 **Ends at:** attaching shows the correct screen instantly, then fills in
 scrollback. The Mac client attaches, decodes the snapshot into its own
@@ -67,7 +67,7 @@ libghostty-vt terminal and renders it; input round-trips to the PTY.
 | ✅ | Output fan-out to N clients |
 | ✅ | Client-side streaming `SnapshotRestore` (reader callback, not `new_buf`) |
 | ✅ | Mac client transport + session/terminal dropdown, live |
-| | Loading state for history that has not arrived — now *reachable*, and still not built. See [CLIENT.md](CLIENT.md#the-loading-state) |
+| ✅ | Loading state for history that has not arrived: the scrollbar describes the extent the snapshot **declares** at READY, not the part that has landed. See [CLIENT.md](CLIENT.md#the-loading-state) |
 
 **Gate:** attach latency does not vary between 1 MB and 100 MB of scrollback.
 **Met, within a bound the gate did not anticipate** — `scripts/bench-attach.sh`,

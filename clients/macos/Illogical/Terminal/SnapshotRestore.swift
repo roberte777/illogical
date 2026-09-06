@@ -194,14 +194,57 @@ final class SnapshotRestore: @unchecked Sendable {
         return handle
     }
 
-    /// Prepend one page of scrollback. Returns false once FINISH is reached.
+    /// How many rows sit above the active area, as the snapshot declares them.
+    ///
+    /// Available as soon as READY validates, which is what makes a loading
+    /// state possible at all: the size of the history is known before a single
+    /// page of it has arrived, so the scrollbar can be drawn against the
+    /// finished extent from the first frame instead of growing to meet it.
+    ///
+    /// Advisory, and `snapshot.h` says so. This is what the encoder saw; a
+    /// page that can no longer be applied to the live terminal is still
+    /// consumed and still reports zero rows. It therefore sizes the region
+    /// drawn as pending and is not a promise about what will land, which is
+    /// why the count is cleared outright when the restore ends rather than
+    /// being trusted to reach zero on its own.
+    ///
+    /// Zero before READY, and zero for a snapshot with no history.
+    var declaredHistoryRows: UInt64 {
+        guard let decoder else { return 0 }
+        var rows: UInt64 = 0
+        guard
+            ghostty_snapshot_decoder_get(
+                decoder, GHOSTTY_SNAPSHOT_DECODER_DATA_HISTORY_ROWS_PRIMARY, &rows)
+                == GHOSTTY_SUCCESS
+        else { return 0 }
+        return rows
+    }
+
+    /// Prepend one page of scrollback, and report how many rows it added.
+    ///
+    /// Nil once FINISH is reached. Nil and zero are different answers and the
+    /// caller has to keep them apart: a page that was consumed and validated
+    /// but could not be applied returns zero, and history continues after it.
+    ///
+    /// Returning the count rather than a bool alongside a separate progress
+    /// query is deliberate. `snapshot.h` requires the PROGRESS values be read
+    /// before the next call to next, and a caller that breaks out of its loop
+    /// and then reads them gets the previous page's numbers — which for a
+    /// pending count means stranding it above zero forever.
     @discardableResult
-    func restoreNextHistoryPage() throws -> Bool {
-        guard let decoder else { return false }
+    func restoreNextHistoryPage() throws -> Int? {
+        guard let decoder else { return nil }
         let result = ghostty_snapshot_decoder_next(decoder)
         switch result {
-        case GHOSTTY_SUCCESS: return true
-        case GHOSTTY_NO_VALUE: return false
+        case GHOSTTY_SUCCESS:
+            var rows = 0
+            guard
+                ghostty_snapshot_decoder_get(
+                    decoder, GHOSTTY_SNAPSHOT_DECODER_DATA_PROGRESS_ROWS, &rows)
+                    == GHOSTTY_SUCCESS
+            else { return 0 }
+            return rows
+        case GHOSTTY_NO_VALUE: return nil
         default:
             throw GhosttyError(result: result, operation: "ghostty_snapshot_decoder_next")
         }

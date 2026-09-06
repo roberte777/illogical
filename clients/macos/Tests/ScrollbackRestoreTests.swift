@@ -75,7 +75,7 @@ final class ScrollbackRestoreTests: XCTestCase {
 
         // Phase 2: prepend history until FINISH.
         var pages = 0
-        while try restore.restoreNextHistoryPage() {
+        while try restore.restoreNextHistoryPage() != nil {
             pages += 1
             XCTAssertLessThan(pages, 10_000, "history restore did not terminate")
         }
@@ -107,7 +107,7 @@ final class ScrollbackRestoreTests: XCTestCase {
         let restore = try SnapshotRestore(snapshot: Data(bytes: raw, count: len))
         let restored = try restore.ready()
         defer { ghostty_terminal_free(restored) }
-        while try restore.restoreNextHistoryPage() {}
+        while try restore.restoreNextHistoryPage() != nil {}
 
         // Scroll to the very top and read the first row back through the
         // render state, which is the same path the renderer uses.
@@ -165,7 +165,7 @@ final class ScrollbackRestoreTests: XCTestCase {
         stream.close()
 
         var pages = 0
-        while try restore.restoreNextHistoryPage() {
+        while try restore.restoreNextHistoryPage() != nil {
             pages += 1
             XCTAssertLessThan(pages, 10_000, "history restore did not terminate")
         }
@@ -220,7 +220,7 @@ final class ScrollbackRestoreTests: XCTestCase {
         let control = try SnapshotRestore(snapshot: Data(bytes: raw, count: len))
         let controlTerminal = try control.ready()
         defer { ghostty_terminal_free(controlTerminal) }
-        XCTAssertTrue(
+        XCTAssertNotNil(
             try control.restoreNextHistoryPage(),
             "fixture carries no history page, so the assertion below proves nothing")
 
@@ -232,8 +232,9 @@ final class ScrollbackRestoreTests: XCTestCase {
 
         var pages = 0
         while pages < 64 {
-            let more = (try? restore.restoreNextHistoryPage()) ?? false
-            if !more { break }
+            // A throw and a FINISH both flatten to nil here; either one is the
+            // loop stopping, which is what this is asserting.
+            guard ((try? restore.restoreNextHistoryPage()) ?? nil) != nil else { break }
             pages += 1
         }
         XCTAssertEqual(pages, 0, "abandon should stop the history loop at once")
