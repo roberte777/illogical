@@ -56,7 +56,7 @@ public enum TransportError: Error, Equatable, CustomStringConvertible {
     case spawnFailed(command: String, reason: String)
     /// The spawn failed for a reason about the *file*: it is not there, or not
     /// executable, or not a program. Retrying cannot help.
-    case notExecutable(command: String)
+    case notExecutable(command: String, reason: String)
 
     /// Read by a person, in the session dropdown, next to the host that failed.
     /// `Error`'s own rendering of these is `NSCocoaErrorDomain` noise.
@@ -72,7 +72,7 @@ public enum TransportError: Error, Equatable, CustomStringConvertible {
         // "The file ... doesn't exist.", which sends somebody looking for an
         // `ssh` that is sitting right where they left it. We already know
         // better than the string does by the time we get here.
-        case .notExecutable(let command): "\(command) is not an executable program"
+        case .notExecutable(let command, let reason): "\(command) \(reason)"
         }
     }
 
@@ -243,19 +243,34 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// on something temporary costs the machine for the life of the process.
     static func spawnError(_ error: Error, command: String) -> TransportError {
         let ns = error as NSError
-        let reason = ns.localizedDescription
-        let permanent: Set<Int32> = [ENOENT, EACCES, ENOEXEC, EISDIR, ENAMETOOLONG, ELOOP]
 
-        if ns.domain == NSPOSIXErrorDomain, permanent.contains(Int32(ns.code)) {
-            return .notExecutable(command: command)
+        // Our wording, from the errno, rather than Foundation's sentence.
+        // Foundation says "The file ... doesn't exist." for a file that is
+        // present and merely not executable, and a flat "is not an executable
+        // program" is wrong the other way for one that really is missing --
+        // both send somebody to fix the wrong thing. These six are also the
+        // whole permanent set: anything else is retried.
+        let permanent: [Int32: String] = [
+            ENOENT: "is not there",
+            EACCES: "is not executable",
+            ENOEXEC: "is not a program",
+            EISDIR: "is a directory",
+            ENAMETOOLONG: "is too long a path to open",
+            ELOOP: "is a loop of symlinks",
+        ]
+        if ns.domain == NSPOSIXErrorDomain, let reason = permanent[Int32(ns.code)] {
+            return .notExecutable(command: command, reason: reason)
         }
         // `NSFileNoSuchFileError` (4) and `NSFileReadNoPermissionError` (257)
-        // are the same two answers wearing Cocoa's numbering, which is what
+        // are two of the same answers wearing Cocoa's numbering, which is what
         // Foundation actually raises for a missing or unreadable image.
-        if ns.domain == NSCocoaErrorDomain, ns.code == 4 || ns.code == 257 {
-            return .notExecutable(command: command)
+        if ns.domain == NSCocoaErrorDomain {
+            if ns.code == 4 { return .notExecutable(command: command, reason: "is not there") }
+            if ns.code == 257 {
+                return .notExecutable(command: command, reason: "cannot be read")
+            }
         }
-        return .spawnFailed(command: command, reason: reason)
+        return .spawnFailed(command: command, reason: ns.localizedDescription)
     }
 
     public init(argv: [String]) throws {

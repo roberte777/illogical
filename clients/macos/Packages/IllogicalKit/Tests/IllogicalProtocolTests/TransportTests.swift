@@ -367,9 +367,16 @@ struct TransportTests {
         // the file it is actually about -- present, not executable -- that
         // wording is "The file ... doesn't exist.", which sends somebody
         // looking for an `ssh` that is sitting where they left it.
+        // Distinct wording per errno, because "is not an executable program"
+        // is wrong for a file that is simply missing and Foundation's own
+        // "The file ... doesn't exist." is wrong for one that is present and
+        // not runnable. Both send somebody to fix the wrong thing.
+        #expect(String(describing: classify(NSCocoaErrorDomain, 4)) == "ssh is not there")
         #expect(
-            String(describing: classify(NSCocoaErrorDomain, 4))
-                == "ssh is not an executable program")
+            String(describing: classify(NSPOSIXErrorDomain, EACCES))
+                == "ssh is not executable")
+        #expect(
+            String(describing: classify(NSPOSIXErrorDomain, ENOEXEC)) == "ssh is not a program")
         let transient = String(describing: classify(NSPOSIXErrorDomain, EMFILE))
         #expect(transient.hasPrefix("could not run ssh: "))
         #expect(!transient.contains("UserInfo="))

@@ -326,13 +326,16 @@ final class ReconnectTests: XCTestCase {
         let first = store.tabs[0]
         let second = store.tabs[1]
 
-        // Asked for before there is a connection, so the request goes nowhere
-        // and the entry is left waiting on a reply that cannot come.
+        // Connect *first*, then ask. Asking first would have the entry voided
+        // by `closeControl` inside `connect()` itself, and the test would pass
+        // with the line it is named for deleted -- which is exactly what the
+        // first version of it did. This way the create goes out on a live
+        // connection and only `controlClosed` can retire it.
+        host.connect()
         store.split(pane: first.panes[0].id, in: first.id, direction: .columns)
 
-        // Now connect, and let the server hang up. That is what runs
-        // `controlClosed`, which is the path under test.
-        host.connect()
+        // The server reads the handshake and hangs up, which is what runs
+        // `controlClosed`: the path under test.
         try await waitFor("the control connection to drop") {
             if case .reconnecting = host.status { return true }
             return false
