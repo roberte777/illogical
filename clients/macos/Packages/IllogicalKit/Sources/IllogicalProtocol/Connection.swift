@@ -115,7 +115,10 @@ public final class Connection: @unchecked Sendable {
         transport.shutdown()
         continuation.finish()
 
-        let thread = readerThread
+        // A `Bool`, not the `Thread`: the block only ever asks whether there
+        // was a reader, and `Thread` is not `Sendable`, so capturing it is a
+        // strict-concurrency warning for nothing.
+        let hasReader = readerThread != nil
         readerThread = nil
         let transport = self.transport
         let finished = readerFinished
@@ -127,7 +130,7 @@ public final class Connection: @unchecked Sendable {
             // never see end-of-file, and freeing the number then is the bug
             // this ordering exists to prevent. `shutdown` has already made the
             // descriptor inert.
-            if thread != nil, finished.wait(timeout: .now() + 2) != .success { return }
+            if hasReader, finished.wait(timeout: .now() + 2) != .success { return }
 
             // Under the write lock, so a `send` that was already inside it has
             // finished with the descriptor before the number goes back.
