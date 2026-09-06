@@ -59,26 +59,44 @@ pub const Conn = struct {
         };
     }
 
-    /// Connect through `ssh` to a remote daemon. Caller owns `arena` only for
-    /// the duration of this call; the connection itself holds no memory from it.
-    pub fn connectSsh(gpa: Allocator, arena: Allocator, opts: Ssh) !Conn {
-        const argv = try opts.argv(arena);
-        return spawn(gpa, argv);
-    }
+    /// How long a command connection's child gets to forward what it still
+    /// holds and exit on its own before it is signalled.
+    ///
+    /// This is not politeness. A frame sent without waiting for a reply --
+    /// `kill`, `input`, `detach` -- is still sitting in `ssh`'s stdin pipe when
+    /// `deinit` runs, and `ssh` has to encrypt and write it before it is gone.
+    /// Signalling immediately discards it: `illogical --host box kill 3` exited
+    /// 0 having done nothing at all, every time.
+    const child_exit_grace_ns = 2 * std.time.ns_per_s;
+    const child_exit_poll_ns = 2 * std.time.ns_per_ms;
 
     pub fn deinit(self: *Conn) void {
-        // The write end first: the far end of a command connection reads
-        // end-of-file from it and unwinds, which is how `ssh` learns to exit.
+        // The write end first, and on its own: the far end reads end-of-file
+        // from it and unwinds, which is how `ssh` learns to exit. The read end
+        // stays open until it has, or we would break the channel it is
+        // flushing through.
         if (self.write_fd != self.read_fd) sys.closeFd(self.write_fd);
-        sys.closeFd(self.read_fd);
+
         if (self.child) |pid| {
-            // Not only end-of-file. `ssh` with a control master can outlive its
-            // own session, and a CLI that waited for it would appear to hang
-            // after printing its answer.
-            sys.signal(pid, sys.SIGTERM);
-            _ = sys.wait(pid);
+            const deadline = sys.monotonicNs() + child_exit_grace_ns;
+            const reaped = while (sys.monotonicNs() < deadline) {
+                switch (sys.tryWait(pid)) {
+                    .running => sys.sleepNs(child_exit_poll_ns),
+                    .exited, .gone => break true,
+                }
+            } else false;
+
+            // Only now, and only if end-of-file was not enough. `ssh` holding a
+            // control master can outlive its own session, and a CLI that waited
+            // for that would appear to hang after printing its answer.
+            if (!reaped) {
+                sys.signal(pid, sys.SIGTERM);
+                _ = sys.wait(pid);
+            }
             self.child = null;
         }
+
+        sys.closeFd(self.read_fd);
         self.read_buf.deinit(self.gpa);
     }
 
@@ -151,6 +169,11 @@ pub const Ssh = struct {
     destination: []const u8,
     /// The daemon to run on the far side. Resolved by the login shell's PATH.
     remote_binary: []const u8 = "illogicald",
+    /// The socket the far side's bridge dials, *on that machine*. Null leaves
+    /// it to the remote's own default rather than imposing this machine's,
+    /// which is why it is not filled in from our `--socket` unless the user
+    /// actually passed one.
+    socket: ?[]const u8 = null,
     /// The `ssh` to run. A field rather than a constant so a test can stand in
     /// for it, and so someone with a second OpenSSH can say which.
     ssh: []const u8 = "ssh",
@@ -200,11 +223,24 @@ pub const Ssh = struct {
             }
         }
 
+        // `--` first. Without it a destination beginning with `-` is parsed by
+        // `ssh` as an option: `-weirdhost` becomes `-w eirdhost` and fails with
+        // "Bad tun device". Nothing reachable today gets further than a usage
+        // dump, but a destination is user input sitting in an option slot, and
+        // `-oProxyCommand=` is what that slot is one argument away from.
+        try parts.append(arena, "--");
         try parts.append(arena, self.destination);
         // `ssh` joins what follows with spaces and hands it to the login shell,
         // which is what resolves `illogicald` on the far side.
         try parts.append(arena, self.remote_binary);
         try parts.append(arena, "--stdio");
+        // The socket the *far side's* bridge dials. Left null the remote uses
+        // its own default, which is the right answer for a machine whose state
+        // directory is not laid out like ours.
+        if (self.socket) |path| {
+            try parts.append(arena, "--socket");
+            try parts.append(arena, path);
+        }
 
         const out = try arena.allocSentinel(?[*:0]const u8, parts.items.len, null);
         for (parts.items, 0..) |part, i| out[i] = (try arena.dupeZ(u8, part)).ptr;
@@ -259,6 +295,9 @@ test "the ssh command ends in the remote daemon, in stdio mode" {
     try testing.expectEqualStrings("build-box", args[args.len - 3]);
     try testing.expectEqualStrings("illogicald", args[args.len - 2]);
     try testing.expectEqualStrings("--stdio", args[args.len - 1]);
+    // ...and `--` immediately before the destination, so a host name is never
+    // read as an option.
+    try testing.expectEqualStrings("--", args[args.len - 4]);
 
     // No pty. This is not a preference: a line discipline in the middle of the
     // frame stream would rewrite every 0x0a byte a snapshot chunk carried.
@@ -280,6 +319,45 @@ test "the ssh command ends in the remote daemon, in stdio mode" {
         if (std.mem.eql(u8, a, "-o")) options += 1;
     }
     try testing.expectEqual(@as(usize, 5), options);
+}
+
+test "a destination that looks like an option is not read as one" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Without the `--`, ssh reads this as `-w eirdhost` and dies with "Bad tun
+    // device". A destination is user input in an option slot, and the slot next
+    // to it is `-oProxyCommand=`.
+    const args = try argvStrings(arena, .{ .destination = "-weirdhost", .multiplex = false });
+    const dash_dash = indexOfArg(args, "--") orelse return error.NoTerminator;
+    try testing.expectEqualStrings("-weirdhost", args[dash_dash + 1]);
+}
+
+test "the remote socket is forwarded, and only when one was asked for" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `--socket` names a path on the *far* machine, which is what the far
+    // side's `--stdio` dials. Dropping it silently pointed the user at a
+    // different daemon than the one they named.
+    const with = try argvStrings(arena, .{
+        .destination = "box",
+        .socket = "/run/illogical/dev.sock",
+        .multiplex = false,
+    });
+    try testing.expectEqualStrings("--socket", with[with.len - 2]);
+    try testing.expectEqualStrings("/run/illogical/dev.sock", with[with.len - 1]);
+    try testing.expectEqualStrings("--stdio", with[with.len - 3]);
+
+    // Unset, the remote uses its own default rather than being handed ours --
+    // a machine whose state directory is not laid out like this one's.
+    const without = try argvStrings(arena, .{ .destination = "box", .multiplex = false });
+    try testing.expect(indexOfArg(without, "--socket") == null);
+    try testing.expectEqualStrings("--stdio", without[without.len - 1]);
 }
 
 test "a remote binary somewhere else is respected" {
@@ -316,6 +394,55 @@ test "a control path that would not fit in a unix socket is not asked for" {
     try testing.expect(indexOfArg(args, "ControlMaster=auto") == null);
     // ...and the rest of the command is unaffected.
     try testing.expectEqualStrings("--stdio", args[args.len - 1]);
+}
+
+test "a frame sent without waiting for a reply survives deinit" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var path_buf: [96]u8 = undefined;
+    const out_path = try std.fmt.bufPrintZ(
+        &path_buf,
+        "/tmp/illogical-flush-{d}",
+        .{std.c.getpid()},
+    );
+    defer sys.unlinkPath(out_path.ptr);
+    std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+
+    // Stands in for ssh: something that has to be *scheduled* before the bytes
+    // in its stdin pipe reach their destination. `deinit` used to close the
+    // pipe and SIGTERM in the same breath, which killed it first.
+    var script_buf: [256]u8 = undefined;
+    const script = try std.fmt.bufPrintZ(&script_buf, "cat > {s}", .{out_path});
+    const argv = try arena.allocSentinel(?[*:0]const u8, 3, null);
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = @ptrCast(script.ptr);
+
+    var conn = try Conn.spawn(gpa, argv);
+    // `kill` is the shape that broke: one frame, no reply expected, and the
+    // process exits immediately after. `illogical --host box kill 3` reported
+    // success having sent nothing at all.
+    try conn.sendJson(.kill, 3, protocol.body.Kill{});
+    conn.deinit();
+
+    const written = try std.Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .limited(4096));
+    defer gpa.free(written);
+
+    var header_buf: [protocol.header_len]u8 = undefined;
+    try testing.expect(written.len >= protocol.header_len);
+    @memcpy(&header_buf, written[0..protocol.header_len]);
+    const header = try protocol.Header.decode(&header_buf);
+    try testing.expectEqual(protocol.FrameType.kill, header.type);
+    try testing.expectEqual(@as(u64, 3), header.session);
+    try testing.expectEqual(written.len - protocol.header_len, header.len);
 }
 
 test "a command connection speaks frames over its child's pipes" {

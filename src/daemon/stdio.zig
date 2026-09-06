@@ -28,9 +28,11 @@ const sys = illogical.sys;
 
 const log = std.log.scoped(.stdio);
 
-/// One copy buffer, per direction. Sixteen PTY reads, matching the per-client
-/// output queue, so a burst of output crosses the bridge in one read and one
-/// write rather than sixteen of each.
+/// One copy buffer, per direction. Four PTY reads (`Terminal.read_buf_size` is
+/// 16 KiB), so an ordinary burst of output crosses the bridge in one read and
+/// one write rather than four of each. Deliberately far below the 1 MiB
+/// per-client output queue: this buffer is on a thread stack, and the queue it
+/// feeds from is the thing allowed to be large.
 const buf_size = 64 * 1024;
 
 /// The upstream pump's stack. Its copy buffer lives on it.
@@ -50,7 +52,8 @@ pub const Options = struct {
     /// How often to retry the connect while waiting for that.
     retry_interval_ns: u64 = 20 * std.time.ns_per_ms,
     /// The daemon to start. Null means "this executable", which is what SSH
-    /// wants; the tests point it at something they can observe.
+    /// wants. A caller that wants to observe the spawn -- or start something
+    /// other than itself -- names it here.
     exe: ?[]const u8 = null,
 };
 
@@ -167,9 +170,15 @@ fn detachStdio() !void {
 const Pump = struct {
     from: sys.fd_t,
     to: sys.fd_t,
-    /// Broken when this direction ends, so the other one comes back from its
-    /// read. Only a socket can be woken this way; a pipe cannot, which is why
-    /// the downstream pump leaves this null and is woken by a signal instead.
+    /// Broken when this direction ends, so the other one comes back from
+    /// whichever syscall it is in.
+    ///
+    /// Both pumps set this, and to the same descriptor: the socket is the one
+    /// end of the splice that *can* be broken from another thread, and each
+    /// direction touches it — upstream writes to it, downstream reads from it.
+    /// Breaking it is therefore the only wake that works in every case. The
+    /// signal below is not a substitute: a pump blocked in `sys.writeAll`
+    /// absorbs every signal, because `writeFd` retries on `EINTR` by design.
     shutdown_on_exit: ?sys.fd_t = null,
     /// Shared: set by whichever direction ends first.
     stop: *std.atomic.Value(bool),
@@ -209,15 +218,21 @@ pub fn bridge(in_fd: sys.fd_t, out_fd: sys.fd_t, sock_fd: sys.fd_t) !void {
     sys.installThreadInterrupt();
 
     var stop: std.atomic.Value(bool) = .init(false);
+    // Both directions break the socket on the way out. Whichever ends first,
+    // the other is either reading it or writing it, so this is the wake that
+    // works for both -- see `Pump.shutdown_on_exit`.
     var upstream: Pump = .{
         .from = in_fd,
         .to = sock_fd,
-        // The client has gone, so nothing the daemon still owes it is worth
-        // waiting for. Breaking the socket is what ends the downstream pump.
         .shutdown_on_exit = sock_fd,
         .stop = &stop,
     };
-    var downstream: Pump = .{ .from = sock_fd, .to = out_fd, .stop = &stop };
+    var downstream: Pump = .{
+        .from = sock_fd,
+        .to = out_fd,
+        .shutdown_on_exit = sock_fd,
+        .stop = &stop,
+    };
 
     const t = try std.Thread.spawn(.{ .stack_size = stack_size }, Pump.run, .{&upstream});
 
@@ -225,14 +240,17 @@ pub fn bridge(in_fd: sys.fd_t, out_fd: sys.fd_t, sock_fd: sys.fd_t) !void {
     // the one that should not pay for a thread hop.
     downstream.run();
 
-    // Either the daemon went away or stdout did. The upstream pump is asleep
-    // in `read` on a descriptor nothing will ever write to again, and a pipe
-    // cannot be shut down from the far side, so it has to be signalled out.
+    // Downstream has broken the socket, so an upstream pump blocked *writing*
+    // to it has already failed and left. One asleep in `read` on stdin has
+    // not: a pipe cannot be shut down from the far side, so it is signalled.
     //
     // In a loop, and unbounded, for the same reason as
     // `Terminal.stopReaderLocked`: delivery only interrupts the syscall the
-    // thread is in at that instant, and a signal that arrives while it is
-    // mid-write is absorbed by that write's own retry.
+    // thread is in at that instant. It is bounded in practice by the shutdown
+    // above -- without it, an upstream pump wedged in `sys.writeAll` absorbs
+    // every one of these signals (`writeFd` retries on `EINTR`) and this loop
+    // spins at 50 Hz for the life of the process, leaking the process and its
+    // SSH channel on every dropped connection.
     var attempts: usize = 0;
     while (!upstream.done.load(.acquire)) : (attempts += 1) {
         sys.interruptThread(t.getHandle());
