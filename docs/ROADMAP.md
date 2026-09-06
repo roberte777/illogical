@@ -191,7 +191,7 @@ milestone the whole architecture exists for. See [PARKING.md](PARKING.md).
 | ✅ | **F2** — flow control: bounded per-client queue, overflow ⇒ forced re-attach |
 | ✅ | **A3** (second half) — PTY fd migration between dedicated thread and shared poller, with hysteresis |
 | ✅ | **A4** — client buffer parking |
-| | **A6** — per-terminal fixed costs: zero-init, lazy allocation, shared palette |
+| ✅ | **A6** — per-terminal fixed costs: zero-init, lazy allocation, shared palette |
 | | **F3** — snapshot **encryption**. Compression landed; encryption did not, so park files are plaintext on disk and scrollback holds secrets. This is a real gap, not a refinement |
 
 **Gate:** the benchmark table. Partially met — see below.
@@ -229,39 +229,43 @@ macOS, `phys_footprint`, same terminal shapes — and report losses honestly.
 
 | Benchmark | Superlogical | tmux 3.5a | ours | status |
 | --- | --- | --- | --- | --- |
-| Server start, no terminals | 10.6 MiB | 2.50 MiB | **2.45 MiB** | measured |
-| Per terminal, 10,000 lines, live | **407 KiB** | 4.89 MiB | 1876 KiB | measured |
-| Per terminal, 10,000 lines, parked | — | — | **192 KiB** | measured |
-| Per empty 80×24 terminal | 68 KiB | **15 KiB** | — | not measured |
-| Per client connection (50 filled) | **85 KiB** | 157 KiB | 180 KiB | measured |
+| Server start, no terminals | 10.6 MiB | 2.50 MiB | **1.27 MiB** | measured |
+| Per terminal, 10,000 lines, settled | 407 KiB | 4.89 MiB | **390 KiB** | measured |
+| Per empty 80×24 terminal | 68 KiB | **15 KiB** | 90 KiB | measured |
+| Per client connection (50 filled) | 85 KiB | 157 KiB | **46 KiB** | measured |
 | Unpark, 64 MB scrollback | ~200 µs (excl. disk) | — | — | not measured |
 | Parked-PTY throughput cost | 5–10% | — | **+0.2%** one PTY, **+98%** eight at once | measured |
 
-Run it with `scripts/bench-memory.sh 20 10000`, and the last row with
+Run it with `scripts/bench-memory.sh 20 10000 50`, and the last row with
 `scripts/bench-pty.sh 100000 32 3`.
 
-That last row needs its two halves read together. One parked PTY costs nothing
-measurable, comfortably inside the reference figure. Eight busy ones at the same
-time cost twice as much, because what a poller wake-up triggers is the VT parse
+We win the two rows that scale and lose the fixed-cost one to tmux, which is the
+same shape Superlogical's own numbers have. Most of the empty-terminal row is
+not ours — a libghostty terminal and the one preheated page that gets touched.
+
+The throughput row needs its two halves read together. One parked PTY costs
+nothing measurable, comfortably inside the reference figure. Eight busy ones at
+once cost twice as much, because what a poller wake-up triggers is the VT parse
 rather than the `read`, and four pool threads are doing what eight dedicated
 readers would have. The cost is `terminals / pool`, it is paid only by terminals
-nobody is watching, and it buys the row below.
+nobody is watching, and it buys the flat thread count below.
 
-Three things to be careful about when reading that table. First, it is
-`phys_footprint`, not RSS — with RSS the compression and parking wins are
-invisible on macOS, because `MADV_FREE_REUSABLE` leaves pages counted until
-there is pressure. Second, Superlogical's 407 KiB does not say whether it was
-measured parked. Our parked figure is now well under it and our live figure is
-4.6× over, so either their number is also a settled measurement or their live
-representation is genuinely leaner. We do not know which, and should not claim
-the win either way.
+⚠ **These are release-build numbers, and that changed them by an order of
+magnitude.** Everything here was previously measured on a debug build, where
+Zig fills `undefined` with `0xAA` and so writes every buffer a binary declares
+before it is used — including the four ~390 KiB pages libghostty preheats per
+terminal *because* they are demand-paged. An empty terminal measures 1743 KiB
+debug and 90 KiB release. Everything in the two reference columns is a release
+build. `scripts/bench-memory.sh` builds one now rather than trusting `zig-out`.
 
-Third, the parked row moved because of A3, not because terminals got smaller:
-it was **356 KiB** on the branch before, on this machine, and the 164 KiB that
-went is the reader thread's touched stack. A parked terminal no longer has a
-thread. The per-client row is the mirror image and the reason it is still twice
-the reference: a connection owns two threads, and their stacks are what is left
-after its buffers are freed. That is A6.
+Three more things to be careful of. It is `phys_footprint`, not RSS — with RSS
+the compression and parking wins are invisible on macOS, because
+`MADV_FREE_REUSABLE` leaves pages counted until there is pressure. Freeing is
+not returning: parking frees a terminal and A4 frees a client's buffers, and
+the tests assert both on capacity, but whether the pages go back to the kernel
+is the allocator's decision. And A5 gets there first — by the time a fill has
+settled, compression has already released the physical pages, so there is no
+separate "parked" row any more; it measures the same as settled-live.
 
 Sources and methodology in [RESEARCH.md §7](RESEARCH.md#7-numbers).
 

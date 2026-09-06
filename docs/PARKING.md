@@ -365,29 +365,51 @@ appear to do *nothing*; measured with `phys_footprint` the win is plain. This is
 also the metric Superlogical's own charts report, so it is the only way to
 compare honestly. `scripts/bench-memory.sh` reads it from `vmmap --summary`.
 
-Results from `scripts/bench-memory.sh 20 10000 50`, against the reference
-figures in [RESEARCH.md](RESEARCH.md#7-numbers):
+⚠ **Measure a release build.** This is not a refinement. It is the difference
+between 90 KiB and 1743 KiB for an empty terminal, and every figure in this
+document was wrong for a while because of it.
+
+Zig fills `undefined` with `0xAA` in a debug build, so every buffer a debug
+binary declares gets written before it is ever used. libghostty preheats four
+~390 KiB pages per terminal *because* they are demand-paged — "this only costs
+us address space" — and the debug fill makes all four resident. Our own reader
+buffer went the same way. Everything published to compare against is a release
+build, so ours has to be; `scripts/bench-memory.sh` builds one itself rather
+than trusting whatever is in `zig-out`.
+
+Two more things a zero in the table below does not mean:
+
+- **Freeing is not returning.** Parking frees a terminal outright and level 3
+  frees a client's buffers; the tests assert both directly, on capacity.
+  Whether those pages go back to the kernel is the allocator's decision — the
+  debug allocator hands them back, the release one keeps them for the next
+  caller.
+- **A5 gets there first.** By the time a fill has settled, scrollback
+  compression has already released the physical pages, so parking has little
+  left to reclaim in this metric. The live row is an already-compressed
+  terminal, not a raw one.
+
+Results from `scripts/bench-memory.sh 20 10000 50`, ReleaseFast, M-series,
+against the reference figures in [RESEARCH.md](RESEARCH.md#7-numbers):
 
 | | ours | Superlogical | tmux 3.5a |
 | --- | --- | --- | --- |
-| Server start, no terminals | **2.45 MiB** | 10.6 MiB | 2.50 MiB |
-| Per filled 10,000-line terminal, live | 1876 KiB | 407 KiB | 4.89 MiB |
-| Per filled 10,000-line terminal, parked | **192 KiB** | — | — |
-| Per client connection, idle | 180 KiB | **85 KiB** | 157 KiB |
+| Server start, no terminals | **1.27 MiB** | 10.6 MiB | 2.50 MiB |
+| Per empty 80×24 terminal | 90 KiB | 68 KiB | **15 KiB** |
+| Per client connection, idle | **46 KiB** | 85 KiB | 157 KiB |
+| Per filled 10,000-line terminal, settled | **390 KiB** | 407 KiB | 4.89 MiB |
 | Snapshot on disk | 32 KiB | — | — |
-| Reclaimed by parking | 89% | — | — |
 
-The parked row was **356 KiB** before A3, measured on this same machine an hour
-earlier. The 164 KiB that went is the reader thread's touched stack: a parked
-terminal does not have a thread any more. An earlier revision of this table read
-374 KiB from a different machine, which is the same number and not a comparison.
+The two rows Superlogical loses are the two that scale, which is the same shape
+their own numbers have. We lose the empty-terminal row to tmux by 6×, and most
+of what is in it is libghostty's, not ours: one preheated page that gets touched
+and the terminal struct behind it.
 
-Read the live row carefully before claiming a win anywhere. Superlogical's
-407 KiB is labelled "per filled terminal" and does not say whether it was
-parked. Our *parked* number is now well under it and our *live* number is 4.6×
-over, so the honest reading is either that their figure is a settled measurement
-too, or that their live representation is leaner than ours. We do not know
-which.
+The filled row is a *settled* measurement — the fill and A5's compression race
+each other, and an earlier version of this table stopped the clock at whichever
+of them happened to win, reporting 1876 KiB from a debug build and 9979 KiB from
+a release one for the same code. Neither was wrong; they were answers to
+different questions.
 
 Still to measure:
 
@@ -395,4 +417,3 @@ Still to measure:
 - **Unpark → `ready()` returns.** The headline latency; target ~200 µs at 64 MB
   excluding disk.
 - Full history restore time (background; must not regress interactivity).
-- Per empty 80×24 terminal, against tmux's 15 KiB and Superlogical's 68 KiB.

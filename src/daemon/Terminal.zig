@@ -25,7 +25,37 @@ const session = illogical.session;
 
 const log = std.log.scoped(.terminal);
 
-const read_buf_size = 64 * 1024;
+/// How much one `read` of a PTY master can return.
+///
+/// Sixteen kilobytes, and the number is measured rather than chosen. A macOS
+/// pty master never returns more than **1024 bytes** per read however large the
+/// buffer is -- 118,000 reads of a child writing 13 MB as fast as it could, mean
+/// 115 bytes, maximum 1024 -- because that is what its output queue holds. Linux
+/// is larger but the same shape, around 8 KiB. So this is roomy on both and
+/// there is nothing to gain by making it larger.
+///
+/// It used to be 64 KiB, which cost 48 KiB of stack per hot terminal that no
+/// read could ever reach. In a release build only the pages actually written
+/// are dirtied, so that was mostly address space; in a debug build Zig fills
+/// `undefined` with 0xAA and every byte of it became resident.
+const read_buf_size = 16 * 1024;
+
+/// Stack for the threads this daemon spawns.
+///
+/// The default is 16 MiB, which is address space rather than memory -- only
+/// touched pages are ever resident. It still matters at this project's target
+/// scale: two threads per client at 16 MiB each is 320 GiB of reservation for
+/// ten thousand clients. Half a megabyte is far more than any of these threads
+/// use, measured at 32 KiB for a reader under load.
+pub const thread_stack_size = 512 * 1024;
+
+/// Buffer between the park store and the compressor, in both directions.
+///
+/// Heap-allocated for the duration of a park or an attach rather than sitting
+/// on the stack of whichever thread is doing it. On the stack it was permanent:
+/// a client that attached once left 64 KiB of its reader thread dirty for the
+/// life of the connection.
+const park_io_buf_size = 64 * 1024;
 
 /// Cap on the unfinished-VT-input suffix we will carry in a snapshot. Matches
 /// libghostty-vt's own default (its largest built-in APC protocol buffer).
@@ -352,7 +382,7 @@ fn setRegimeLocked(self: *Terminal, want: Regime) !void {
             sys.setNonblock(self.pty_pair.master, false);
             self.reader_stop.store(false, .release);
             self.reader_done.store(false, .release);
-            self.thread = try std.Thread.spawn(.{}, readLoop, .{self});
+            self.thread = try std.Thread.spawn(.{ .stack_size = thread_stack_size }, readLoop, .{self});
             self.regime = .hot;
         },
         .polled => {
@@ -802,8 +832,12 @@ pub fn park(self: *Terminal) !void {
         const file = try cwd.createFile(self.io, staging, .{ .truncate = true });
         errdefer file.close(self.io);
 
-        var out_buf: [64 * 1024]u8 = undefined;
-        var file_writer = file.writer(self.io, &out_buf);
+        // Heap, not stack. Parking runs on the maintenance thread, and a
+        // 64 KiB buffer there is 64 KiB of stack dirtied for the life of the
+        // daemon in exchange for the few milliseconds a park takes. See A6.
+        const out_buf = try self.gpa.alloc(u8, park_io_buf_size);
+        defer self.gpa.free(out_buf);
+        var file_writer = file.writer(self.io, out_buf);
 
         const window = try self.gpa.alloc(u8, illogical.park.Store.window_len);
         defer self.gpa.free(window);
@@ -906,7 +940,7 @@ fn unparkLocked(self: *Terminal) !void {
 
     self.residency = .rehydrating;
     self.rehydration = rehydration;
-    rehydration.thread = std.Thread.spawn(.{}, restoreHistory, .{rehydration}) catch |err| {
+    rehydration.thread = std.Thread.spawn(.{ .stack_size = thread_stack_size }, restoreHistory, .{rehydration}) catch |err| {
         // Without the background thread we still have a correct, renderable
         // terminal -- just no scrollback.
         log.warn("history restore thread failed: {t}", .{err});
@@ -969,8 +1003,13 @@ fn streamParkFileLocked(
     const file = try std.Io.Dir.cwd().openFile(self.io, path, .{});
     defer file.close(self.io);
 
-    var file_buf: [64 * 1024]u8 = undefined;
-    var file_reader = file.reader(self.io, &file_buf);
+    // Heap, not stack. This runs on the *client's* reader thread, once per
+    // attach, and on the stack it left 64 KiB dirty on every connection for
+    // as long as that connection lived -- which at this project's scale is
+    // the cost A6 is about. See docs/OPTIMIZATIONS.md A6.
+    const file_buf = try self.gpa.alloc(u8, park_io_buf_size);
+    defer self.gpa.free(file_buf);
+    var file_reader = file.reader(self.io, file_buf);
 
     const window = try self.gpa.alloc(u8, illogical.park.Store.window_len);
     defer self.gpa.free(window);

@@ -24,3 +24,4 @@ clients/macos/Frameworks/
 
 # macOS
 .DS_Store
+.zig-bench/

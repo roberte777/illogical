@@ -71,6 +71,15 @@ pub const Handler = struct {
     readableFn: *const fn (ctx: *anyopaque) bool,
 };
 
+/// Stack for a shard's thread.
+///
+/// Half a megabyte, against the 16 MiB default. A callback here reads a PTY
+/// into a buffer on this stack and parses what it got, which measures well
+/// under 64 KiB; the rest of the default is address space nothing will touch.
+/// Declared here rather than shared with the daemon's constant, because this
+/// file has no business importing one.
+const stack_size = 512 * 1024;
+
 /// How many threads the pool gets, unless a caller says otherwise.
 ///
 /// Four is a compromise, and the shape of the compromise is the point. One is
@@ -132,7 +141,7 @@ const Shard = struct {
     fn start(self: *Shard) !void {
         if (self.running.load(.acquire)) return;
         self.running.store(true, .release);
-        self.thread = std.Thread.spawn(.{}, run, .{self}) catch |err| {
+        self.thread = std.Thread.spawn(.{ .stack_size = stack_size }, run, .{self}) catch |err| {
             self.running.store(false, .release);
             return err;
         };

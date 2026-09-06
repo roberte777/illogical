@@ -133,7 +133,7 @@ pub fn listen(self: *Server) !void {
     self.listener = fd;
     self.running.store(true, .release);
     try self.pty_poller.start();
-    self.maintenance = try std.Thread.spawn(.{}, maintenanceLoop, .{self});
+    self.maintenance = try std.Thread.spawn(.{ .stack_size = Terminal.thread_stack_size }, maintenanceLoop, .{self});
     log.info("listening on {s}", .{self.socket_path});
 }
 
