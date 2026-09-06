@@ -163,13 +163,19 @@ pub fn clearCloexec(fd: fd_t) void {
 /// this legal between `fork` and `exec`.
 pub fn closeFrom(lowest: fd_t) void {
     // Clamped, because `getdtablesize` is the *soft* `RLIMIT_NOFILE` and that
-    // is the caller's environment to set: it reads 138,240 on an ordinary mac
-    // and can be 2^30 under a service manager, where the loop would run for
-    // minutes between `fork` and `exec` and the bridge would give up waiting
-    // for a daemon that eventually turns up anyway. Best-effort by the same
-    // token -- a descriptor above the current soft limit survives, which is
-    // only reachable if the limit was lowered after it was opened.
-    const limit = @min(getdtablesize(), 4096);
+    // is the caller's environment to set: it can be 2^30 under a service
+    // manager, where the loop would run for minutes between `fork` and `exec`
+    // and the bridge would give up waiting for a daemon that turns up anyway.
+    //
+    // The ceiling is high enough that the clamp is only ever reached by that
+    // pathological case. An ordinary mac reads 138,240 here and a distro sshd
+    // is typically configured to 65,536, both well under; a `close` on an
+    // unused descriptor is tens of nanoseconds, so even the full million is
+    // some tens of milliseconds, once, when a daemon is started. It was 4096
+    // before, which is *below* both -- so on the systemd `LimitNOFILE=65536`
+    // configuration this function's own doc comment describes, anything the
+    // ssh wrapper had parked at a high descriptor survived into the daemon.
+    const limit = @min(getdtablesize(), 1 << 20);
     var fd = lowest;
     while (fd < limit) : (fd += 1) _ = close(fd);
 }
@@ -181,8 +187,13 @@ pub fn closeFrom(lowest: fd_t) void {
 /// grandchild tries to open a log inside it, because the daemon does not
 /// create that directory until it is already running.
 ///
-/// 0700, because what ends up in there is the park store -- a terminal's
-/// scrollback and the key it is encrypted with.
+/// 0700 because of what ends up in there: the park store, a terminal's
+/// scrollback and the key it is encrypted with. Only a preference, though --
+/// the daemon creates this same directory itself through
+/// `std.Io.Dir.createDirPath`, which is 0777 before umask, so on a host where
+/// `illogicald` was ever started by hand the mode is whatever that left. The
+/// protection that does not depend on who got there first is the key file's
+/// own 0600, in crypt.zig.
 pub fn makeDirPath(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     if (path.len == 0 or path.len >= buf.len) return;
@@ -209,10 +220,21 @@ pub fn makeDirPath(path: []const u8) void {
 /// of many descriptors in the shared poller, where a `read` that turned out to
 /// have nothing behind it would stall every other terminal.
 pub fn setNonblock(fd: fd_t, on: bool) void {
+    _ = trySetNonblock(fd, on);
+}
+
+/// The same, reporting whether it took.
+///
+/// For the one caller that cannot proceed without it: a "non-blocking" drain
+/// on a descriptor that is still blocking is an unbounded wait on a child that
+/// may never write again, which is precisely what the caller's deadline exists
+/// to prevent. Everything else toggles a descriptor it just created and has
+/// nothing to do about a failure, so `setNonblock` stays void.
+pub fn trySetNonblock(fd: fd_t, on: bool) bool {
     const flags = fcntl(fd, F_GETFL);
-    if (flags == -1) return;
+    if (flags == -1) return false;
     const next = if (on) flags | O_NONBLOCK else flags & ~O_NONBLOCK;
-    _ = fcntl(fd, F_SETFL, next);
+    return fcntl(fd, F_SETFL, next) != -1;
 }
 
 /// A pipe, used only to wake a thread blocked in the poller.

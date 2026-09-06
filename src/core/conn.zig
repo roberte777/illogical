@@ -88,12 +88,17 @@ pub const Conn = struct {
             // never sees the end-of-file above, and every such exit burned the
             // full grace and then got signalled anyway: `illogical --host box
             // list` took 2.34 s instead of returning at once.
-            sys.setNonblock(self.read_fd, true);
-            defer sys.setNonblock(self.read_fd, false);
+            // Checked, because a drain that is not actually non-blocking is a
+            // blocking read on a child that may never write again -- an
+            // unbounded wait, which is the one thing the deadline below exists
+            // to rule out. If the mode will not take, wait the child out
+            // without draining and accept the slow exit.
+            const nonblocking = sys.trySetNonblock(self.read_fd, true);
+            defer if (nonblocking) sys.setNonblock(self.read_fd, false);
 
             const deadline = sys.monotonicNs() + child_exit_grace_ns;
             const reaped = while (sys.monotonicNs() < deadline) {
-                self.drainRead();
+                if (nonblocking) self.drainRead(deadline);
                 switch (sys.tryWait(pid)) {
                     .running => sys.sleepNs(child_exit_poll_ns),
                     .exited, .gone => break true,
@@ -116,13 +121,16 @@ pub const Conn = struct {
 
     /// Read and discard whatever is waiting, without blocking.
     ///
-    /// `read_fd` must be non-blocking. Bounded by the loop's own exit
-    /// conditions rather than by a count: a child that can produce bytes
-    /// faster than this drains them is still making progress towards its own
-    /// exit, and `deinit`'s deadline is what stops us either way.
-    fn drainRead(self: *Conn) void {
+    /// `read_fd` must be non-blocking, and the deadline is checked here rather
+    /// than only by the caller: a child that produces bytes as fast as this
+    /// discards them -- a remote rc file looping on stdout, or a stand-in
+    /// transport under ILLOGICAL_SSH -- never returns 0, so without this the
+    /// loop outlasts the grace it is supposed to fit inside and `deinit` never
+    /// reaches the SIGTERM that is its whole fallback. `illogical --host box
+    /// list` would hang instead of taking at most the grace.
+    fn drainRead(self: *Conn, deadline: u64) void {
         var scratch: [4096]u8 = undefined;
-        while (true) {
+        while (sys.monotonicNs() < deadline) {
             const n = sys.readFdOnce(self.read_fd, &scratch) catch return;
             // End of stream, or nothing more for now.
             if (n == 0) return;
@@ -472,6 +480,39 @@ test "a frame sent without waiting for a reply survives deinit" {
     try testing.expectEqual(protocol.FrameType.kill, header.type);
     try testing.expectEqual(@as(u64, 3), header.session);
     try testing.expectEqual(written.len - protocol.header_len, header.len);
+}
+
+test "deinit drains a child that is blocked writing at us" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A megabyte at us, then exit. A pipe holds 64 KiB, so this child is
+    // blocked in `write` long before it is done -- and a child blocked writing
+    // never gets back to reading its stdin, so it never sees the end-of-file
+    // `deinit` sends it and never exits on its own.
+    //
+    // Not a contrived shape. `attach` breaks its read loop on `exited` with up
+    // to the daemon's 1 MiB client queue still in flight, and a failed `peek`
+    // leaves a whole `screen` frame behind. Nothing else in this file reaches
+    // it: the other two spawn tests read everything their child sends, or use
+    // a child that writes nothing at all.
+    const argv = try arena.allocSentinel(?[*:0]const u8, 3, null);
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "head -c 1000000 /dev/zero";
+
+    var conn = try Conn.spawn(gpa, argv);
+    const before = sys.monotonicNs();
+    conn.deinit();
+    const elapsed = sys.monotonicNs() - before;
+
+    // Undrained, this child cannot reach its own exit, so `deinit` burns the
+    // whole two-second grace and then signals it -- `illogical --host box
+    // list` took 2.34s to print an answer it already had in hand.
+    try testing.expect(elapsed < 500 * std.time.ns_per_ms);
 }
 
 test "a command connection speaks frames over its child's pipes" {
