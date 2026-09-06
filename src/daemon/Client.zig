@@ -479,6 +479,12 @@ fn attach(self: *Client, id: session.TerminalId, req: protocol.body.Attach) !voi
     // longer part of the fan-out path and that window is gone.
     if (!self.isAttached(id)) try self.attached.append(self.gpa, id);
 
+    // Somebody is judging this terminal now, so give its PTY a thread back --
+    // immediately, not on the next maintenance tick. Outside the terminal's
+    // lock, which `t.attach` has already released: changing regime joins a
+    // thread that wants it.
+    t.observed();
+
     // The chunker sends `snapshot_ready` the moment the encoder passes READY.
     // If the scan never found it — a snapshot format change, a truncated park
     // file — send it here, so the client paints a blank screen and takes live

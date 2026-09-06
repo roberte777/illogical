@@ -175,6 +175,11 @@ pub const body = struct {
         cols: u16,
         rows: u16,
         residency: []const u8,
+        /// `hot`, `polled` or `stopped`: which IO regime the terminal's PTY is
+        /// in. Defaulted so that an older server, which does not send it, is
+        /// read as the regime that was the only one it had. See
+        /// docs/ARCHITECTURE.md, "Server IO: two regimes per PTY".
+        regime: []const u8 = "hot",
         attached: u32,
         pty_read_idle_ns: u64,
         exit_code: ?i32 = null,

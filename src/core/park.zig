@@ -48,9 +48,18 @@ pub const default_park_after_ns: u64 = 60 * std.time.ns_per_s;
 /// only touches non-active, non-viewport pages.
 pub const default_compress_after_ns: u64 = 250 * std.time.ns_per_ms;
 
+/// How long a terminal must go unobserved before its PTY leaves its dedicated
+/// thread for the shared poller.
+///
+/// The hysteresis, and one-sided on purpose: promotion back to a thread is
+/// immediate on attach, demotion waits. A person clicking between tabs must
+/// not spawn and join a thread each time. See docs/PARKING.md, level 2.
+pub const default_pty_park_unobserved_after_ns: u64 = 5 * std.time.ns_per_s;
+
 pub const Config = struct {
     park_after_ns: u64 = default_park_after_ns,
     compress_after_ns: u64 = default_compress_after_ns,
+    pty_park_unobserved_after_ns: u64 = default_pty_park_unobserved_after_ns,
     /// Park even while clients are attached. Because idleness is measured in
     /// PTY reads, an attached-but-silent terminal is still idle — and that is
     /// the common case for agent workloads, so this defaults on.
@@ -163,6 +172,57 @@ pub fn shouldPark(
     if (residency != .live) return false;
     if (attached > 0 and !cfg.park_while_attached) return false;
     return pty_read_idle_ns >= cfg.park_after_ns;
+}
+
+/// Mirrors `Terminal.Regime`, minus `stopped` -- that is a lifecycle state
+/// rather than a choice this function gets to make.
+pub const PtyRegime = enum { hot, polled };
+
+/// Which IO regime a PTY belongs in right now. Level 2 of docs/PARKING.md.
+///
+/// Two rules, both from [MEM t=504]: a parked terminal's descriptor goes to the
+/// poller, and so does one nobody is observing, because *"that 5 to 10% speed
+/// isn't going to matter as much when a human isn't judging it"*.
+///
+/// `unobserved_ns` is time since the last subscriber left, and is zero while
+/// one is attached. Note what is deliberately *not* here: PTY-read idleness. A
+/// busy terminal nobody is watching still belongs in the poller — ten thousand
+/// unwatched build logs should be ten thousand registrations, not ten thousand
+/// threads. That is the whole reason this rule is separate from `shouldPark`.
+pub fn ptyRegime(
+    cfg: Config,
+    residency: session.Residency,
+    attached: u32,
+    unobserved_ns: u64,
+) PtyRegime {
+    // Its state is on disk, so there is nothing in memory to feed.
+    if (residency == .parked) return .polled;
+    if (attached > 0) return .hot;
+    return if (unobserved_ns >= cfg.pty_park_unobserved_after_ns) .polled else .hot;
+}
+
+test "ptyRegime parks the descriptor of anything nobody is judging" {
+    const testing = std.testing;
+    const cfg: Config = .{};
+    const delay = default_pty_park_unobserved_after_ns;
+
+    // Watched and live: worth a whole thread.
+    try testing.expectEqual(PtyRegime.hot, ptyRegime(cfg, .live, 1, 0));
+    try testing.expectEqual(PtyRegime.hot, ptyRegime(cfg, .rehydrating, 2, 0));
+
+    // Parked, even with a client attached: attach is served from disk and does
+    // not unpark, so there is still no thread's worth of work here.
+    try testing.expectEqual(PtyRegime.polled, ptyRegime(cfg, .parked, 0, 0));
+    try testing.expectEqual(PtyRegime.polled, ptyRegime(cfg, .parked, 3, 0));
+
+    // Unobserved, but only once the delay has run.
+    try testing.expectEqual(PtyRegime.hot, ptyRegime(cfg, .live, 0, 0));
+    try testing.expectEqual(PtyRegime.hot, ptyRegime(cfg, .live, 0, delay - 1));
+    try testing.expectEqual(PtyRegime.polled, ptyRegime(cfg, .live, 0, delay));
+
+    // And an attach cancels it outright, however long it had been waiting.
+    // Promotion immediate, demotion delayed: that asymmetry is the hysteresis.
+    try testing.expectEqual(PtyRegime.hot, ptyRegime(cfg, .live, 1, delay * 100));
 }
 
 test "shouldPark honours residency, PTY-read idle time and attachment" {

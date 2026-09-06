@@ -58,6 +58,10 @@ pub const TerminalSummary = struct {
     cols: u16,
     rows: u16,
     residency: Residency,
+    /// Where this terminal's PTY master is being read: `hot` on a dedicated
+    /// thread, `polled` in the server's shared poller, `stopped` not at all.
+    /// See docs/ARCHITECTURE.md, "Server IO: two regimes per PTY".
+    regime: []const u8,
     /// Number of clients currently subscribed to this terminal's output.
     attached: u32,
     /// Monotonic nanoseconds since the PTY last produced output. This — not
