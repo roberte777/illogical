@@ -20,7 +20,10 @@ final class TabReconcileTests: XCTestCase {
 
     /// A store with one host and nothing on it.
     private func emptyStore(_ hosts: [ServerHost] = [local]) -> SessionStore {
-        SessionStore(hosts: hosts)
+        // A throwaway defaults suite: `addHost`/`removeHost` persist, and a
+        // unit test must not write to the developer's real preferences.
+        let suite = UserDefaults(suiteName: "illogical-test-\(UUID().uuidString)") ?? .standard
+        return SessionStore(hosts: hosts, defaults: suite)
     }
 
     private func store(_ ids: [UInt64], session: UInt64 = 1) -> SessionStore {
@@ -308,6 +311,8 @@ final class TabReconcileTests: XCTestCase {
     /// longer there to report that its terminals are gone.
     func testRemovingAHostTakesItsTabs() {
         let store = emptyStore([Self.local, Self.remote])
+        // `removeHost` persists; give it somewhere that is not the developer's
+        // real defaults.
         list(store, host: Self.local, [1])
         list(store, host: Self.remote, [1, 2])
         XCTAssertEqual(store.tabs.count, 3)
@@ -333,20 +338,82 @@ final class TabReconcileTests: XCTestCase {
     }
 
     /// A destination already in the list is one machine, not two.
+    ///
+    /// `connect: false` on purpose: the connecting form spawns a real
+    /// `ssh build-box illogicald --stdio` and creates `~/.ssh`, which a unit
+    /// test has no business doing.
     func testAddingAHostTwiceIsIdempotent() {
         let store = emptyStore([Self.local])
         let before = store.hosts.count
-        store.addHost(Self.remote)
-        store.addHost(Self.remote)
+        store.addHost(Self.remote, connect: false)
+        let first = store.host(Self.remote)
+        store.addHost(Self.remote, connect: false)
+
         XCTAssertEqual(store.hosts.count, before + 1)
+        // Identity, not just the count: replacing the entry would keep the
+        // count and orphan the first connection's control pump and every live
+        // controller on it — every open remote pane goes dead and an ssh
+        // process leaks, with the count still right.
+        XCTAssertTrue(store.host(Self.remote) === first)
     }
 
-    /// One unreachable machine must not take the window over: the others still
-    /// work, and the dropdown marks the one that does not.
-    func testOneFailedHostIsNotAWindowWideError() {
+    /// One unreachable machine must not take the window over. The previous
+    /// version of this test never put a host into `.failed` at all, so it
+    /// asserted nil against a store with no failures — true under any
+    /// implementation, including one where a single failure blanks the window.
+    func testOneFailedHostIsNotAWindowWideErrorButAllOfThemIs() {
         let store = emptyStore([Self.local, Self.remote])
         list(store, host: Self.local, [1])
-        // Nothing has connected in a test, so the remote is `.connecting`.
-        XCTAssertNil(store.connectionError)
+        store.host(Self.local)?.setStatusForTesting(.connected)
+        store.host(Self.remote)?.setStatusForTesting(.failed("could not resolve hostname"))
+
+        XCTAssertNil(store.connectionError, "one dead remote blanked a working window")
+
+        // ...and when nothing is reachable, it says so, with the message.
+        store.host(Self.local)?.setStatusForTesting(.failed("No illogicald"))
+        XCTAssertEqual(store.connectionError, "No illogicald")
     }
+
+    /// A new terminal must go to a machine that can actually make one.
+    /// `hosts.first` is always the local daemon, and `createTerminal` sends
+    /// through `try?`, so with no local daemon every ⌘T silently did nothing.
+    func testNewTerminalsAvoidAHostThatIsNotConnected() {
+        let store = emptyStore([Self.local, Self.remote])
+        store.host(Self.local)?.setStatusForTesting(.failed("No illogicald"))
+        store.host(Self.remote)?.setStatusForTesting(.connected)
+
+        XCTAssertEqual(store.selectedHost?.host, Self.remote)
+    }
+
+    /// Persistence round-trips, and `ILLOGICAL_HOSTS` entries are not written.
+    func testOnlyUserAddedHostsAreRemembered() throws {
+        let suite = try XCTUnwrap(UserDefaults(suiteName: "illogical-test-\(UUID().uuidString)"))
+        defer { suite.removePersistentDomain(forName: suite.description) }
+
+        let store = SessionStore(hosts: [Self.local], defaults: suite)
+        store.addHost(Self.remote, connect: false)
+
+        XCTAssertEqual(RemoteHostStore.load(suite), [Self.remote])
+        // And the local host is never stored: it is wherever this machine puts
+        // its socket, not something the user chose.
+        XCTAssertFalse(RemoteHostStore.load(suite).contains(Self.local))
+    }
+
+    /// Two hosts number their sessions from 1 as well as their terminals, so a
+    /// split must not resolve the front session's *id* against another machine.
+    func testASplitStaysOnItsOwnHostsSession() {
+        let store = emptyStore([Self.local, Self.remote])
+        list(store, host: Self.local, [1], session: 1, named: "here")
+        list(store, host: Self.remote, [1], session: 1, named: "there")
+
+        let remoteTab = store.tabs.first { $0.session.host == Self.remote }
+        XCTAssertEqual(remoteTab?.session.session, 1)
+        XCTAssertEqual(remoteTab?.session.host, Self.remote)
+        // The two sessions share an id and differ only by host, which is the
+        // whole reason `SessionRef` exists.
+        XCTAssertNotEqual(
+            store.tabs[0].session, store.tabs[1].session,
+            "two hosts' session 1 compared equal")
+    }
+
 }

@@ -61,9 +61,12 @@ Which machine you are looking at is on the session button; which machine a
 *pane* is on is in its own header, because a tab has one strip entry and a split
 tab could otherwise say nothing about it.
 
-Hosts are remembered in `UserDefaults` as destination strings and nothing else.
-There is no credential to store: `ssh` reads the user's own config, so a `Host`
-alias out of it is a perfectly good answer.
+Hosts are remembered in `UserDefaults`, and there is no credential among them:
+`ssh` reads the user's own config, so a `Host` alias out of it is a perfectly
+good answer. Only what the *user* added is written — hosts injected by
+`ILLOGICAL_HOSTS` are deliberately not, so a session started with that variable
+does not quietly make them permanent the first time you add or forget anything
+else.
 
 **One unreachable machine is not a broken window.** A failed host is a marker in
 the dropdown with `ssh`'s own complaint behind it and a button to try again; the

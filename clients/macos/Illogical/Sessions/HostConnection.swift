@@ -45,6 +45,24 @@ final class HostConnection: Identifiable {
         case connected
         /// Nothing is coming; the message is `ssh`'s own where there is one.
         case failed(String)
+
+        var isConnected: Bool {
+            if case .connected = self { return true }
+            return false
+        }
+
+        /// What to put in front of a person, or nil when there is nothing to
+        /// say yet.
+        var message: String? {
+            if case .failed(let message) = self { return message }
+            return nil
+        }
+    }
+
+    /// Drive the status directly. Only for tests: `.failed` is otherwise
+    /// reached by a connection actually failing, which needs a socket.
+    func setStatusForTesting(_ next: Status) {
+        setStatus(next)
     }
 
     private(set) var status: Status = .connecting
@@ -57,7 +75,7 @@ final class HostConnection: Identifiable {
     private var control: Connection?
     private var pump: Task<Void, Never>?
 
-    // -- events, for the store that owns the layout --------------------------
+    // MARK: - Events, for the store that owns the layout
     //
     // The host knows what exists; the window knows where it is drawn. Keeping
     // that split is what lets the reconcile stay in one place across every
@@ -132,11 +150,12 @@ final class HostConnection: Identifiable {
         closeController(id)
     }
 
-    /// A message worth putting in front of somebody.
+    /// Why a connection could not be *opened*, phrased for a person.
     ///
-    /// For a remote host that is `ssh`'s own complaint where there is one:
-    /// "could not resolve hostname" is the answer, and "connection closed" is
-    /// not.
+    /// This is the throw out of `Connection(host:)` -- ssh not on PATH, a
+    /// socket that is not there -- and not ssh's own stderr, which has not been
+    /// written yet at this point. That arrives later as
+    /// `Connection.failureDescription`, and `controlClosed` is what carries it.
     private func describe(_ error: Error) -> String {
         if case .local(let path) = host {
             return "No illogicald at \(path). Start one with `illogicald`."

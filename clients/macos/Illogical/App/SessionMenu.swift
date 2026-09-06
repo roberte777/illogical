@@ -18,7 +18,7 @@
 //      │ ⊜  Filter or create...         │
 //      │ LOCAL                          │  host header, 10pt, dim
 //      │ ✓   Demo                       │
-//      │ BUILD-BOX                  ⌫   │  remote: removable
+//      │ BUILD-BOX                  ✕   │  remote: removable
 //      │     api                        │
 //      │     agent                      │
 //      └────────────────────────────────┘
@@ -84,9 +84,17 @@ struct SessionMenu: View {
 
     /// "Filter **or create**": a name that matches nothing can be made. On the
     /// machine in front, since that is where a new terminal would go.
+    ///
+    /// Checked against *every* host's sessions, not just that one. The rows
+    /// below list them all, so a name that matches a session on another machine
+    /// is one you can switch to — offering "Create" for it as well meant Enter
+    /// silently made a second, local session with the same name instead of
+    /// going where the visible row pointed.
     private var canCreate: Bool {
-        guard !filter.isEmpty, let host = store.selectedHost else { return false }
-        return !host.sessions.contains { $0.name.caseInsensitiveCompare(filter) == .orderedSame }
+        guard !filter.isEmpty, store.selectedHost != nil else { return false }
+        return !store.hosts.contains { host in
+            host.sessions.contains { $0.name.caseInsensitiveCompare(filter) == .orderedSame }
+        }
     }
 
     /// Whether to name the machine each session is on. One host is the common
@@ -110,7 +118,7 @@ struct SessionMenu: View {
             }
 
             ForEach(store.hosts) { host in
-                if showsHosts {
+                if showsHosts && !matches(host).isEmpty {
                     HostHeader(
                         host: host,
                         isHovered: hovered == "h\(host.id)",
@@ -276,7 +284,12 @@ struct HostHeader: View {
             // Only what the user added can be removed; the local daemon is not
             // a host they chose, and removing it would leave nowhere to make a
             // terminal.
-            if host.host.isRemote && isHovered {
+            //
+            // Not hover-gated. `Chrome.swift` records the lesson for the tab
+            // close button in as many words -- "hover-only made it
+            // undiscoverable" -- and the diagram at the top of this file draws
+            // it unconditionally.
+            if host.host.isRemote {
                 Button(action: remove) {
                     Image(systemName: "xmark")
                         .font(.system(size: 8, weight: .bold))

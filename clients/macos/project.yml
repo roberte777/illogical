@@ -77,10 +77,11 @@ targets:
       # layout is testable without a window, a socket or a terminal.
       - path: Illogical/Splits/SplitTree.swift
       - path: Illogical/Splits/TabLayout.swift
-      # SessionStore owns the tab list and one connection per pane;
-      # HostConnection owns one machine's sessions and terminals. A window can
-      # hold several of the latter at once, which is what makes the reconcile
-      # worth testing across hosts and not only across sessions.
+      # SessionStore owns the layout -- tabs, splits, selection -- across every
+      # machine; HostConnection owns one machine's sessions, terminals and
+      # per-pane connections. A window holds several of the latter at once,
+      # which is what makes the reconcile worth testing across hosts and not
+      # only across sessions.
       - path: Illogical/Sessions/SessionStore.swift
       - path: Illogical/Sessions/HostConnection.swift
       - path: Illogical/Terminal/TerminalController.swift
