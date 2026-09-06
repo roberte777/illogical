@@ -112,6 +112,12 @@ final class HostConnection: Identifiable {
         apply(frame)
     }
 
+    /// The same, but through the identity guard, so a test can hand it a
+    /// connection that is not the current one.
+    func handleForTesting(_ frame: Frame, from source: Connection) {
+        handle(frame, from: source)
+    }
+
     private(set) var status: Status = .connecting
     var sessions: [SessionSummary] = []
     var terminals: [TerminalSummary] = []
@@ -224,6 +230,12 @@ final class HostConnection: Identifiable {
         pump = nil
         control?.close()
         control = nil
+        // Here rather than only in `disconnect`, because `openControl` comes
+        // through here too and a reconnect is the commonest way a `create`
+        // stops being answerable. The cancelled pump's own tail cannot do it:
+        // `control` has already been replaced by the time it runs, so its
+        // identity guard sends it home.
+        voidPendingCreates()
     }
 
     func disconnect() {
@@ -231,7 +243,6 @@ final class HostConnection: Identifiable {
         retry?.cancel()
         retry = nil
         closeControl()
-        voidPendingCreates()
         for id in controllers.keys { closeController(id) }
     }
 

@@ -126,19 +126,21 @@ full_sock="$daemon_sock"
 # what the bridge costs. Without this the table below was timing the writer.
 wait_idle() {
   local sock="$1"
-  local rows idle empty=0
+  local rows idle rc empty=0
   for _ in $(seq 1 2400); do
-    # `|| true` on both: a bare `x=$(...)` takes the pipeline's exit status as
-    # its own, and under `set -euo pipefail` that ends the script -- silently,
-    # because the `2>/dev/null` here is exactly for the seconds while the
-    # daemon is still coming up and `list` cannot connect. The whole benchmark
-    # exited 1 with no output and looked like a build failure.
-    # The status is kept, because an empty `rows` has two very different
-    # causes and the diagnosis below is now load-bearing: `list` answered and
-    # said there is nothing, or `list` could not connect at all and its
-    # complaint went to /dev/null.
-    rows=$(ILLOGICAL_SOCK="$sock" "$cli" list 2>/dev/null | awk 'NR > 1')
-    rc=$?
+    # `|| rc=$?`, not a bare `rc=$?` on the next line. A plain `x=$(pipeline)`
+    # is a simple command whose status is the pipeline's, so under `set -e`
+    # with `pipefail` a failing `list` ends the script *before* any following
+    # line runs -- silently, because the `2>/dev/null` here is exactly for the
+    # seconds while the daemon is still coming up. The whole benchmark exited 1
+    # with no output and looked like a build failure. An assignment inside a
+    # `||` list is exempt from `errexit`, which is what keeps the status.
+    #
+    # The status is kept because an empty `rows` has two very different causes,
+    # and the diagnosis below is load-bearing: `list` answered and said there
+    # is nothing, or `list` could not connect at all.
+    rc=0
+    rows=$(ILLOGICAL_SOCK="$sock" "$cli" list 2>/dev/null | awk 'NR > 1') || rc=$?
     if [ -z "$rows" ]; then
       # Ten seconds of this is not a slow filler; it is a daemon that never
       # got a terminal, or one that has since died. Waiting the full twenty
@@ -157,8 +159,10 @@ wait_idle() {
       continue
     fi
     empty=0
+    # `|| true`: `head -1` closes the pipe under `sort`, so this can come back
+    # non-zero under `pipefail` even when it printed exactly what was wanted.
     idle=$(printf '%s\n' "$rows" |
-      awk '{ gsub(/s$/, "", $NF); print $NF }' | sort -n | head -1)
+      awk '{ gsub(/s$/, "", $NF); print $NF }' | sort -n | head -1) || true
     # An IDLE column that is not an integer would make the comparison below
     # false forever -- `rows` is non-empty, so the ten-second guard above never
     # trips either, and the whole thing becomes a twenty-minute wait ending in

@@ -260,6 +260,89 @@ final class ReconnectTests: XCTestCase {
             "a host that came back kept the backoff from the outage it recovered from")
     }
 
+    /// The control connection has the same guard as the pane's, and until now
+    /// nothing reached it: `handleForTesting` goes straight to `apply`, and the
+    /// helper it replaced bypassed it too. What it prevents is a `session_list`
+    /// buffered on a superseded connection — `close()` drains the stream to its
+    /// end — overwriting the lists the *new* connection has just published, and
+    /// reporting `.connected` for a machine still mid-handshake.
+    func testAListFromAReplacedControlConnectionIsIgnored() async throws {
+        let server = try HangUpServer()
+        defer { server.stop() }
+
+        let store = SessionStore(hosts: [.local(socketPath: server.path)])
+        guard let host = store.host(.local(socketPath: server.path)) else {
+            return XCTFail("no host")
+        }
+        defer { host.disconnect() }
+
+        // Never installed as this host's control connection, so the guard must
+        // send it home. Comparing identity is all the guard does.
+        let stale = try Connection(host: .local(socketPath: server.path))
+        defer { stale.close() }
+        host.handleForTesting(
+            Frame(
+                type: .sessionList, terminal: Protocol.controlSession,
+                payload: Data(#"{"sessions":[{"id":1,"name":"ghost","terminals":[]}],"terminals":[]}"#.utf8)
+            ),
+            from: stale)
+
+        XCTAssertTrue(
+            host.sessions.isEmpty,
+            "a superseded connection's session_list overwrote the current one's")
+        XCTAssertFalse(
+            host.status.isConnected,
+            "a superseded connection's session_list reported the host connected")
+    }
+
+    /// A `create` outstanding when the control connection drops is never going
+    /// to be answered, and must not stay in the queue: replies are matched to
+    /// requests by position, so one stranded entry lands every later split in
+    /// the tab before last, for the life of the process.
+    ///
+    /// The dropped-connection path, specifically. `disconnect()` is covered in
+    /// TabReconcileTests without a socket; this one needs a real connection to
+    /// really close.
+    func testACreateOutstandingWhenTheConnectionDropsIsVoided() async throws {
+        let server = try HangUpServer()
+        defer { server.stop() }
+
+        let store = SessionStore(hosts: [.local(socketPath: server.path)])
+        guard let host = store.host(.local(socketPath: server.path)) else {
+            return XCTFail("no host")
+        }
+        defer { host.disconnect() }
+
+        host.sessions = [SessionSummary(id: 1, name: "s", terminals: [1, 2])]
+        host.terminals = [1, 2].map {
+            TerminalSummary(
+                id: $0, session: 1, name: "t\($0)", command: "/bin/zsh", cwd: "/",
+                cols: 80, rows: 24, residency: .live, attached: 0, ptyReadIdleNanoseconds: 0)
+        }
+        store.reconcileTabs()
+        XCTAssertEqual(store.tabs.count, 2)
+        let first = store.tabs[0]
+        let second = store.tabs[1]
+
+        // Asked for before there is a connection, so the request goes nowhere
+        // and the entry is left waiting on a reply that cannot come.
+        store.split(pane: first.panes[0].id, in: first.id, direction: .columns)
+
+        // Now connect, and let the server hang up. That is what runs
+        // `controlClosed`, which is the path under test.
+        host.connect()
+        try await waitFor("the control connection to drop") {
+            if case .reconnecting = host.status { return true }
+            return false
+        }
+
+        store.split(pane: second.panes[0].id, in: second.id, direction: .columns)
+        store.host(.local(socketPath: server.path))?.onCreated?(12)
+        XCTAssertEqual(
+            store.tabs.first { $0.id == second.id }?.panes.count, 2,
+            "a create orphaned by a dropped connection shifted the queue")
+    }
+
     /// A frame buffered on a connection that has since been replaced must not
     /// be applied to its successor. `close()` finishes the stream but still
     /// delivers what is already in it, so an `exited` in flight when a pane

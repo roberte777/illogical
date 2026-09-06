@@ -56,7 +56,7 @@ public enum TransportError: Error, Equatable, CustomStringConvertible {
     case spawnFailed(command: String, reason: String)
     /// The spawn failed for a reason about the *file*: it is not there, or not
     /// executable, or not a program. Retrying cannot help.
-    case notExecutable(command: String, reason: String)
+    case notExecutable(command: String)
 
     /// Read by a person, in the session dropdown, next to the host that failed.
     /// `Error`'s own rendering of these is `NSCocoaErrorDomain` noise.
@@ -67,7 +67,12 @@ public enum TransportError: Error, Equatable, CustomStringConvertible {
         case .pathTooLong: "the socket path is too long"
         case .notOnPath(let command): "\(command) is not on PATH"
         case .spawnFailed(let command, let reason): "could not run \(command): \(reason)"
-        case .notExecutable(let command, let reason): "cannot run \(command): \(reason)"
+        // Deliberately not Foundation's sentence. For the case this branch
+        // exists for -- a file that is there and is not executable -- it says
+        // "The file ... doesn't exist.", which sends somebody looking for an
+        // `ssh` that is sitting right where they left it. We already know
+        // better than the string does by the time we get here.
+        case .notExecutable(let command): "\(command) is not an executable program"
         }
     }
 
@@ -240,13 +245,13 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         let permanent: Set<Int32> = [ENOENT, EACCES, ENOEXEC, EISDIR, ENAMETOOLONG, ELOOP]
 
         if ns.domain == NSPOSIXErrorDomain, permanent.contains(Int32(ns.code)) {
-            return .notExecutable(command: command, reason: reason)
+            return .notExecutable(command: command)
         }
         // `NSFileNoSuchFileError` (4) and `NSFileReadNoPermissionError` (257)
         // are the same two answers wearing Cocoa's numbering, which is what
         // Foundation actually raises for a missing or unreadable image.
         if ns.domain == NSCocoaErrorDomain, ns.code == 4 || ns.code == 257 {
-            return .notExecutable(command: command, reason: reason)
+            return .notExecutable(command: command)
         }
         return .spawnFailed(command: command, reason: reason)
     }
