@@ -56,10 +56,19 @@ pub const default_compress_after_ns: u64 = 250 * std.time.ns_per_ms;
 /// not spawn and join a thread each time. See docs/PARKING.md, level 2.
 pub const default_pty_park_unobserved_after_ns: u64 = 5 * std.time.ns_per_s;
 
+/// How long a client must be quiet before its pipeline buffers are freed.
+///
+/// Level 3 of docs/PARKING.md. Kilobytes each, but multiplied by client count
+/// at the scale this project is for. Ten seconds is long enough that it never
+/// fires between a keystroke and its echo, and short enough that a window left
+/// open overnight is not holding a megabyte per pane.
+pub const default_client_park_after_ns: u64 = 10 * std.time.ns_per_s;
+
 pub const Config = struct {
     park_after_ns: u64 = default_park_after_ns,
     compress_after_ns: u64 = default_compress_after_ns,
     pty_park_unobserved_after_ns: u64 = default_pty_park_unobserved_after_ns,
+    client_park_after_ns: u64 = default_client_park_after_ns,
     /// Park even while clients are attached. Because idleness is measured in
     /// PTY reads, an attached-but-silent terminal is still idle — and that is
     /// the common case for agent workloads, so this defaults on.

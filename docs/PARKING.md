@@ -273,8 +273,47 @@ a separate scaling problem in the daemon and it is not measured here.
 > after the initial synchronization, we park the buffers, which is basically we
 > free them." — [MEM t=551]
 
-Kilobytes each, but multiplied by client count at our target scale. Free after an
-idle period past initial sync; reallocate on activity.
+Kilobytes each, but multiplied by client count at our target scale. Freed after
+`client_park_after` with no frame in either direction; reallocated on the next
+one, which is the allocator's business rather than a state machine of ours.
+
+Two buffers per connection: the queue the writer thread drains to the socket,
+and the frame body the reader fills. Both grow to the largest thing that
+connection ever carried and then keep it — a pane that streamed a build log
+holds that queue capacity for as long as the window stays open.
+
+Each is freed **by the thread that owns it**, and that is the only part of this
+with any subtlety:
+
+- The queue is freed by the writer, the next time it finds it empty. Asking is
+  a flag and a wake-up. Doing it from the maintenance tick would mean freeing a
+  buffer that is inside a `write` syscall.
+- The read buffer goes under a `tryLock` the reader holds only between a
+  frame's header and its dispatch. An idle connection is one blocked waiting
+  for its next header, so it is never holding that lock — and a busy one is
+  skipped rather than waited for, because one connection must not hold up the
+  tick for all the others.
+
+A connection with bytes still queued is never parked, idle clock or not: those
+bytes are a stream nothing is going to send again.
+
+### What it costs
+
+`scripts/bench-memory.sh 20 10000 50` — 50 clients attached to a parked
+terminal, Debug, M-series:
+
+| | ours | Superlogical | tmux 3.5a |
+| --- | --- | --- | --- |
+| Just after attach, snapshot still in flight | 1091 KiB | — | — |
+| Idle, buffers parked | **180 KiB** | 85 KiB | 157 KiB |
+| Reclaimed by parking | 83% | — | — |
+
+The first row is not a steady state, it is the snapshot itself sitting in the
+pipeline; the second is what a connection actually costs to keep open.
+
+Still twice the reference figure. What is left is not buffers — it is the two
+thread stacks a connection owns, and that is A6's problem rather than this
+one's.
 
 ---
 
@@ -310,7 +349,12 @@ for now.
 | `park_after` | 60 s | PTY-read idle before terminal parking [MEM t=246] |
 | `compress_after` | 250 ms | idle before an incremental compression step |
 | `pty_park_unobserved_after` | 5 s | delay before demoting an unwatched PTY |
+| `client_park_after` | 10 s | quiet time before a client's buffers are freed |
 | `max_snapshot_bytes` | 256 MiB | refuse to park beyond this; stay resident |
+
+The first three and the fourth are also `illogicald` flags —  `--park-after`,
+`--pty-park-after`, `--client-park-after` — which is how the benchmarks pin one
+behaviour at a time.
 
 ## Measuring it
 
@@ -321,22 +365,29 @@ appear to do *nothing*; measured with `phys_footprint` the win is plain. This is
 also the metric Superlogical's own charts report, so it is the only way to
 compare honestly. `scripts/bench-memory.sh` reads it from `vmmap --summary`.
 
-Results from `scripts/bench-memory.sh 20 10000` (macOS, Apple M4 Max), against
-the reference figures in [RESEARCH.md](RESEARCH.md#7-numbers):
+Results from `scripts/bench-memory.sh 20 10000 50`, against the reference
+figures in [RESEARCH.md](RESEARCH.md#7-numbers):
 
 | | ours | Superlogical | tmux 3.5a |
 | --- | --- | --- | --- |
-| Server start, no terminals | **2.38 MiB** | 10.6 MiB | 2.50 MiB |
-| Per filled 10,000-line terminal, live | 1867 KiB | 407 KiB | 4.89 MiB |
-| Per filled 10,000-line terminal, parked | **374 KiB** | — | — |
+| Server start, no terminals | **2.45 MiB** | 10.6 MiB | 2.50 MiB |
+| Per filled 10,000-line terminal, live | 1876 KiB | 407 KiB | 4.89 MiB |
+| Per filled 10,000-line terminal, parked | **192 KiB** | — | — |
+| Per client connection, idle | 180 KiB | **85 KiB** | 157 KiB |
 | Snapshot on disk | 32 KiB | — | — |
-| Reclaimed by parking | 79% | — | — |
+| Reclaimed by parking | 89% | — | — |
 
-Read this carefully before claiming a win. Superlogical's 407 KiB is labelled
-"per filled terminal" and does not say whether it was parked. Our *parked*
-number lands next to it and our *live* number is 4.5× worse, so the honest
-reading is either that their figure is a settled/parked measurement too, or that
-their live representation is leaner than ours. We do not know which.
+The parked row was **356 KiB** before A3, measured on this same machine an hour
+earlier. The 164 KiB that went is the reader thread's touched stack: a parked
+terminal does not have a thread any more. An earlier revision of this table read
+374 KiB from a different machine, which is the same number and not a comparison.
+
+Read the live row carefully before claiming a win anywhere. Superlogical's
+407 KiB is labelled "per filled terminal" and does not say whether it was
+parked. Our *parked* number is now well under it and our *live* number is 4.6×
+over, so the honest reading is either that their figure is a settled measurement
+too, or that their live representation is leaner than ours. We do not know
+which.
 
 Still to measure:
 
@@ -344,5 +395,4 @@ Still to measure:
 - **Unpark → `ready()` returns.** The headline latency; target ~200 µs at 64 MB
   excluding disk.
 - Full history restore time (background; must not regress interactivity).
-- IO throughput, hot vs parked PTY. Target ≤10% loss.
-- Thread count vs terminal count. Should flatten, not track.
+- Per empty 80×24 terminal, against tmux's 15 KiB and Superlogical's 68 KiB.

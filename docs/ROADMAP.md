@@ -190,7 +190,7 @@ milestone the whole architecture exists for. See [PARKING.md](PARKING.md).
 | ✅ | The benchmark, as `scripts/bench-memory.sh` (not yet in CI — there is no CI) |
 | ✅ | **F2** — flow control: bounded per-client queue, overflow ⇒ forced re-attach |
 | ✅ | **A3** (second half) — PTY fd migration between dedicated thread and shared poller, with hysteresis |
-| | **A4** — client buffer parking |
+| ✅ | **A4** — client buffer parking |
 | | **A6** — per-terminal fixed costs: zero-init, lazy allocation, shared palette |
 | | **F3** — snapshot **encryption**. Compression landed; encryption did not, so park files are plaintext on disk and scrollback holds secrets. This is a real gap, not a refinement |
 
@@ -229,11 +229,11 @@ macOS, `phys_footprint`, same terminal shapes — and report losses honestly.
 
 | Benchmark | Superlogical | tmux 3.5a | ours | status |
 | --- | --- | --- | --- | --- |
-| Server start, no terminals | 10.6 MiB | 2.50 MiB | **2.38 MiB** | measured |
-| Per terminal, 10,000 lines, live | **407 KiB** | 4.89 MiB | 1867 KiB | measured |
-| Per terminal, 10,000 lines, parked | — | — | **374 KiB** | measured |
+| Server start, no terminals | 10.6 MiB | 2.50 MiB | **2.45 MiB** | measured |
+| Per terminal, 10,000 lines, live | **407 KiB** | 4.89 MiB | 1876 KiB | measured |
+| Per terminal, 10,000 lines, parked | — | — | **192 KiB** | measured |
 | Per empty 80×24 terminal | 68 KiB | **15 KiB** | — | not measured |
-| Per client connection (50 filled) | **85 KiB** | 157 KiB | — | not measured |
+| Per client connection (50 filled) | **85 KiB** | 157 KiB | 180 KiB | measured |
 | Unpark, 64 MB scrollback | ~200 µs (excl. disk) | — | — | not measured |
 | Parked-PTY throughput cost | 5–10% | — | **+0.2%** one PTY, **+98%** eight at once | measured |
 
@@ -247,14 +247,21 @@ rather than the `read`, and four pool threads are doing what eight dedicated
 readers would have. The cost is `terminals / pool`, it is paid only by terminals
 nobody is watching, and it buys the row below.
 
-Two things to be careful about when reading that table. First, it is
+Three things to be careful about when reading that table. First, it is
 `phys_footprint`, not RSS — with RSS the compression and parking wins are
 invisible on macOS, because `MADV_FREE_REUSABLE` leaves pages counted until
 there is pressure. Second, Superlogical's 407 KiB does not say whether it was
-measured parked. Our parked figure lands beside it and our live figure is 4.5×
-worse, so either their number is also a settled measurement or their live
+measured parked. Our parked figure is now well under it and our live figure is
+4.6× over, so either their number is also a settled measurement or their live
 representation is genuinely leaner. We do not know which, and should not claim
 the win either way.
+
+Third, the parked row moved because of A3, not because terminals got smaller:
+it was **356 KiB** on the branch before, on this machine, and the 164 KiB that
+went is the reader thread's touched stack. A parked terminal no longer has a
+thread. The per-client row is the mirror image and the reason it is still twice
+the reference: a connection owns two threads, and their stacks are what is left
+after its buffers are freed. That is A6.
 
 Sources and methodology in [RESEARCH.md §7](RESEARCH.md#7-numbers).
 

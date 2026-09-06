@@ -69,6 +69,23 @@ queue_drained: illogical.thread.Condition = .{},
 /// Set when the queue overflowed. The client has missed output and has been
 /// unsubscribed; it is told so and must re-attach.
 desynced: bool = false,
+/// Set by `parkBuffers`, acted on by the writer thread when it next finds the
+/// queue empty. See "buffer parking" below.
+park_requested: bool = false,
+
+// -- the read path ---------------------------------------------------------
+
+/// Guards `read_payload`, and only that. Held by the reader from the moment a
+/// frame header arrives until that frame has been dispatched -- so a client
+/// blocked waiting for its next frame, which is the idle state, holds nothing.
+read_mutex: illogical.thread.Mutex = .{},
+/// The frame body being read. A field rather than a local so that it can be
+/// freed while the client is idle; it grows to the largest frame the client
+/// ever sent and then keeps that memory forever.
+read_payload: std.ArrayList(u8) = .empty,
+
+/// Monotonic nanoseconds at the last frame in or out. Drives buffer parking.
+last_activity_ns: std.atomic.Value(u64),
 
 reader: ?std.Thread = null,
 writer: ?std.Thread = null,
@@ -87,6 +104,7 @@ pub fn create(server: *Server, fd: sys.fd_t) !*Client {
         .fd = fd,
         .gpa = server.gpa,
         .queue_cap = server.client_queue_bytes,
+        .last_activity_ns = .init(sys.monotonicNs()),
     };
     return self;
 }
@@ -113,6 +131,7 @@ pub fn destroy(self: *Client) void {
     sys.closeFd(self.fd);
     self.queue.deinit(self.gpa);
     self.outgoing.deinit(self.gpa);
+    self.read_payload.deinit(self.gpa);
     self.attached.deinit(self.gpa);
     self.gpa.destroy(self);
 }
@@ -161,21 +180,26 @@ fn run(self: *Client) void {
     }
 
     var header_buf: [protocol.header_len]u8 = undefined;
-    var payload: std.ArrayList(u8) = .empty;
-    defer payload.deinit(self.gpa);
 
     while (self.alive.load(.acquire)) {
+        // Outside `read_mutex`: this is where an idle client waits, sometimes
+        // for hours, and holding the lock here would mean its read buffer
+        // could never be parked.
         self.readExact(&header_buf) catch break;
         const header = protocol.Header.decode(&header_buf) catch |err| {
             log.warn("bad frame header: {t}", .{err});
             break;
         };
+        self.touch();
 
-        payload.clearRetainingCapacity();
-        payload.resize(self.gpa, header.len) catch break;
-        if (header.len > 0) self.readExact(payload.items) catch break;
+        self.read_mutex.lock();
+        defer self.read_mutex.unlock();
 
-        self.dispatch(header, payload.items) catch |err| switch (err) {
+        self.read_payload.clearRetainingCapacity();
+        self.read_payload.resize(self.gpa, header.len) catch break;
+        if (header.len > 0) self.readExact(self.read_payload.items) catch break;
+
+        self.dispatch(header, self.read_payload.items) catch |err| switch (err) {
             // The queue overflowed underneath this frame. The client has
             // already been sent `desync` and unsubscribed; another `err` on
             // top of it would say nothing new.
@@ -186,6 +210,11 @@ fn run(self: *Client) void {
             },
         };
     }
+}
+
+/// Note that this client is not idle. See "buffer parking".
+fn touch(self: *Client) void {
+    self.last_activity_ns.store(sys.monotonicNs(), .release);
 }
 
 fn readExact(self: *Client, buf: []u8) !void {
@@ -575,6 +604,10 @@ fn enqueue(
     backpressure: Backpressure,
 ) !void {
     if (!self.alive.load(.acquire)) return error.ClientGone;
+    // A client being sent output is not idle, whichever direction the traffic
+    // is going: its queue is in use and freeing it would only mean allocating
+    // it again on the next chunk.
+    self.touch();
 
     self.queue_mutex.lock();
     defer self.queue_mutex.unlock();
@@ -685,6 +718,15 @@ fn writeLoop(self: *Client) void {
             while (self.queue.items.len == 0) {
                 if (!self.alive.load(.acquire)) return;
                 if (self.draining.load(.acquire)) return;
+                if (self.park_requested) {
+                    self.park_requested = false;
+                    // Both buffers belong to this thread at this instant: the
+                    // queue is empty and `outgoing` was cleared after the last
+                    // write. That is the whole reason parking is asked for
+                    // rather than done by the thread that wants it.
+                    self.queue.clearAndFree(self.gpa);
+                    self.outgoing.clearAndFree(self.gpa);
+                }
                 self.queue_ready.wait(&self.queue_mutex);
             }
             std.mem.swap(std.ArrayList(u8), &self.queue, &self.outgoing);
@@ -715,6 +757,58 @@ fn clearDesync(self: *Client) void {
     self.queue_mutex.lock();
     defer self.queue_mutex.unlock();
     self.desynced = false;
+}
+
+// -- buffer parking --------------------------------------------------------
+//
+// Level 3 of docs/PARKING.md, and the smallest of the three:
+//
+//   > "when a client attaches, in order to optimize the speed at which a
+//   > client could read data from the server, we have a bunch of buffers ...
+//   > it adds up. It's kilobytes of buffers. When a client is mostly idle
+//   > after a period of time, after the initial synchronization, we park the
+//   > buffers, which is basically we free them." -- [MEM t=551]
+//
+// Kilobytes each, and multiplied by client count at the scale this project
+// exists for. A pane that streamed a build log holds the queue capacity that
+// took, and a pane that sent one large frame holds a read buffer to match,
+// both of them for as long as the window stays open.
+
+/// Free this client's pipeline buffers if it has been quiet long enough.
+///
+/// Never blocks: the maintenance tick calls this for every client in turn, and
+/// one busy connection must not hold up the rest. A client that is mid-frame
+/// or mid-write simply keeps its buffers until the next tick.
+pub fn parkBuffers(self: *Client, cfg: illogical.park.Config) void {
+    const idle = sys.monotonicNs() -| self.last_activity_ns.load(.acquire);
+    if (idle < cfg.client_park_after_ns) return;
+
+    // The read buffer, if the reader is not between a header and its dispatch.
+    if (self.read_mutex.tryLock()) {
+        self.read_payload.clearAndFree(self.gpa);
+        self.read_mutex.unlock();
+    }
+
+    // The queue is freed by the writer thread instead of here. `outgoing` is
+    // inside a `write` for most of its life and only the writer knows when it
+    // is not; asking costs one flag and a wake-up.
+    self.queue_mutex.lock();
+    defer self.queue_mutex.unlock();
+    if (self.queue.items.len > 0) return;
+    self.park_requested = true;
+    self.queue_ready.signal();
+}
+
+/// Bytes of capacity this client's pipeline is holding. For tests and for the
+/// memory benchmark; not otherwise interesting.
+pub fn bufferedCapacity(self: *Client) usize {
+    self.queue_mutex.lock();
+    const queued = self.queue.capacity + self.outgoing.capacity;
+    self.queue_mutex.unlock();
+
+    self.read_mutex.lock();
+    defer self.read_mutex.unlock();
+    return queued + self.read_payload.capacity;
 }
 
 /// Wake both ends of the queue, for a state change they are waiting on.
@@ -1196,6 +1290,100 @@ const Tee = struct {
         return gpa.dupe(u8, self.bytes.items);
     }
 };
+
+test "an idle client's buffers are freed, and come back on activity" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var pair = try SocketPair.open("park-buffers");
+    defer pair.close();
+
+    const server = try Server.init(gpa, threaded.io(), "/tmp/illogical-unused.sock", "/tmp/illogical-unused");
+    defer server.deinit();
+    // Idle immediately, so the test does not have to wait ten seconds for the
+    // behaviour it is checking.
+    server.park_config.client_park_after_ns = 0;
+
+    const client = try Client.create(server, pair.server_end);
+    defer client.destroy();
+    try client.startWriter();
+
+    // Push enough through to grow both the queue and its partner buffer, and
+    // drain it so nothing is left pending.
+    const chunk: [16 * 1024]u8 = @splat('x');
+    for (0..8) |_| try client.enqueue(.output, 1, &chunk, .wait);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    var drained: usize = 0;
+    while (drained < 8 * chunk.len) {
+        const header = try readFrame(pair.client_end, gpa, &payload);
+        drained += header.len;
+    }
+    try testing.expect(client.bufferedCapacity() >= chunk.len);
+
+    // Also give the read buffer something to hold on to. Driven through
+    // `dispatch` because that is the path that grows it in production.
+    const big_name: [4096]u8 = @splat('n');
+    const body = try protocol.body.encode(gpa, protocol.body.Create{ .name = &big_name });
+    defer gpa.free(body);
+    client.read_payload.clearRetainingCapacity();
+    try client.read_payload.appendSlice(gpa, body);
+    try testing.expect(client.read_payload.capacity >= body.len);
+
+    // Park. The queue is freed by the writer thread, so this is a request and
+    // the assertion has to wait for it to be honoured.
+    client.parkBuffers(server.park_config);
+    var waited: usize = 0;
+    while (waited < 2000) : (waited += 5) {
+        if (client.bufferedCapacity() == 0) break;
+        sys.sleepNs(5 * std.time.ns_per_ms);
+    } else return error.BuffersNeverParked;
+
+    // Freed, not merely emptied: `clearRetainingCapacity` would leave every
+    // byte of that 128 KiB allocated, which is exactly the thing level 3 is
+    // about at ten thousand clients.
+    try testing.expectEqual(@as(usize, 0), client.bufferedCapacity());
+
+    // And the client still works. Reallocation is the allocator's business,
+    // not a state machine we have to get right.
+    try client.enqueue(.output, 1, "back to life", .wait);
+    const header = try readFrame(pair.client_end, gpa, &payload);
+    try testing.expectEqual(protocol.FrameType.output, header.type);
+    try testing.expectEqualStrings("back to life", payload.items);
+}
+
+test "a busy client keeps its buffers" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var pair = try SocketPair.open("park-busy");
+    defer pair.close();
+
+    const server = try Server.init(gpa, threaded.io(), "/tmp/illogical-unused.sock", "/tmp/illogical-unused");
+    defer server.deinit();
+    server.park_config.client_park_after_ns = 0;
+
+    const client = try Client.create(server, pair.server_end);
+    defer client.destroy();
+    // No writer thread: whatever is queued stays queued.
+
+    try client.enqueue(.output, 1, "pending", .drop);
+    const before = client.bufferedCapacity();
+    try testing.expect(before > 0);
+
+    // Idle by the clock, but with bytes the client has not been sent. Freeing
+    // here would drop output that nothing is going to send again.
+    client.parkBuffers(server.park_config);
+    try testing.expectEqual(before, client.bufferedCapacity());
+    try testing.expect(!client.park_requested);
+}
 
 test "a client that keeps up gets the byte stream whole and in order" {
     const testing = std.testing;

@@ -34,7 +34,14 @@ pub fn run(conn: *Conn, gpa: Allocator, io: std.Io, args: []const []const u8) !v
         .rows = size.rows,
     });
 
-    try enterRawMode();
+    // A pipe has no termios to put in raw mode, and that is not a reason to
+    // refuse. `illogical attach 3 </dev/null >log` is a legitimate thing to
+    // want -- it is how the memory benchmark holds fifty connections open --
+    // and the rest of this works unchanged without a terminal on either end.
+    enterRawMode() catch |err| switch (err) {
+        error.NotATerminal => {},
+        else => return err,
+    };
     defer leaveRawMode();
 
     // stdin -> server, on its own thread. One writer, as always.
