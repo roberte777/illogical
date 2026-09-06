@@ -515,6 +515,49 @@ test "deinit drains a child that is blocked writing at us" {
     try testing.expect(elapsed < 500 * std.time.ns_per_ms);
 }
 
+test "deinit gives up on a child that never stops writing" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A child that never ends and never stops writing. Two things are pinned,
+    // and it is worth being exact about which, because the obvious third is
+    // not one of them:
+    //
+    //   * `deinit` is *bounded*. Its outer loop must stop at the grace; give
+    //     that loop a minute instead and this never returns in time.
+    //   * the SIGTERM fallback actually runs. Without it `deinit` still
+    //     returns on time and leaves `yes` running forever with nobody to
+    //     reap it, which the pid check below is what notices.
+    //
+    // It does *not* pin `drainRead`'s own deadline. Measured: with this child
+    // the drain leaves via `WouldBlock` every time -- 688 times over one grace
+    // period -- because a 4 KiB read loop outpaces `yes`. That deadline guards
+    // a producer fast enough to keep the pipe continuously non-empty, which a
+    // shell child cannot be made to be reliably. It is defence in depth, and
+    // is not claimed here as covered.
+    const argv = try arena.allocSentinel(?[*:0]const u8, 3, null);
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = "yes";
+
+    var conn = try Conn.spawn(gpa, argv);
+    const pid = conn.child.?;
+    const before = sys.monotonicNs();
+    conn.deinit();
+    const elapsed = sys.monotonicNs() - before;
+
+    // The grace, and then the signal. Not less, which would mean giving up on
+    // a child that was merely busy; not more, which is the hang.
+    try testing.expect(elapsed >= Conn.child_exit_grace_ns);
+    try testing.expect(elapsed < 2 * Conn.child_exit_grace_ns);
+    // And it is really gone, rather than left running with nobody to reap it.
+    // `deinit` returns on time either way; only this notices the difference.
+    try testing.expect(!sys.processExists(pid));
+}
+
 test "a command connection speaks frames over its child's pipes" {
     const testing = std.testing;
     const gpa = testing.allocator;
