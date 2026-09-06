@@ -160,6 +160,37 @@ struct TransportTests {
         #expect(!transport.isRunning)
     }
 
+    /// `Process.executableURL` is a path, not a command: a bare `ssh` resolves
+    /// against the *current directory*, which for a .app is wherever Finder
+    /// launched it from. Without this the only remote host anyone would ever
+    /// configure fails with "the file ssh doesn't exist".
+    @Test("a bare command name is resolved against PATH, the way a shell would")
+    func resolvesOnPath() throws {
+        // Not compared against a literal: which `sh` is first on PATH is the
+        // environment's business — inside `nix develop` it is not /bin/sh.
+        // What has to hold is that a bare name comes back absolute, executable
+        // and still itself.
+        let resolved = try CommandTransport.resolve("sh")
+        #expect(resolved.path.hasPrefix("/"))
+        #expect(resolved.lastPathComponent == "sh")
+        #expect(FileManager.default.isExecutableFile(atPath: resolved.path))
+
+        // A path stays exactly the path it was.
+        #expect(try CommandTransport.resolve("/bin/cat").path == "/bin/cat")
+
+        #expect(throws: TransportError.notOnPath("illogical-no-such-command")) {
+            _ = try CommandTransport.resolve("illogical-no-such-command")
+        }
+    }
+
+    /// These end up in the session dropdown next to the host that failed, so
+    /// they have to read like something a person wrote.
+    @Test("transport errors say what happened without NSCocoaErrorDomain in it")
+    func errorsAreReadable() {
+        #expect(String(describing: TransportError.notOnPath("ssh")) == "ssh is not on PATH")
+        #expect(String(describing: TransportError.pathTooLong) == "the socket path is too long")
+    }
+
     @Test("a unix socket transport reports a path that is not there")
     func missingSocket() {
         #expect(throws: TransportError.self) {

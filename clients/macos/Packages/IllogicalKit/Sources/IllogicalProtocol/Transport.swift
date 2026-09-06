@@ -33,11 +33,24 @@ public protocol Transport: AnyObject, Sendable {
     var failureDescription: String? { get }
 }
 
-public enum TransportError: Error, Equatable {
+public enum TransportError: Error, Equatable, CustomStringConvertible {
     case socketFailed(Int32)
     case connectFailed(Int32)
     case pathTooLong
+    case notOnPath(String)
     case spawnFailed(String)
+
+    /// Read by a person, in the session dropdown, next to the host that failed.
+    /// `Error`'s own rendering of these is `NSCocoaErrorDomain` noise.
+    public var description: String {
+        switch self {
+        case .socketFailed(let code): "could not open a socket (\(code))"
+        case .connectFailed(let code): "could not connect (\(code))"
+        case .pathTooLong: "the socket path is too long"
+        case .notOnPath(let command): "\(command) is not on PATH"
+        case .spawnFailed(let detail): detail
+        }
+    }
 }
 
 // MARK: - Local
@@ -131,7 +144,7 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         let stderrPipe = Pipe()
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
+        process.executableURL = try Self.resolve(executable)
         process.arguments = Array(argv.dropFirst())
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
@@ -161,6 +174,27 @@ public final class CommandTransport: Transport, @unchecked Sendable {
             }
             sink.append(data)
         }
+    }
+
+    /// Find `command` the way a shell would.
+    ///
+    /// `Process` does not do this: `executableURL` is a *path*, and a bare
+    /// `ssh` is resolved against the current directory, which for a .app is
+    /// wherever it happened to be launched from. So `ssh` failed with "the
+    /// file ssh doesn't exist" and the host looked unreachable.
+    ///
+    /// The `PATH` a bundle inherits from Finder is the minimal one, which does
+    /// contain `/usr/bin`; the fallback below is that same list, for a launch
+    /// context that passes no `PATH` at all.
+    static func resolve(_ command: String) throws -> URL {
+        if command.contains("/") { return URL(fileURLWithPath: command) }
+        let path =
+            ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        for directory in path.split(separator: ":") where !directory.isEmpty {
+            let candidate = URL(fileURLWithPath: String(directory)).appending(path: command)
+            if FileManager.default.isExecutableFile(atPath: candidate.path) { return candidate }
+        }
+        throw TransportError.notOnPath(command)
     }
 
     deinit { close() }
