@@ -158,7 +158,7 @@ final class HostConnection: Identifiable {
         for id in controllers.keys { closeController(id) }
     }
 
-    /// Every `create` still outstanding on this host is now unanswerable.
+    /// Give up on every `create` still outstanding on this host.
     ///
     /// `created` carries a terminal id and nothing else -- no request id -- so
     /// the client can only match replies to requests by position. That holds
@@ -166,6 +166,11 @@ final class HostConnection: Identifiable {
     /// request whose connection died produces none. One stranded entry shifts
     /// the queue by one for the life of the process, which shows up as splits
     /// landing in the tab before last and the window jumping to it.
+    ///
+    /// "Unanswerable" is exact for the two teardown callers and deliberately
+    /// approximate for the third: an `err` on the control session means *one*
+    /// request failed, and this abandons the lot because the frame does not
+    /// say which. See the `.error` case for why that is the safe direction.
     private func voidPendingCreates() {
         onCreatesVoided?()
     }

@@ -259,7 +259,8 @@ final class SessionStore {
     /// view reading no host would not redraw -- but this reads every host's
     /// `status`, and `HostConnection` is `@Observable`, so the dependency is
     /// already registered by the read below.
-    /// Nor is a machine we have not finished dialling. A host only reports
+    ///
+    /// Nor is one unreachable machine this while another is still dialling. A host only reports
     /// `.connected` once its first `session_list` proves the far end is really
     /// there, and over SSH everything before that -- auth, the remote spawn,
     /// the list itself -- is a second or more. Without this, launching with no
