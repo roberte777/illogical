@@ -143,13 +143,13 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// means a window that opens and closes remote panes walks to `EMFILE`, at
     /// which point even a local unix socket stops connecting.
     ///
-    /// When `close`'s wait times out this descriptor is left alone, and what
-    /// eventually frees it is `closeOnDealloc` -- but on *this* object's
-    /// deallocation, not the drain's. Three things hold the handle: this
-    /// property, the `Pipe` reachable through `process.standardError`, and the
-    /// drain closure. So the bound is "when the caller lets go of the
-    /// transport", which for a failed one is as long as it wants to keep
-    /// reading `failureDescription`.
+    /// When `close`'s wait times out this descriptor is left alone and
+    /// `closeOnDealloc` is what eventually frees it -- once *all three* holders
+    /// let go: this property, the `Pipe` reachable through
+    /// `process.standardError`, and the drain closure. So the bound is the
+    /// later of "the caller released the transport" and "the drain returned",
+    /// and in the timeout branch it is always the second, because timing out
+    /// is what "the drain is still inside its read" means.
     private let stderrHandle: FileHandle
     private let shutdownFlag = ManagedAtomicFlag()
     private let closedFlag = ManagedAtomicFlag()
@@ -312,11 +312,14 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         // exists for. The loud one is what a test sees; the quiet one is what
         // a user sees.
         //
-        // Not a permanent leak when it times out: the drain closure holds the
-        // last reference to a `Pipe` handle, which closes on dealloc, so the
-        // descriptor comes back when the child finally goes and the read
-        // returns. This branch is what makes it prompt in the ordinary case,
-        // where the child is already gone.
+        // Not a permanent leak when it times out, but not prompt either.
+        // `Pipe` handles close on dealloc and three things hold this one --
+        // the stored property, the `Pipe` under `process.standardError`, and
+        // the drain closure -- so the descriptor comes back on the *later* of
+        // the transport being released and the drain returning. In this branch
+        // that is always the drain, because timing out is what "the drain is
+        // still inside its read" means. This line is what makes the ordinary
+        // case, where the child is already gone, immediate instead.
         if drainFinished.wait(timeout: .now() + Self.drainGrace) == .success {
             try? stderrHandle.close()
         }
@@ -365,21 +368,17 @@ public enum SSHCommand {
     /// that changed networks waits forever on a socket with nobody behind it.
     static let aliveInterval = "15"
     static let aliveCountMax = "3"
-    /// The same argument, for the connection that has not happened *yet*.
-    ///
-    /// `ServerAlive*` applies only once a session is up, so without this a
-    /// black-holed host sits in the TCP connect for the platform default --
-    /// about 75 seconds on macOS. Not merely slow: a host that has not
-    /// finished dialling is deliberately treated as "no news yet", which is
-    /// what stops an ordinary handshake flashing a failure screen, so those 75
-    /// seconds are spent showing nothing wrong at all -- while the message the
-    /// user may actually need, about some *other* host, is suppressed with it.
-    /// Ten seconds is far longer than a reachable host needs and short enough
-    /// to become a message.
-    ///
-    /// It does not bound every wait, and should not: a key on a hardware token
-    /// blocks until somebody touches it, and that is worth waiting for.
-    static let connectTimeout = "10"
+    // And deliberately *no* `ConnectTimeout`. It is the obvious companion to
+    // these -- without one a black-holed host sits in the TCP connect for the
+    // platform default, about 75 seconds on macOS -- but it also bounds the
+    // banner exchange, and behind a `ProxyJump` the target's banner cannot
+    // arrive until the whole inner hop has authenticated. So a bastion that
+    // wants a hardware-key touch or a push gets however long we set, and no
+    // longer: measured, `ConnectTimeout=2` against a proxy ready at 3s fails
+    // at 2.009s with "Connection timed out during banner exchange". A
+    // command-line `-o` beats the user's own ssh_config, so there would be no
+    // way to opt back out. Jump hosts are part of the config this client
+    // exists to inherit; a slow first paint is the better failure.
     /// How long the multiplexing master lingers after the last connection, so
     /// closing a window and opening another does not re-authenticate.
     static let controlPersist = "60"
@@ -425,7 +424,6 @@ public enum SSHCommand {
             "-T",
             "-o", "ServerAliveInterval=\(aliveInterval)",
             "-o", "ServerAliveCountMax=\(aliveCountMax)",
-            "-o", "ConnectTimeout=\(connectTimeout)",
         ]
 
         if options.multiplex, let path = controlPath(options) {
