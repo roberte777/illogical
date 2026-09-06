@@ -122,12 +122,20 @@ fn spawnDaemon(socket_path: []const u8, exe_override: ?[]const u8) !void {
     @memcpy(sock_z[0..socket_path.len], socket_path);
     sock_z[socket_path.len] = 0;
 
+    // Where the daemon's stderr goes. Beside the socket, which is also where
+    // the park store lives, so a daemon nobody started by hand still has one
+    // place to complain -- see `spawnDetached`.
+    var log_z: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = std.fs.path.dirname(socket_path) orelse ".";
+    const log_path = std.fmt.bufPrintZ(&log_z, "{s}/daemon.log", .{dir}) catch
+        return error.PathTooLong;
+
     const exe_ptr: [*:0]const u8 = @ptrCast(&exe_z);
     const sock_ptr: [*:0]const u8 = @ptrCast(&sock_z);
     const argv = [_:null]?[*:0]const u8{ exe_ptr, "--socket", sock_ptr };
 
-    log.info("no daemon at {s}; starting one", .{socket_path});
-    try spawnDetached(exe_ptr, &argv);
+    log.info("no daemon at {s}; starting one, logging to {s}", .{ socket_path, log_path });
+    try spawnDetached(exe_ptr, &argv, log_path.ptr);
 }
 
 /// Start `argv` in a session of its own, with no standard streams, and do not
@@ -137,7 +145,11 @@ fn spawnDaemon(socket_path: []const u8, exe_override: ?[]const u8) !void {
 /// reparented to init and there is nothing left for this process to reap —
 /// which matters here more than usual, because this process lives for one SSH
 /// session and the daemon must outlive it by hours.
-fn spawnDetached(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) !void {
+fn spawnDetached(
+    file: [*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    log_path: [*:0]const u8,
+) !void {
     const pid = sys.forkProcess() catch return error.SpawnFailed;
     if (pid == 0) {
         // Intermediate child. Nothing here may allocate or return.
@@ -149,7 +161,12 @@ fn spawnDetached(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) !void 
         // and our stdout is the client's frame stream. Refusing to exec is the
         // only safe answer if we cannot take it away, because injected text
         // would look to the client like a malformed frame.
-        detachStdio() catch sys.exitProcess(1);
+        detachStdio(log_path) catch sys.exitProcess(1);
+        // Everything else our parent had open. A daemon started this way lives
+        // for days and hands each inherited descriptor on to every shell it
+        // spawns; an `~/.ssh/rc` or `authorized_keys command=` wrapper that
+        // opened a credential file before exec'ing us is enough to leak one.
+        sys.closeFrom(sys.STDERR + 1);
         sys.exec(file, argv);
         sys.exitProcess(127);
     }
@@ -158,12 +175,29 @@ fn spawnDetached(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) !void 
     _ = sys.wait(pid);
 }
 
-fn detachStdio() !void {
+/// Give the daemon no stdin, no stdout, and a *real* stderr.
+///
+/// Stderr is not `/dev/null`, and that is the whole point of taking a path.
+/// The daemon reports a failed park key there and carries on -- `Server.init`
+/// treats it as loud but not fatal -- and park files are then written in the
+/// clear, defeating F3. Sent to `/dev/null` that condition is unobservable and
+/// permanent, and the auto-start path is the one nobody is watching.
+fn detachStdio(log_path: [*:0]const u8) !void {
     const null_fd = try sys.openDevNull();
     sys.dup2Fd(null_fd, sys.STDIN);
     sys.dup2Fd(null_fd, sys.STDOUT);
-    sys.dup2Fd(null_fd, sys.STDERR);
     if (null_fd > sys.STDERR) sys.closeFd(null_fd);
+
+    // A daemon with no diagnostics at all is worse than one whose log we could
+    // not open, so fall back rather than refuse to start.
+    if (sys.openAppend(log_path)) |log_fd| {
+        sys.dup2Fd(log_fd, sys.STDERR);
+        if (log_fd > sys.STDERR) sys.closeFd(log_fd);
+    } else |_| {
+        const fallback = try sys.openDevNull();
+        sys.dup2Fd(fallback, sys.STDERR);
+        if (fallback > sys.STDERR) sys.closeFd(fallback);
+    }
 }
 
 /// One direction of the splice.
@@ -445,35 +479,52 @@ test "the bridge carries a whole conversation in both directions" {
     _ = std.c.shutdown(pipe.client_end, 1);
 }
 
-test "a detached daemon outlives the process that started it" {
+test "a detached daemon outlives its parent, keeps a stderr, and inherits nothing" {
     const gpa = testing.allocator;
 
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    var buf: [96]u8 = undefined;
-    const marker = try std.fmt.bufPrintZ(
-        &buf,
-        "/tmp/illogical-detached-{d}",
-        .{std.c.getpid()},
-    );
+    const pid = std.c.getpid();
+    var marker_buf: [96]u8 = undefined;
+    const marker = try std.fmt.bufPrintZ(&marker_buf, "/tmp/illogical-detached-{d}", .{pid});
     defer sys.unlinkPath(marker.ptr);
     std.Io.Dir.cwd().deleteFile(io, marker) catch {};
 
-    // Stands in for the daemon: something slow enough that it is definitely
-    // still running when `spawnDetached` returns, so the file appearing proves
-    // the grandchild survived the intermediate child's exit.
-    var script_buf: [256]u8 = undefined;
+    var log_buf: [96]u8 = undefined;
+    const log_path = try std.fmt.bufPrintZ(&log_buf, "/tmp/illogical-detached-{d}.log", .{pid});
+    defer sys.unlinkPath(log_path.ptr);
+    std.Io.Dir.cwd().deleteFile(io, log_path) catch {};
+
+    var secret_buf: [96]u8 = undefined;
+    const secret = try std.fmt.bufPrintZ(&secret_buf, "/tmp/illogical-secret-{d}", .{pid});
+    defer sys.unlinkPath(secret.ptr);
+
+    // A descriptor the daemon has no business seeing, in the slot an
+    // `~/.ssh/rc` wrapper's own log or credential file would occupy. Without
+    // `closeFrom` the grandchild inherits it and hands it to every shell it
+    // ever spawns -- for days.
+    const secret_fd = try sys.openAppend(secret.ptr);
+    sys.dup2Fd(secret_fd, 9);
+    if (secret_fd != 9) sys.closeFd(secret_fd);
+    defer sys.closeFd(9);
+
+    // Stands in for the daemon: slow enough to still be running when
+    // `spawnDetached` returns, so the marker proves the grandchild survived
+    // the intermediate child's exit. It also reports what it inherited, and
+    // complains on stderr the way a daemon with no park key does.
+    var script_buf: [512]u8 = undefined;
     const script = try std.fmt.bufPrintZ(
         &script_buf,
-        "sleep 0.2; : > {s}",
+        "sleep 0.2; echo DAEMON_COMPLAINT >&2; " ++
+            "if : <&9 2>/dev/null; then echo LEAKED; else echo CLEAN; fi > {s}",
         .{marker},
     );
     const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", @ptrCast(script.ptr) };
 
     const before = sys.monotonicNs();
-    try spawnDetached("/bin/sh", &argv);
+    try spawnDetached("/bin/sh", &argv, log_path.ptr);
     // The wait inside is for the intermediate child, which exits immediately.
     // If it were waiting for the grandchild this would be 200ms, and the
     // daemon would hold up every SSH connection for as long as it ran.
@@ -484,6 +535,17 @@ test "a detached daemon outlives the process that started it" {
         if (std.Io.Dir.cwd().access(io, marker, .{})) |_| break else |_| {}
         sys.sleepNs(10 * std.time.ns_per_ms);
     } else return error.DetachedChildNeverRan;
+
+    const inherited = try std.Io.Dir.cwd().readFileAlloc(io, marker, gpa, .limited(64));
+    defer gpa.free(inherited);
+    try testing.expectEqualStrings("CLEAN", std.mem.trim(u8, inherited, " \n"));
+
+    // And the daemon has somewhere to complain. Sent to /dev/null, a park-key
+    // failure -- which leaves every park file in the clear -- is invisible
+    // forever, and auto-start is the path nobody is watching.
+    const complaint = try std.Io.Dir.cwd().readFileAlloc(io, log_path, gpa, .limited(4096));
+    defer gpa.free(complaint);
+    try testing.expect(std.mem.indexOf(u8, complaint, "DAEMON_COMPLAINT") != null);
 }
 
 test "dialling waits for a daemon that is still coming up" {
