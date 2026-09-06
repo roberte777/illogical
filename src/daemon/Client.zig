@@ -139,11 +139,11 @@ pub fn destroy(self: *Client) void {
 pub fn start(self: *Client) !void {
     try self.startWriter();
     errdefer self.stopWriter();
-    self.reader = try std.Thread.spawn(.{}, run, .{self});
+    self.reader = try std.Thread.spawn(.{ .stack_size = Terminal.thread_stack_size }, run, .{self});
 }
 
 fn startWriter(self: *Client) !void {
-    self.writer = try std.Thread.spawn(.{}, writeLoop, .{self});
+    self.writer = try std.Thread.spawn(.{ .stack_size = Terminal.thread_stack_size }, writeLoop, .{self});
 }
 
 /// Let the writer finish what it has, then join it.

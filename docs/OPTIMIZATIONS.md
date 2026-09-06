@@ -222,8 +222,8 @@ Ghostty also has `renderer: avoid starving scrollback compression`
 
 ### A6. Per-terminal fixed costs
 
-**Status: Adopt.** Ongoing — and this is the one where the reference
-implementation currently *loses*.
+**Status: Done** for M4, and permanently ongoing. This is the one where the
+reference implementation currently *loses*.
 
 tmux costs 15 KiB per empty terminal; Superlogical costs 68 KiB. Mitchell
 concedes it and says it is fixable [MEM t=197]. Since we are starting fresh we
@@ -242,6 +242,53 @@ overhead, and libghostty has been chipping at exactly this:
 
 The lesson for us: anything we allocate per session must also be zero-initialized
 or lazy. At 10,000 sessions, a 4 KB eager buffer is 40 MB.
+
+#### What we found when we went looking
+
+**The measurement was wrong before the code was.** Every memory figure in this
+project was taken from a debug build, and a debug build is not off by a little.
+Zig fills `undefined` with `0xAA`, so every buffer a debug binary declares is
+written before it is used — including the four ~390 KiB pages libghostty
+preheats per terminal *precisely because* they are demand-paged and "only cost
+us address space". An empty terminal measures **1743 KiB debug and 90 KiB
+release**. Everything we compare against is a release build.
+`scripts/bench-memory.sh` builds one now.
+
+Three costs were ours, and all three are gone:
+
+- **A 64 KiB PTY read buffer that no read could ever fill.** A macOS pty master
+  returns at most 1024 bytes per read whatever you give it — 118,000 reads of a
+  child writing 13 MB flat out, mean 115 bytes, maximum 1024 — because that is
+  what its output queue holds. Linux is larger and the same shape. Now 16 KiB.
+- **64 KiB of stack, permanently, per client that ever attached.** The buffer
+  between the park store and the decompressor sat on the stack of whichever
+  thread was attaching, so a connection that attached once dirtied 64 KiB of its
+  reader's stack for as long as it lived. On the heap it lasts as long as the
+  attach does.
+- **16 MiB of stack reservation per thread.** Address space rather than memory,
+  but two threads per client at ten thousand clients is 320 GiB of it. Now
+  512 KiB, against a measured high-water mark of 32 KiB.
+
+Measured, ReleaseFast, same machine, before and after:
+
+| | before | after |
+| --- | --- | --- |
+| Per hot terminal | 176 KiB | **155 KiB** |
+| Per client connection | 87 KiB | **59 KiB** |
+
+And against the reference figures, from `scripts/bench-memory.sh 20 10000 50`:
+
+| | ours | Superlogical | tmux 3.5a |
+| --- | --- | --- | --- |
+| Server start, no terminals | **1.27 MiB** | 10.6 MiB | 2.50 MiB |
+| Per empty 80×24 terminal | 90 KiB | 68 KiB | **15 KiB** |
+| Per client connection, idle | **46 KiB** | 85 KiB | 157 KiB |
+
+We win the connection row and lose the empty-terminal row, which is the row this
+section was written about. Most of what is in it is not ours: a libghostty
+terminal and the one preheated page that gets touched. Winning it outright needs
+either a smaller page for small terminals or lazy page allocation, and both are
+upstream's to make.
 
 ### A7. Position-independent page memory
 

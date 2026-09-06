@@ -11,6 +11,16 @@
 # so the same figure is taken twice -- once with the clients live and once
 # after they have gone quiet and level 3 of docs/PARKING.md has freed them.
 #
+# ⚠ This measures a RELEASE build, and builds one itself.
+#
+# A debug build is not off by a little, it is off by an order of magnitude, and
+# not in a direction that flatters anything. Zig fills `undefined` with 0xAA, so
+# every buffer a debug binary declares is written before it is ever used --
+# including libghostty's four preheated ~390 KiB pages per terminal, which it
+# allocates precisely because they are demand-paged and "only cost us address
+# space". An empty terminal measures 1743 KiB debug against 105 KiB release.
+# Every figure this compares against is from a release build.
+#
 # Usage: scripts/bench-memory.sh [terminal-count] [lines-per-terminal] [clients]
 set -euo pipefail
 
@@ -20,10 +30,16 @@ clients="${3:-50}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 state="$(mktemp -d /tmp/illogical-bench.XXXXXX)"
 sock="$state/server.sock"
-daemon="$root/zig-out/bin/illogicald"
-cli="$root/zig-out/bin/illogical"
 
-[ -x "$daemon" ] || { echo "build first: zig build" >&2; exit 1; }
+# Its own prefix, so this never overwrites the debug binaries everything else
+# in the repo expects to find in zig-out.
+out="$root/.zig-bench"
+daemon="$out/bin/illogicald"
+cli="$out/bin/illogical"
+echo "building release..." >&2
+(cd "$root" && zig build -Doptimize=ReleaseFast --prefix "$out")
+
+[ -x "$daemon" ] || { echo "no release binary at $daemon" >&2; exit 1; }
 
 attached_pids=()
 cleanup() {
@@ -64,6 +80,64 @@ sleep 0.5
 base=$(footprint)
 printf 'server start, no terminals            %8s KiB\n' "$base"
 
+# --- an empty terminal ------------------------------------------------------
+#
+# The fixed cost, before a byte of content: a pty, a libghostty terminal and
+# whatever we hang off it. tmux is 15 KiB here and Superlogical 68, and both of
+# them beat the two rows below that actually scale, so this is the row where
+# being honest matters most.
+for i in $(seq 1 "$count"); do
+  ILLOGICAL_SOCK="$sock" "$cli" new -n "empty$i" -- /bin/sh -c 'sleep 600' >/dev/null
+done
+sleep 1.5
+empty=$(footprint)
+printf '%d empty 80x24 terminals (hot)         %8s KiB   %6s KiB/terminal\n' \
+  "$count" "$empty" "$(( (empty - base) / count ))"
+
+# --- what a client connection costs -----------------------------------------
+#
+# Measured here, against an empty terminal, rather than after the fill. What
+# this row is meant to be is the standing cost of a connection: two threads and
+# the pipeline buffers of docs/PARKING.md level 3. Attaching to a *filled*
+# terminal instead measures the snapshot -- a megabyte per client through the
+# queue, freed by A4 but kept on the release allocator's free list -- which
+# reports 689 KiB/client and is an answer to a different question.
+before_clients=$(footprint)
+target=$(ILLOGICAL_SOCK="$sock" "$cli" list | awk 'NR == 2 { print $1 }')
+for _ in $(seq 1 "$clients"); do
+  ILLOGICAL_SOCK="$sock" "$cli" attach "$target" </dev/null >/dev/null 2>&1 &
+  attached_pids+=("$!")
+done
+for _ in $(seq 1 200); do
+  [ "$(ILLOGICAL_SOCK="$sock" "$cli" list | awk -v id="$target" '$1 == id { print $6 }')" -ge "$clients" ] && break
+  sleep 0.25
+done
+sleep 1
+with_clients=$(footprint)
+printf '%d clients attached                    %8s KiB   %6s KiB/client\n' \
+  "$clients" "$with_clients" "$(( (with_clients - before_clients) / clients ))"
+
+sleep 5
+parked_clients=$(footprint)
+printf '%d clients idle, buffers parked        %8s KiB   %6s KiB/client\n' \
+  "$clients" "$parked_clients" "$(( (parked_clients - before_clients) / clients ))"
+
+for p in ${attached_pids+"${attached_pids[@]}"}; do kill "$p" 2>/dev/null || true; done
+attached_pids=()
+sleep 1
+
+# Kill the terminals off again so the filled measurement below starts clean.
+for id in $(ILLOGICAL_SOCK="$sock" "$cli" list | awk 'NR > 1 { print $1 }'); do
+  ILLOGICAL_SOCK="$sock" "$cli" kill "$id" >/dev/null 2>&1 || true
+done
+for _ in $(seq 1 60); do
+  [ "$(ILLOGICAL_SOCK="$sock" "$cli" list | grep -c ' live \| polled ')" -eq 0 ] && break
+  sleep 0.25
+done
+sleep 1
+base=$(footprint)
+printf 'after killing them                    %8s KiB\n' "$base"
+
 # One awk process per terminal writes the fill in a single pass, so the
 # measurement is not dominated by shell startup.
 for i in $(seq 1 "$count"); do
@@ -72,13 +146,26 @@ for i in $(seq 1 "$count"); do
     >/dev/null
 done
 
-# The fill is done when everything has gone quiet, which is also when parking
-# starts. Measure live at the last moment before that.
+# Wait for the footprint to *settle*, not merely to stop climbing.
+#
+# The fill and A5's incremental scrollback compression race each other, and
+# which one wins depends on the build. An earlier version of this loop stopped
+# at the first sample that was not higher than the last, which in a debug build
+# landed after compression had kept up and in a release build landed on the raw
+# peak -- 1876 KiB/terminal against 9979, from the same code. Neither was
+# wrong; they were answers to different questions. This waits for three
+# consecutive samples within 2% of each other, which is the settled figure.
 echo "filling ${count}x${lines} lines..."
 prev=0
-while :; do
+stable=0
+for _ in $(seq 1 120); do
   now=$(footprint)
-  [ "$now" -le "$prev" ] && break
+  if [ "$prev" -gt 0 ] && [ "$(( (now > prev ? now - prev : prev - now) * 100 ))" -le "$(( prev * 2 ))" ]; then
+    stable=$((stable + 1))
+    [ "$stable" -ge 3 ] && break
+  else
+    stable=0
+  fi
   prev=$now
   sleep 0.5
 done
@@ -100,36 +187,19 @@ snap=$(du -sk "$state/sessions" 2>/dev/null | cut -f1 || echo 0)
 printf 'snapshots on disk                     %8s KiB   %6s KiB/terminal\n' \
   "$snap" "$(( snap / count ))"
 
-# --- what a client connection costs -----------------------------------------
-#
-# Attaching to a parked terminal is served from disk and does not unpark it, so
-# what this adds is the connection itself: two threads and the pipeline buffers
-# that level 3 of docs/PARKING.md exists to reclaim.
-echo
-before_clients=$(footprint)
-target=$(ILLOGICAL_SOCK="$sock" "$cli" list | awk 'NR == 2 { print $1 }')
-for _ in $(seq 1 "$clients"); do
-  ILLOGICAL_SOCK="$sock" "$cli" attach "$target" </dev/null >/dev/null 2>&1 &
-  attached_pids+=("$!")
-done
+cat <<'NOTE'
 
-# Wait for the server to agree they have all arrived, rather than guessing.
-for _ in $(seq 1 200); do
-  [ "$(ILLOGICAL_SOCK="$sock" "$cli" list | awk -v id="$target" '$1 == id { print $6 }')" -ge "$clients" ] && break
-  sleep 0.25
-done
-sleep 1
-with_clients=$(footprint)
-printf '%d clients attached                    %8s KiB   %6s KiB/client\n' \
-  "$clients" "$with_clients" "$(( (with_clients - before_clients) / clients ))"
+Two things this cannot show you, both worth knowing before reading a zero as a
+failure.
 
-# Past --client-park-after, with nothing being sent to them.
-sleep 5
-parked_clients=$(footprint)
-printf '%d clients idle, buffers parked        %8s KiB   %6s KiB/client\n' \
-  "$clients" "$parked_clients" "$(( (parked_clients - before_clients) / clients ))"
-if [ "$with_clients" -gt "$before_clients" ]; then
-  printf 'reclaimed by client parking           %8s KiB   (%s%%)\n' \
-    "$(( with_clients - parked_clients ))" \
-    "$(( (with_clients - parked_clients) * 100 / (with_clients - before_clients) ))"
-fi
+Freeing is not returning. A4 frees a quiet client's buffers and parking frees a
+terminal outright -- the tests assert both directly, on capacity -- but whether
+that shows up in phys_footprint depends on whether the allocator hands those
+pages back to the kernel. The debug allocator does; the release one keeps them
+on a free list for the next client.
+
+And A5 gets there first. By the time the fill has settled, scrollback
+compression has already released the physical pages with MADV_FREE_REUSABLE, so
+parking has little left to reclaim in this metric. The live row is a terminal
+that is already compressed, not a raw one.
+NOTE
