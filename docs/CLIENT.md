@@ -490,6 +490,10 @@ Three things this deliberately does **not** do:
 - **It does not treat a first failure differently from a later one.** A host
   that was never reachable and one that went away are the same question.
 
+There is one exception to "retried forever", and it is about the *kind* of failure rather than how many there have been: a host that cannot be dialled at all — `ssh` not on `PATH`, a socket path too long for `sockaddr_un`, an `ssh` that is not an executable program — is marked `failed` and left alone, because rescanning `PATH` on a thirty-second timer tells nobody anything. Everything else keeps trying.
+
+The line between the two is drawn on the errno rather than on the shape of the failure, and that matters more than it sounds: `Process.run()` throwing is `EMFILE` as readily as it is a broken shebang. A remote connection costs three descriptors, so a window with enough panes open reaches `EMFILE` by itself and recovers the moment one closes — calling that a verdict would kill a perfectly reachable machine for the life of the process. `CommandTransport.spawnError` is where the two are told apart.
+
 A resize during an outage is remembered and carried into the re-attach, so a
 window resized while disconnected comes back at the size it is now.
 
