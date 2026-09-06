@@ -133,15 +133,24 @@ wait_idle() {
     # because the `2>/dev/null` here is exactly for the seconds while the
     # daemon is still coming up and `list` cannot connect. The whole benchmark
     # exited 1 with no output and looked like a build failure.
-    rows=$(ILLOGICAL_SOCK="$sock" "$cli" list 2>/dev/null | awk 'NR > 1') || true
+    # The status is kept, because an empty `rows` has two very different
+    # causes and the diagnosis below is now load-bearing: `list` answered and
+    # said there is nothing, or `list` could not connect at all and its
+    # complaint went to /dev/null.
+    rows=$(ILLOGICAL_SOCK="$sock" "$cli" list 2>/dev/null | awk 'NR > 1')
+    rc=$?
     if [ -z "$rows" ]; then
-      # Answered, but with nothing on it. Ten seconds of that is not a slow
-      # filler, it is a daemon that never got a terminal -- and waiting the
-      # full twenty minutes to say so wastes the run. The long ceiling is for
-      # a genuinely large scrollback, which only applies once one exists.
+      # Ten seconds of this is not a slow filler; it is a daemon that never
+      # got a terminal, or one that has since died. Waiting the full twenty
+      # minutes to say so wastes the run -- the long ceiling below is for a
+      # genuinely large scrollback, which only applies once one exists.
       empty=$((empty + 1))
       if [ "$empty" -ge 20 ]; then
-        echo "no terminals on $sock after 10s; the daemon never got one" >&2
+        if [ "$rc" -ne 0 ]; then
+          echo "cannot list $sock after 10s; the daemon is not answering" >&2
+        else
+          echo "no terminals on $sock after 10s; the daemon never got one" >&2
+        fi
         exit 1
       fi
       sleep 0.5
@@ -149,8 +158,19 @@ wait_idle() {
     fi
     empty=0
     idle=$(printf '%s\n' "$rows" |
-      awk '{ gsub(/s$/, "", $NF); print $NF }' | sort -n | head -1) || true
-    [ -n "$idle" ] && [ "$idle" -ge 2 ] 2>/dev/null && return 0
+      awk '{ gsub(/s$/, "", $NF); print $NF }' | sort -n | head -1)
+    # An IDLE column that is not an integer would make the comparison below
+    # false forever -- `rows` is non-empty, so the ten-second guard above never
+    # trips either, and the whole thing becomes a twenty-minute wait ending in
+    # a message about a filler that in fact finished. `cli list` prints `{d}s`
+    # today; this is what notices if that ever changes.
+    case "$idle" in
+      '' | *[!0-9]*)
+        echo "unexpected IDLE column '$idle' from $sock; cannot tell when it went idle" >&2
+        exit 1
+        ;;
+    esac
+    [ "$idle" -ge 2 ] && return 0
     sleep 0.5
   done
   # Not a warning. Attaching to a terminal that is still a firehose measures

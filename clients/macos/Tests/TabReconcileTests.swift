@@ -465,4 +465,87 @@ final class TabReconcileTests: XCTestCase {
         XCTAssertEqual(store.tabs.first { $0.id == second.id }?.panes.count, 2)
     }
 
+    /// A `create` that will never be answered must take its queue entry with
+    /// it. Replies are matched to requests by position — `created` carries a
+    /// terminal id and no request id — so one stranded entry shifts the queue
+    /// by one for the life of the process: every later split lands in the tab
+    /// before last, and yanks the window to it.
+    func testACreateThatWillNeverBeAnsweredLeavesNothingBehind() {
+        let store = emptyStore()
+        list(store, host: Self.local, [1, 2], session: 1)
+        let first = store.tabs[0]
+        let second = store.tabs[1]
+
+        // Asked for, and the server answers with an error instead of a
+        // terminal — a bad session name, or a host out of PTYs.
+        store.split(pane: first.panes[0].id, in: first.id, direction: .columns)
+        store.host(Self.local)?.handleForTesting(
+            Frame(
+                type: .error, terminal: Protocol.controlSession,
+                payload: Data(#"{"code":2,"message":"no such session"}"#.utf8)))
+
+        // A later split in a different tab must be the next reply's match.
+        store.split(pane: second.panes[0].id, in: second.id, direction: .columns)
+        store.host(Self.local)?.onCreated?(12)
+        XCTAssertEqual(
+            store.tabs.first { $0.id == second.id }?.panes.count, 2,
+            "a stranded create shifted the queue: this split landed elsewhere")
+    }
+
+    /// The same, for the other way a create dies: the connection carrying it
+    /// went away, so the reply is never coming.
+    func testALostConnectionVoidsTheSplitsItWasCarrying() {
+        let store = emptyStore()
+        list(store, host: Self.local, [1, 2], session: 1)
+        let first = store.tabs[0]
+        let second = store.tabs[1]
+
+        store.split(pane: first.panes[0].id, in: first.id, direction: .columns)
+        store.host(Self.local)?.disconnect()
+
+        store.split(pane: second.panes[0].id, in: second.id, direction: .columns)
+        store.host(Self.local)?.onCreated?(12)
+        XCTAssertEqual(
+            store.tabs.first { $0.id == second.id }?.panes.count, 2,
+            "a create orphaned by a dropped connection shifted the queue")
+    }
+
+    /// A host still dialling is not a failure worth taking the window over
+    /// for. Over SSH the handshake — auth, the remote spawn, the first list —
+    /// is a second or more, and nothing is `.connected` during it, so a dead
+    /// local daemon's message covered the whole window and then vanished. The
+    /// only button on that screen reconnects *every* host, so a user who
+    /// believed it killed the ssh connection a moment before it succeeded.
+    func testAHostStillDiallingIsNotAFailure() {
+        let store = emptyStore([Self.local, Self.remote])
+        store.host(Self.local)?.setStatusForTesting(.failed("No illogicald"))
+        // The remote is still `.connecting` — where a HostConnection starts.
+        XCTAssertNil(store.connectionError, "a handshake was reported as an outage")
+        XCTAssertEqual(
+            store.selectedHost?.host, Self.remote,
+            "⌘T was routed to the failed host over the one still connecting")
+
+        // Once it has really failed, the screen is right to appear.
+        store.host(Self.remote)?.setStatusForTesting(.failed("could not resolve hostname"))
+        XCTAssertNotNil(store.connectionError)
+    }
+
+    /// The union clause in `hostsToRemember`: a host that is both on disk and
+    /// named by ILLOGICAL_HOSTS stays on disk. Provenance is otherwise lost —
+    /// `startingHosts` dedupes the two lists — so it would be classed as
+    /// injected and silently forgotten the next time anything was added.
+    func testAnInjectedHostThatIsAlsoSavedIsNotForgotten() {
+        let suite = InMemoryDefaults()
+        RemoteHostStore.save([Self.remote], to: suite)
+
+        let store = SessionStore(hosts: [Self.local, Self.remote], defaults: suite)
+        XCTAssertEqual(
+            store.hostsToRemember(injected: [Self.remote]), [Self.remote],
+            "a saved host was dropped because ILLOGICAL_HOSTS also named it")
+
+        // ...and one that is *only* injected is still not written.
+        let other = ServerHost.ssh(destination: "other-box")
+        let store2 = SessionStore(hosts: [Self.local, other], defaults: suite)
+        XCTAssertEqual(store2.hostsToRemember(injected: [other]), [])
+    }
 }

@@ -51,7 +51,12 @@ public enum TransportError: Error, Equatable, CustomStringConvertible {
     case connectFailed(Int32)
     case pathTooLong
     case notOnPath(String)
-    case spawnFailed(String)
+    /// The spawn failed for a reason that will clear on its own: out of
+    /// descriptors, out of processes, out of memory. Retryable.
+    case spawnFailed(command: String, reason: String)
+    /// The spawn failed for a reason about the *file*: it is not there, or not
+    /// executable, or not a program. Retrying cannot help.
+    case notExecutable(command: String, reason: String)
 
     /// Read by a person, in the session dropdown, next to the host that failed.
     /// `Error`'s own rendering of these is `NSCocoaErrorDomain` noise.
@@ -61,7 +66,24 @@ public enum TransportError: Error, Equatable, CustomStringConvertible {
         case .connectFailed(let code): "could not connect (\(code))"
         case .pathTooLong: "the socket path is too long"
         case .notOnPath(let command): "\(command) is not on PATH"
-        case .spawnFailed(let detail): detail
+        case .spawnFailed(let command, let reason): "could not run \(command): \(reason)"
+        case .notExecutable(let command, let reason): "cannot run \(command): \(reason)"
+        }
+    }
+
+    /// Whether waiting and trying again could plausibly help.
+    ///
+    /// The split exists because a spawn failure is two completely different
+    /// events wearing one name, and the client has to pick a behaviour: retry
+    /// forever with an amber "reconnecting…", or stop and say so. `EMFILE` is
+    /// the first -- a remote connection costs three descriptors, so a window
+    /// with enough panes reaches it, and it clears the moment one closes.
+    /// A broken shebang is the second, and retrying it every thirty seconds
+    /// for the life of the process tells nobody anything.
+    public var isTransient: Bool {
+        switch self {
+        case .socketFailed, .connectFailed, .spawnFailed: true
+        case .pathTooLong, .notOnPath, .notExecutable: false
         }
     }
 }
@@ -142,13 +164,21 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     private let process: Process
     private let toChild: FileHandle
     private let fromChild: FileHandle
-    /// Held so `close` can free it. Without this the read end of the child's
-    /// stderr leaked one descriptor per transport, permanently: the dispatch
-    /// source behind `readabilityHandler` keeps the `FileHandle` alive well
-    /// past this object, so nothing else ever closed it. One connection per
-    /// terminal means a window that opens and closes remote panes walks the
-    /// process to `EMFILE`, at which point even a local unix socket stops
-    /// connecting.
+    /// Held so `close` can free it promptly, rather than whenever the drain
+    /// thread happens to end.
+    ///
+    /// The read end of the child's stderr used to leak one descriptor per
+    /// transport for the life of the process: the dispatch source behind the
+    /// `readabilityHandler` this drain replaced kept the `FileHandle` alive
+    /// past its owner, so nothing ever closed it. One connection per terminal
+    /// means a window that opens and closes remote panes walks to `EMFILE`, at
+    /// which point even a local unix socket stops connecting.
+    ///
+    /// The drain closure retains this handle too, and `Pipe` builds its
+    /// handles with `closeOnDealloc`, so the descriptor does come back on its
+    /// own once the drain ends. That is the safety net under `close`'s
+    /// timeout, not the mechanism: a finished drain is what makes closing here
+    /// *safe*, and closing here is what makes it *prompt*.
     private let stderrHandle: FileHandle
     private let shutdownFlag = ManagedAtomicFlag()
     private let closedFlag = ManagedAtomicFlag()
@@ -192,9 +222,38 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         signal(SIGPIPE, SIG_IGN)
     }()
 
+    /// Which kind of spawn failure this is, from the errno Foundation carries.
+    ///
+    /// Worth the unwrapping: `"\(error)"` on what `Process.run()` throws is an
+    /// `NSError` dump — `Error Domain=NSCocoaErrorDomain Code=4 "…"
+    /// UserInfo={NSFilePath=…}` — and this string is a tooltip in the session
+    /// dropdown and, when it is the only host, the full-window message. It is
+    /// also what decides whether the host is retried at all, and that decision
+    /// is only makeable because the errno survives to here.
+    ///
+    /// Unrecognised failures are treated as transient. Retrying something
+    /// permanent costs one connection attempt every thirty seconds; giving up
+    /// on something temporary costs the machine for the life of the process.
+    static func spawnError(_ error: Error, command: String) -> TransportError {
+        let ns = error as NSError
+        let reason = ns.localizedDescription
+        let permanent: Set<Int32> = [ENOENT, EACCES, ENOEXEC, EISDIR, ENAMETOOLONG, ELOOP]
+
+        if ns.domain == NSPOSIXErrorDomain, permanent.contains(Int32(ns.code)) {
+            return .notExecutable(command: command, reason: reason)
+        }
+        // `NSFileNoSuchFileError` (4) and `NSFileReadNoPermissionError` (257)
+        // are the same two answers wearing Cocoa's numbering, which is what
+        // Foundation actually raises for a missing or unreadable image.
+        if ns.domain == NSCocoaErrorDomain, ns.code == 4 || ns.code == 257 {
+            return .notExecutable(command: command, reason: reason)
+        }
+        return .spawnFailed(command: command, reason: reason)
+    }
+
     public init(argv: [String]) throws {
         guard let executable = argv.first else {
-            throw TransportError.spawnFailed("no command")
+            throw TransportError.spawnFailed(command: "<none>", reason: "no command given")
         }
         _ = Self.sigpipeIgnored
 
@@ -212,7 +271,7 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         do {
             try process.run()
         } catch {
-            throw TransportError.spawnFailed("\(error)")
+            throw Self.spawnError(error, command: executable)
         }
 
         self.process = process
@@ -277,9 +336,14 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     }
 
     /// How long the stderr drain gets to reach end-of-file before its
-    /// descriptor is left alone. `shutdown` has already ended the child, so
-    /// this is the time for one thread to notice EOF, not for a process to
-    /// die.
+    /// descriptor is left to `closeOnDealloc`.
+    ///
+    /// Long enough to be a process's exit rather than a thread's wakeup, which
+    /// is what it has to cover: `shutdown` only sends SIGTERM, and the case it
+    /// exists for is precisely a child that does not take it — `ssh` holding a
+    /// ControlPersist master, or anything with a `trap`. EOF on this pipe
+    /// needs every copy of its write end closed, so it waits on the child, not
+    /// on the reader.
     private static let drainGrace: TimeInterval = 1
 
     /// A pipe has no `shutdown(2)`, so the equivalent is to stop the thing on
@@ -303,8 +367,19 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         try? fromChild.close()
 
         // Stderr is ours to order, though: its drain thread is reading that
-        // descriptor. Left open if it has not finished -- a leaked descriptor
-        // beats pulling one out from under a live read.
+        // descriptor, and closing a `FileHandle` out from under a live
+        // `readDataUpToLength:` is not a soft failure. Foundation raises an
+        // ObjC exception on the *reading* thread, which `try?` cannot catch,
+        // and the process aborts. Making this unconditional takes the test
+        // bundle down with SIGABRT inside
+        // `-[NSConcreteFileHandle readDataUpToLength:error:]` -- so this wait
+        // is load-bearing, not a tidiness measure.
+        //
+        // Not a permanent leak when it times out: the drain closure holds the
+        // last reference to a `Pipe` handle, which closes on dealloc, so the
+        // descriptor comes back when the child finally goes and the read
+        // returns. This branch is what makes it prompt in the ordinary case,
+        // where the child is already gone.
         if drainFinished.wait(timeout: .now() + Self.drainGrace) == .success {
             try? stderrHandle.close()
         }

@@ -269,6 +269,16 @@ final class TerminalController {
 
     // MARK: - Frames
 
+    /// Feed a frame as though it had arrived on `source`. For tests: the frame
+    /// the guard below exists for is one buffered on a *superseded*
+    /// connection, and arranging for a real one to be delivered after the swap
+    /// is a race a test cannot reliably win -- the pump and `openConnection`
+    /// are on the same actor, so which of them runs first is up to the
+    /// scheduler.
+    func handleForTesting(_ frame: Frame, from source: Connection) {
+        handle(frame, from: source)
+    }
+
     /// Takes the connection the frame arrived on, for the same reason
     /// `connectionClosed` does — and it is the same hazard one frame earlier.
     /// `close()` finishes the stream, but frames already buffered in it are
@@ -278,15 +288,6 @@ final class TerminalController {
     /// permanently dead with no retry, because `scheduleReconnect` refuses to
     /// act on `.exited`. Output and snapshot chunks are worse still -- they
     /// are another terminal's screen written into this one.
-    /// Feed a frame as though it had arrived on `source`. For tests: the frame
-    /// this guard exists for is one buffered on a *superseded* connection, and
-    /// arranging for a real one to be delivered after the swap is a race a test
-    /// cannot reliably win -- the pump and `openConnection` are on the same
-    /// actor, so which of them runs first is up to the scheduler.
-    func handleForTesting(_ frame: Frame, from source: Connection) {
-        handle(frame, from: source)
-    }
-
     private func handle(_ frame: Frame, from source: Connection) {
         guard connection === source else { return }
         switch frame.type {

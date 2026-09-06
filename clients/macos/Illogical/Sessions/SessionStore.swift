@@ -76,12 +76,22 @@ final class SessionStore {
     /// a socket").
     private let defaults: HostDefaults
 
+    /// `hosts: nil` means "whatever was remembered", read through `defaults`.
+    ///
+    /// Not defaulted to `startingHosts()` directly: that reads
+    /// `UserDefaults.standard` regardless of what is passed here, so
+    /// `SessionStore(defaults: InMemoryDefaults())` would have loaded the
+    /// developer's own remembered hosts and, on `connect()`, spawned real `ssh`
+    /// processes out of a unit test. Half a seam is worse than none -- it reads
+    /// as isolated and is not.
     init(
-        hosts: [ServerHost] = SessionStore.startingHosts(),
+        hosts: [ServerHost]? = nil,
         defaults: HostDefaults = UserDefaults.standard
     ) {
         self.defaults = defaults
-        for host in hosts { adopt(HostConnection(host: host)) }
+        for host in hosts ?? SessionStore.startingHosts(defaults) {
+            adopt(HostConnection(host: host))
+        }
     }
 
     /// The local daemon, plus whichever remote hosts were added last time.
@@ -90,12 +100,12 @@ final class SessionStore {
     /// launch and not remembered. Same purpose as ILLOGICAL_SPLIT and
     /// ILLOGICAL_OPEN_SESSION_MENU: a window with two machines in it can be
     /// inspected — or screenshotted — without driving the mouse.
-    static func startingHosts() -> [ServerHost] {
+    static func startingHosts(_ defaults: HostDefaults = UserDefaults.standard) -> [ServerHost] {
         var hosts: [ServerHost] = [.local(socketPath: defaultSocketPath)]
         for host in environmentHosts() where !hosts.contains(host) {
             hosts.append(host)
         }
-        for host in RemoteHostStore.load() where !hosts.contains(host) {
+        for host in RemoteHostStore.load(defaults) where !hosts.contains(host) {
             hosts.append(host)
         }
         return hosts
@@ -125,17 +135,32 @@ final class SessionStore {
     /// save the whole list, so adding or forgetting anything in a session
     /// started with that variable wrote its hosts to disk permanently -- which
     /// is the opposite of what it and the docs promise.
-    private var hostsToRemember: [ServerHost] {
-        let injected = Set(Self.environmentHosts())
-        // Anything already on disk stays on disk. `startingHosts` dedupes the
-        // injected list against the saved one, so provenance is otherwise
-        // lost: a host the user added last week and that ILLOGICAL_HOSTS also
-        // names today would be classed as injected and silently dropped the
-        // next time anything else was added or forgotten.
+    /// `injected` is a parameter so a test can supply one: `ILLOGICAL_HOSTS` is
+    /// read from `ProcessInfo`, which cannot be changed underneath a running
+    /// process, so with it hardcoded the whole of this filter was untestable --
+    /// and duly landed untested.
+    func hostsToRemember(injected injectedHosts: [ServerHost]) -> [ServerHost] {
+        let injected = Set(injectedHosts)
+        // A host that is on disk *and* in this window stays on disk, even when
+        // ILLOGICAL_HOSTS also names it. `startingHosts` dedupes the injected
+        // list against the saved one, so provenance is otherwise lost: a host
+        // the user added last week and that ILLOGICAL_HOSTS also names today
+        // would be classed as injected and silently dropped the next time
+        // anything else was added or forgotten.
+        //
+        // Not "anything on disk stays on disk": the filter is over `hosts`, so
+        // a saved host absent from this window is dropped. That is unreachable
+        // today because the app's only `SessionStore` is built from
+        // `startingHosts()`, which loads every saved one -- but it is what the
+        // expression does, and a second construction site would find out.
         let saved = Set(RemoteHostStore.load(defaults))
         return hosts.map(\.host).filter {
             $0.isRemote && (!injected.contains($0) || saved.contains($0))
         }
+    }
+
+    private var hostsToRemember: [ServerHost] {
+        hostsToRemember(injected: Self.environmentHosts())
     }
 
     // MARK: - Hosts
@@ -152,9 +177,14 @@ final class SessionStore {
     /// with no local `illogicald` running and a working remote, every ⌘T, every
     /// "+" and every New Session went to the dead host and did nothing at all --
     /// silently, with no tab, no error, and nothing on screen saying why.
+    /// A host still connecting is preferred over one that has failed, for the
+    /// same reason: during an ssh handshake nothing is connected yet, and
+    /// falling through to a dead local daemon put ⌘T back to doing nothing.
     var selectedHost: HostConnection? {
         if let ref = selectedTab?.session.host, let host = host(ref) { return host }
-        return hosts.first { $0.status.isConnected } ?? hosts.first
+        return hosts.first { $0.status.isConnected }
+            ?? hosts.first { $0.status.isConnecting }
+            ?? hosts.first
     }
 
     /// Add a machine and connect to it. A destination already in the list is
@@ -208,6 +238,10 @@ final class SessionStore {
             guard let self, let connection else { return }
             self.terminalCreated(connection.ref(terminal))
         }
+        connection.onCreatesVoided = { [weak self, weak connection] in
+            guard let self, let connection else { return }
+            self.pendingSplits.removeAll { $0.host == connection.host }
+        }
         hosts.append(connection)
     }
 
@@ -228,9 +262,20 @@ final class SessionStore {
     /// view reading no host would not redraw -- but this reads every host's
     /// `status`, and `HostConnection` is `@Observable`, so the dependency is
     /// already registered by the read below.
+    /// Nor is a machine we have not finished dialling. A host only reports
+    /// `.connected` once its first `session_list` proves the far end is really
+    /// there, and over SSH everything before that -- auth, the remote spawn,
+    /// the list itself -- is a second or more. Without this, launching with no
+    /// local daemon and one remote put "No illogicald at ..." over the whole
+    /// window for the length of the handshake and then flipped to the remote's
+    /// tabs. Worse, the only button on that screen is Try Again, which
+    /// reconnects every host -- so a user who believed it killed the ssh
+    /// connection a moment before it would have succeeded, and could keep
+    /// doing so indefinitely.
     var connectionError: String? {
         guard !hosts.isEmpty else { return nil }
-        guard !hosts.contains(where: { $0.status.isConnected }) else { return nil }
+        guard !hosts.contains(where: { $0.status.isConnected || $0.status.isConnecting })
+        else { return nil }
         return hosts.compactMap(\.status.message).first
     }
 
@@ -419,15 +464,24 @@ final class SessionStore {
     // MARK: - Reconciling
 
     private func terminalCreated(_ ref: TerminalRef) {
-        // The oldest split still waiting on *this* host whose tab is still
-        // here. Matching the host matters: two machines answer independently,
-        // and a reply from one must not consume the other's pending split.
-        // Matched on host alone, and always retired. Requiring the tab to
-        // still exist left dead entries in the queue forever -- `TabLayout.id`
-        // is a fresh UUID, so a closed tab can never come back to claim one --
-        // and worse, the reply that should have retired it was matched against
-        // the *next* entry instead, splicing a terminal created in one session
-        // into a tab belonging to another.
+        // The oldest split still waiting on *this* host. Matching the host
+        // matters: two machines answer independently, and a reply from one must
+        // not consume the other's pending split.
+        //
+        // Matched on host alone, and always retired. Requiring the tab to still
+        // exist left dead entries in the queue forever -- `TabLayout.id` is a
+        // fresh UUID, so a closed tab can never come back to claim one -- and
+        // worse, the reply that should have retired it was matched against the
+        // *next* entry instead, splicing a terminal created in one session into
+        // a tab belonging to another.
+        //
+        // Position is the only correlation there is: `created` carries a
+        // terminal id and no request id. That makes this queue correct exactly
+        // while every request produces exactly one reply, which is why
+        // `HostConnection.voidPendingCreates` exists -- a request that can no
+        // longer be answered has to take its entry with it, or the queue is one
+        // out of step for the life of the process and every later split lands
+        // in the tab before last.
         guard let index = pendingSplits.firstIndex(where: { $0.host == ref.host }) else {
             pendingTab = ref
             return

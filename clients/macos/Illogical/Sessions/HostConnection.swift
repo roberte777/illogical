@@ -73,6 +73,17 @@ final class HostConnection: Identifiable {
             if case .connected = self { return true }
             return false
         }
+
+        /// Still trying, and nothing has gone wrong yet. Over SSH this covers
+        /// the whole handshake — authentication, the remote spawn, the first
+        /// list — which is a second or more, and much longer behind 2FA.
+        ///
+        /// Deliberately not true for `.reconnecting`: that one has a message
+        /// worth showing, and something did go wrong.
+        var isConnecting: Bool {
+            if case .connecting = self { return true }
+            return false
+        }
     }
 
     /// Drive the status directly. Only for tests: the interesting states are
@@ -82,23 +93,24 @@ final class HostConnection: Identifiable {
         setStatus(next)
     }
 
-    /// Apply a session list as though one had arrived on the wire — including
-    /// the backoff reset a real `session_list` carries. For tests, which have
-    /// no daemon to send one.
-    func applyListForTesting(sessions: [SessionSummary], terminals: [TerminalSummary]) {
-        self.sessions = sessions
-        self.terminals = terminals
-        backoff.reset()
-        setStatus(.connected)
-        onListChanged?()
-    }
-
     /// How far into the backoff the *control* connection is. For tests: the
     /// reset lives on the `session_list` path rather than on the connect, and
     /// nothing else observes it -- the delay it produces is what a person
     /// sees, and a test cannot wait thirty seconds to notice it was not
     /// forgiven.
     var backoffAttemptForTesting: Int { backoff.attempt }
+
+    /// Feed a frame as though the daemon had sent it, skipping only the
+    /// identity check — a test has no `Connection` to be the current one.
+    ///
+    /// This replaced an `applyListForTesting` that reassigned the lists and
+    /// reset the backoff itself. It looked like the wire path and was not: the
+    /// only line whose deletion failed the backoff test was that helper's own
+    /// `reset()`, so deleting the real one in `apply` left it green — a test
+    /// pinning its own stand-in.
+    func handleForTesting(_ frame: Frame) {
+        apply(frame)
+    }
 
     private(set) var status: Status = .connecting
     var sessions: [SessionSummary] = []
@@ -126,6 +138,9 @@ final class HostConnection: Identifiable {
     var onListChanged: (() -> Void)?
     /// The server made a terminal, in reply to our `create`.
     var onCreated: ((UInt64) -> Void)?
+    /// Every `create` we are still waiting on has become unanswerable. See
+    /// `voidPendingCreates`.
+    var onCreatesVoided: (() -> Void)?
 
     init(host: ServerHost) {
         self.host = host
@@ -179,24 +194,23 @@ final class HostConnection: Identifiable {
         } catch let error as TransportError {
             Trace.log("connect to \(host.displayName) failed: \(error)")
             // Some failures are not worth retrying every thirty seconds for
-            // the life of the process. `ssh` missing from PATH, or a socket
-            // path that does not fit in `sockaddr_un`, will not fix itself,
-            // and showing it as an amber "reconnecting…" forever -- while
-            // rescanning PATH on a timer -- tells the user nothing. This is
-            // what makes `.failed` reachable; before it, nothing ever set it.
+            // the life of the process. `ssh` missing from PATH, a socket path
+            // that does not fit in `sockaddr_un`, a shebang that is not a
+            // program: none will fix itself, and showing one as an amber
+            // "reconnecting…" forever -- while rescanning PATH on a timer --
+            // tells the user nothing. This is what makes `.failed` reachable;
+            // before it, nothing ever set it.
             //
-            // `.spawnFailed` is *not* one of them, however much it reads like
-            // one: it is whatever `Process.run()` threw, and that is `EAGAIN`
-            // or `EMFILE` as readily as anything permanent. A window with
-            // enough panes open transiently runs out of descriptors -- three
-            // per remote connection -- and giving up for the life of the
-            // process on a condition that clears when one pane closes is the
-            // worst of the two mistakes.
-            switch error {
-            case .notOnPath, .pathTooLong:
-                setStatus(.failed(describe(error)))
-            case .socketFailed, .connectFailed, .spawnFailed:
+            // The error decides, rather than a list repeated here. Which side
+            // a *spawn* failure falls on is not knowable from the case: it is
+            // `EMFILE` -- three descriptors per remote connection, so a window
+            // with enough panes reaches it and one closing clears it -- as
+            // readily as it is a broken image. `TransportError` keeps the
+            // errno for exactly this.
+            if error.isTransient {
                 scheduleReconnect(detail: describe(error))
+            } else {
+                setStatus(.failed(describe(error)))
             }
         } catch {
             Trace.log("connect to \(host.displayName) failed: \(error)")
@@ -217,7 +231,20 @@ final class HostConnection: Identifiable {
         retry?.cancel()
         retry = nil
         closeControl()
+        voidPendingCreates()
         for id in controllers.keys { closeController(id) }
+    }
+
+    /// Every `create` still outstanding on this host is now unanswerable.
+    ///
+    /// `created` carries a terminal id and nothing else -- no request id -- so
+    /// the client can only match replies to requests by position. That holds
+    /// exactly as long as every request produces exactly one reply, and a
+    /// request whose connection died produces none. One stranded entry shifts
+    /// the queue by one for the life of the process, which shows up as splits
+    /// landing in the tab before last and the window jumping to it.
+    private func voidPendingCreates() {
+        onCreatesVoided?()
     }
 
     // MARK: - Reconnecting
@@ -293,6 +320,10 @@ final class HostConnection: Identifiable {
         let detail = connection.failureDescription
         control = nil
 
+        // The creates do not survive, though: the connection that would have
+        // answered them is the one that just went.
+        voidPendingCreates()
+
         // The session and terminal lists are deliberately *kept*. They are the
         // last thing this machine said it had, the machine is still running
         // them -- that is the entire premise of the project -- and clearing
@@ -310,6 +341,13 @@ final class HostConnection: Identifiable {
     /// machine we are in fact still connecting to.
     private func handle(_ frame: Frame, from source: Connection) {
         guard control === source else { return }
+        apply(frame)
+    }
+
+    /// What a frame does, once it is established that it should do anything.
+    /// Split out so `handleForTesting` reaches the real thing rather than a
+    /// second copy of it.
+    private func apply(_ frame: Frame) {
         switch frame.type {
         case .sessionList:
             guard let list = try? JSONDecoder().decode(SessionListBody.self, from: frame.payload)
@@ -355,6 +393,24 @@ final class HostConnection: Identifiable {
 
         case .sessionsChanged:
             refresh()
+
+        case .error:
+            // Only the ones addressed to the control session. The daemon
+            // answers a bad `kill` or `input` on the terminal's own id, and
+            // those say nothing about a `create`.
+            //
+            // Which control request failed is not knowable -- `hello`, `list`
+            // and `create` all carry the control session, and the error names
+            // none of them -- so this voids *every* outstanding create rather
+            // than guessing at one. Erring the other way silently shifts the
+            // split queue for the life of the process; erring this way means a
+            // create that did succeed opens a tab of its own instead of a
+            // pane, which is visible and recoverable.
+            guard frame.terminal == Protocol.controlSession else { break }
+            let body = try? JSONDecoder().decode(ErrBody.self, from: frame.payload)
+            Trace.log(
+                "\(host.displayName): control error: " + (body?.message ?? "unknown"))
+            voidPendingCreates()
 
         default:
             break

@@ -202,15 +202,19 @@ final class ReconnectTests: XCTestCase {
         try await waitFor("the retry to connect") { server.accepted == 2 }
 
         // Connection B is now current and A -- closed by `openConnection` --
-        // is running its tail. Longer than the 250ms first backoff, so a
-        // reconnect scheduled by that tail would have landed by now.
-        try await Task.sleep(for: .milliseconds(450))
+        // is running its tail. Well past the 250ms first backoff, so a
+        // reconnect scheduled by that tail has had time to land *and* to be
+        // answered, which is what the accept count would show.
+        //
+        // The accept count is the whole assertion. A state check would not
+        // help: the unguarded tail schedules a reconnect, the retry fires at
+        // 250ms, connection C gets the same `err` and lands back in `.failed`,
+        // so by any later moment the state is identical either way. Only the
+        // extra accept survives.
+        try await Task.sleep(for: .milliseconds(700))
         XCTAssertEqual(
             server.accepted, 2,
             "a superseded pump tore down the connection its retry had just made")
-        XCTAssertFalse(
-            controller.state.isReconnecting,
-            "a superseded pump dropped the controller back into the backoff")
     }
 
     /// A host that recovers must start its next outage at the bottom of the
@@ -234,13 +238,23 @@ final class ReconnectTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(host.backoffAttemptForTesting, 3)
 
         // A `session_list` is what proves the connection works, and it is where
-        // the backoff is forgiven. Asserted on the counter rather than on the
-        // next `.reconnecting(attempt:)`, because reaching that needs another
-        // `connect()` -- which resets the backoff itself, so the assertion held
-        // with the reset here deleted. No `await` between these two lines: the
-        // retry task is on this actor, so nothing can advance the backoff
-        // underneath the check.
-        host.applyListForTesting(sessions: [], terminals: [])
+        // the backoff is forgiven. Driven as a real frame through the real
+        // handler: an `applyListForTesting` that reset the backoff itself
+        // stood here, and the only line whose deletion failed this test was
+        // that helper's own `reset()` -- so the production one could be
+        // deleted with the suite still green, which is the whole regression
+        // this test is named for.
+        //
+        // Asserted on the counter rather than on the next
+        // `.reconnecting(attempt:)`, because reaching that needs another
+        // `connect()`, which resets the backoff too. No `await` between these
+        // two lines: the retry task is on this actor, so nothing can advance
+        // the backoff underneath the check.
+        host.handleForTesting(
+            Frame(
+                type: .sessionList, terminal: Protocol.controlSession,
+                payload: Data(#"{"sessions":[],"terminals":[]}"#.utf8)))
+        XCTAssertTrue(host.status.isConnected, "a session_list did not land")
         XCTAssertEqual(
             host.backoffAttemptForTesting, 0,
             "a host that came back kept the backoff from the outage it recovered from")
@@ -298,24 +312,25 @@ final class ReconnectTests: XCTestCase {
         if case .failed = host.status {} else { XCTFail("a hopeless host went back to retrying") }
     }
 
-    /// The other half of that judgement, and the one that is easy to get
-    /// wrong: `.spawnFailed` reads like a permanent verdict and is not. It is
-    /// whatever `Process.run()` threw, which is `EAGAIN` or `EMFILE` as
-    /// readily as anything else — and a remote connection costs three
-    /// descriptors, so a window with enough panes reaches it. Giving up for
-    /// the life of the process on a condition that clears when one pane closes
-    /// kills a machine that is perfectly reachable.
-    func testAHostThatCouldNotBeSpawnedKeepsTrying() async throws {
+    /// The other half of that judgement: a spawn failure that is about the
+    /// *file* — not there, not executable, not a program — is permanent, and
+    /// must not become an amber "reconnecting…" that rescans it every thirty
+    /// seconds for the life of the process.
+    ///
+    /// Which side a spawn failure falls on is decided by the errno, in
+    /// `CommandTransport.spawnError`, and pinned there. What this covers is
+    /// that `HostConnection` acts on that verdict — and that the string it
+    /// puts in front of a person is a sentence rather than an `NSError` dump.
+    func testAnUnrunnableSshIsTerminal() async throws {
         let store = SessionStore(hosts: [.ssh(destination: "nowhere")])
         guard let host = store.host(.ssh(destination: "nowhere")) else {
             return XCTFail("no host")
         }
         defer { host.disconnect() }
 
-        // An `ssh` that exists and cannot be executed throws out of
-        // `Process.run()` — the same place `EMFILE` arrives. `resolve` returns
-        // any argument containing a slash unexamined, so this reaches the spawn
-        // rather than stopping at `.notOnPath`.
+        // Exists and cannot be executed, so this reaches `Process.run()` --
+        // `resolve` returns any argument containing a slash unexamined, so it
+        // does not stop at `.notOnPath` on the way.
         let blocked = "/tmp/illogical-unspawnable-\(getpid())-\(UInt32.random(in: 0..<1_000_000))"
         XCTAssertTrue(
             FileManager.default.createFile(
@@ -329,10 +344,14 @@ final class ReconnectTests: XCTestCase {
             if case .connecting = host.status { return false }
             return true
         }
-        if case .failed(let message) = host.status {
-            XCTFail("a spawn failure that may be EMFILE was treated as permanent: \(message)")
+        guard case .failed(let message) = host.status else {
+            return XCTFail("an ssh that cannot be run was left retrying: \(host.status)")
         }
+        XCTAssertFalse(
+            message.contains("NSCocoaErrorDomain") || message.contains("UserInfo="),
+            "an NSError dump was put in front of a person: \(message)")
     }
+
 }
 
 struct AttachSize: Equatable, Sendable {
@@ -461,17 +480,33 @@ final class HangUpServer: @unchecked Sendable {
         while !state.stopped {
             let client = Darwin.accept(listener, nil, nil)
             if client < 0 { return }
+            // Belt and braces with the `spoke` check below: a write to a
+            // socket whose peer has gone is a SIGPIPE, whose default
+            // disposition kills the process -- and this one is the test
+            // runner. `CommandTransport` sets SIG_IGN process-wide, but only
+            // once something has built one, which most runs never do.
+            var on: Int32 = 1
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
             state.record(accepted: true)
             // Read one round of frames -- `hello` then `attach` -- so the
-            // client's request is observable, then hang up mid-handshake,
-            // which is what a network going away looks like from here.
-            readFrames(client, state)
+            // client's request is observable. What happens next is the mode's:
+            // hang up, which is what a network going away looks like from
+            // here, or answer with an error and keep the socket, which is what
+            // `no_such_terminal` looks like.
+            let spoke = readFrames(client, state)
             switch mode {
             case .hangUp:
                 Darwin.close(client)
             case .errorThenHold:
-                sendError(client)
-                state.hold(client)
+                // Only to a client that actually completed its handshake. A
+                // connection opened and dropped without a word -- which one of
+                // these tests does deliberately -- must not be written to.
+                if spoke {
+                    sendError(client)
+                    state.hold(client)
+                } else {
+                    Darwin.close(client)
+                }
             }
         }
     }
@@ -500,21 +535,27 @@ final class HangUpServer: @unchecked Sendable {
         }
     }
 
-    private static func readFrames(_ fd: Int32, _ state: State) {
+    /// True only if both frames arrived. The caller needs to tell that apart
+    /// from a client that hung up or never spoke: writing an `err` back down a
+    /// socket whose peer has gone raises SIGPIPE, and an accepted descriptor
+    /// has no `SO_NOSIGPIPE` unless we set one -- which would take the whole
+    /// test bundle down with a crash report rather than a failure.
+    @discardableResult
+    private static func readFrames(_ fd: Int32, _ state: State) -> Bool {
         var buffer = [UInt8](repeating: 0, count: 4096)
         var pending: [UInt8] = []
         // Two frames is all a client sends before it waits: hello, attach.
         for _ in 0..<2 {
             while pending.count < Protocol.headerLength {
                 let n = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, 4096) }
-                if n <= 0 { return }
+                if n <= 0 { return false }
                 pending.append(contentsOf: buffer[0..<n])
             }
-            guard let header = try? FrameHeader.decode(pending) else { return }
+            guard let header = try? FrameHeader.decode(pending) else { return false }
             let total = Protocol.headerLength + Int(header.length)
             while pending.count < total {
                 let n = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, 4096) }
-                if n <= 0 { return }
+                if n <= 0 { return false }
                 pending.append(contentsOf: buffer[0..<n])
             }
             let payload = Data(pending[Protocol.headerLength..<total])
@@ -525,6 +566,7 @@ final class HangUpServer: @unchecked Sendable {
                 state.record(attach: AttachSize(cols: body.cols, rows: body.rows))
             }
         }
+        return true
     }
 
     func stop() {

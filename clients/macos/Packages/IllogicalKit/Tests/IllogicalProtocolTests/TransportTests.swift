@@ -160,8 +160,9 @@ struct TransportTests {
         // The stream finishes when the child's stdout closes.
         for await _ in connection.frames {}
 
-        // The message arrives on a readability handler, so give it the moment
-        // it needs rather than racing it.
+        // The message arrives on the drain thread, which is not synchronised
+        // with the frame stream ending, so give it the moment it needs rather
+        // than racing it.
         for _ in 0..<100 where connection.failureDescription == nil {
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -191,14 +192,28 @@ struct TransportTests {
         transport.shutdown()
         transport.close()
         transport.close()
+        // Polled, like every other `isRunning` assertion in this file. `close`
+        // used to spin on this itself, which is the only reason a bare read
+        // was ever safe; it now waits on the stderr drain instead. EOF on that
+        // pipe and Foundation flipping `isRunning` are two independent
+        // consequences of the child exiting -- the kernel wakes the blocked
+        // read during `proc_exit`, Foundation notices on a dispatch source of
+        // its own -- with no ordering between them, so a bare read loses the
+        // race whenever the drain wins by the microseconds it usually does.
+        for _ in 0..<300 where transport.isRunning { usleep(10_000) }
         #expect(!transport.isRunning)
     }
 
     /// One descriptor per transport leaked, unconditionally, because nothing
-    /// held the stderr read end — the dispatch source behind
-    /// `readabilityHandler` keeps it alive past the object. One connection per
-    /// terminal means a window that opens and closes remote panes walks to
-    /// `EMFILE`, after which even a local socket stops connecting.
+    /// held the stderr read end — the dispatch source behind the
+    /// `readabilityHandler` the drain thread replaced kept it alive past its
+    /// owner. One connection per terminal means a window that opens and closes
+    /// remote panes walks to `EMFILE`, after which even a local socket stops
+    /// connecting.
+    ///
+    /// Counts descriptors process-wide, so any test that leaves a child alive
+    /// past its own body can fail this one instead of itself. Every test here
+    /// that spawns a stubborn child waits it out for that reason.
     @Test("a transport gives every descriptor back")
     func noDescriptorLeak() throws {
         func openCount() -> Int {
@@ -293,6 +308,44 @@ struct TransportTests {
         #expect(String(describing: TransportError.pathTooLong) == "the socket path is too long")
     }
 
+    /// A spawn failure is two different events wearing one name, and the whole
+    /// retry decision hangs on telling them apart. `EMFILE` clears when a pane
+    /// closes — a remote connection costs three descriptors, so a window with
+    /// enough of them reaches it — while a broken image never will. Before
+    /// this the errno was stringified away at the throw, so the client had to
+    /// treat both alike, and treating both as permanent killed a perfectly
+    /// reachable machine for the life of the process.
+    @Test("a spawn failure is classified by its errno, not by its wording")
+    func spawnFailuresAreClassified() {
+        func classify(_ domain: String, _ code: Int32) -> TransportError {
+            CommandTransport.spawnError(
+                NSError(domain: domain, code: Int(code)), command: "ssh")
+        }
+
+        for code in [EMFILE, ENFILE, EAGAIN, ENOMEM] {
+            #expect(
+                classify(NSPOSIXErrorDomain, code).isTransient,
+                "errno \(code) is worth a retry")
+        }
+        for code in [ENOENT, EACCES, ENOEXEC, EISDIR] {
+            #expect(
+                !classify(NSPOSIXErrorDomain, code).isTransient,
+                "errno \(code) will not fix itself")
+        }
+        // What Foundation actually raises for a missing or unreadable image.
+        #expect(!classify(NSCocoaErrorDomain, 4).isTransient)
+        #expect(!classify(NSCocoaErrorDomain, 257).isTransient)
+
+        // Unknown means retry: one attempt every thirty seconds is cheaper
+        // than giving up on a machine that was briefly out of something.
+        #expect(classify(NSPOSIXErrorDomain, EINTR).isTransient)
+
+        // And whichever it is, it reads like a sentence rather than a dump.
+        let described = String(describing: classify(NSCocoaErrorDomain, 4))
+        #expect(described.hasPrefix("cannot run ssh: "))
+        #expect(!described.contains("UserInfo="))
+    }
+
     /// `close()` is called from the main actor, once per pane. Blocking there
     /// while a wedged child fails to die froze the window for seconds when
     /// closing a split tab — up to four seconds per connection, and a four-pane
@@ -316,15 +369,26 @@ struct TransportTests {
         connection.close()
         let elapsed = Date().timeIntervalSince(start)
         #expect(elapsed < 0.5, "close() blocked its caller for \(elapsed)s")
+
+        // The point of this test is that `close` returns before the child
+        // does, so on the way out it is still alive and holding three
+        // descriptors. This suite runs in parallel and `noDescriptorLeak`
+        // counts descriptors process-wide with a slack of two, so leaving them
+        // to expire in their own time hands that test a spurious +3.
+        for _ in 0..<300 where transport.isRunning { usleep(10_000) }
     }
 
     /// The message must survive the close that follows it. Closing used to
     /// free the stderr descriptor with bytes still undrained, so the one thing
     /// this mechanism exists to capture was thrown away with it.
     ///
-    /// This does not defend the *ordering* — removing `close`'s wait on the
-    /// drain is caught by `closeIsIdempotent`, which trips on the handle being
-    /// pulled out from under a live read. It defends the outcome.
+    /// This is also where the *ordering* is defended, and more sharply than
+    /// intended: make `close`'s `stderrHandle.close()` unconditional and the
+    /// whole bundle aborts with SIGABRT inside
+    /// `-[NSConcreteFileHandle readDataUpToLength:error:]`. Closing a handle a
+    /// thread is reading raises an ObjC exception on *that* thread, which no
+    /// `try?` on this side can catch. `close` runs a fraction of a millisecond
+    /// after the spawn, so the drain is reliably still inside its read.
     @Test("a failure message survives the close that follows it")
     func diagnosticsSurviveClose() throws {
         let transport = try CommandTransport(
