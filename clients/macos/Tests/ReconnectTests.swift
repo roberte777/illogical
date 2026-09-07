@@ -448,6 +448,281 @@ final class ReconnectTests: XCTestCase {
             "a file that is present and unrunnable was described as something else: \(message)")
     }
 
+    // MARK: - Starting a server
+
+    /// A socket path nothing is listening on, and nothing ever was.
+    private static func absentSocket() -> String {
+        let path = "/tmp/illogical-nostart-\(getpid())-\(UInt32.random(in: 0..<1_000_000)).sock"
+        unlink(path)
+        return path
+    }
+
+    private func localStore(
+        _ path: String, _ launcher: RecordingLauncher
+    ) throws -> HostConnection {
+        let store = SessionStore(hosts: [.local(socketPath: path)], launcher: launcher)
+        return try XCTUnwrap(store.host(.local(socketPath: path)), "no host")
+    }
+
+    /// The premise of the whole change: running the app is enough. Nothing is
+    /// listening, so the app starts a server and then connects to it over the
+    /// socket like any other client.
+    func testARefusedLocalSocketStartsAServer() async throws {
+        let path = Self.absentSocket()
+        let launcher = RecordingLauncher(.bindListener)
+        defer { launcher.stop() }
+        let host = try localStore(path, launcher)
+        defer { host.disconnect() }
+
+        host.connect()
+        try await waitFor("a server to be started") { launcher.callCount == 1 }
+        XCTAssertEqual(
+            launcher.calls, [path],
+            "the daemon was pointed at a socket other than the one the app is dialling")
+
+        // And the app came back and connected. That second connect is the
+        // shape the design is for: an ordinary `connect()` over the socket,
+        // with no bridge and no child of ours in the middle.
+        try await waitFor("the app to connect to it") { launcher.accepted >= 1 }
+
+        // Exactly once, ever. The listener is there now, so the reconnect
+        // after this stub hangs up finds it and has nothing left to start.
+        try await Task.sleep(for: .milliseconds(700))
+        XCTAssertEqual(launcher.callCount, 1, "a second server was started")
+    }
+
+    /// The one that must never fire. A daemon that accepts a connection and
+    /// drops it is *there*, and it owns every terminal behind that socket —
+    /// starting another would take the socket from it and orphan the lot. Only
+    /// a refused connect means there is nothing running.
+    func testAServerThatAcceptsAndDropsIsNeverStartedOver() async throws {
+        let server = try HangUpServer()
+        defer { server.stop() }
+        let launcher = RecordingLauncher(.succeedSilently)
+        let host = try localStore(server.path, launcher)
+        defer { host.disconnect() }
+
+        host.connect()
+        try await waitFor("a few failed attempts") {
+            if case .reconnecting(let attempt, _) = host.status { return attempt >= 2 }
+            return false
+        }
+        XCTAssertEqual(
+            launcher.callCount, 0, "a daemon that was answering the socket was started over")
+    }
+
+    /// A remote machine has no bundle of ours to start anything from, and
+    /// `--ensure` on this Mac would start a daemon for the *local* socket in
+    /// response to a remote failure. `ssh <host> illogicald --stdio` is what
+    /// starts a server over there, and it already does.
+    func testARemoteHostNeverStartsALocalServer() async throws {
+        let launcher = RecordingLauncher(.succeedSilently)
+        let store = SessionStore(hosts: [.ssh(destination: "nowhere")], launcher: launcher)
+        let host = try XCTUnwrap(store.host(.ssh(destination: "nowhere")), "no host")
+        defer { host.disconnect() }
+        setenv("ILLOGICAL_SSH", "illogical-no-such-ssh-binary", 1)
+        defer { unsetenv("ILLOGICAL_SSH") }
+
+        host.connect()
+        try await waitFor("a verdict either way") {
+            if case .connecting = host.status { return false }
+            return true
+        }
+        XCTAssertEqual(launcher.callCount, 0)
+    }
+
+    /// A server that will not start says why, names the log that has the rest,
+    /// and is not tried again on every backoff tick — which at 250ms would be
+    /// four forks a second against a machine already in trouble.
+    func testAServerThatWillNotStartSaysWhyAndIsNotRetriedEveryTick() async throws {
+        let path = Self.absentSocket()
+        let launcher = RecordingLauncher(
+            .fail(.failed(socket: path, status: 1, stderr: "could not open the park store")))
+        let host = try localStore(path, launcher)
+        defer { host.disconnect() }
+
+        host.connect()
+        try await waitFor("the daemon's own words to reach the status") {
+            host.status.message?.contains("could not open the park store") == true
+        }
+        // The daemon's stderr is a line; `daemon.log` beside the socket is
+        // where the rest of it is, and naming it is most of what this sentence
+        // can usefully do.
+        XCTAssertTrue(
+            host.status.message?.contains("daemon.log") == true,
+            "the daemon's log was not named: \(host.status.message ?? "nil")")
+
+        let after = launcher.callCount
+        try await Task.sleep(for: .milliseconds(900))
+        XCTAssertEqual(
+            launcher.callCount, after, "a server was started again on the backoff's own schedule")
+    }
+
+    /// ...but asking explicitly does try again. Try Again is a person saying
+    /// "and this time start one if you have to".
+    func testTryAgainAsksForAServerAgain() async throws {
+        let path = Self.absentSocket()
+        let launcher = RecordingLauncher(.fail(.timedOut(socket: path, after: .seconds(15))))
+        let host = try localStore(path, launcher)
+        defer { host.disconnect() }
+
+        host.connect()
+        try await waitFor("the first attempt") { launcher.callCount == 1 }
+        host.connect()
+        try await waitFor("a second attempt") { launcher.callCount == 2 }
+    }
+
+    /// One spawn per outage, and a `session_list` is what ends an outage. A
+    /// daemon that started, answered, and later died must be startable again —
+    /// otherwise the first crash of the day is the last server of the day.
+    func testANewOutageMayStartAServerAgain() async throws {
+        let path = Self.absentSocket()
+        // Reports success and binds nothing, which is what a daemon that
+        // starts and immediately dies looks like from out here.
+        let launcher = RecordingLauncher(.succeedSilently)
+        let host = try localStore(path, launcher)
+        defer { host.disconnect() }
+        // Below the 700 ms this test already waits, so the `session_list` that
+        // ends the outage arrives against a server that has *outlived* its
+        // probation. That is the other half of the rule the test below states:
+        // a daemon which ran long enough may be replaced.
+        host.minimumServerLifetime = .milliseconds(300)
+
+        host.connect()
+        try await waitFor("the first start") { launcher.callCount == 1 }
+        try await Task.sleep(for: .milliseconds(700))
+        XCTAssertEqual(launcher.callCount, 1, "the backoff was forking a daemon a tick")
+
+        // The frame that proves the far end is real. Driven through the real
+        // handler for the same reason the backoff test drives it: the reset
+        // has to be the production line, not a test's own copy of it.
+        host.handleForTesting(
+            Frame(
+                type: .sessionList, terminal: Protocol.controlSession,
+                payload: Data(#"{"sessions":[],"terminals":[]}"#.utf8)))
+        XCTAssertTrue(host.status.isConnected, "a session_list did not land")
+
+        // The retry already scheduled finds the socket still refusing, and
+        // this time it is allowed to start one.
+        try await waitFor("a start for the next outage") { launcher.callCount == 2 }
+    }
+
+    /// The hole in "one spawn per outage": a `session_list` ends the outage, so
+    /// a daemon that starts, lists, and dies on its first attach re-arms the
+    /// spawn on its way past and is replaced by an identical copy of itself
+    /// three times a second, forever (REVIEW F7). A server this app started has
+    /// to survive `minimumServerLifetime` before it earns a successor.
+    func testAServerThatDiesRightAfterListingIsNotStartedAgainAndAgain() async throws {
+        let path = Self.absentSocket()
+        let launcher = RecordingLauncher(.succeedSilently)
+        let host = try localStore(path, launcher)
+        defer { host.disconnect() }
+
+        host.connect()
+        try await waitFor("the first start") { launcher.callCount == 1 }
+
+        // The frame that used to be enough to earn a second spawn. Immediately,
+        // so that the server is well inside the default ten-second window when
+        // the retry below finds the socket refusing.
+        host.handleForTesting(
+            Frame(
+                type: .sessionList, terminal: Protocol.controlSession,
+                payload: Data(#"{"sessions":[],"terminals":[]}"#.utf8)))
+        XCTAssertTrue(host.status.isConnected, "a session_list did not land")
+
+        // The retry already scheduled (250 ms) finds the socket refusing.
+        try await waitFor("the host to give up") {
+            if case .failed(let message) = host.status { return message.contains("daemon.log") }
+            return false
+        }
+
+        // And stays given up, rather than resuming the storm a tick later.
+        try await Task.sleep(for: .milliseconds(700))
+        if case .failed = host.status {} else { XCTFail("the host went back to retrying") }
+        XCTAssertEqual(launcher.callCount, 1, "a second daemon was forked")
+
+        // Try Again is the person saying "once more", and it is the only thing
+        // that gets past this.
+        host.connect()
+        try await waitFor("Try Again to start one") { launcher.callCount == 2 }
+    }
+
+}
+
+/// A `DaemonLauncher` that starts nothing, and remembers being asked.
+///
+/// A lock rather than an actor, for the same reason `HangUpServer` is not
+/// `@MainActor`: the assertions read the call count from `waitFor`'s
+/// synchronous predicate, and an actor would turn every one of them into an
+/// await inside a polling loop.
+final class RecordingLauncher: DaemonLauncher, @unchecked Sendable {
+    enum Behaviour: Sendable {
+        /// Report success and bind nothing. A daemon that started and died.
+        case succeedSilently
+        /// Bind a real listener at the socket before returning, which is what
+        /// a working `--ensure` leaves behind.
+        case bindListener
+        case fail(LocalDaemonError)
+    }
+
+    private let lock = NSLock()
+    private var _calls: [String] = []
+    private var _behaviour: Behaviour
+    private var _server: HangUpServer?
+
+    init(_ behaviour: Behaviour) { _behaviour = behaviour }
+
+    /// The socket paths it was asked about, in order. The path matters as much
+    /// as the count: a daemon started on the wrong socket is a daemon the app
+    /// will never reach.
+    var calls: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _calls
+    }
+    var callCount: Int { calls.count }
+
+    /// How many times something connected to the listener this stub bound.
+    var accepted: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _server?.accepted ?? 0
+    }
+
+    func ensure(socketPath: String) async throws -> LocalDaemon.Outcome {
+        // Every line of the work is in the synchronous helper below: `lock()`
+        // and `unlock()` are unavailable from an async context, and this
+        // protocol method is async because the real launcher waits for a
+        // child.
+        try answer(socketPath)
+    }
+
+    private func answer(_ socketPath: String) throws -> LocalDaemon.Outcome {
+        lock.lock()
+        _calls.append(socketPath)
+        let behaviour = _behaviour
+        lock.unlock()
+
+        switch behaviour {
+        case .succeedSilently:
+            return .started
+        case .bindListener:
+            lock.lock()
+            defer { lock.unlock() }
+            if _server == nil { _server = try HangUpServer(path: socketPath) }
+            return .started
+        case .fail(let error):
+            throw error
+        }
+    }
+
+    func stop() {
+        lock.lock()
+        let server = _server
+        _server = nil
+        lock.unlock()
+        server?.stop()
+    }
 }
 
 struct AttachSize: Equatable, Sendable {
@@ -542,10 +817,15 @@ final class HangUpServer: @unchecked Sendable {
     var accepted: Int { state.accepted }
     var lastAttach: AttachSize? { state.lastAttach }
 
-    init(mode: Mode = .hangUp) throws {
+    /// `path` names where to bind. Only the daemon-launcher tests pass one:
+    /// they have to put a listener at the socket the client is *already*
+    /// looking at, which is the whole shape of "start a server and connect
+    /// again".
+    init(mode: Mode = .hangUp, path: String? = nil) throws {
         self.mode = mode
-        path = "/tmp/illogical-hangup-\(getpid())-\(UInt32.random(in: 0..<1_000_000)).sock"
-        unlink(path)
+        self.path =
+            path ?? "/tmp/illogical-hangup-\(getpid())-\(UInt32.random(in: 0..<1_000_000)).sock"
+        unlink(self.path)
 
         listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard listener >= 0 else { throw TransportError.socketFailed(errno) }
@@ -553,7 +833,7 @@ final class HangUpServer: @unchecked Sendable {
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
         addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-        withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: Array(path.utf8)) }
+        withUnsafeMutableBytes(of: &addr.sun_path) { $0.copyBytes(from: Array(self.path.utf8)) }
         let bound = withUnsafePointer(to: &addr) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size))

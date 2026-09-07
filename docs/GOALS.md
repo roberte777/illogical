@@ -107,6 +107,9 @@ libghostty-vt. macOS is first: Swift, AppKit/SwiftUI, Metal.
 The Mac client specifically must:
 
 - **Launch in half a bounce.** Chrome appears before any network work completes.
+- **Start the server itself** if none is running, and the server it starts
+  outlives it. Running the app is the whole install: no terminal, no
+  hand-started daemon.
 - **Switch sessions and terminals from a dropdown**, showing residency inline.
 - **Connect to remote hosts**, several at once, over the user's own SSH config —
   and get them back on its own when a network goes away.

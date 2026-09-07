@@ -460,6 +460,101 @@ that as a failure made a healthy host render as the broken one.
 Superlogical's server additionally has built-in Tailscale/Headscale support and
 acts as a node ([MASTO]). Out of scope for us; SSH first.
 
+## Starting the server
+
+**Running the app is enough.** If nothing is listening on the local socket, the
+app starts a server, and the server it starts outlives it.
+
+The order matters, because the fast path must not pay for any of this. The app
+connects to the unix socket exactly as it always has. Only when *that* connect
+comes back `ECONNREFUSED` or `ENOENT` — a socket with nothing accepting on it,
+or no socket at all — does it run
+
+```
+<Illogical.app>/Contents/MacOS/illogicald --ensure --socket <path>
+```
+
+off the main actor, wait for it to exit, and connect again. Everything after
+that second connect is the path every other host takes.
+
+**Whatever is already listening always wins.** A daemon answering that socket
+owns every terminal behind it, and the app never kills, restarts or replaces
+it. `--ensure` connects before it forks; if two of them race — two windows, or
+an SSH bridge arriving at the same moment — `Server.listen` probes and the loser
+exits without unlinking the winner's socket. A connection that is *accepted* and
+then dropped is not this case: something is there, so nothing is started.
+
+**At most one start per outage.** A daemon that starts and immediately dies
+leaves the socket refusing connections exactly as before, so without that rule
+every backoff tick would fork another one — four a second, against a machine
+already in trouble. The permission comes back on the next `session_list`, which
+is the frame that proves the outage is over, and on the user pressing Try Again.
+
+**And at most one start per ten seconds of server.** A `session_list` proving
+the outage is over is exactly right for a daemon that ran for a day and then
+died, and exactly wrong for one that starts, answers `list`, and dies on its
+first attach — a corrupt park file, a full disk on `park.key`. That one clears
+the rule above on its way past and gets replaced by an identical copy of itself,
+three times a second, forever. So a server *this app started* which stops
+answering within ten seconds of coming up is not started again: the host goes to
+"no server" naming `daemon.log`, and stays there until somebody presses Try
+Again.
+
+Four things this deliberately is not:
+
+- **Not `illogicald --stdio` locally.** The bridge would give spawn-if-missing
+  away for free, and it would put a process and a byte copy on every *local*
+  connection — one per terminal, so a window with four splits is five bridges.
+  M5 measured the bridge at +10% on a whole snapshot. The local path stays one
+  `connect()`.
+- **Not a reimplementation in Swift.** `fork()` in a multithreaded Cocoa process
+  is not safe, so it would be `posix_spawn` with `POSIX_SPAWN_SETSID` and
+  `POSIX_SPAWN_CLOEXEC_DEFAULT` and file actions for the log — a second
+  implementation, in a second language, of a double fork that
+  `src/daemon/stdio.zig` already does and already tests on both platforms in
+  CI. And the local and SSH spawn paths could then drift apart, which is a whole
+  class of bug that one code path cannot have. The SSH path *is* this path with
+  a pipe in front of it.
+- **Not a `Process` holding the daemon.** That daemon would be a child in the
+  app's process group and session, holding the app's pipes: Xcode's Stop button,
+  `pkill -f Illogical`, a crash reporter's group kill, or the `Process` object
+  being deallocated could each take it. `--ensure` exits; what it leaves behind
+  is two forks away, `setsid`'d into a session of its own, with `/dev/null` for
+  stdin and stdout, `daemon.log` for stderr, and `closeFrom(3)` having dropped
+  every inherited descriptor. Nothing ties it to the app — not the process
+  group, not the session, not a controlling terminal, not a descriptor — so ⌘Q
+  and a crash both leave the terminals running. `scripts/smoke-ensure.sh` is the
+  proof: it SIGKILLs the starter's entire process group and the daemon keeps
+  answering. Logging out does take it, exactly as it takes a hand-started one.
+- **Not a launchd agent or `SMAppService` login item.** That would hand the
+  daemon's lifecycle to launchd — bundle-path-bound, restarted on its terms,
+  registered per user — and split the story from the CLI and SSH paths, which
+  use the detached model. Its supervision is not something we want anyway: a
+  daemon that exits is a daemon whose terminals are gone, and nothing launchd
+  does brings those back.
+
+Two macOS consequences worth knowing about:
+
+- **TCC responsibility is inherited.** Shells under an app-started daemon are
+  attributed to `Illogical.app` for Files & Folders and Full Disk Access
+  prompts. That is what a Terminal.app user expects, but it differs from a
+  daemon started *from* Terminal.app, which is attributed to Terminal — so
+  somebody who granted Full Disk Access there will be asked again.
+- **The daemon inherits launchd's environment, not a shell's.** No `LANG`, and a
+  `PATH` of `/usr/bin:/bin:/usr/sbin:/sbin`. `pty.zig` repairs the locale; the
+  server spawns `$SHELL -l` so that `path_helper` and the user's own `zprofile`
+  repair the `PATH`. Without the login shell, no terminal opened from the app
+  would find brew.
+
+**The seam.** `ILLOGICAL_DAEMON` names the executable to run, read in one place
+(`LocalDaemon.executable()`) — the local analogue of `ILLOGICAL_SSH`. Above it,
+`DaemonLauncher` is injected into `SessionStore` and `HostConnection`, so
+`ReconnectTests` uses a recording stub and never spawns anything. The launch
+budget is untouched by construction: `store.connect()` already runs in `.task`
+after the first layout, and `--ensure` runs in a `Task` off the main actor while
+the host sits in `.connecting` — the one status the "no server" screen does not
+take over for.
+
 ## Losing the network, and getting it back
 
 **Reconnecting needed almost no new machinery, and that is the point.** A

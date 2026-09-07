@@ -76,6 +76,11 @@ final class SessionStore {
     /// a socket").
     private let defaults: HostDefaults
 
+    /// What every `HostConnection` here uses to start a local server. Only the
+    /// local host ever calls it; a remote one has no bundle to start anything
+    /// from.
+    private let launcher: DaemonLauncher
+
     /// `hosts: nil` means "whatever was remembered", read through `defaults`.
     ///
     /// Not defaulted to `startingHosts()` directly: that reads
@@ -84,13 +89,21 @@ final class SessionStore {
     /// developer's own remembered hosts and, on `connect()`, spawned real `ssh`
     /// processes out of a unit test. Half a seam is worse than none -- it reads
     /// as isolated and is not.
+    /// `launcher` is what starts a local server when there is none, and is
+    /// injected for the same reason `defaults` is: a test that reaches
+    /// `connect()` on a `.local` host would otherwise run the real one. It is
+    /// threaded through every `HostConnection` this store makes, `addHost`
+    /// included -- a store with a recording launcher and a host that quietly
+    /// had the real one is a seam that reads as isolated and is not.
     init(
         hosts: [ServerHost]? = nil,
-        defaults: HostDefaults = UserDefaults.standard
+        defaults: HostDefaults = UserDefaults.standard,
+        launcher: DaemonLauncher = BundledDaemonLauncher()
     ) {
         self.defaults = defaults
+        self.launcher = launcher
         for host in hosts ?? SessionStore.startingHosts(defaults) {
-            adopt(HostConnection(host: host))
+            adopt(HostConnection(host: host, launcher: launcher))
         }
     }
 
@@ -203,7 +216,7 @@ final class SessionStore {
     /// the tests pass false; everything in the app wants the connection.
     func addHost(_ host: ServerHost, connect: Bool) {
         guard self.host(host) == nil else { return }
-        let connection = HostConnection(host: host)
+        let connection = HostConnection(host: host, launcher: launcher)
         adopt(connection)
         RemoteHostStore.save(hostsToRemember, to: defaults)
         if connect { connection.connect() }
