@@ -662,6 +662,27 @@ struct TransportTests {
     /// The defaults are the point. An errno this does not recognise says so
     /// rather than guessing: naming a cause that was never established is how
     /// a file somebody was looking at came to be described as absent.
+    /// Membership by name, not by iterating the set the code uses.
+    ///
+    /// The loops below walk `CommandTransport.recoverable`, which keeps the
+    /// two switches consistent with each other but cannot notice a member
+    /// being deleted — removing one removes it from the check as well.
+    /// Verified: dropping `ESHUTDOWN` passed everything. So the errnos are
+    /// also written out once, here, where deleting one is visible.
+    @Test("the recoverable errnos are the ones the mounts actually report")
+    func recoverableMembership() {
+        let expected: Set<Int32> = [
+            EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET, ECONNABORTED,
+            ESHUTDOWN, EPIPE, EHOSTDOWN, EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV,
+            EPWROFF, EDEVERR,
+        ]
+        #expect(CommandTransport.recoverable == expected)
+        // And nothing that will not fix itself has crept in.
+        for code in [ENOENT, EACCES, EPERM, ENOTDIR, ELOOP, ENAMETOOLONG, ENOEXEC] {
+            #expect(!CommandTransport.recoverable.contains(code), "errno \(code)")
+        }
+    }
+
     @Test("an unrecognised reason says so, and an unreachable one is retried")
     func pathFailuresAreNamedOrAdmitted() {
         #expect(CommandTransport.pathReason(ENOENT) == ("is not there", false))
