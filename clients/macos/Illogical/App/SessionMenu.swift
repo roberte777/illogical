@@ -52,6 +52,17 @@ enum MenuMetrics {
     /// something you click.
     static let headerHeight: CGFloat = 18
     static let headerFont: CGFloat = 10
+
+    /// How much room a row's title actually has: the panel, less its padding,
+    /// less the row's own, less the icon column and the gap after it.
+    ///
+    /// Derived rather than written down as 128, so that a test can hold
+    /// `SessionNameRefusal`'s sentences against the geometry they are drawn
+    /// in. Two of them did not fit and were truncated with an ellipsis, and
+    /// the one people actually hit — by typing a space — lost the half that
+    /// carried the meaning.
+    static let titleWidth: CGFloat =
+        width - 2 * padding - 2 * rowPadding - iconColumn - iconToTitle
 }
 
 extension Palette {
@@ -76,26 +87,27 @@ struct SessionMenu: View {
     @State private var addingHost = false
     @State private var newHost = ""
 
+    /// The session whose row is currently a text field, and what is in it.
+    /// Set by the row's own context menu, or by File ▸ Rename Session… leaving
+    /// a `pendingRename` on the store for `onAppear` below to pick up.
+    @State private var renaming: SessionRef?
+    @State private var renameText = ""
+
     /// Sessions on one host that survive the filter.
+    ///
+    /// Normalized, so that ` wo` finds `work`: the ends of what is typed are
+    /// never part of what is meant, and the create path already reads it that
+    /// way.
     private func matches(_ host: HostConnection) -> [SessionSummary] {
-        guard !filter.isEmpty else { return host.sessions }
-        return host.sessions.filter { $0.name.localizedCaseInsensitiveContains(filter) }
+        let typed = SessionName.normalized(filter)
+        guard !typed.isEmpty else { return host.sessions }
+        return host.sessions.filter { $0.name.localizedCaseInsensitiveContains(typed) }
     }
 
-    /// "Filter **or create**": a name that matches nothing can be made. On the
-    /// machine in front, since that is where a new terminal would go.
-    ///
-    /// Checked against *every* host's sessions, not just that one. The rows
-    /// below list them all, so a name that matches a session on another machine
-    /// is one you can switch to — offering "Create" for it as well meant Enter
-    /// silently made a second, local session with the same name instead of
-    /// going where the visible row pointed.
-    private var canCreate: Bool {
-        guard !filter.isEmpty, store.selectedHost != nil else { return false }
-        return !store.hosts.contains { host in
-            host.sessions.contains { $0.name.caseInsensitiveCompare(filter) == .orderedSame }
-        }
-    }
+    /// "Filter **or create**", and why not when not. The decision belongs to
+    /// the store: it is one rule with two visible consequences, and a view
+    /// cannot be asked about either.
+    private var offer: FilterOffer { store.filterOffer(filter) }
 
     /// Whether to name the machine each session is on. One host is the common
     /// case and a header over every row would be noise.
@@ -108,13 +120,25 @@ struct SessionMenu: View {
             filterField
                 .padding(.bottom, MenuMetrics.fieldToRows)
 
-            if canCreate {
+            // The separator after this block divides it from the session rows,
+            // so it is drawn only when there are session rows. Typing a name
+            // that matches nothing is the ordinary way to reach it, and
+            // without the guard the panel drew that separator and the one
+            // above "New Session" as a pair of hairlines 13pt apart with
+            // nothing at all between them.
+            switch offer {
+            case .create(let name):
                 MenuRow(
-                    icon: "plus", title: "Create “\(filter)”", shortcut: "↩",
+                    icon: "plus", title: "Create “\(name)”", shortcut: "↩",
                     isHovered: hovered == "__create",
                     hover: { hovered = $0 ? "__create" : nil },
                     action: create)
-                MenuSeparator()
+                if anyMatches { MenuSeparator() }
+            case .refused(let refusal):
+                MenuNotice(text: refusal.message)
+                if anyMatches { MenuSeparator() }
+            case .nothing:
+                EmptyView()
             }
 
             ForEach(store.hosts) { host in
@@ -128,7 +152,9 @@ struct SessionMenu: View {
                 // `build-box` disappear from the dropdown while staying in
                 // `UserDefaults` — back on every launch and impossible to
                 // forget — and left a restarted local daemon with no retry.
-                if showsHosts && (filter.isEmpty || !matches(host).isEmpty) {
+                if showsHosts
+                    && (SessionName.normalized(filter).isEmpty || !matches(host).isEmpty)
+                {
                     HostHeader(
                         host: host,
                         isHovered: hovered == "h\(host.id)",
@@ -137,17 +163,50 @@ struct SessionMenu: View {
                         retry: { store.reconnect(host.host) })
                 }
                 ForEach(matches(host)) { session in
-                    MenuRow(
-                        icon: isSelected(session, on: host) ? "checkmark" : nil,
-                        title: session.name,
-                        isHovered: hovered == rowID(session, on: host),
-                        hover: { hovered = $0 ? rowID(session, on: host) : nil },
-                        action: { select(session, on: host) })
+                    let ref = SessionRef(host: host.host, session: session.id)
+                    if renaming == ref {
+                        SessionRenameRow(
+                            text: $renameText,
+                            refusal: store.renameRefusal(ref, to: renameText),
+                            commit: { commitRename(ref) },
+                            cancel: cancelRename)
+                    } else {
+                        MenuRow(
+                            icon: isSelected(session, on: host) ? "checkmark" : nil,
+                            title: session.name,
+                            isHovered: hovered == rowID(session, on: host),
+                            hover: { hovered = $0 ? rowID(session, on: host) : nil },
+                            action: { select(session, on: host) }
+                        )
+                        // Right-click, rather than a hover affordance: the
+                        // row is 22pt with an icon column already spoken
+                        // for, and both of these are rare next to
+                        // "switch to it", which is what the row is for.
+                        .contextMenu {
+                            Button("Rename") { beginRename(ref, from: session.name) }
+                            Divider()
+                            Button("Delete…", role: .destructive) {
+                                store.requestDeleteSession(ref)
+                                // The dialog belongs to the window, and
+                                // this menu is an overlay on top of it.
+                                // Leaving it up would put a panel between
+                                // the person and the question.
+                                isPresented = false
+                            }
+                            // Greyed rather than absent while the machine is
+                            // being reconnected to: the row still lists a
+                            // session, because the machine is still running
+                            // it, but nothing can be sent — and a dialog
+                            // saying "this cannot be undone" for something
+                            // that cannot happen is worse than no menu item.
+                            .disabled(!store.canDeleteSession(ref))
+                        }
+                    }
                 }
             }
 
-            if !anyMatches && !canCreate {
-                Text(filter.isEmpty ? "No sessions" : "No matches")
+            if !anyMatches && offer == .nothing {
+                Text(SessionName.normalized(filter).isEmpty ? "No sessions" : "No matches")
                     .font(.system(size: MenuMetrics.font))
                     .foregroundStyle(Palette.menuShortcut)
                     .frame(height: MenuMetrics.rowHeight)
@@ -184,7 +243,20 @@ struct SessionMenu: View {
                 )
                 .shadow(color: .black.opacity(0.45), radius: 14, y: 6)
         }
-        .onAppear { fieldFocused = true }
+        // File ▸ Rename Session… has no field to reach: `SessionMenu` only
+        // exists while the dropdown is open. It leaves the session on the
+        // store instead, and these are the two ways this view finds out —
+        // `onAppear` when the menu bar had to open the menu first, `onChange`
+        // when it was already open, which `sessionMenuOpen = true` cannot
+        // reopen and which used to strand the flag until some later, unrelated
+        // opening picked it up and put the wrong row into a text field.
+        .onAppear { adoptPendingRename(orFocusFilter: true) }
+        .onChange(of: store.pendingRename) { _, _ in
+            adoptPendingRename(orFocusFilter: false)
+        }
+        // Nothing outlives the menu. A flag left set here is a rename armed
+        // against a session the person has since stopped looking at.
+        .onDisappear { store.pendingRename = nil }
         // Escape closes the menu, the way it closes an NSMenu. It has to be
         // here rather than on the overlay: key events go where focus is, and
         // the filter field takes it as the menu appears. Closing hands the
@@ -217,7 +289,7 @@ struct SessionMenu: View {
                 .foregroundStyle(Palette.menuText)
                 .focused($fieldFocused)
                 .onSubmit {
-                    if canCreate {
+                    if case .create = offer {
                         create()
                     } else if let host = store.hosts.first(where: { !matches($0).isEmpty }),
                         let first = matches(host).first
@@ -247,15 +319,145 @@ struct SessionMenu: View {
         isPresented = false
     }
 
+    /// Takes the name out of the offer rather than off the field, so that the
+    /// row shown and the name sent cannot be two different strings — the offer
+    /// is what already normalized it.
     private func create() {
-        store.createTerminal(sessionName: filter)
+        guard case .create(let name) = offer else { return }
+        store.createTerminal(sessionName: name)
         isPresented = false
     }
 
+    /// "session-N" is digits and a dash, so it is always a name the server
+    /// accepts; no gate is needed here beyond the one in the store.
     private func newSession() {
         let count = store.selectedHost?.sessions.count ?? 0
         store.createTerminal(sessionName: "session-\(count + 1)")
         isPresented = false
+    }
+
+    // MARK: - Renaming in place
+
+    private func beginRename(_ ref: SessionRef, from name: String) {
+        renameText = name
+        renaming = ref
+    }
+
+    /// Whatever the store left for the dropdown to pick up, or the filter
+    /// field taking focus when there is nothing to pick up.
+    ///
+    /// `orFocusFilter` is false for the `onChange` arm: the menu is already
+    /// open there, and stealing focus back to the filter every time the flag
+    /// happened to clear would fight whatever the person is typing in.
+    private func adoptPendingRename(orFocusFilter: Bool) {
+        guard let ref = store.pendingRename else {
+            if orFocusFilter { fieldFocused = true }
+            return
+        }
+        store.pendingRename = nil
+        beginRename(ref, from: store.session(ref)?.name ?? "")
+    }
+
+    /// Enter. A name the server would refuse — or that was never sent, because
+    /// the machine is mid-reconnect — leaves the field open with the text
+    /// still in it, rather than closing on a rename that will not happen.
+    /// There is no room in a 22pt row for a sentence, so the field going amber
+    /// and staying put is the whole of the feedback.
+    ///
+    /// The rule is the store's, and only the store's. This used to keep half
+    /// of it: it validated the raw text and committed a trimmed one, so
+    /// `work ` painted amber, showed the tooltip and then renamed anyway.
+    private func commitRename(_ ref: SessionRef) {
+        guard store.renameSession(ref, to: renameText) else { return }
+        renaming = nil
+        // Back to the field the menu opened on, so the next keystroke filters
+        // rather than falling on nothing.
+        fieldFocused = true
+    }
+
+    private func cancelRename() {
+        renaming = nil
+        fieldFocused = true
+    }
+}
+
+/// A session row turned into a text field for the length of a rename.
+///
+/// Its own view so the field owns its focus. A `@FocusState` shared with the
+/// filter field would have the two fighting over it: the filter takes focus
+/// when the menu appears, and the rename would have to take it back on a later
+/// pass.
+struct SessionRenameRow: View {
+    @Binding var text: String
+    /// Handed in rather than worked out here, and by the same call that Enter
+    /// goes through (`SessionStore.renameRefusal`). This view used to decide
+    /// for itself, on the untrimmed text and with no idea which names were
+    /// taken, so the colour and the commit disagreed in both directions.
+    let refusal: SessionNameRefusal?
+    let commit: () -> Void
+    let cancel: () -> Void
+
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Image(systemName: "pencil")
+                .font(.system(size: 11))
+                .frame(width: MenuMetrics.iconColumn, alignment: .center)
+
+            Spacer().frame(width: MenuMetrics.iconToTitle)
+
+            TextField("", text: $text)
+                .textFieldStyle(.plain)
+                .font(.system(size: MenuMetrics.font))
+                .focused($focused)
+                .onSubmit(commit)
+        }
+        .foregroundStyle(refusal == nil ? Palette.menuText : Color.orange)
+        .padding(.horizontal, MenuMetrics.rowPadding)
+        .frame(height: MenuMetrics.rowHeight)
+        .background {
+            RoundedRectangle(cornerRadius: MenuMetrics.rowCornerRadius, style: .continuous)
+                .fill(Palette.menuField)
+                .overlay(
+                    RoundedRectangle(
+                        cornerRadius: MenuMetrics.rowCornerRadius, style: .continuous
+                    )
+                    .strokeBorder(
+                        refusal == nil ? Color.white.opacity(0.06) : Color.orange,
+                        lineWidth: 1))
+        }
+        .onAppear { focused = true }
+        // Escape. The field is the first responder, so `cancelOperation:`
+        // arrives here rather than at the menu — which is why the menu's own
+        // dismissal cannot double as this.
+        .onExitCommand(perform: cancel)
+        .help(refusal?.message ?? "")
+    }
+}
+
+/// A row that says something rather than doing something. Not a `MenuRow`:
+/// there is nothing to hover and nothing to click.
+struct MenuNotice: View {
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Image(systemName: "exclamationmark.circle")
+                .font(.system(size: 11))
+                .frame(width: MenuMetrics.iconColumn, alignment: .center)
+
+            Spacer().frame(width: MenuMetrics.iconToTitle)
+
+            Text(text)
+                .font(.system(size: MenuMetrics.font))
+                .lineLimit(1)
+
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(Palette.menuShortcut)
+        .padding(.horizontal, MenuMetrics.rowPadding)
+        .frame(height: MenuMetrics.rowHeight)
     }
 }
 

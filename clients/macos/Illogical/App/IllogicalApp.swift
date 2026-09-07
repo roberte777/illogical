@@ -41,6 +41,26 @@ struct IllogicalApp: App {
                     store.createTerminal(sessionName: "session-\(count + 1)")
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
+                Divider()
+                // No key equivalents. Both are rare, one of them is
+                // destructive, and a chord for either would be spent for the
+                // life of the app on something reached a few times a week.
+                //
+                // Rename opens the dropdown rather than a sheet: the field is
+                // the row itself, which is where the name is read, and this is
+                // the same gesture the row's own context menu performs.
+                Button("Rename Session…") {
+                    if let ref = store.selectedSession { store.requestRenameSession(ref) }
+                }
+                .disabled(store.selectedSession == nil)
+                // Also disabled while the machine is being reconnected to. The
+                // session is still listed — `controlClosed` keeps the lists on
+                // purpose — but nothing can be sent, and the dialog behind this
+                // says "This cannot be undone."
+                Button("Delete Session…") {
+                    if let ref = store.selectedSession { store.requestDeleteSession(ref) }
+                }
+                .disabled(store.selectedSession.map { !store.canDeleteSession($0) } ?? true)
             }
             // Closing and splits. ⌘W itself is deliberately absent: it goes
             // through the responder chain as `performClose:`, so the focused
