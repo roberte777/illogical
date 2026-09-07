@@ -29,6 +29,7 @@ Packages/IllogicalKit/
     ├── Frame.swift             the wire header
     ├── Connection.swift        reader thread, frame stream, serialized writes
     ├── Transport.swift         unix socket, or `ssh <dest> illogicald --stdio`
+    ├── LocalDaemon.swift        starts the local illogicald when there is none
     └── Session.swift           sessions, terminals, hosts
 ```
 
