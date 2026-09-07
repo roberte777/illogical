@@ -111,46 +111,40 @@ struct TransportTests {
     /// share one multiplexing master. Drifting apart silently doubles the SSH
     /// connections a machine holds.
     ///
-    /// **In this suite rather than "The ssh command", and that is the point.**
-    /// It is the only test that writes to the process environment, and the
-    /// only spawning tests are here — `.serialized` therefore keeps it from
-    /// overlapping them. That matters more than it sounds: `posix_spawn` reads
-    /// the live `environ`, and `setenv` mutates the very strings it points at
-    /// even when it does not move the array. Overwriting an existing name can
-    /// publish a freshly-malloc'd pointer before filling it, `strcpy` over a
-    /// live value in place, or `realloc` a value and free the old buffer. An
-    /// earlier version of this reasoned only about the array and concluded
-    /// overwriting was safe; it is not, and serializing is what makes it so.
-    ///
-    /// `HOME` is *set* here rather than read. Two earlier versions computed
-    /// the expectation the same way the code computes the value — inline, then
-    /// through a parameter whose default was the same expression — so
-    /// substituting `homeDirectoryForCurrentUser` left them green. Only an
-    /// input the test controls can tell the two apart.
+    /// The environment is *passed in*, not mutated. Earlier versions computed
+    /// the expectation the same way the code computes the value, so
+    /// substituting `homeDirectoryForCurrentUser` left them green; the version
+    /// after that set `HOME` for real, which works but puts a write to
+    /// `environ` next to suites that walk it — `.serialized` is scoped to one
+    /// suite and does not hold across them, and every `SSHCommand.argv` call
+    /// reads the whole environment through this same default. Handing the
+    /// dictionary in tells the two sources apart with nothing shared.
+    @Test("the home directory comes from the environment, not the passwd entry")
+    func homeComesFromTheEnvironment() {
+        #expect(
+            SSHCommand.home(from: ["HOME": "/tmp/illogical-not-your-home"])
+                == "/tmp/illogical-not-your-home")
+        // Nil rather than a path rooted at nothing, matching
+        // `src/core/conn.zig:291`'s `orelse return null`.
+        #expect(SSHCommand.home(from: [:]) == nil)
+        #expect(SSHCommand.home(from: ["HOMEBREW_PREFIX": "/opt/homebrew"]) == nil)
+    }
+
     @Test("the default control path is the one src/core/conn.zig renders")
     func defaultControlPath() throws {
-        let original = try #require(getenv("HOME").map { String(cString: $0) })
-        defer { setenv("HOME", original, 1) }
-
-        setenv("HOME", "/tmp/illogical-not-your-home", 1)
+        let home = try #require(SSHCommand.home(from: ProcessInfo.processInfo.environment))
         #expect(
             SSHCommand.controlPath(SSHCommand.Options(destination: "h"))
-                == "/tmp/illogical-not-your-home/.ssh/illogical-%C")
+                == home + "/.ssh/illogical-%C")
 
-        // Through the *default*, not the parameter: `src/core/conn.zig:291`
-        // returns null when `HOME` is unset, and nothing else pins that the
-        // default agrees. Safe to remove the name here only because this suite
-        // is serialized against everything that spawns.
-        unsetenv("HOME")
-        #expect(SSHCommand.controlPath(SSHCommand.Options(destination: "h")) == nil)
-
-        // ...and an explicit home still wins, which is what the parameter is
-        // for: production never passes it.
+        // An explicit home wins over the environment, which is what the
+        // parameter is for. Asserted while `HOME` is set and different, so it
+        // pins precedence rather than merely "the parameter is read".
         #expect(
             SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: "/tmp/elsewhere")
                 == "/tmp/elsewhere/.ssh/illogical-%C")
+        #expect(SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: nil) == nil)
     }
-
     /// `cat` is the smallest thing that behaves like the far end of an SSH
     /// pipe: what goes in comes back, framed exactly as it was sent. The
     /// transport is what is under test, not the server.
