@@ -25,17 +25,26 @@ Illogical.app
 │   └── Renderer/                Metal renderer, atlases, fonts, sprites
 
 Packages/IllogicalKit/
-└── IllogicalProtocol           pure Swift, no libghostty — testable alone
-    ├── Frame.swift             the wire header
-    ├── Connection.swift        reader thread, frame stream, serialized writes
-    ├── Transport.swift         unix socket, or `ssh <dest> illogicald --stdio`
-    ├── LocalDaemon.swift        starts the local illogicald when there is none
-    └── Session.swift           sessions, terminals, hosts
+├── IllogicalProtocol           pure Swift, no libghostty — testable alone
+│   ├── Frame.swift             the wire header
+│   ├── Connection.swift        reader thread, frame stream, serialized writes
+│   ├── Transport.swift         unix socket, or `ssh <dest> illogicald --stdio`
+│   ├── LocalDaemon.swift        starts the local illogicald when there is none
+│   └── Session.swift           sessions, terminals, hosts
+└── IllogicalConfig             the config file, in Ghostty's format
+    ├── ConfigSyntax.swift      key = value, comments, quoting
+    ├── Config.swift            the keys, and what setting one does
+    ├── ConfigPath.swift        XDG and Application Support
+    ├── ConfigLoad.swift        reading the files, and the diagnostics
+    └── ConfigTemplate.swift    the file written when a machine has none
 ```
 
 Transport is in the package rather than the app on purpose: it is the half of
 remote support that can be tested without a window, a GPU or a daemon, and
-`just test-swift` runs it in under a second.
+`just test-swift` runs it in under a second. The config parser is there for the
+same reason. The two are separate targets because they answer to different
+machines: the protocol to the one the terminals run on, the config to the one
+you are sitting at.
 
 ## Several machines in one window
 
@@ -262,8 +271,10 @@ bold-italic the italic face with the same, which is what `SharedGridSet.zig`
 does. Italic needs its own file because asking CoreText for the italic trait
 on a variable upright face hands the upright face straight back. The faces are
 built from their bytes and never registered with `CTFontManager`, so they are
-private to the process and never turn up in the user's font list. A named
-family still wins; there is just nothing yet that can name one (#42).
+private to the process and never turn up in the user's font list.
+
+A configured family wins, and the shipped font stays behind it as a fallback
+rather than being replaced by it — see **Configuration** below.
 
 **Sprites.** Cursors, the five underline styles, strikethrough, overline, box
 drawing, block elements, braille, powerline separators, sextants, octants and
@@ -944,6 +955,76 @@ to kill the process. A daemon going away with a keystroke in flight is the
 ordinary case here, so the recovery path was the one that killed the app.
 `SO_NOSIGPIPE` on the socket; the process-wide disposition for the pipe, which
 has no per-descriptor equivalent.
+
+## Configuration
+
+Ghostty's file format, Ghostty's option names, and Ghostty's semantics. The
+audience for this app largely has a `~/.config/ghostty/config` already, the two
+files end up next to each other holding the same font, and a file that looks
+identical while behaving differently is worse than one that looks nothing
+alike. The parser is `IllogicalConfig`, ported from `cli/args.zig` — a pure
+Swift package target, so it tests under `swift test` without a window or an
+XCFramework.
+
+**Two files, both optional**, read in order and applied to one config:
+`$XDG_CONFIG_HOME/illogical/config`, then
+`~/Library/Application Support/<bundle id>/config`. "Later wins" is per line
+rather than per file: a `font-family` in the second appends to the list the
+first started, exactly as a second line in one file would, and `font-family =
+""` is how you mean "replace". If neither file exists the app writes a
+commented template to the second — a config file that does not exist is
+undiscoverable, and there is no menu item that reveals it.
+
+The name is `config`, not `config.illogical`. Ghostty 1.3 moved to the
+extension so editors can key syntax highlighting off it; we ship no editor
+plugin, so it would cost a file name nobody guesses and buy nothing.
+
+**Loading is explicit**, from `IllogicalApp.init()`, and not a lazy global.
+Lazily, the first pane to ask for a font size would read the file — which means
+every *test* process that builds a surface reads the developer's own config and,
+finding none, creates one under whatever bundle identifier the test host has.
+A process that never calls `AppConfig.load()` gets the defaults, which is the
+right answer for all of them. `ILLOGICAL_CONFIG` names one file instead of
+both, the same seam as `ILLOGICAL_SOCK` and `ILLOGICAL_DAEMON`.
+
+**Everything is a warning.** A misspelled key is reported with its file, line
+and spelling and the rest of the file still applies. A config file is not a
+program, and refusing to open a terminal over a typo is a poor trade when the
+terminal is how the file gets fixed. They go to `os.Logger` rather than only to
+`Trace`, because a config warning is the one kind of message that has to reach
+somebody who is not debugging the app.
+
+### The font, exactly as libghostty arranges it
+
+`font-family` repeats to build an ordered fallback list, and the four style
+lists are searched independently. `FontGrid.build` follows `SharedGridSet.zig`
+step for step, and each step is a decision that shows up as text in the wrong
+typeface if it is skipped:
+
+1. **The configured families, in order**, each asked for the style — its own
+   bold, or one synthesized from it. A family nothing on the system provides is
+   *skipped*, not substituted: `CTFontCreateWithFontDescriptor` hands back
+   Helvetica for a family it cannot match, and a proportional face mismeasures
+   every cell in the grid.
+2. **A style that came out empty borrows the regular family** (libghostty's
+   `completeStyles`). `font-family-bold` naming something uninstalled falls back
+   to `font-family` in bold — never to another family, because bold text in a
+   different typeface than the text around it looks wrong in a way a missing
+   bold does not.
+3. **The font we ship, behind all of it.** A fallback, not a default: a
+   codepoint the configured family lacks is drawn from JetBrains Mono before
+   the system cascade is asked.
+4. **The system's fixed-pitch face** only if the bundle lost its font
+   resources.
+
+The cascade is asked last and per style, so the CJK face CoreText returns for
+bold is the bold one. `FontGridSet` keys its shared grids on the whole
+`FontConfig` plus the display scale, so panes that agree about the font still
+share one atlas and panes that do not are not silently handed each other's.
+
+What is deliberately still missing: reload while running, `font-style`,
+`font-feature`, `font-variation`, the `adjust-*` metric modifiers, codepoint
+maps, and the Nerd Font symbols fallback. #39 and #42.
 
 ## Not sandboxed
 

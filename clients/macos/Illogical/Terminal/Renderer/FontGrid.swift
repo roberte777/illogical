@@ -29,8 +29,12 @@ enum FontPresentation: Hashable {
     case emoji
 }
 
-/// Which face in the grid. Slots 0-3 are the primary family's styles;
-/// anything above that is a fallback discovered for some codepoint.
+/// Which face in the grid.
+///
+/// An index into one flat array of every face the grid has loaded. What a
+/// given slot *is* — a configured family, the font we ship, something the
+/// system cascade turned up — is `styleSlots`' business. The glyph cache is
+/// keyed on this, so it stays a bare number.
 struct FontIndex: Hashable {
     var slot: UInt16
 
@@ -81,11 +85,28 @@ final class FontGrid: @unchecked Sendable {
     let metrics: GridMetrics
     let sprite: SpriteFace
 
-    /// The point size and display scale this grid was built for.
-    let pointSize: Double
+    /// The fonts and display scale this grid was built for. Part of
+    /// `FontGridSet`'s key: a grid is only shared by panes that agree on both.
+    let font: FontConfig
     let scale: Double
 
+    /// The point size this grid was built for.
+    var pointSize: Double { font.pointSize }
+
+    /// Every face the grid has loaded, in load order. Indexed by
+    /// `FontIndex.slot`.
     private var faces: [FontFace]
+
+    /// Which faces answer for each style, in the order they are searched:
+    /// the configured families first, then the font we ship behind them.
+    /// Indexed by `FontStyle.rawValue`, and never empty for any style.
+    private var styleSlots: [[UInt16]]
+
+    /// Faces the system cascade turned up, per style, in discovery order.
+    /// Searched after `styleSlots` — a font the person named always wins over
+    /// one we went looking for.
+    private var discovered: [[UInt16]]
+
     /// Fallbacks discovered so far, keyed by PostScript name and style so the
     /// same font isn't loaded twice.
     private var fallbackSlots: [String: UInt16] = [:]
@@ -108,17 +129,19 @@ final class FontGrid: @unchecked Sendable {
     /// grayscale one, small enough that an idle pane isn't carrying megabytes.
     private static let initialAtlasSize: UInt32 = 512
 
-    init(family: String?, pointSize: Double, scale: Double) {
-        self.pointSize = pointSize
+    init(font: FontConfig, scale: Double) {
+        self.font = font
         self.scale = scale
 
         // CoreText is asked for the font at its *pixel* size, so all the
         // metrics come back in pixels and no scaling is needed downstream.
-        let pixelSize = pointSize * scale
+        let built = Self.build(font: font, pixelSize: font.pointSize * scale)
+        faces = built.faces
+        styleSlots = built.styleSlots
+        discovered = Array(repeating: [], count: FontStyle.allCases.count)
 
-        faces = Self.primaryFaces(family: family, pixelSize: pixelSize)
-
-        metrics = GridMetrics.calc(faces[FontStyle.regular.rawValue].faceMetrics())
+        metrics = GridMetrics.calc(
+            built.faces[Int(built.styleSlots[FontStyle.regular.rawValue][0])].faceMetrics())
         sprite = SpriteFace(metrics: metrics)
 
         atlasGrayscale = Atlas(size: Self.initialAtlasSize, format: .grayscale)
@@ -131,8 +154,8 @@ final class FontGrid: @unchecked Sendable {
     /// handed a family nothing matches it returns Helvetica — proportional,
     /// so every cell would be measured off the wrong advance — rather than
     /// saying so. Matching first is what turns an uninstalled family into a
-    /// miss, so `primaryFaces` can fall through to the font we ship instead
-    /// of quietly drawing the terminal in Helvetica.
+    /// miss, so `build` can fall through to the font we ship instead of
+    /// quietly drawing the terminal in Helvetica.
     private static func font(named name: String, size: Double) -> CTFont? {
         let descriptor = CTFontDescriptorCreateWithAttributes(
             [kCTFontFamilyNameAttribute: name] as CFDictionary)
@@ -144,30 +167,90 @@ final class FontGrid: @unchecked Sendable {
         return CTFontCreateWithFontDescriptor(matched, size, nil)
     }
 
-    /// The four styles of the primary family, in `FontStyle` order.
+    /// Every face the grid starts with, and which of them answers for each
+    /// style.
     ///
-    /// A named family wins, then the font we ship, then whatever the system
-    /// calls fixed-pitch. The first two of those are libghostty's ordering:
-    /// `SharedGridSet.zig` adds its built-in faces only after completing the
-    /// configured ones, so a configured font always wins.
+    /// `SharedGridSet.zig`'s ordering, step for step, because each step is a
+    /// decision that shows up as text drawn in the wrong typeface if it is
+    /// skipped:
     ///
-    /// Where this stops short of it is that libghostty *keeps* the built-in
-    /// behind a configured family as a per-style fallback, so a codepoint
-    /// the user's font lacks is drawn from ours before the system cascade is
-    /// asked. Our fallback slots carry no style, so that belongs with the
-    /// configurable font list rather than here (#42).
-    private static func primaryFaces(family: String?, pixelSize: Double) -> [FontFace] {
-        if let family, let named = font(named: family, size: pixelSize) {
-            return derivedFaces(named, size: pixelSize)
+    /// 1. **The configured families, in order.** Each one is resolved and
+    ///    then asked for the style — its own bold, or a synthesized one. A
+    ///    family that is not installed is skipped rather than substituted.
+    /// 2. **Styles that came out empty borrow the regular face.** This is
+    ///    libghostty's `completeStyles`, and the rule it encodes is that a
+    ///    style is never taken from another family: `font-family-bold` naming
+    ///    something uninstalled falls back to `font-family` in bold, not to
+    ///    the next family in the bold list.
+    /// 3. **The font we ship, behind all of it.** A fallback rather than a
+    ///    default: a codepoint the configured family lacks is drawn from ours
+    ///    before the system cascade is asked. libghostty adds it here for the
+    ///    stated reason that "we want to ensure our built-in styles are
+    ///    fallbacks to the configured styles".
+    /// 4. **The system's fixed-pitch face, if there is nothing else.** Only
+    ///    reachable in a build whose bundle lost its font resources.
+    private static func build(
+        font config: FontConfig, pixelSize: Double
+    ) -> (faces: [FontFace], styleSlots: [[UInt16]]) {
+        var faces: [FontFace] = []
+        var slots: [[UInt16]] = Array(repeating: [], count: FontStyle.allCases.count)
+
+        func append(_ face: FontFace, to style: FontStyle) {
+            slots[style.rawValue].append(UInt16(faces.count))
+            faces.append(face)
         }
-        if let builtin = builtinFaces(size: pixelSize) { return builtin }
-        // Nothing bundled, which in practice means a build that dropped the
-        // resources. Land on the system's fixed-pitch face rather than on
-        // nothing.
-        let system =
-            CTFontCreateUIFontForLanguage(.userFixedPitch, pixelSize, nil)
-            ?? CTFontCreateWithName("Menlo" as CFString, pixelSize, nil)
-        return derivedFaces(system, size: pixelSize)
+
+        // 1. What the config named.
+        for style in FontStyle.allCases {
+            for family in config[style] {
+                guard let named = font(named: family, size: pixelSize) else { continue }
+                append(styled(named, style: style, size: pixelSize), to: style)
+            }
+        }
+
+        // 2. Complete the styles from the regular family, never across
+        //    families. Regular itself has nothing to borrow from.
+        if let regular = slots[FontStyle.regular.rawValue].first.map({ faces[Int($0)] }) {
+            for style in FontStyle.allCases where slots[style.rawValue].isEmpty {
+                append(
+                    derive(
+                        regular.font, bold: style.isBold, italic: style.isItalic,
+                        size: pixelSize, from: regular), to: style)
+            }
+        }
+
+        // 3. The font we ship, behind whatever the config asked for.
+        if let builtin = builtinFaces(size: pixelSize) {
+            for style in FontStyle.allCases {
+                append(builtin[style.rawValue], to: style)
+            }
+        }
+
+        // 4. Nothing bundled, which in practice means a build that dropped
+        //    the resources. Land on the system's fixed-pitch face rather than
+        //    on nothing: `metrics` reads the first regular face, and every
+        //    style has to answer.
+        if slots.contains(where: \.isEmpty) {
+            let system =
+                CTFontCreateUIFontForLanguage(.userFixedPitch, pixelSize, nil)
+                ?? CTFontCreateWithName("Menlo" as CFString, pixelSize, nil)
+            for style in FontStyle.allCases where slots[style.rawValue].isEmpty {
+                append(styled(system, style: style, size: pixelSize), to: style)
+            }
+        }
+
+        return (faces, slots)
+    }
+
+    /// One family's face for one style: the family's own, or synthesized from
+    /// it. Regular is the family itself, with nothing asked of it — asking
+    /// CoreText for "no traits" is a match that can come back with a face the
+    /// family did not intend.
+    private static func styled(_ base: CTFont, style: FontStyle, size: Double) -> FontFace {
+        let regular = FontFace(font: base)
+        guard style != .regular else { return regular }
+        return derive(
+            base, bold: style.isBold, italic: style.isItalic, size: size, from: regular)
     }
 
     /// The font we ship, in the four styles, or nil when it is not in the
@@ -200,17 +283,6 @@ final class FontGrid: @unchecked Sendable {
             regular.withVariation(axis: axis, value: bold),
             italic,
             italic.withVariation(axis: axis, value: bold),
-        ]
-    }
-
-    /// The four styles of one face, synthesizing whatever the family lacks.
-    private static func derivedFaces(_ base: CTFont, size: Double) -> [FontFace] {
-        let regular = FontFace(font: base)
-        return [
-            regular,
-            derive(base, bold: true, italic: false, size: size, from: regular),
-            derive(base, bold: false, italic: true, size: size, from: regular),
-            derive(base, bold: true, italic: true, size: size, from: regular),
         ]
     }
 
@@ -252,6 +324,28 @@ final class FontGrid: @unchecked Sendable {
         return faces[Int(index.slot)]
     }
 
+    /// The face a style is drawn with when the codepoint needs no fallback:
+    /// the first family that was configured for it, or the font we ship.
+    ///
+    /// Never nil — `build` guarantees every style has at least one face — but
+    /// optional anyway, because the alternative is a subscript that traps if
+    /// that guarantee is ever broken.
+    func face(style: FontStyle) -> FontFace? {
+        faces(style: style).first
+    }
+
+    /// Every face a style will be searched through, in order, before the
+    /// system cascade is asked.
+    ///
+    /// That order *is* the font configuration's behaviour — the families
+    /// somebody named, in the order they named them, and the font we ship
+    /// behind all of them — and it is invisible from the outside otherwise: a
+    /// grid that dropped the fallbacks still draws every ordinary character
+    /// correctly.
+    func faces(style: FontStyle) -> [FontFace] {
+        lock.withRead { styleSlots[style.rawValue].map { faces[Int($0)] } }
+    }
+
     // MARK: - Codepoint resolution
 
     /// Which face should render this codepoint, or nil if nothing can.
@@ -286,17 +380,28 @@ final class FontGrid: @unchecked Sendable {
 
         let wantEmoji = presentation == .emoji
 
-        // The primary family in the requested style.
-        let primary = faces[style.rawValue]
-        if !wantEmoji, let g = primary.glyphIndex(cp), g != 0 {
-            return FontIndex(slot: UInt16(style.rawValue))
+        // The faces this style was built with, in order: every family the
+        // config named, then the font we ship. First one that has the
+        // codepoint wins, which is what makes `font-family` repeating a
+        // fallback list rather than four ways to say the same thing.
+        //
+        // Never for an explicit emoji request — none of these carry colour
+        // glyphs, and asking the cascade is the whole point of that request.
+        let primary = faces[Int(styleSlots[style.rawValue][0])]
+        if !wantEmoji {
+            for slot in styleSlots[style.rawValue] {
+                if let g = faces[Int(slot)].glyphIndex(cp), g != 0 {
+                    return FontIndex(slot: slot)
+                }
+            }
         }
 
-        // Any fallback we already discovered.
-        for (slot, face) in faces.enumerated().dropFirst(FontStyle.allCases.count) {
+        // Anything the cascade already turned up for this style.
+        for slot in discovered[style.rawValue] {
+            let face = faces[Int(slot)]
             if wantEmoji && !face.hasColor { continue }
             if let g = face.glyphIndex(cp), g != 0 {
-                return FontIndex(slot: UInt16(slot))
+                return FontIndex(slot: slot)
             }
         }
 
@@ -325,6 +430,11 @@ final class FontGrid: @unchecked Sendable {
 
         let slot = UInt16(faces.count)
         faces.append(face)
+        // Per style, because the cascade was asked starting from *this*
+        // style's face: the CJK face it returns for bold is the bold one, and
+        // filing it under regular as well would draw bold CJK at regular
+        // weight the next time it came up.
+        discovered[style.rawValue].append(slot)
         fallbackSlots[dedupeKey] = slot
         return FontIndex(slot: slot)
     }
@@ -445,8 +555,7 @@ final class FontGrid: @unchecked Sendable {
 /// Process-wide registry of grids, so panes with the same font share one.
 enum FontGridSet {
     private struct Key: Hashable {
-        var family: String?
-        var pointSize: Double
+        var font: FontConfig
         var scale: Double
     }
 
@@ -454,13 +563,19 @@ enum FontGridSet {
     // Guarded by `lock`; the compiler can't see that, hence the annotation.
     nonisolated(unsafe) private static var grids: [Key: FontGrid] = [:]
 
-    static func grid(family: String?, pointSize: Double, scale: Double) -> FontGrid {
-        let key = Key(family: family, pointSize: pointSize, scale: scale)
+    static func grid(font: FontConfig, scale: Double) -> FontGrid {
+        let key = Key(font: font, scale: scale)
         lock.lock()
         defer { lock.unlock() }
         if let existing = grids[key] { return existing }
-        let grid = FontGrid(family: family, pointSize: pointSize, scale: scale)
+        let grid = FontGrid(font: font, scale: scale)
         grids[key] = grid
         return grid
+    }
+
+    /// One family for every style. What the tests want, and it keeps them
+    /// from having to spell out four identical lists to say "Menlo".
+    static func grid(family: String?, pointSize: Double, scale: Double) -> FontGrid {
+        grid(font: FontConfig(family: family, pointSize: pointSize), scale: scale)
     }
 }

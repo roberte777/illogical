@@ -18,8 +18,11 @@ final class EmbeddedFontTests: XCTestCase {
         FontGridSet.grid(family: nil, pointSize: Self.pointSize, scale: Self.scale)
     }
 
+    /// The face a style is drawn with before any fallback: what the grid
+    /// resolves the style to, rather than a slot number. Slots stopped being
+    /// one-per-style when a family became a list.
     private func face(_ style: FontStyle) throws -> FontFace {
-        try XCTUnwrap(defaultGrid().face(FontIndex(slot: UInt16(style.rawValue))))
+        try XCTUnwrap(defaultGrid().face(style: style))
     }
 
     /// The face's `wght`, falling back to the axis default when the face
@@ -73,7 +76,7 @@ final class EmbeddedFontTests: XCTestCase {
     /// a hard-coding.
     func testNamedFamilyStillWins() throws {
         let grid = FontGridSet.grid(family: "Menlo", pointSize: Self.pointSize, scale: Self.scale)
-        let regular = try XCTUnwrap(grid.face(FontIndex(slot: 0)))
+        let regular = try XCTUnwrap(grid.face(style: .regular))
         XCTAssertEqual(CTFontCopyFamilyName(regular.font) as String, "Menlo")
     }
 
@@ -87,7 +90,7 @@ final class EmbeddedFontTests: XCTestCase {
     func testAnUnavailableFamilyFallsBackToWhatWeShip() throws {
         let grid = FontGridSet.grid(
             family: "ThisFontIsNotInstalled12345", pointSize: Self.pointSize, scale: Self.scale)
-        let regular = try XCTUnwrap(grid.face(FontIndex(slot: 0)))
+        let regular = try XCTUnwrap(grid.face(style: .regular))
         XCTAssertEqual(CTFontCopyFamilyName(regular.font) as String, "JetBrains Mono")
     }
 

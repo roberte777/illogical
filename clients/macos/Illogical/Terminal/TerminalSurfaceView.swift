@@ -96,8 +96,15 @@ final class TerminalSurfaceView: NSView {
         precisionMultiplier: config.scrollMultiplierPrecision,
         discreteMultiplier: config.scrollMultiplierDiscrete)
 
-    /// Point size of the terminal font. A config option eventually.
-    private static let fontPointSize: Double = 13
+    /// The fonts this surface draws with, read once when it is built.
+    ///
+    /// Once, and not per grid lookup, because the three places below have to
+    /// agree: `gridSize` measures a cell with it before the renderer exists,
+    /// and a surface that measured against one font and drew with another
+    /// would report a size the server then allocated. Reloading the config
+    /// while the app runs is a separate problem (#39) and needs the surface
+    /// rebuilt, not a different read here.
+    private let font = AppConfig.font
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -160,8 +167,7 @@ final class TerminalSurfaceView: NSView {
         let scale = window.backingScaleFactor
         currentScale = scale
 
-        let grid = FontGridSet.grid(
-            family: nil, pointSize: Self.fontPointSize, scale: Double(scale))
+        let grid = FontGridSet.grid(font: font, scale: Double(scale))
         fontGrid = grid
 
         guard let layer else { return }
@@ -286,8 +292,7 @@ final class TerminalSurfaceView: NSView {
             // Before the renderer exists, fall back to the shared grid's
             // metrics so an attach can still pick a sensible size.
             let scale = window?.backingScaleFactor ?? 2
-            let grid = FontGridSet.grid(
-                family: nil, pointSize: Self.fontPointSize, scale: Double(scale))
+            let grid = FontGridSet.grid(font: font, scale: Double(scale))
             let cellW = max(1, Double(grid.metrics.cellWidth))
             let cellH = max(1, Double(grid.metrics.cellHeight))
             let cols = max(1, Int(bounds.width * scale / cellW))
@@ -450,7 +455,7 @@ final class TerminalSurfaceView: NSView {
     /// Cell height in device pixels, which is the unit the viewport moves in.
     private var currentCellHeight: UInt32 {
         if let fontGrid { return fontGrid.metrics.cellHeight }
-        return Self.fallbackMetrics(scale: window?.backingScaleFactor ?? 2).cellHeight
+        return fallbackMetrics(scale: window?.backingScaleFactor ?? 2).cellHeight
     }
 
     /// Cell width, for the horizontal axis of a wheel report. Nothing scrolls
@@ -458,11 +463,11 @@ final class TerminalSurfaceView: NSView {
     /// and seven do, and they are counted in columns.
     private var currentCellWidth: UInt32 {
         if let fontGrid { return fontGrid.metrics.cellWidth }
-        return Self.fallbackMetrics(scale: window?.backingScaleFactor ?? 2).cellWidth
+        return fallbackMetrics(scale: window?.backingScaleFactor ?? 2).cellWidth
     }
 
-    private static func fallbackMetrics(scale: CGFloat) -> GridMetrics {
-        FontGridSet.grid(family: nil, pointSize: fontPointSize, scale: Double(scale)).metrics
+    private func fallbackMetrics(scale: CGFloat) -> GridMetrics {
+        FontGridSet.grid(font: font, scale: Double(scale)).metrics
     }
 
     /// Jump back to the live output.
