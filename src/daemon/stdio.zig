@@ -549,8 +549,7 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     //
     // Inside 3..9 all seven answer correctly in both directions, checked.
     // At or below 2 the grandchild's own stdio answers, which `detachStdio`
-    // has just pointed at /dev/null and the log. At or below 2 the grandchild's own stdio answers, which
-    // `detachStdio` has just pointed at /dev/null and the log.
+    // has just pointed at /dev/null and the log.
     //
     // A skip was the obvious answer and the wrong one: seven descriptors
     // leaked into this binary by anything upstream would turn the only
