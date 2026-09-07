@@ -516,20 +516,25 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     // Whatever number `open` gives us, rather than a hard-coded one: this is a
     // thirty-test binary and dup2'ing onto a fixed slot would silently smash
     // whatever another test had there.
-    // Read-write, though nothing reads it: the probe is `true <&N`, and the
-    // pdksh family checks the access mode of `<&n` rather than only whether
-    // the descriptor exists. Write-only there answers "not open for reading",
-    // which reads as CLEAN -- a leaked descriptor reported as closed.
-    const secret_fd = try sys.openReadWrite(secret.ptr);
+    // Write-only is fine even though the probe dups it for *reading*. mksh
+    // and pdksh do have an access check on `<&n`, but they pass `X_OK` to skip
+    // it -- "a kludge to disable this check for dups", their words -- and
+    // measured, both answer LEAKED on a write-only descriptor while `read -u`
+    // on that same descriptor correctly refuses. Ten shell/mode combinations,
+    // none that disagree.
+    const secret_fd = try sys.openAppend(secret.ptr);
     defer sys.closeFd(secret_fd);
 
     // ...but placed into 3..9 rather than left where `open` put it, because
-    // the check below only discriminates there. Above 9 the `/bin/sh` running
-    // the script has its own descriptor in the way: both dash and bash save a
-    // redirected fd with `F_DUPFD` from 10 upward for the length of a compound
-    // command, and the script's `> marker` and `2>/dev/null` are two of those,
-    // so `true <&10` succeeds and the test reads LEAKED however well
-    // `closeFrom` worked. At or below 2 the grandchild's own stdio answers, which
+    // above 9 the check below stops meaning anything, in a different way per
+    // shell. bash saves a redirected descriptor with `F_DUPFD` from 10 upward
+    // for the length of the command, and `> marker` alone takes fd 10 -- so
+    // `true <&10` succeeds and reads LEAKED however well `closeFrom` worked.
+    // dash cannot address a two-digit descriptor at all ("Syntax error: Bad fd
+    // number"), so the script dies before writing the marker and the test
+    // fails as `DetachedChildNeverRan`. zsh and ksh93 park their saves much
+    // higher and read CLEAN, which is the worst answer of the three: a leak
+    // reported as clean. Only inside 3..9 do all four agree. At or below 2 the grandchild's own stdio answers, which
     // `detachStdio` has just pointed at /dev/null and the log.
     //
     // A skip was the obvious answer and the wrong one: seven descriptors
@@ -559,10 +564,10 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
         // The `2>/dev/null` does not suppress the diagnostic, incidentally --
         // redirections apply left to right, so `<&{d}` has already failed and
         // printed by the time it is applied, and the line lands in the daemon
-        // log on every green run. It stays because it is one of the two
-        // compound-command fd saves the 3..9 placement above is reasoned
-        // about; removing it would falsify that paragraph. The log assertion
-        // is an `indexOf`, so the extra line costs nothing.
+        // log on every green run. It is kept only because the log assertion is
+        // an `indexOf` and one more line costs nothing; deleting it would
+        // change nothing else, since `> marker` on its own already occupies
+        // the descriptor the 3..9 placement is reasoned about.
         "sleep 0.2; echo DAEMON_COMPLAINT >&2; " ++
             "if true <&{d} 2>/dev/null; then echo LEAKED; else echo CLEAN; fi > {s}",
         .{ placed, marker },

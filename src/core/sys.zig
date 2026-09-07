@@ -300,21 +300,6 @@ pub fn openAppend(path: [*:0]const u8) Error!fd_t {
     return fd;
 }
 
-/// Open `path` for reading *and* writing, creating it 0600. Not close-on-exec,
-/// for the same reason as `openDevNull`.
-///
-/// The read half matters to the one caller even though it never reads: a
-/// descriptor is checked for leaking with `true <&N` in a shell, and the pdksh
-/// family validates the access mode of `<&n` rather than just its existence.
-/// A write-only descriptor there answers "not open for reading", the test
-/// reads CLEAN, and a descriptor that leaked wide open is reported as closed
-/// -- the one outcome that test must never produce.
-pub fn openReadWrite(path: [*:0]const u8) Error!fd_t {
-    const fd = open(path, O_RDWR | O_CREAT, @as(c_uint, 0o600));
-    if (fd < 0) return error.OpenFailed;
-    return fd;
-}
-
 /// Path to this executable, written into `buf`.
 ///
 /// `std.fs.selfExePath` went away in Zig 0.16, and the stdio bridge needs it:
