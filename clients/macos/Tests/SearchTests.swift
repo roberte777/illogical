@@ -284,9 +284,28 @@ final class SearchTests: XCTestCase {
 
     // MARK: - Getting out of the way
 
-    /// The bar as it sits in a 900x500 surface: 296 wide, 30 tall, 10 in from
-    /// the top and the trailing edge.
-    private let bar = CGRect(x: 594, y: 10, width: 296, height: 30)
+    /// The bar as it sits in a 900x500 surface: `SearchBar.Metrics` at the
+    /// default 17 pt row, 10 in from the top and the trailing edge.
+    private let bar = CGRect(x: 450, y: 10, width: 446, height: 41)
+
+    /// The bar is measured in terminal rows, not points, so that it keeps the
+    /// reference's proportions when the font size changes — which the font
+    /// work landing alongside this makes a live question rather than a
+    /// hypothetical one.
+    func testTheBarIsSizedInTerminalRows() {
+        let m = SearchBar.Metrics.self
+        // 2.43 rows tall, and 10.8 times as wide as it is tall, as measured off
+        // the reference: 56 px against a 23 px row pitch.
+        XCTAssertEqual(m.height(rowHeight: 17), 41)
+        XCTAssertEqual(m.width(rowHeight: 17), 443)
+
+        // The ratio is what is fixed, at every size a terminal font reaches.
+        for row in stride(from: 10.0, through: 40.0, by: 1) {
+            XCTAssertEqual(
+                m.height(rowHeight: row) / row, m.rowsTall, accuracy: 0.05,
+                "bar is not 2.43 rows at a \(row) pt row")
+        }
+    }
     private let limit: CGFloat = 225
 
     private func match(row: Int, x: CGFloat, width: CGFloat = 60) -> CGRect {

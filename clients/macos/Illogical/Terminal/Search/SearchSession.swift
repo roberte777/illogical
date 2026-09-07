@@ -66,6 +66,13 @@ final class SearchSession {
     /// not dodging at all.
     private(set) var selectedMatchRect: CGRect?
 
+    /// One terminal row, in the surface's coordinates. The bar is measured in
+    /// these rather than in points: that is the proportion the reference sets,
+    /// and it is what keeps the bar looking the same at any font size. Nil
+    /// until a surface has laid a grid out, which is what the bar's own
+    /// fallback is for.
+    private(set) var rowHeight: CGFloat?
+
     private let engine: TerminalEngine
 
     /// The surface these matches are measured in. Weak, and rebound by the
@@ -191,6 +198,9 @@ final class SearchSession {
         if position != found { position = found }
         let working = !progress.isComplete
         if isSearching != working { isSearching = working }
+
+        let row = surface?.rowHeight
+        if rowHeight != row { rowHeight = row }
 
         let spans = query.isEmpty ? [] : engine.searchViewportSpans()
         let selected = surface?.rects(for: spans.filter(\.isSelected))

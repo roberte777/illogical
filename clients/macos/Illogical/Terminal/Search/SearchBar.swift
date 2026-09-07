@@ -37,26 +37,70 @@ struct SearchBar: View {
 
     @FocusState private var fieldFocused: Bool
 
+    /// Sized off the reference, in the one unit that survives not knowing what
+    /// font size the recording was made at: rows of its own terminal. The bar
+    /// there is 56 px tall against a 23 px row pitch — **2.43 rows** — and 10.8
+    /// times as wide as it is tall.
+    ///
+    /// So the bar is a function of the row height rather than a pair of magic
+    /// numbers, and it keeps the reference's proportions at any font size. That
+    /// is not future-proofing for its own sake: the app is growing a font
+    /// setting, and a find bar pinned to 41 pt would be two rows tall at one
+    /// size and one row at another.
+    ///
+    /// It is worth saying why the height was wrong before, because the bug was
+    /// invisible in review: it was applied to a frame *around* the `HStack`,
+    /// while the fill was a `.background` on the stack itself, which sizes to
+    /// its content. The panel painted at 22 pt inside a 32 pt box and looked
+    /// correct from every direction except the screen. The frame is inside
+    /// `bar` now, under the fill.
     enum Metrics {
-        static let width: CGFloat = 300
-        static let height: CGFloat = 32
+        /// Bar height in terminal rows, and width as a multiple of that height.
+        static let rowsTall: CGFloat = 2.43
+        static let aspect: CGFloat = 10.8
+        /// What to assume before a surface has reported its grid. The 13 pt
+        /// default face, whose line height is 17 pt.
+        static let assumedRowHeight: CGFloat = 17
+
         /// From the top and trailing edges of the surface.
         static let inset: CGFloat = 10
-        static let cornerRadius: CGFloat = 10
-        static let button: CGFloat = 22
         /// How far down the bar may be pushed, as a fraction of the surface.
         /// Only reachable by a match that wraps across many rows; see
         /// `SearchNudge.offset`.
         static let dodgeLimit: CGFloat = 0.45
+
+        static func height(rowHeight: CGFloat) -> CGFloat {
+            (max(1, rowHeight) * rowsTall).rounded()
+        }
+        static func width(rowHeight: CGFloat) -> CGFloat {
+            (height(rowHeight: rowHeight) * aspect).rounded()
+        }
+        /// Rounded corners scale with the panel, or a tall bar looks boxy and a
+        /// short one looks like a pill.
+        static func cornerRadius(rowHeight: CGFloat) -> CGFloat {
+            (height(rowHeight: rowHeight) * 0.27).rounded()
+        }
+        static func button(rowHeight: CGFloat) -> CGFloat {
+            (height(rowHeight: rowHeight) * 0.63).rounded()
+        }
+        static func font(rowHeight: CGFloat) -> CGFloat {
+            (height(rowHeight: rowHeight) * 0.34).rounded()
+        }
+    }
+
+    /// The terminal's row height, which everything above is measured in.
+    private var rowHeight: CGFloat {
+        session.rowHeight ?? Metrics.assumedRowHeight
     }
 
     /// Where the bar sits before anything is dodged.
     private var home: CGRect {
-        CGRect(
-            x: max(Metrics.inset, surface.width - Metrics.width - Metrics.inset),
+        let width = Metrics.width(rowHeight: rowHeight)
+        return CGRect(
+            x: max(Metrics.inset, surface.width - width - Metrics.inset),
             y: Metrics.inset,
-            width: min(Metrics.width, max(0, surface.width - 2 * Metrics.inset)),
-            height: Metrics.height)
+            width: min(width, max(0, surface.width - 2 * Metrics.inset)),
+            height: Metrics.height(rowHeight: rowHeight))
     }
 
     /// How far down the selected match is pushing it.
@@ -69,7 +113,6 @@ struct SearchBar: View {
 
     var body: some View {
         bar
-            .frame(width: home.width, height: home.height)
             .offset(x: home.minX, y: home.minY + dodge)
             // Only the dodge animates. The bar's arrival is a transition on the
             // container in `TerminalPane`, and animating the offset itself
@@ -83,7 +126,7 @@ struct SearchBar: View {
         HStack(spacing: 0) {
             TextField("Find", text: Binding(get: { session.query }, set: { session.query = $0 }))
                 .textFieldStyle(.plain)
-                .font(.system(size: 13, weight: .medium))
+                .font(.system(size: Metrics.font(rowHeight: rowHeight), weight: .medium))
                 .foregroundStyle(Palette.textBright)
                 .focused($fieldFocused)
                 .onSubmit { session.selectNext() }
@@ -93,7 +136,7 @@ struct SearchBar: View {
                 .onChange(of: session.focusRequests) { fieldFocused = true }
 
             Text(count)
-                .font(.system(size: 12).monospacedDigit())
+                .font(.system(size: Metrics.font(rowHeight: rowHeight) - 1).monospacedDigit())
                 .foregroundStyle(
                     session.total == 0 && !session.query.isEmpty
                         ? Palette.textFaint : Palette.textBright
@@ -104,17 +147,24 @@ struct SearchBar: View {
 
             Rectangle()
                 .fill(Palette.searchBarDivider)
-                .frame(width: 1, height: Metrics.height - 14)
+                .frame(width: 1, height: (home.height * 0.44).rounded())
 
             step(icon: "chevron.up", help: "Previous Match (⇧⌘G)", action: session.selectPrevious)
             step(icon: "chevron.down", help: "Next Match (⌘G)", action: session.selectNext)
             step(icon: "xmark", help: "Close (esc)", action: dismiss)
         }
-        .padding(.leading, 12)
-        .padding(.trailing, 4)
+        .padding(.leading, (home.height * 0.34).rounded())
+        .padding(.trailing, (home.height * 0.15).rounded())
+        // Inside the fill, not around it. A `.frame` applied *outside* the
+        // `.background` leaves the stack at its content height and paints the
+        // panel at that size, centred in a taller box — which is exactly how
+        // this shipped 32 pt tall and drew 22.
+        .frame(width: home.width, height: home.height)
         .background(
-            RoundedRectangle(cornerRadius: Metrics.cornerRadius, style: .continuous)
-                .fill(Palette.searchBar)
+            RoundedRectangle(
+                cornerRadius: Metrics.cornerRadius(rowHeight: rowHeight), style: .continuous
+            )
+            .fill(Palette.searchBar)
         )
     }
 
@@ -122,11 +172,12 @@ struct SearchBar: View {
     /// than a special case: in the reference they are one evenly spaced group.
     private func step(icon: String, help: String, action: @escaping () -> Void) -> some View {
         let enabled = icon == "xmark" || session.canStep
+        let size = Metrics.button(rowHeight: rowHeight)
         return Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: (size * 0.42).rounded(), weight: .semibold))
                 .foregroundStyle(enabled ? Palette.textDim : Palette.textFaint)
-                .frame(width: Metrics.button, height: Metrics.button)
+                .frame(width: size, height: size)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

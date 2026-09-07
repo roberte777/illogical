@@ -280,6 +280,19 @@ final class TerminalSurfaceView: NSView {
     /// knowing where the renderer decided to put the grid.
     var rendererSizeForTesting: RendererSize? { renderer?.currentSize }
 
+    /// One terminal row, in this view's own coordinates.
+    ///
+    /// The find bar is sized in rows rather than points — that is the reference
+    /// proportion, and it is the only thing that stays right when the font size
+    /// changes — so it has to ask the renderer that laid the grid out rather
+    /// than assume a line height.
+    var rowHeight: CGFloat? {
+        guard let renderer else { return nil }
+        let scale = window?.backingScaleFactor ?? 2
+        guard scale > 0 else { return nil }
+        return CGFloat(renderer.currentSize.cell.height) / scale
+    }
+
     /// Where `spans` are on screen, in this view's own coordinates.
     ///
     /// The find bar dodges what the search found, so it has to know where the
