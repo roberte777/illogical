@@ -48,8 +48,8 @@ stay `live` after every client disconnects.
 **Gate:** a terminal survives client exit; queries answered while detached. ✅
 
 Also landed: `illogical peek`, which returns the server's rendered screen as
-plain text without attaching. It was pulled forward from M6 because it is how
-the whole stack gets tested.
+plain text without attaching. It was pulled forward from what is now M7 because
+it is how the whole stack gets tested.
 
 ## M2 — Attach ✅
 
@@ -297,7 +297,84 @@ convenience: it is what makes the remote path testable from a shell rather than
 only from a window, and `ILLOGICAL_SSH` stands something else in for `ssh` so
 both halves can be exercised without a second machine.
 
-## M6 — Beyond
+## M6 — Ships
+
+**Ends at:** download the app, open it, get a terminal. Drop one tarball on a
+Linux box and `--host` it.
+
+Two premises, restated as gates.
+
+**P1 — running the Mac client is enough.** No terminal, no hand-started
+`illogicald`, no `just demo`. If nothing is listening, the app starts a server,
+and that server outlives the app.
+
+| | Work |
+| --- | --- |
+| ✅ | `illogicald --ensure` — dial-or-start with the bridge left off, one code path shared with `--stdio` |
+| ✅ | `-Dversion` / `-Dghostty-pin`, so `--version` and `welcome.server` are a build rather than a literal |
+| ✅ | `$SHELL -l` — an app-started daemon inherits launchd's `PATH`, and a non-login shell never reads `zprofile` |
+| ✅ | `LocalDaemon` in IllogicalKit, and `DaemonLauncher` injected so tests spawn nothing |
+| ✅ | `illogicald` embedded in `Contents/MacOS/`, staged by `just stage-daemon` |
+| ✅ | The app starts one on `ECONNREFUSED`/`ENOENT`, once per outage |
+| ✅ | Skew reported from `welcome.server`; `version_mismatch` stops the reconnect loop |
+
+**Gate:** `launch → window` must not move when there is no server to connect
+to. Measured, `scripts/bench-launch.sh`, Debug, median of 5:
+
+| | launch → window |
+| --- | --- |
+| warm (a daemon already listening) | 155 ms |
+| cold (nothing listening; the app starts one) | 154 ms |
+
+`--ensure` runs in a `Task` off the main actor while the host sits in
+`.connecting`, so the only number a cold start can move is `attach → ready`,
+and only by the daemon's own startup. `just smoke-ensure` is the G1 proof at
+shell level: SIGKILL the starter's whole process group, and the daemon keeps
+answering.
+
+**P2 — the server is one binary, embedded for local use and shippable
+standalone.** One source tree and one ghostty pin in both places today; not yet
+one set of bytes. `just stage-daemon` embeds the Debug host-arch binary from
+`just build`, which is what the dev loop wants, while `just dist-daemon
+universal` produces ReleaseFast, stripped and lipo'd. They become the same build
+when #47's app job stages the release workflow's `macos-universal` artifact
+instead of `zig-out`. Until then, installing the release tarball and starting it
+by hand under a dev app shows the version-skew marker — correctly: it really is
+a different build of the same commit.
+
+| | Work |
+| --- | --- |
+| ✅ | `just dist-daemon` / `just dist` — ReleaseFast, stripped, tarred |
+| ✅ | `.github/workflows/release.yml` — tag-triggered, three targets, every artifact smoke-run on the machine that built it |
+| ✅ | `apple_sdk` from the ghostty submodule, so `-Dtarget=x86_64-macos` compiles at all |
+
+Two findings worth keeping:
+
+- **`x86_64-macos` from an arm64 Mac did not compile** until `build.zig` used
+  ghostty's own `apple-sdk` package. Zig resolves the macOS SDK headers through
+  `xcrun` for the *native* target only; for another Darwin arch it falls back
+  to its bundled Darwin libc headers, which have no `util.h` — so
+  `src/core/pty.zig`'s `@cImport` of `openpty` failed. `--sysroot "$SDKROOT"`
+  is not the fix: inside the devshell zig double-appends the nix SDK path.
+- **The `illogical` CLI cannot live in `Contents/MacOS/`.** That directory
+  already holds the app's own executable `Illogical`, and the default macOS
+  volume is case-insensitive, so a file named `illogical` copied in there *is*
+  that file — it replaced the app's binary, same inode, and the bundle then
+  failed `codesign --verify --deep`. The CLI ships in the tarball instead.
+
+Linux is built natively on Linux runners rather than crossed from the macOS
+job. Cross-compiling to `x86_64-linux-musl` and `aarch64-linux-musl` works at
+the current pin — `just dist` does it, and the artifacts are static stripped
+ELF — but a native build gets its smoke run for free, and a pin bump that adds
+a host-only dependency should not take the release with it.
+
+Still open, deliberately: a **Restart Server…** action. Restarting today ends
+every terminal (no fd handoff until M7), so it is destructive and deserves the
+confirmation UI and a `pid` field in `Welcome` designed together — ideally
+after handoff makes it non-destructive. The app reports skew and does nothing
+about it.
+
+## M7 — Beyond
 
 - Session sharing — multiple people, one session. Needs identity and permissions,
   neither of which the protocol addresses yet.

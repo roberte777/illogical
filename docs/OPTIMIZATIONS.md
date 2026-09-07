@@ -483,7 +483,7 @@ under live resize.
 
 ### D3. Incremental, caller-driven search
 
-**Status: Free.** Milestone M6.
+**Status: Free.** Milestone M7.
 
 Terminal search over a large scrollback is split into small steps the caller
 drives, so it never blocks a frame. Results survive resize, reflow, primary/alt

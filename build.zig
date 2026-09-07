@@ -33,6 +33,12 @@ pub fn build(b: *std.Build) void {
         "ghostty-pin",
         "vendor/ghostty revision to stamp into the version (default: unknown)",
     ) orelse "unknown";
+    // Release tarballs only. An unstripped static musl `illogicald` is 15 MB
+    // of which most is debug_info; `strip` is asked for through zig rather
+    // than run afterwards because a release is cross-compiled from a Mac and
+    // the host's `strip` cannot touch an ELF.
+    const strip = b.option(bool, "strip", "Leave out debug information (default: no)");
+
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption([]const u8, "ghostty_pin", ghostty_pin);
@@ -45,6 +51,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = strip,
     });
     if (ghostty_vt) |m| core.addImport("ghostty-vt", m);
     // On the core module alone. Both executables read the version through
@@ -60,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = strip,
     });
     daemon_mod.addImport("illogical", core);
     if (ghostty_vt) |m| daemon_mod.addImport("ghostty-vt", m);
@@ -68,6 +76,7 @@ pub fn build(b: *std.Build) void {
         .name = "illogicald",
         .root_module = daemon_mod,
     });
+    appleSdkPaths(b, daemon);
     b.installArtifact(daemon);
 
     // ---------------------------------------------------------------
@@ -78,6 +87,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .strip = strip,
     });
     cli_mod.addImport("illogical", core);
     if (ghostty_vt) |m| cli_mod.addImport("ghostty-vt", m);
@@ -86,6 +96,7 @@ pub fn build(b: *std.Build) void {
         .name = "illogical",
         .root_module = cli_mod,
     });
+    appleSdkPaths(b, cli);
     b.installArtifact(cli);
 
     // ---------------------------------------------------------------
@@ -102,6 +113,33 @@ pub fn build(b: *std.Build) void {
         const t = b.addTest(.{ .root_module = mod });
         test_step.dependOn(&b.addRunArtifact(t).step);
     }
+}
+
+/// Point a Darwin build at the real macOS SDK, for any Apple target.
+///
+/// Only `-Dtarget=<other arch>-macos` needs this, and it is the difference
+/// between a universal daemon and none. Zig resolves the SDK headers through
+/// `xcrun` for the *native* target only; for another Darwin arch it falls back
+/// to its bundled Darwin libc headers, which have no `util.h` -- so
+/// `src/core/pty.zig`'s `@cImport` of `openpty` fails and `illogicald` does not
+/// compile. (`illogical` does, because its path never reaches `openpty`; it is
+/// given the same treatment anyway so the two cannot drift.)
+///
+/// `--sysroot "$SDKROOT"` looks like the answer and is not: inside the devshell
+/// zig double-appends the nix SDK path -- ".../MacOSX.sdk/nix/store/.../usr/lib"
+/// -- and highway and simdutf then fail to link. This is ghostty's own helper,
+/// out of the same submodule, and is what builds its universal XCFramework: it
+/// runs `LibCInstallation.findNative` through `xcrun` and hands the compile
+/// step a `--libc` file plus the SDK's include, framework and library
+/// directories.
+///
+/// A no-op for every non-Darwin target, so the Linux release path never sees
+/// it.
+fn appleSdkPaths(b: *std.Build, exe: *std.Build.Step.Compile) void {
+    if (!exe.rootModuleTarget().os.tag.isDarwin()) return;
+    @import("apple_sdk").addPaths(b, exe) catch |err| {
+        std.debug.panic("could not resolve the macOS SDK: {t}", .{err});
+    };
 }
 
 /// Resolve the `ghostty-vt` module from the vendored ghostty checkout.

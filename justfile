@@ -38,6 +38,25 @@ test:
 smoke-ensure: build
     ./scripts/smoke-ensure.sh
 
+# --- releasing the server ---------------------------------------------------
+
+# Build one release tarball into dist/. See scripts/dist-daemon.sh for why musl
+# and why the Linux legs are built natively in CI rather than crossed.
+#
+#   just dist-daemon                     this machine
+#   just dist-daemon universal           both macOS arches, lipo'd
+#   just dist-daemon x86_64-linux-musl   a Linux box
+dist-daemon target="native" version="":
+    ./scripts/dist-daemon.sh {{target}} {{version}}
+
+# Every target the release ships, from a Mac. Cross-compiling to Linux works at
+# the current ghostty pin and fails loudly if a pin bump breaks it; CI builds
+# those two natively, which is also where they get smoke-run.
+dist version="": (dist-daemon "universal" version) (dist-daemon "x86_64-linux-musl" version) (dist-daemon "aarch64-linux-musl" version)
+
+clean-dist:
+    rm -rf dist
+
 # Run illogicald in the foreground.
 serve *ARGS:
     zig build run -- --foreground {{ARGS}}
@@ -158,6 +177,6 @@ fmt-swift:
 ci: fmt-check test smoke-ensure test-swift
 
 clean:
-    rm -rf zig-out .zig-cache zig-pkg
+    rm -rf zig-out .zig-cache zig-pkg dist
     rm -rf clients/macos/.build clients/macos/Frameworks clients/macos/Illogical.xcodeproj
     rm -rf clients/macos/Illogical/Supporting/bin
