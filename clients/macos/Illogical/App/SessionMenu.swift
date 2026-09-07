@@ -185,6 +185,11 @@ struct SessionMenu: View {
                 .shadow(color: .black.opacity(0.45), radius: 14, y: 6)
         }
         .onAppear { fieldFocused = true }
+        // Escape closes the menu, the way it closes an NSMenu. It has to be
+        // here rather than on the overlay: key events go where focus is, and
+        // the filter field takes it as the menu appears. Closing hands the
+        // keyboard back to the terminal (SessionStore.focusTerminal).
+        .onExitCommand { isPresented = false }
         .sheet(isPresented: $addingHost) {
             AddRemoteHost(destination: $newHost) { destination in
                 store.addHost(.ssh(destination: destination))

@@ -78,8 +78,13 @@ struct PaneHeader: View {
                 ) {
                     store.toggleZoom(pane.id, in: tab)
                 }
+                // Through `closeSurfacePane` — the policy ⌘W goes through,
+                // because that is the chord this button advertises. Calling
+                // `closePane` directly made the two differ on the one case
+                // that matters: the last pane of the last tab, where ⌘W closes
+                // the window and this left an empty one behind.
                 PaneButton(systemImage: "xmark", help: "Close (⌘W)") {
-                    store.closePane(pane.id, in: tab)
+                    WindowClose.pane(pane.id, in: tab, of: store)
                 }
             }
             .traceFrame("pane-buttons")

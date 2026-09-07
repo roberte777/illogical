@@ -22,7 +22,12 @@ struct TerminalPane: View {
         VStack(spacing: 0) {
             PaneHeader(pane: pane, tab: tab, isFocused: isFocused)
                 .environment(store)
-            TerminalSurface(pane: pane, tab: tab)
+            // `focusGeneration` is read *here*, in a body, so the store's
+            // observation registers it. Handing it to the representable is
+            // what guarantees an `updateNSView` when something — the session
+            // menu closing — asks for the keyboard back; a representable
+            // whose inputs did not change need not be updated at all.
+            TerminalSurface(pane: pane, tab: tab, focusGeneration: store.focusGeneration)
                 .environment(store)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 // Over the terminal, not instead of it. The screen underneath
@@ -95,6 +100,10 @@ struct TerminalSurface: NSViewRepresentable {
     @Environment(SessionStore.self) private var store
     let pane: Pane
     let tab: TabLayout.ID
+    /// `SessionStore.focusGeneration`. Not read here for its value — only so
+    /// that a bump changes this representable and forces `updateNSView`, which
+    /// is where first responder is re-asserted.
+    var focusGeneration: Int = 0
 
     func makeCoordinator() -> Coordinator {
         Coordinator(store: store, terminal: pane.terminal, pane: pane.id, tab: tab)
@@ -178,12 +187,11 @@ struct TerminalSurface: NSViewRepresentable {
             controller?.didPresentFirstFrame(at: moment)
         }
 
+        /// The policy is `SessionStore.closeSurfacePane`, not this method:
+        /// this file has no test target, and "does ⌘W close the window" is
+        /// exactly the question worth a test (#41).
         func surfaceShouldClose(_ surface: TerminalSurfaceView) -> Bool {
-            guard let tab = store.tabs.first(where: { $0.id == tab }), tab.isSplit else {
-                return false
-            }
-            store.closePane(pane, in: tab.id)
-            return true
+            store.closeSurfacePane(pane, in: tab)
         }
     }
 }

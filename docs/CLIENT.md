@@ -109,9 +109,38 @@ nothing to zoom out of.
 Focus is AppKit's. The pane the layout calls focused is whichever surface is
 first responder, reported back by the surface, rather than a SwiftUI tap
 gesture layered over the terminal that would swallow the clicks selection
-needs. ⌘W reaches the focused surface as `performClose:` through the responder
-chain, so it closes a pane and falls through to closing the window when there
-is only one — no fight with the standard Close Window item for the shortcut.
+needs.
+
+**⌘W closes the focused terminal.** It reaches the surface as `performClose:`
+through the responder chain, so the terminal gets first refusal without
+fighting the standard Close Window item for the chord. The window closes only
+when that terminal was the last one in it — the condition is
+`tabs.count > 1 || tab.isSplit`, and it counts *every* tab the window holds,
+not the strip's. A window whose front session shows one tab may be holding
+tabs on another session, and closing it would take those with it; the selection
+moves to them instead (issue #41).
+
+The policy is `SessionStore.closeSurfacePane` and not the delegate method over
+it, so "does ⌘W close the window" is a question a test can ask without a window.
+
+**⇧⌘W closes the whole tab** — as does the ✕ in the tab strip, and a pane's own
+✕ is ⌘W for that pane. All four routes answer to the same two store calls, and
+the window half of each goes through `WindowClose`, because they used to
+disagree: ⌘W on the last terminal closed the window and left the shell running,
+while ⇧⌘W on the same terminal hung it up and left an empty window behind.
+
+The rules, in the order they are applied:
+
+- **The window's last tab closes the window**, and kills nothing. Closing a
+  window here is a detach — "Sessions keep running after you close this window"
+  is the empty state's own promise, and re-launching re-attaches. That is also
+  why this case does not confirm: nothing is destroyed.
+- **A tab with more than one pane asks first**, because closing it really does
+  hang up every terminal in it.
+- **One pane closes outright.** No shipping terminal confirms a single close,
+  and the one thing that would justify it — a foreground process still
+  running — is not something we can detect (`TerminalSummary.command` is the
+  child's argv[0], not the foreground job).
 
 ## The attach path, and the launch budget
 
@@ -418,6 +447,71 @@ those *mean* is never ours to decide.
 
 Client-side echo would be a latency optimization that breaks the one-writer
 invariant, which is what makes desync recovery trivial. Don't.
+
+## Keybindings
+
+The whole set, and where each one is registered. **Where** is the interesting
+column: a chord a menu item claims is consumed by the key-equivalent pass and
+never reaches `keyDown`, so the menu bar is also the list of things that can
+never be typed into a terminal.
+
+| Key | Action | Registered where |
+|---|---|---|
+| ⌘T | New Terminal | File |
+| ⇧⌘N | New Session | File |
+| ⌘W | Close the focused terminal; the window when it was the last one | responder chain — the standard Close item sends `performClose:`, and `TerminalSurfaceView` answers it |
+| ⇧⌘W | Close Tab (asks first when the tab holds more than one terminal; closes the window when it is the last tab) | File |
+| ⌘D / ⇧⌘D | Split Right / Split Down | File |
+| ⇧⌘↩ | Zoom / Unzoom pane | File |
+| ⌥⌘← → ↑ ↓ | Focus pane left/right/above/below | View |
+| ⇧⌘K | Change Session — toggles the dropdown | View |
+| ⌘R | Refresh Sessions | View |
+| ⇧⌘] / ⇧⌘[ | Show Next / Previous Tab, wrapping | Window |
+| ⌘1 … ⌘8 | Select that tab | Window |
+| ⌘9 | Last tab (the iTerm/Ghostty/browser convention, not the ninth) | Window |
+| Esc | Dismiss the session menu | `SessionMenu`'s `onExitCommand` — key events go where focus is, and the filter field has it |
+| ⌘Home / ⌘End | Scroll to the top / bottom of the scrollback | `TerminalSurfaceView.keyDown` |
+| ⌘PgUp / ⌘PgDn | Scroll one page (a screen less a row of overlap) | `TerminalSurfaceView.keyDown` |
+| ⌘C / ⌘V / ⌘A | Copy / Paste / Select All | system Edit menu → responder chain |
+| ⌘Q / ⌘H / ⌘M | Quit / Hide / Minimize | the system's own items |
+
+Tab switching is scoped to the session in front: the strip shows one session at
+a time, and a chord must not move the window to another session — or, with two
+machines connected, to another machine. ⌘1–⌘9 are greyed out when they would go
+nowhere. That is honesty, not safety: a *disabled* menu item still consumes its
+key equivalent — `performKeyEquivalent` reports the chord handled and simply
+does not fire the action — so ⌘5 with two tabs open never reaches the terminal
+either way.
+
+The four scroll chords are the only keys taken in `keyDown`, and they are taken
+**before** `KeyTranslation` and the encoder. That order is the whole point: a
+program speaking the Kitty protocol is told about keys the legacy encoding
+drops, so intercepting after the encoder would let ⌘PgUp through as a key
+event. It is the same rule the wheel follows — the viewport half of the surface
+never synthesizes a sequence.
+
+They are claimed narrowly, and the three exclusions each cost a bug to find:
+
+- **⌘ and nothing else.** ⇧⌘Home is macOS's "extend selection to the top of the
+  document"; ⌥⌘Home and ⌃⌘End are ordinary editor bindings under the Kitty
+  protocol. A `contains(.command)` test ate all three.
+- **The key-up is matched to the key-*down* this view actually swallowed**,
+  never to the modifiers the release happens to carry. Letting go of ⌘ before
+  the key — the ordinary way anyone releases a chord — otherwise put a release
+  on the wire for a press the program never saw.
+- **Only where there is scrollback to move through.** On the alternate screen
+  (`vim`, `less`, `htop`) there is none, so the chord falls through to the
+  program rather than becoming a dead key that eats a keystroke and does
+  nothing. Without ⌘ the identical keys are always the program's: `less` gets
+  its own PgUp.
+
+Closing the session menu hands the keyboard back to the terminal. The menu's
+filter field held it, and nothing in the split tree changed when the overlay
+went away, so `SessionStore.focusGeneration` is bumped instead — a counter
+`TerminalPane` reads in its body and passes to the surface, which makes SwiftUI
+re-run `updateNSView`, which is where first responder is re-asserted. Only the
+counter is under test; the rest of that chain needs a running app and was
+checked by hand.
 
 ## Session and terminal switching
 
