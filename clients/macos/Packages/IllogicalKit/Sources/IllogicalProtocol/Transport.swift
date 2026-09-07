@@ -708,15 +708,20 @@ public enum SSHCommand {
     /// --host` would bind different control sockets and hold two ssh masters
     /// per host. That pairing is the whole reason this function exists.
     ///
-    /// The two sources agree on every machine anyone tests on, so no assertion
-    /// can tell them apart without an input the test chooses. Four earlier
-    /// versions tried to *detect* the substitution and each was a tautology in
-    /// a new place — the expectation computed the same way the code computed
-    /// the value, and once a parameter was added, the tautology moved into its
-    /// default. Setting `HOME` for real does work, and puts a write to
-    /// `environ` beside suites that walk it. Taking the dictionary makes the
-    /// mistake unrepresentable instead: there is nowhere to put
-    /// `homeDirectoryForCurrentUser` that type-checks.
+    /// The two sources agree on every machine anyone tests on, so no in-process
+    /// assertion can tell them apart without an input the test chooses. Taking
+    /// the dictionary is what makes that input available, and it secures the
+    /// *derivation*: the body cannot read the passwd entry, or fall back to
+    /// it, without failing a test.
+    ///
+    /// It does not secure the default argument below, and nothing in this
+    /// process can — `= ["HOME": FileManager.default
+    /// .homeDirectoryForCurrentUser.path]` type-checks and is invisible to
+    /// every assertion, because the two agree here. That is one line of
+    /// wiring; the test pins it against the process environment, which catches
+    /// an empty, filtered or differing default and not the passwd dictionary.
+    /// Distinguishing that would need a helper spawned with a different
+    /// `HOME`, which is more machinery than the line is worth.
     ///
     /// Nil when `HOME` is absent, which is what the Zig side does too.
     static func controlPath(
