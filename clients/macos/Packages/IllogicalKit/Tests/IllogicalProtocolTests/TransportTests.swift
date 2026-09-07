@@ -93,37 +93,32 @@ struct SSHCommandTests {
     /// share one multiplexing master. Drifting apart silently doubles the SSH
     /// connections a machine holds.
     ///
-    /// `HOME` is *set* here rather than read. Every previous version of this
-    /// test computed its expectation the same way the code computes the value
-    /// — first inline, then via a parameter whose default was the same
-    /// expression — and each time the tautology simply moved: substituting
-    /// `homeDirectoryForCurrentUser` for the environment read left the suite
-    /// green, because the two agree on every machine anyone runs this on.
-    /// Only an input the test controls can tell them apart.
+    /// `HOME` is *set* here rather than read. Three earlier versions computed
+    /// the expectation the same way the code computes the value — inline, then
+    /// through a parameter whose default was the same expression — and each
+    /// time substituting `homeDirectoryForCurrentUser` left the suite green,
+    /// because the two agree on every machine anyone runs this on. Only an
+    /// input the test controls can tell them apart.
     ///
-    /// Nothing else in this package reads `HOME`, so mutating it briefly is
-    /// safe even though suites run concurrently. `src/core/conn.zig:291` uses
-    /// `getenv("HOME")`, which is what this is pinning parity with.
+    /// Overwriting only: no `unsetenv`. Removing a name and re-adding it makes
+    /// libc *grow* `environ`, freeing the old array, and the transport suite
+    /// runs concurrently with this one and hands the live `environ` to
+    /// `posix_spawn`. The no-home branch is reached through the parameter
+    /// instead, which is what the parameter is for.
     @Test("the default control path is the one src/core/conn.zig renders")
     func defaultControlPath() throws {
-        let original = getenv("HOME").map { String(cString: $0) }
-        defer {
-            if let original { setenv("HOME", original, 1) } else { unsetenv("HOME") }
-        }
+        // Required rather than optional-handled: restoring a `HOME` that was
+        // never there would need the `unsetenv` this test exists to avoid.
+        let original = try #require(getenv("HOME").map { String(cString: $0) })
+        defer { setenv("HOME", original, 1) }
 
         setenv("HOME", "/tmp/illogical-not-your-home", 1)
         #expect(
             SSHCommand.controlPath(SSHCommand.Options(destination: "h"))
                 == "/tmp/illogical-not-your-home/.ssh/illogical-%C")
 
-        // No home at all is not a path, rather than one rooted at nothing.
-        unsetenv("HOME")
-        #expect(SSHCommand.controlPath(SSHCommand.Options(destination: "h")) == nil)
-
-        // And an explicit home still wins, which is what the parameter is for.
-        #expect(
-            SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: "/tmp/elsewhere")
-                == "/tmp/elsewhere/.ssh/illogical-%C")
+        // No home is not a path, rather than one rooted at nothing.
+        #expect(SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: nil) == nil)
     }
 
     @Test("the ssh binary can be overridden")

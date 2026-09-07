@@ -148,10 +148,13 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// let go: this property, the `Pipe` reachable through
     /// `process.standardError`, and the drain closure. So the bound is the
     /// later of "the caller released the transport" and "the drain returned".
-    /// Which of those is last depends on the caller: `Connection.close` drops
-    /// the transport as soon as `close` returns, so there it is the drain --
-    /// but `failureDescription` exists to be read *after* a failure, and a
-    /// caller holding a failed transport to poll it holds this descriptor too.
+    /// For the one caller in this tree it is the *transport*: `Connection`
+    /// holds it in a `let` it never clears, and `failureDescription` reads
+    /// that same stored transport, so `close()` returning frees nothing. On
+    /// its two-second-timeout path it does not even call `transport.close()`.
+    /// A model object that keeps closed `Connection`s therefore keeps one
+    /// stderr descriptor per closed remote pane, which is the walk to `EMFILE`
+    /// this doc opens with.
     private let stderrHandle: FileHandle
     private let shutdownFlag = ManagedAtomicFlag()
     private let closedFlag = ManagedAtomicFlag()
@@ -457,12 +460,11 @@ public enum SSHCommand {
     /// and `illogical --host` bind different control sockets and hold two ssh
     /// masters, which is precisely what this exists to avoid. Nil when `$HOME`
     /// is unset, which is what the Zig side does too.
-    /// `home` is a parameter so a test can pass one that differs from this
-    /// process's own. Without that the assertion can only compare `$HOME`
-    /// against itself, and the bug it exists for -- reading the passwd entry
-    /// instead of the environment, so the app and `illogical --host` bind
-    /// different control sockets and hold two masters -- is invisible on any
-    /// machine where the two agree, which is every machine anyone tests on.
+    /// `home` is a parameter so the no-home branch can be tested without
+    /// removing `HOME` from the process. Taking a variable out of `environ`
+    /// and putting it back makes libc grow the array, and this package spawns
+    /// children from concurrently-running tests -- `posix_spawn` walks that
+    /// same array. Production never passes it.
     static func controlPath(
         _ options: Options,
         home: String? = ProcessInfo.processInfo.environment["HOME"]
