@@ -129,6 +129,26 @@ works at all:
 Zig, because the terminal core is Zig. `ghostty-vt` is imported as a native Zig
 module, so the server uses it with no FFI boundary.
 
+**A terminal with no command of its own runs `$SHELL -l`** — a login shell, the
+way Terminal.app and Ghostty do it. The daemon's own environment is whoever
+started it: from a terminal that is a full interactive `PATH`, but from the Mac
+app it is launchd's, which is `/usr/bin:/bin:/usr/sbin:/sbin` and nothing else.
+A non-login shell reads no `zprofile`, so `path_helper` never runs and no
+terminal would find brew or anything else the user installed. Same class of
+repair as the child locale in `pty.zig`, for the same reason. A client that
+wants something else says so in `create.argv`.
+
+Two things follow that are worth saying out loud rather than rediscovering.
+`illogical new` from a shell that is *itself* a login shell re-runs
+`/etc/zprofile` — where `path_helper` may reorder `PATH` — and `~/.zprofile`, so
+a `PATH` carefully arranged in the outer shell can come back rearranged. That is
+the well-known tmux-on-macOS behaviour, and it is accepted here for the reason
+Terminal.app and Ghostty accept it: a terminal whose `PATH` is complete is worth
+more than one whose `PATH` is untouched, and the daemon cannot tell which of its
+clients started from where. And a `$SHELL` with no `-l` at all — elvish is the
+one in circulation — opens a terminal that exits immediately on a usage error;
+`create.argv` is the way to say otherwise.
+
 **Threading.** A terminal is never touched by two threads at once — libghostty-vt
 requires this. Each terminal has a lock; its hot PTY thread holds it while
 writing. Snapshot encode/decode and scrollback compression run on a pool and take
