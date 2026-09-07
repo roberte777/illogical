@@ -312,7 +312,7 @@ public final class CommandTransport: Transport, @unchecked Sendable {
 
     /// The image itself was refused. Darwin distinguishes these; `ENOEXEC` is
     /// the generic one.
-    private static func imageReason(_ ns: NSError) -> String {
+    static func imageReason(_ ns: NSError) -> String {
         guard ns.domain == NSPOSIXErrorDomain else { return "cannot be run" }
         switch Int32(ns.code) {
         case ENOEXEC: return "is not a program"
@@ -331,7 +331,7 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// A link that resolves to nothing is broken. A link whose target merely
     /// cannot be reached is not, and calling it broken sends somebody to
     /// inspect a symlink that is perfectly fine.
-    private static func targetReason(_ code: Int32) -> (reason: String, retryable: Bool) {
+    static func targetReason(_ code: Int32) -> (reason: String, retryable: Bool) {
         switch code {
         case ENOENT: return ("is a broken symlink", false)
         case ELOOP: return ("is a loop of symlinks", false)
@@ -345,7 +345,13 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     }
 
     /// Why a path could not be walked, and whether that is worth retrying.
-    private static func pathReason(_ code: Int32) -> (reason: String, retryable: Bool) {
+    ///
+    /// Internal rather than private, like its two siblings: the retryable arms
+    /// are a stalled network volume, which no test can produce without a mount
+    /// to unplug. Reaching them directly is the only way they are pinned at
+    /// all, and an unpinned retry decision is what put a host into a
+    /// thirty-second loop for the life of the process twice already.
+    static func pathReason(_ code: Int32) -> (reason: String, retryable: Bool) {
         switch code {
         case EACCES: return ("is in a directory that cannot be searched", false)
         // Not the same fault, and not the same advice: there is no

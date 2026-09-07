@@ -554,6 +554,38 @@ struct TransportTests {
         #expect(String(describing: classify(NSPOSIXErrorDomain, EISDIR)) == "ssh cannot be run")
     }
 
+    /// A volume that stopped answering is the most retryable failure there is,
+    /// and it reaches this code wearing the same `NSCocoaErrorDomain` 4 as a
+    /// missing file — because Foundation's `isExecutableFile` pre-check fails
+    /// either way. Classifying it permanent means a laptop that lost its NAS
+    /// is told the binary is absent and never retries that host again.
+    ///
+    /// Driven against the two classifiers directly. Every other arm of these
+    /// is reachable from a real spawn and is tested that way; these are not,
+    /// without a mount to unplug, and an unpinned retry decision is exactly
+    /// what has twice put a host into a thirty-second loop for good.
+    @Test("a path that is merely unreachable stays retryable")
+    func unreachablePathsAreRetried() {
+        for code in [EIO, ESTALE, ETIMEDOUT, ENXIO, ENETDOWN, ENETUNREACH] {
+            let walked = CommandTransport.pathReason(code)
+            #expect(walked.retryable, "errno \(code) walking the path")
+            #expect(walked.reason == "is on a volume that is not responding")
+
+            let target = CommandTransport.targetReason(code)
+            #expect(target.retryable, "errno \(code) through a symlink")
+            #expect(target.reason == "points at a volume that is not responding")
+        }
+
+        // ...and the permanent ones stay permanent through both, so the
+        // override cannot leak into cases that will never fix themselves.
+        for code in [EACCES, ENOTDIR, ELOOP, ENAMETOOLONG] {
+            #expect(!CommandTransport.pathReason(code).retryable, "errno \(code)")
+            #expect(!CommandTransport.targetReason(code).retryable, "errno \(code)")
+        }
+        #expect(!CommandTransport.targetReason(ENOENT).retryable)
+        #expect(CommandTransport.targetReason(ENOENT).reason == "is a broken symlink")
+    }
+
     /// `close()` is called from the main actor, once per pane. Blocking there
     /// while a wedged child fails to die froze the window for seconds when
     /// closing a split tab — up to four seconds per connection, and a four-pane
