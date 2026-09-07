@@ -116,24 +116,9 @@ final class FontGrid: @unchecked Sendable {
         // metrics come back in pixels and no scaling is needed downstream.
         let pixelSize = pointSize * scale
 
-        let base: CTFont
-        if let family, let f = Self.font(named: family, size: pixelSize) {
-            base = f
-        } else {
-            base =
-                CTFontCreateUIFontForLanguage(.userFixedPitch, pixelSize, nil)
-                ?? CTFontCreateWithName("Menlo" as CFString, pixelSize, nil)
-        }
+        faces = Self.primaryFaces(family: family, pixelSize: pixelSize)
 
-        let regular = FontFace(font: base)
-        faces = [
-            regular,
-            Self.derive(base, bold: true, italic: false, size: pixelSize, from: regular),
-            Self.derive(base, bold: false, italic: true, size: pixelSize, from: regular),
-            Self.derive(base, bold: true, italic: true, size: pixelSize, from: regular),
-        ]
-
-        metrics = GridMetrics.calc(regular.faceMetrics())
+        metrics = GridMetrics.calc(faces[FontStyle.regular.rawValue].faceMetrics())
         sprite = SpriteFace(metrics: metrics)
 
         atlasGrayscale = Atlas(size: Self.initialAtlasSize, format: .grayscale)
@@ -144,6 +129,76 @@ final class FontGrid: @unchecked Sendable {
         let descriptor = CTFontDescriptorCreateWithAttributes(
             [kCTFontFamilyNameAttribute: name] as CFDictionary)
         return CTFontCreateWithFontDescriptor(descriptor, size, nil)
+    }
+
+    /// The four styles of the primary family, in `FontStyle` order.
+    ///
+    /// A named family wins, then the font we ship, then whatever the system
+    /// calls fixed-pitch. The first two of those are libghostty's ordering:
+    /// `SharedGridSet.zig` adds its built-in faces only after completing the
+    /// configured ones, so a configured font always wins.
+    ///
+    /// Where this stops short of it is that libghostty *keeps* the built-in
+    /// behind a configured family as a per-style fallback, so a codepoint
+    /// the user's font lacks is drawn from ours before the system cascade is
+    /// asked. Our fallback slots carry no style, so that belongs with the
+    /// configurable font list rather than here (#42).
+    private static func primaryFaces(family: String?, pixelSize: Double) -> [FontFace] {
+        if let family, let named = font(named: family, size: pixelSize) {
+            return derivedFaces(named, size: pixelSize)
+        }
+        if let builtin = builtinFaces(size: pixelSize) { return builtin }
+        // Nothing bundled, which in practice means a build that dropped the
+        // resources. Land on the system's fixed-pitch face rather than on
+        // nothing.
+        let system =
+            CTFontCreateUIFontForLanguage(.userFixedPitch, pixelSize, nil)
+            ?? CTFontCreateWithName("Menlo" as CFString, pixelSize, nil)
+        return derivedFaces(system, size: pixelSize)
+    }
+
+    /// The font we ship, in the four styles, or nil when it is not in the
+    /// bundle.
+    ///
+    /// This is `SharedGridSet.zig`'s arrangement exactly. Two variable files
+    /// cover four styles: bold is the upright face with the `wght` axis at
+    /// 700, bold-italic the italic face with the same. libghostty embeds the
+    /// four static faces as well and then does not use them, and the reason
+    /// shows up here — a variable face carries every weight between 100 and
+    /// 800, so a static bold would only be a second copy of one of them.
+    ///
+    /// Italic does need its own file. `derive` cannot reach it: JetBrains
+    /// Mono ships italic separately, and asking CoreText for the italic
+    /// trait on the upright variable face returns the upright face, which
+    /// would quietly leave every italic cell synthetically skewed.
+    private static func builtinFaces(size: Double) -> [FontFace]? {
+        guard let upright = EmbeddedFont.variable,
+            let slanted = EmbeddedFont.variableItalic
+        else { return nil }
+
+        // The faces are parsed once at a nominal size and copied to the size
+        // wanted here, which is libghostty's `initFontCopy`.
+        let regular = FontFace(font: CTFontCreateCopyWithAttributes(upright, size, nil, nil))
+        let italic = FontFace(font: CTFontCreateCopyWithAttributes(slanted, size, nil, nil))
+        let bold = EmbeddedFont.boldWeight
+        let axis = EmbeddedFont.weightAxis
+        return [
+            regular,
+            regular.withVariation(axis: axis, value: bold),
+            italic,
+            italic.withVariation(axis: axis, value: bold),
+        ]
+    }
+
+    /// The four styles of one face, synthesizing whatever the family lacks.
+    private static func derivedFaces(_ base: CTFont, size: Double) -> [FontFace] {
+        let regular = FontFace(font: base)
+        return [
+            regular,
+            derive(base, bold: true, italic: false, size: size, from: regular),
+            derive(base, bold: false, italic: true, size: size, from: regular),
+            derive(base, bold: true, italic: true, size: size, from: regular),
+        ]
     }
 
     /// Derive a styled face, synthesizing whatever the family doesn't have.
