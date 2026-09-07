@@ -299,6 +299,30 @@ struct HostHeader: View {
                 .help(status.help)
             }
 
+            // The server answering this socket is not the one the app shipped.
+            // Deliberately *not* a button and not an action: whatever is
+            // running owns the terminals behind it, restarting it would end
+            // every one of them (there is no descriptor handoff yet), and a
+            // daemon from another checkout usually works perfectly well. This
+            // says so and gets out of the way. A snapshot that genuinely does
+            // not match fails loudly at `snapshot_begin` on its own.
+            if let skew = host.versionSkew {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.orange)
+                    // Says nothing about *why* the two differ. An app update is
+                    // one way to get here and the least likely one today: the
+                    // bundle carries a Debug host-arch daemon from `just build`
+                    // while a released one is ReleaseFast and universal, so a
+                    // developer -- or anyone who installed the tarball and
+                    // started it by hand -- sees this against an app built from
+                    // the identical commit (REVIEW F16).
+                    .help(
+                        "The server answering this socket is \(skew.server); this app ships "
+                            + "\(skew.shipped). Whatever started it owns its terminals, and they "
+                            + "are still here.")
+            }
+
             Spacer(minLength: 4)
 
             // Only what the user added can be removed; the local daemon is not

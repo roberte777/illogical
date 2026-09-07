@@ -64,7 +64,7 @@ no parser.
 
 | Type | Name | Payload |
 | --- | --- | --- |
-| `0x81` | `welcome` | protocol version, server version, session list |
+| `0x81` | `welcome` | protocol version, and the server's own build |
 | `0x82` | `session_list` | sessions and their terminals |
 | `0x83` | `created` | new terminal id |
 | `0x84` | `snapshot_begin` | snapshot format version |
@@ -297,6 +297,27 @@ Two consequences worth stating:
   probes the socket first and returns `AlreadyRunning` rather than unlinking a
   live daemon's socket out from under it, which would have left every terminal
   behind that daemon alive and unreachable.
+
+### `welcome.server`, and what a client does with it
+
+The `server` field is the daemon's `--version` string: a release version and the
+`vendor/ghostty` revision it was built against, `0.0.0-dev+g492300cad104`. The
+pin is in it because the pin is what decides whether two builds agree about a
+snapshot — format v1 makes no promise across pins, so two builds differing only
+in pin must compare unequal.
+
+It is a *notice*, not a gate. The Mac app compares it against the daemon it
+shipped and marks the host in the session dropdown when they differ; it blocks
+nothing, because a daemon from another checkout usually works, whatever is
+listening owns the terminals behind it, and a snapshot that genuinely does not
+match already fails at `snapshot_begin.format`. Skew is checked at three levels
+and this is the softest of them:
+
+| Level | Where | What happens |
+| --- | --- | --- |
+| Protocol version | `hello` → `err(version_mismatch)` | the client stops and says so |
+| Snapshot format | `snapshot_begin.format` | the attach fails loudly |
+| Server build | `welcome.server` | a marker and a tooltip |
 
 `illogicald --ensure` is this same dial-or-start with the bridge left off: it
 makes sure a daemon is listening, prints one line saying which of the two
