@@ -452,7 +452,8 @@ struct TransportTests {
         // self-referential link above does not reach, since that one's `lstat`
         // succeeds.
         let cycle = root.appending(path: "cycle")
-        try FileManager.default.createSymbolicLink(atPath: cycle.path, withDestinationPath: cycle.path)
+        try FileManager.default.createSymbolicLink(
+            atPath: cycle.path, withDestinationPath: cycle.path)
         let throughCycle = cycle.appending(path: "ssh").path
         #expect(reasonFor(throughCycle) == "\(throughCycle) is a loop of symlinks")
 
