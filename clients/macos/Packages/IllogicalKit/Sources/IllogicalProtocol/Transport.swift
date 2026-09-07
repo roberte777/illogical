@@ -54,8 +54,9 @@ public enum TransportError: Error, Equatable, CustomStringConvertible {
     /// The spawn failed for a reason that will clear on its own: out of
     /// descriptors, out of processes, out of memory. Retryable.
     case spawnFailed(command: String, reason: String)
-    /// The spawn failed for a reason about the *file*: it is not there, or not
-    /// executable, or not a program. Retrying cannot help.
+    /// The spawn failed for a reason retrying cannot help with: something
+    /// about the file -- not there, not executable, not a program -- or a
+    /// policy above it refusing to run the file at all.
     case notExecutable(command: String, reason: String)
 
     /// Read by a person, in the session dropdown, next to the host that failed.
@@ -259,17 +260,30 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// That disposes of the sub-case it was argued from, not of the objection.
     /// For a mount that times out rather than hanging -- soft NFS, autofs,
     /// smbfs -- retrying stalls the main actor for that timeout on every
-    /// backoff tick, and `whyNotRunnable` adds three more blocking calls on
-    /// the same path. Auto-recovery is still the right default for a volume
+    /// backoff tick, and `whyNotRunnable` adds two more blocking calls on the
+    /// same path. Auto-recovery is still the right default for a volume
     /// that comes back, and `.failed` is not a dead end either way: the
     /// dropdown's marker and the no-server screen both retry. But until
     /// `Connection(host:)` is off the main actor this verdict buys a window
     /// that stalls periodically, and that is the thing to fix next.
     ///
-    /// Unrecognised failures are transient. Retrying something permanent costs
-    /// one connection attempt every thirty seconds; giving up on something
-    /// temporary costs the machine for the life of the process.
-    static func spawnError(_ error: Error, command: String, path: String) -> TransportError {
+    /// An unrecognised *error* is transient -- retrying something permanent
+    /// costs one attempt every thirty seconds, while giving up on something
+    /// temporary costs the machine for the life of the process. An
+    /// unrecognised *stat errno* below is not, and the difference is not a
+    /// contradiction: by then the error has already been matched against the
+    /// permanent set, and the probe is only being asked which sentence to
+    /// use. Only the errnos named as recoverable send it back.
+    /// `verdict` is injectable because the composition below cannot otherwise
+    /// be checked: every condition a test can build on a real filesystem is
+    /// permanent, so `spawnError` discarding the retryable half -- which is
+    /// the regression this whole arm exists to prevent -- passed the entire
+    /// suite even with `route` itself pinned. Extracting `route` moved that
+    /// edge rather than closing it.
+    static func spawnError(
+        _ error: Error, command: String, path: String,
+        verdict: (String, NSError) -> (reason: String, retryable: Bool) = whyNotRunnable
+    ) -> TransportError {
         let ns = error as NSError
         let permanent: Set<Int32> = [
             ENOENT, EACCES, EPERM, ENOEXEC, EISDIR, ENOTDIR, ENAMETOOLONG, ELOOP,
@@ -286,7 +300,7 @@ public final class CommandTransport: Transport, @unchecked Sendable {
             return .spawnFailed(command: command, reason: ns.localizedDescription)
         }
 
-        return route(command: command, whyNotRunnable(path, ns))
+        return route(command: command, verdict(path, ns))
     }
 
     /// Send a verdict to the case whose template its wording was written for.
@@ -382,8 +396,17 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         // force-ejected volume `ENODEV`. Listing only the NFS ones left the
         // commonest case -- a laptop losing an SMB share -- on the permanent
         // side, which is the bug this arm exists for.
-        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, EHOSTDOWN, EHOSTUNREACH,
-            ENETDOWN, ENETUNREACH, ENODEV:
+        // NFS: `ESTALE`, `ETIMEDOUT`. smbfs: `ENOTCONN` when the session
+        // drops, `ECONNRESET`/`ENETRESET` when it dies mid-operation. The
+        // server itself unreachable: `EHOSTDOWN`, `EHOSTUNREACH`. The network
+        // gone: `ENETDOWN`, `ENETUNREACH`. Removable media: `ENODEV`, and
+        // Darwin's own `EPWROFF`/`EDEVERR` for a disk unpowered or failed.
+        //
+        // The list has to be right because the default below is *permanent*:
+        // an errno missing from here is a host that never comes back on its
+        // own, which is the bug this arm exists for.
+        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET,
+            EHOSTDOWN, EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV, EPWROFF, EDEVERR:
             return ("the volume its target is on is not responding", true)
         default: return ("points at something that could not be checked", false)
         }
@@ -422,8 +445,17 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         // force-ejected volume `ENODEV`. Listing only the NFS ones left the
         // commonest case -- a laptop losing an SMB share -- on the permanent
         // side, which is the bug this arm exists for.
-        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, EHOSTDOWN, EHOSTUNREACH,
-            ENETDOWN, ENETUNREACH, ENODEV:
+        // NFS: `ESTALE`, `ETIMEDOUT`. smbfs: `ENOTCONN` when the session
+        // drops, `ECONNRESET`/`ENETRESET` when it dies mid-operation. The
+        // server itself unreachable: `EHOSTDOWN`, `EHOSTUNREACH`. The network
+        // gone: `ENETDOWN`, `ENETUNREACH`. Removable media: `ENODEV`, and
+        // Darwin's own `EPWROFF`/`EDEVERR` for a disk unpowered or failed.
+        //
+        // The list has to be right because the default below is *permanent*:
+        // an errno missing from here is a host that never comes back on its
+        // own, which is the bug this arm exists for.
+        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET,
+            EHOSTDOWN, EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV, EPWROFF, EDEVERR:
             return ("the volume it is on is not responding", true)
         // Anything not established says so. Naming a cause we have not
         // determined is how a file somebody was looking at came to be

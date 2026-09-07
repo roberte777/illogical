@@ -773,6 +773,18 @@ struct TransportTests {
                     command: "ssh", ("is not executable", false)))
                 == "ssh is not executable")
 
+        // And that `spawnError` uses the verdict rather than discarding it.
+        // Pinning `route` alone left this open: dropping the retryable half in
+        // the composition passed the whole suite, because no filesystem a test
+        // can build produces a retryable verdict.
+        let stalled = CommandTransport.spawnError(
+            NSError(domain: NSCocoaErrorDomain, code: 4), command: "ssh", path: "/unused",
+            verdict: { _, _ in ("the volume it is on is not responding", true) })
+        #expect(
+            String(describing: stalled)
+                == "could not run ssh: the volume it is on is not responding")
+        #expect(stalled.isTransient, "a recoverable verdict was rendered as permanent")
+
         // A permanent one through a real spawn, for the whole path.
         #expect(
             String(
