@@ -573,14 +573,20 @@ struct TransportTests {
                 == ("is in a directory that cannot be searched", false))
         #expect(
             CommandTransport.pathReason(EPERM)
-                == ("is somewhere this app has not been granted access to", false))
+                == (
+                    "is somewhere this app has not been granted access to (Privacy & Security ▸ Files and Folders)",
+                    false
+                ))
         #expect(
             CommandTransport.pathReason(ENOTDIR)
                 == ("is under something that is not a directory", false))
         #expect(CommandTransport.pathReason(ELOOP) == ("is a loop of symlinks", false))
         #expect(
             CommandTransport.pathReason(ENAMETOOLONG) == ("is too long a path to open", false))
-        for code in [EIO, ESTALE, ETIMEDOUT, ENXIO] {
+        for code in [
+            EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, EHOSTDOWN, EHOSTUNREACH, ENETDOWN,
+            ENETUNREACH, ENODEV,
+        ] {
             #expect(
                 CommandTransport.pathReason(code)
                     == ("the volume it is on is not responding", true), "errno \(code)")
@@ -598,7 +604,19 @@ struct TransportTests {
         #expect(
             CommandTransport.targetReason(ENAMETOOLONG)
                 == ("points at too long a path to open", false))
-        for code in [EIO, ESTALE, ETIMEDOUT, ENXIO] {
+        // Its sibling is asserted above; leaving this one out is the asymmetry
+        // this file has objected to twice.
+        #expect(
+            CommandTransport.targetReason(EPERM)
+                == (
+                    "points somewhere this app has not been granted access to"
+                        + " (Privacy & Security ▸ Files and Folders)",
+                    false
+                ))
+        for code in [
+            EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, EHOSTDOWN, EHOSTUNREACH, ENETDOWN,
+            ENETUNREACH, ENODEV,
+        ] {
             #expect(
                 CommandTransport.targetReason(code)
                     == ("the volume its target is on is not responding", true), "errno \(code)")
@@ -606,6 +624,31 @@ struct TransportTests {
         #expect(
             CommandTransport.targetReason(EBUSY)
                 == ("points at something that could not be checked", false))
+    }
+
+    /// `close()` is called from the main actor, once per pane. Blocking there
+    /// while a wedged child fails to die froze the window for seconds when
+    /// closing a split tab — up to four seconds per connection, and a four-pane
+    /// tab closes four of them.
+    @Test("closing does not block the caller on a child that ignores SIGTERM")
+    func closeDoesNotBlockTheCaller() async throws {
+        // `trap` without `exec`: the shell keeps ignoring SIGTERM, so
+        // `shutdown()` cannot end it and the reader never sees end-of-file.
+        let transport = try CommandTransport(
+            argv: ["/bin/sh", "-c", "trap '' TERM; sleep 2"])
+        let connection = Connection(transport: transport)
+        connection.start()
+
+        // Let the reader actually reach its `read`. Without this it is still
+        // at the loop's `closed` guard when `close` runs, exits immediately,
+        // and the wait this test is about succeeds at once — which is how an
+        // earlier version of it passed with the fix removed.
+        try await Task.sleep(for: .milliseconds(200))
+
+        let start = Date()
+        connection.close()
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(elapsed < 0.5, "close() blocked its caller for \(elapsed)s")
     }
 
     /// The pairing between a reason and the case it is routed to, as a rule
@@ -656,11 +699,25 @@ struct TransportTests {
             } catch { return String(describing: error) }
         }
 
-        // Production passes a bare `ssh`, so the subject is the command name.
+        // A real spawn against a path that is absent.
         let absent = root.appending(path: "ssh").path
         #expect(rendered(absent) == "\(absent) is not there")
 
-        // And the retryable template, which nothing rendered before.
+        // The routing, which the spawns above cannot reach: every condition a
+        // test can construct is permanent, so with the ternary inlined in
+        // `spawnError` a mutation that dropped it passed everything.
+        #expect(
+            String(
+                describing: CommandTransport.route(
+                    command: "ssh", ("the volume it is on is not responding", true)))
+                == "could not run ssh: the volume it is on is not responding")
+        #expect(
+            String(
+                describing: CommandTransport.route(
+                    command: "ssh", ("is not executable", false)))
+                == "ssh is not executable")
+
+        // A permanent one through a real spawn, for the whole path.
         #expect(
             String(
                 describing: CommandTransport.spawnError(
