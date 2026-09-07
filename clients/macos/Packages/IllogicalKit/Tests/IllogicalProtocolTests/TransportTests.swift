@@ -93,31 +93,37 @@ struct SSHCommandTests {
     /// share one multiplexing master. Drifting apart silently doubles the SSH
     /// connections a machine holds.
     ///
-    /// Asserted against `$HOME` explicitly, not against whatever API the
-    /// implementation happens to call. Computing the expectation the same way
-    /// the code does made this tautological: it stayed green while the two
-    /// languages derived home differently, which is exactly the bug it is named
-    /// for. `src/core/conn.zig` uses `getenv("HOME")`.
+    /// `HOME` is *set* here rather than read. Every previous version of this
+    /// test computed its expectation the same way the code computes the value
+    /// — first inline, then via a parameter whose default was the same
+    /// expression — and each time the tautology simply moved: substituting
+    /// `homeDirectoryForCurrentUser` for the environment read left the suite
+    /// green, because the two agree on every machine anyone runs this on.
+    /// Only an input the test controls can tell them apart.
+    ///
+    /// Nothing else in this package reads `HOME`, so mutating it briefly is
+    /// safe even though suites run concurrently. `src/core/conn.zig:291` uses
+    /// `getenv("HOME")`, which is what this is pinning parity with.
     @Test("the default control path is the one src/core/conn.zig renders")
     func defaultControlPath() throws {
-        let home = try #require(ProcessInfo.processInfo.environment["HOME"])
+        let original = getenv("HOME").map { String(cString: $0) }
+        defer {
+            if let original { setenv("HOME", original, 1) } else { unsetenv("HOME") }
+        }
+
+        setenv("HOME", "/tmp/illogical-not-your-home", 1)
         #expect(
             SSHCommand.controlPath(SSHCommand.Options(destination: "h"))
-                == home + "/.ssh/illogical-%C")
+                == "/tmp/illogical-not-your-home/.ssh/illogical-%C")
 
-        // And it is really the *environment* that decides, not the passwd
-        // entry `homeDirectoryForCurrentUser` reads. Asserted with a home that
-        // is not this process's own, because the two agree on every machine
-        // anyone runs this on -- so comparing `$HOME` against itself, which is
-        // what this did before, stayed green with the bug reintroduced. The
-        // bug is real: `src/core/conn.zig` renders the same path from
-        // `getenv("HOME")`, and a client that disagreed would bind a second
-        // control socket and hold a second ssh master for every host.
+        // No home at all is not a path, rather than one rooted at nothing.
+        unsetenv("HOME")
+        #expect(SSHCommand.controlPath(SSHCommand.Options(destination: "h")) == nil)
+
+        // And an explicit home still wins, which is what the parameter is for.
         #expect(
             SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: "/tmp/elsewhere")
                 == "/tmp/elsewhere/.ssh/illogical-%C")
-        // No home at all is not a path, rather than a path rooted at nothing.
-        #expect(SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: nil) == nil)
     }
 
     @Test("the ssh binary can be overridden")
