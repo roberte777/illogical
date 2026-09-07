@@ -443,6 +443,19 @@ struct TransportTests {
             #expect(reasonFor(hidden) == "\(hidden) is in a directory that cannot be searched")
         }
 
+        // A path *through* a regular file. Distinct from the unsearchable
+        // directory above: there is no directory to fix.
+        let underFile = root.appending(path: "ssh").appending(path: "inner").path
+        #expect(reasonFor(underFile) == "\(underFile) is under something that is not a directory")
+
+        // A loop in a parent component, which fails `lstat` too -- the arm the
+        // self-referential link above does not reach, since that one's `lstat`
+        // succeeds.
+        let cycle = root.appending(path: "cycle")
+        try FileManager.default.createSymbolicLink(atPath: cycle.path, withDestinationPath: cycle.path)
+        let throughCycle = cycle.appending(path: "ssh").path
+        #expect(reasonFor(throughCycle) == "\(throughCycle) is a loop of symlinks")
+
         // And none of it is an NSError dump.
         for path in [notExecutable, absent, root.path, notAProgram] {
             let text = try #require(reasonFor(path))
@@ -475,7 +488,11 @@ struct TransportTests {
         }
         // ...and the permanent ones stay permanent, so the guard is pinned
         // from both sides rather than only one.
-        for code in [ENOENT, EACCES, ENOEXEC] {
+        // All six, not the three that were easy to reach: drop `ELOOP` from the
+        // set and a host whose `ssh` is a symlink loop is retried every thirty
+        // seconds under an amber "reconnecting…" for the life of the process,
+        // which is the `EMFILE` regression this test exists for, mirrored.
+        for code in [ENOENT, EACCES, ENOEXEC, EISDIR, ENAMETOOLONG, ELOOP] {
             #expect(!classify(NSPOSIXErrorDomain, code).isTransient, "errno \(code)")
         }
         #expect(!classify(NSCocoaErrorDomain, 4).isTransient)

@@ -300,7 +300,12 @@ public final class CommandTransport: Transport, @unchecked Sendable {
             return followError == ELOOP ? "is a loop of symlinks" : "is a broken symlink"
         }
         switch errno {
-        case EACCES, ENOTDIR: return "is in a directory that cannot be searched"
+        case EACCES: return "is in a directory that cannot be searched"
+        // Not the same fault, and not the same advice: there is no
+        // unsearchable directory to go and look at, because a component of the
+        // path is not a directory at all. `/usr/local/bin/ssh` where
+        // `/usr/local/bin` is a leftover regular file.
+        case ENOTDIR: return "is under something that is not a directory"
         case ELOOP: return "is a loop of symlinks"
         case ENAMETOOLONG: return "is too long a path to open"
         default: return "is not there"
