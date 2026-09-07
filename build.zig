@@ -7,6 +7,37 @@ pub fn build(b: *std.Build) void {
     const ghostty_vt = ghosttyVtModule(b, target, optimize);
 
     // ---------------------------------------------------------------
+    // Version, stamped in rather than written down.
+    //
+    // `illogical.version` was the literal "0.0.0-dev", which made `--version`
+    // and the `server` field of every `welcome` frame the same string for
+    // every build ever made. The Mac client compares the daemon it is talking
+    // to against the daemon it shipped with, and a constant cannot answer
+    // that question.
+    //
+    // The ghostty pin is part of the version rather than a footnote: it is
+    // what actually decides whether two builds agree about a snapshot. Format
+    // v1 carries no compatibility guarantee across pins (README, "The ghostty
+    // pin"), so two builds differing only in pin must compare unequal.
+    // ---------------------------------------------------------------
+    const version = b.option(
+        []const u8,
+        "version",
+        "Version string to stamp into the binaries (default: 0.0.0-dev)",
+    ) orelse "0.0.0-dev";
+    // A default rather than a `git` call from build.zig: `zig build` has to
+    // work from a source tarball with no .git and no submodule, and the repo's
+    // own answer belongs in the justfile where it can fail loudly.
+    const ghostty_pin = b.option(
+        []const u8,
+        "ghostty-pin",
+        "vendor/ghostty revision to stamp into the version (default: unknown)",
+    ) orelse "unknown";
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    build_options.addOption([]const u8, "ghostty_pin", ghostty_pin);
+
+    // ---------------------------------------------------------------
     // illogical-core: everything both the daemon and the CLI need.
     // ---------------------------------------------------------------
     const core = b.addModule("illogical", .{
@@ -16,6 +47,10 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     if (ghostty_vt) |m| core.addImport("ghostty-vt", m);
+    // On the core module alone. Both executables read the version through
+    // `illogical.version`, so there is one copy of the string and one place
+    // that decides its shape.
+    core.addImport("build_options", build_options.createModule());
 
     // ---------------------------------------------------------------
     // illogicald: the session server.

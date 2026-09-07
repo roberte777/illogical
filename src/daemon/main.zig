@@ -21,7 +21,12 @@ const usage =
     \\                           listening: bridge to this host's daemon, starting
     \\                           one if there is none. What `ssh <host> illogicald
     \\                           --stdio` runs.
-    \\  --no-spawn               With --stdio, fail rather than start a daemon
+    \\  --ensure                 Make sure a daemon is listening, then exit. Starts
+    \\                           one, detached, if there is none, and leaves the
+    \\                           existing one alone if there is. What the Mac app
+    \\                           runs when its own connect is refused.
+    \\  --no-spawn               With --stdio or --ensure, fail rather than start
+    \\                           a daemon
     \\  --park-after <s>         PTY-read idle time before a terminal parks to disk (default: 60)
     \\  --pty-park-after <s>     Unobserved time before a PTY leaves its dedicated
     \\                           thread for the shared poller (default: 5)
@@ -53,6 +58,7 @@ pub fn main(init: std.process.Init) !void {
     var pty_park_after_s: ?u64 = null;
     var client_park_after_s: ?u64 = null;
     var stdio_mode = false;
+    var ensure_mode = false;
     var spawn_daemon = true;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -63,6 +69,10 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, arg, "--stdio")) {
             stdio_mode = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--ensure")) {
+            ensure_mode = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--no-spawn")) {
@@ -145,6 +155,29 @@ pub fn main(init: std.process.Init) !void {
     };
     posix.sigaction(posix.SIG.PIPE, &ignore, null);
 
+    // Before `--stdio`, because `--ensure` is the cheaper request and the two
+    // together would otherwise silently mean "bridge": a caller that asked for
+    // both wants a daemon and no pipe.
+    if (ensure_mode) {
+        const started = stdio.ensure(path, .{ .spawn = spawn_daemon }) catch |err| {
+            // Stderr, and never stdout: the app reads this to explain itself to
+            // a human, and one place to look is the whole value of naming the
+            // log here. `spawnDetached` points the daemon's own stderr at that
+            // file, so a daemon that started and then died says why there and
+            // nowhere else.
+            reportEnsureFailure(err, path, spawn_daemon);
+        };
+        // One line, and it is the only thing on stdout: the app does not parse
+        // it, but a person running this by hand wants to know which of the two
+        // happened, because "already running" means their terminals are still
+        // where they left them.
+        switch (started) {
+            .already_running => try out.print("illogicald is already running on {s}\n", .{path}),
+            .started => try out.print("illogicald started, listening on {s}\n", .{path}),
+        }
+        return out.flush();
+    }
+
     if (stdio_mode) {
         // Nothing on stdout but frames from here on: it is the client's
         // transport. Diagnostics go to stderr, which SSH keeps separate.
@@ -154,7 +187,12 @@ pub fn main(init: std.process.Init) !void {
                     "check that illogicald can start on this host",
                 .{ path, err },
             );
-            return err;
+            // Exit rather than return, for the same reason `--ensure` does: a
+            // Debug build returning an error from `main` prints a three-frame
+            // return trace with absolute source paths, and this stderr is
+            // ssh's, which the client reads back as the reason the remote is
+            // unreachable.
+            std.process.exit(1);
         };
         return;
     }
@@ -205,6 +243,74 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 
     try server.run();
+}
+
+/// Say why `--ensure` failed, in one sentence, and exit 1.
+///
+/// One line on stderr, written straight to the descriptor, and then `_exit`.
+/// Every part of that is deliberate, because this text goes in front of a
+/// person twice: it is what someone running `illogicald --ensure` by hand
+/// reads, and it is what the Mac app quotes verbatim into "No server" when the
+/// start it asked for did not happen.
+///
+/// - Not `std.log.err`, which prefixes `error: ` and would make the app's
+///   sentence read "…could not start a server: error: …".
+/// - Not `return error.NoServer` from `main`, which in a Debug build -- the
+///   build `just stage-daemon` embeds -- prints `error: NoServer` and a
+///   three-frame return trace with absolute `.zig` paths after it. The app
+///   showed that trace to people (REVIEW F4).
+/// - Self-contained sentences, naming the path and the log rather than an
+///   error name: `NoServer` means nothing to the person reading it, and the
+///   app has no way to translate it.
+fn reportEnsureFailure(err: anyerror, path: []const u8, spawn_daemon: bool) noreturn {
+    const dir = std.fs.path.dirname(path) orelse ".";
+    const startup_s = (stdio.Options{}).startup_timeout_ns / std.time.ns_per_s;
+
+    var buf: [2 * std.fs.max_path_bytes + 256]u8 = undefined;
+    const line = switch (err) {
+        error.NoServer => if (!spawn_daemon)
+            std.fmt.bufPrint(
+                &buf,
+                "illogicald --ensure: nothing is listening on {s}, and --no-spawn was given\n",
+                .{path},
+            )
+        else
+            std.fmt.bufPrint(
+                &buf,
+                "illogicald --ensure: started a daemon for {s}, but nothing answered " ++
+                    "within {d} s; its log is {s}/daemon.log\n",
+                .{ path, startup_s, dir },
+            ),
+        error.StateDirUnwritable => std.fmt.bufPrint(
+            &buf,
+            "illogicald --ensure: cannot write to {s}, where the socket and daemon.log live\n",
+            .{dir},
+        ),
+        error.SocketPathNotAbsolute => std.fmt.bufPrint(
+            &buf,
+            "illogicald --ensure: the socket path must be absolute (got {s}); " ++
+                "the daemon outlives this shell and its working directory\n",
+            .{path},
+        ),
+        error.SpawnFailed => std.fmt.bufPrint(
+            &buf,
+            "illogicald --ensure: could not fork a daemon for {s}\n",
+            .{path},
+        ),
+        error.PathTooLong => std.fmt.bufPrint(
+            &buf,
+            "illogicald --ensure: the socket path is too long\n",
+            .{},
+        ),
+        else => std.fmt.bufPrint(
+            &buf,
+            "illogicald --ensure: no daemon on {s} ({t})\n",
+            .{ path, err },
+        ),
+    } catch "illogicald --ensure: no daemon, and the reason did not fit in a line\n";
+
+    illogical.sys.writeAll(illogical.sys.STDERR, line) catch {};
+    std.process.exit(1);
 }
 
 fn onSignal(_: std.c.SIG) callconv(.c) void {

@@ -231,6 +231,13 @@ broken.
 `hello` carries the client's protocol version; a mismatch gets `err` with
 `version_mismatch` and the connection closes.
 
+The close is the refusal, and it is not decoration. Clients pipeline — `hello`
+and `list` go out back to back — so a daemon that sent the `err` and kept
+serving would answer the `list` too, and a client that reads a `session_list` as
+"connected" would go on to drive a daemon whose protocol it does not speak. So
+after a refused `hello` the daemon flushes the `err`, shuts the socket down in
+both directions, and answers nothing that was already in flight behind it.
+
 Note the *snapshot* format has **no compatibility guarantee** in libghostty-vt
 right now, which is why client and server are built from one pinned ghostty
 revision. Superlogical intends its protocol to be open and shipped as part of
@@ -246,6 +253,14 @@ document.
 
 No listening TCP socket, no TLS, no authentication of our own. Access to the
 socket is filesystem permissions; remote access is whatever SSH decided.
+
+**Who starts the local daemon.** Whoever needs it and finds none. A person runs
+`illogicald`; the Mac app runs `illogicald --ensure --socket <path>` and then
+connects over the socket as usual. Nothing on the local fast path is a bridge or
+a child — `--ensure` starts a detached daemon and exits, so the daemon it leaves
+behind belongs to no one and outlives everyone. Whatever is already listening
+always wins: `--ensure` connects first and starts nothing if that succeeds, and
+`Server.listen` refuses to unlink a live daemon's socket if two of them race.
 
 ### `--stdio` is a bridge, not a server
 
@@ -282,6 +297,13 @@ Two consequences worth stating:
   probes the socket first and returns `AlreadyRunning` rather than unlinking a
   live daemon's socket out from under it, which would have left every terminal
   behind that daemon alive and unreachable.
+
+`illogicald --ensure` is this same dial-or-start with the bridge left off: it
+makes sure a daemon is listening, prints one line saying which of the two
+happened, and exits. `--no-spawn` composes with both, and turns either into a
+probe. The Mac app uses `--ensure` rather than `--stdio` locally on purpose — a
+bridge would put a process and a copy on every local connection, and a window
+with four splits opens five of them.
 
 ### Multiplexing SSH
 
