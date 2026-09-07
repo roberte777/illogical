@@ -405,6 +405,60 @@ Paste is `ghostty_paste_encode`, which strips control bytes and wraps in
 bracketed paste when the program asked for it; `ghostty_paste_is_safe` decides
 when to ask the user first, because a pasted newline is a pressed return and
 outside bracketed paste the shell cannot tell the difference.
+
+## Search
+
+`search.h` is incremental by design: `tick` makes bounded progress on data the
+search has already copied and never touches the terminal, `feed` reads the
+terminal to pick up changes, and the caller decides how much of each a frame
+may cost. Who that caller is, is the only real design decision here — and it is
+the find bar, not the render thread. `SearchSession` pumps on the main actor
+while the bar is on screen: at frame rate until the search reports complete,
+slowly after that, because feeding is the only way a search learns about new
+output or a moved viewport. Closing the bar drops the needle, so a terminal
+with no find bar over it does no search work at all.
+
+Everything that touches the terminal — the needle, a feed, stepping to the next
+match — goes through the engine's lock, the discipline selection already
+follows and for a sharper reason: a match is an **untracked** grid reference,
+valid only until the next byte of output. Reading the viewport's matches and
+converting them to cells is therefore one operation under that lock, in
+`updateSnapshot`, beside `begin_update`.
+
+A match is a selection over two grid references and nothing more — Ghostty's
+own `RenderState.Highlight` is not in the C API — so mapping matches onto
+per-row cell ranges is ours. The renderer takes them as the four-way
+`{ plain, selection, search, search selected }` value Ghostty carries where we
+had a `selected: Bool`, with one colour pair for a match and another for the
+one you are standing on. Like a selection, a highlight changes no cell, so the
+frame is rebuilt in full when the set of them moves — and doing that has to
+*wake* the render loop, which pauses after a second of quiet.
+
+A search is bound to the terminal it was created with and cannot be rebound, so
+`adopt` makes a new one and gives it the same needle: a find bar open across an
+attach keeps looking for the same thing.
+
+### The find bar floats, and gets out of the way
+
+The bar is an overlay on the surface rather than a row above it. A bar that
+took its own space would resize the PTY every time ⌘F was pressed — a
+`winsize` change, a resize sequence to whatever is running, and a reflow of the
+very screen being searched.
+
+The price of floating is that it covers something, and the one thing it must
+not cover is a match. So it moves: `SearchNudge` walks the bar down, a match at
+a time, until nothing the search found is underneath it, and `SearchBar`
+animates the difference. Down rather than sideways, because what it is dodging
+is text on a grid — moving left would put the bar over the middle of a line,
+which is where output actually lives, while moving down lands it in the gap
+between two rows. It gives up rather than walking off: past a fraction of the
+surface, a find bar in the middle of the screen is worse than one covering a
+hit it has already scrolled you to.
+
+That geometry is a pure function of two rectangles and a list, which is what
+makes "the bar gets out of the way" something a test holds rather than
+something you check by looking at it.
+
 ## Input
 
 Encode with libghostty-vt and send the bytes as `input`. Do not echo locally:
@@ -469,7 +523,9 @@ never be typed into a terminal.
 | ⇧⌘] / ⇧⌘[ | Show Next / Previous Tab, wrapping | Window |
 | ⌘1 … ⌘8 | Select that tab | Window |
 | ⌘9 | Last tab (the iTerm/Ghostty/browser convention, not the ninth) | Window |
-| Esc | Dismiss the session menu | `SessionMenu`'s `onEscape` — a local `NSEvent` monitor, alive only while the menu is |
+| ⌘F | Find — opens the find bar over the focused pane, keeping the last query | Edit |
+| ⌘G / ⇧⌘G | Next / Previous match, wrapping; greyed out with no bar open and nothing found | Edit |
+| Esc | Dismiss the session menu, or the find bar | each one's `onEscape` — a local `NSEvent` monitor, alive only while that overlay is |
 | ⌘Home / ⌘End | Scroll to the top / bottom of the scrollback | `TerminalSurfaceView.keyDown` |
 | ⌘PgUp / ⌘PgDn | Scroll one page (a screen less a row of overlap) | `TerminalSurfaceView.keyDown` |
 | ⌘C / ⌘V / ⌘A | Copy / Paste / Select All | system Edit menu → responder chain |

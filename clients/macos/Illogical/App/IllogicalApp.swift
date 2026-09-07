@@ -86,6 +86,22 @@ struct IllogicalApp: App {
                 .keyboardShortcut(.return, modifiers: [.command, .shift])
                 .disabled(store.selectedTab?.isSplit != true)
             }
+            // Find, where macOS puts it: after the pasteboard items in Edit.
+            // Menu items rather than a key monitor, for the reason the tab
+            // chords are — a chord a menu claims never reaches `keyDown`, so
+            // ⌘F cannot also be typed into the terminal.
+            CommandGroup(after: .pasteboard) {
+                Divider()
+                Button("Find…") { store.beginFind() }
+                    .keyboardShortcut("f", modifiers: .command)
+                    .disabled(store.selectedController == nil)
+                Button("Find Next") { store.findNext() }
+                    .keyboardShortcut("g", modifiers: .command)
+                    .disabled(!store.canFindAgain)
+                Button("Find Previous") { store.findPrevious() }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                    .disabled(!store.canFindAgain)
+            }
             CommandGroup(after: .toolbar) {
                 Button("Change Session") { store.toggleSessionMenu() }
                     .keyboardShortcut("k", modifiers: [.command, .shift])

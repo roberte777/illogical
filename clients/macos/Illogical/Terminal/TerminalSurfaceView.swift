@@ -280,6 +280,33 @@ final class TerminalSurfaceView: NSView {
     /// knowing where the renderer decided to put the grid.
     var rendererSizeForTesting: RendererSize? { renderer?.currentSize }
 
+    /// Where `spans` are on screen, in this view's own coordinates.
+    ///
+    /// The find bar dodges what the search found, so it has to know where the
+    /// matches *are* — and the only thing that knows how the grid was laid out
+    /// is the renderer that laid it out. Points rather than pixels, because the
+    /// thing doing the dodging is a SwiftUI overlay in the same space as this
+    /// view; the view is flipped, so both have their origin at the top left and
+    /// no flipping is needed on the way across.
+    func rects(for spans: [SearchMatchSpan]) -> [CGRect] {
+        guard !spans.isEmpty, let renderer else { return [] }
+        let scale = window?.backingScaleFactor ?? 2
+        guard scale > 0 else { return [] }
+        let size = renderer.currentSize
+        let cellWidth = Double(size.cell.width) / scale
+        let cellHeight = Double(size.cell.height) / scale
+        let left = Double(size.padding.left) / scale
+        let top = Double(size.padding.top) / scale
+
+        return spans.map { span in
+            CGRect(
+                x: left + Double(span.start) * cellWidth,
+                y: top + Double(span.row) * cellHeight,
+                width: Double(Int(span.end) - Int(span.start) + 1) * cellWidth,
+                height: cellHeight)
+        }
+    }
+
     /// The grid size this view can show, in cells.
     var gridSize: (cols: UInt16, rows: UInt16) {
         guard let renderer else {

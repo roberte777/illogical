@@ -329,6 +329,32 @@ final class SessionStore {
         return terminal(ref)
     }
 
+    // MARK: - Find
+    //
+    // Menu items rather than a key monitor, for the reason ⌘1–⌘9 are: a chord
+    // a menu claims never reaches `keyDown`, so it cannot also be typed into
+    // the terminal. Which pane they act on is this store's question and not the
+    // find bar's — there is one bar per terminal, and ⌘F means the one in
+    // front.
+
+    /// The controller for the terminal in front, if it has been attached to.
+    var selectedController: TerminalController? {
+        selectedRef.flatMap { existingController(for: $0) }
+    }
+
+    /// ⌘F. Opens the find bar over the focused pane, keeping whatever was last
+    /// searched for.
+    func beginFind() { selectedController?.search.open() }
+
+    /// ⌘G and ⇧⌘G. Nothing when no bar is open: a find that reopened the bar
+    /// would make the two chords mean different things depending on what was on
+    /// screen a minute ago.
+    func findNext() { selectedController?.search.selectNext() }
+    func findPrevious() { selectedController?.search.selectPrevious() }
+
+    /// Whether stepping between matches would do anything, so the menu says so.
+    var canFindAgain: Bool { selectedController?.search.canStep ?? false }
+
     var selectedSession: SessionRef? {
         if let tab = selectedTab { return tab.session }
         guard let host = hosts.first, let session = host.sessions.first else { return nil }

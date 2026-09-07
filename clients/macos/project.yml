@@ -104,6 +104,12 @@ targets:
       # is only worth anything if the responder methods are in the test too.
       - path: Illogical/Terminal/Input
       - path: Illogical/Terminal/Selection
+      # Search is the other half of that same story. The engine end drives
+      # libghostty's incremental search and maps its matches onto rows, which
+      # is the part with a C API and lifetime rules behind it; `SearchNudge` is
+      # the pure geometry the find bar gets out of the way with, and the only
+      # part of "the bar dodges what it found" a test can hold without a window.
+      - path: Illogical/Terminal/Search
       - path: Illogical/Terminal/TerminalSurfaceView.swift
       - path: Illogical/Terminal/ScrollAccumulator.swift
       - path: Illogical/Terminal/ScrollbarOverlay.swift

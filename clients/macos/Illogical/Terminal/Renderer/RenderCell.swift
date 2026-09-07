@@ -132,6 +132,32 @@ struct RenderCell {
     }
 }
 
+/// A search match, or the part of one that falls on a row.
+///
+/// Row-local and inclusive, like `RenderRow.selection` — the difference is
+/// that a row may intersect any number of matches but only one selection.
+struct SearchHighlight: Equatable {
+    var start: UInt16
+    var end: UInt16
+    /// The match the find bar is currently on, which gets a colour of its own
+    /// so you can see where you are in a screen full of hits.
+    var isSelected: Bool
+}
+
+/// How a cell is painted over: the four-way value Ghostty's own renderer uses
+/// where a terminal without search has a `selected: Bool`.
+///
+/// Ordered by precedence, and the order is the point. A search match wins over
+/// a selection left behind by the mouse: while a find bar is open the matches
+/// are what was asked for, and a stale highlight over one of them would hide
+/// the answer. The match you are *on* wins over the rest for the same reason.
+enum CellPaint {
+    case plain
+    case selection
+    case searchMatch
+    case searchSelected
+}
+
 /// One row of extracted cells plus its grapheme scratch.
 struct RenderRow {
     var cells: [RenderCell] = []
@@ -140,6 +166,9 @@ struct RenderRow {
     var graphemes: [UInt32] = []
     /// Row-local selection range, inclusive, if the row intersects one.
     var selection: (start: UInt16, end: UInt16)? = nil
+    /// Search matches intersecting this row. Empty whenever no find bar is
+    /// open, which is almost always, so this costs nothing to carry.
+    var search: [SearchHighlight] = []
 
     mutating func reset(columns: Int) {
         if cells.count != columns {
@@ -149,5 +178,26 @@ struct RenderRow {
         }
         graphemes.removeAll(keepingCapacity: true)
         selection = nil
+        search.removeAll(keepingCapacity: true)
+    }
+
+    /// How the cell at `column` is painted.
+    ///
+    /// A spacer tail belongs to the character before it, so it takes that
+    /// cell's answer — otherwise the second half of a wide character inside a
+    /// match would be left unhighlighted.
+    func paint(at column: Int) -> CellPaint {
+        guard column < cells.count else { return .plain }
+        let x = cells[column].wide == .spacerTail ? UInt16(max(0, column - 1)) : UInt16(column)
+
+        var result: CellPaint = .plain
+        if let selection, x >= selection.start, x <= selection.end { result = .selection }
+        for highlight in search where x >= highlight.start && x <= highlight.end {
+            // The selected match is the strongest of the four, so it can stop
+            // here; another match cannot outrank it.
+            if highlight.isSelected { return .searchSelected }
+            result = .searchMatch
+        }
+        return result
     }
 }

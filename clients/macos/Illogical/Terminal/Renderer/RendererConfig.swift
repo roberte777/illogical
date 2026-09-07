@@ -52,6 +52,20 @@ struct RendererConfig {
     var selectionBackground: (r: UInt8, g: UInt8, b: UInt8)? = nil
     var selectionForeground: (r: UInt8, g: UInt8, b: UInt8)? = nil
 
+    /// Search match colours, and the match the find bar is on.
+    ///
+    /// Not optional, unlike the selection's: inverting is already what a
+    /// selection looks like, so a search that inverted too would be
+    /// indistinguishable from one — and the whole point of the second pair is
+    /// that you can see *which* of a screenful of hits you are standing on.
+    /// Amber against the theme's dark blue, dim for a match and bright for the
+    /// one you are on, which is what every terminal's find has looked like
+    /// since less(1).
+    var searchBackground: (r: UInt8, g: UInt8, b: UInt8) = (0x7C, 0x66, 0x22)
+    var searchForeground: (r: UInt8, g: UInt8, b: UInt8) = (0xF4, 0xEC, 0xD8)
+    var searchSelectedBackground: (r: UInt8, g: UInt8, b: UInt8) = (0xF2, 0xC0, 0x4C)
+    var searchSelectedForeground: (r: UInt8, g: UInt8, b: UInt8) = (0x0C, 0x1F, 0x2F)
+
     /// Scroll speed. Precision deltas (trackpad) are pixels and pass through
     /// as-is; discrete deltas (wheel) are ticks and get multiplied by the cell
     /// height, so one tick is three rows. libghostty's defaults.

@@ -335,7 +335,7 @@ final class TerminalRenderer: @unchecked Sendable {
             ? snapshot.cursor.x : nil
         let runs = shaper.runs(
             row: row.cells, graphemes: row.graphemes, cols: cols,
-            selection: row.selection, cursorX: cursorX)
+            selection: row.selection, search: row.search, cursorX: cursorX)
 
         // Walk runs and cells together. Both are in increasing x order, so
         // this is a merge, not a search.
@@ -354,20 +354,21 @@ final class TerminalRenderer: @unchecked Sendable {
         for x in 0..<cols {
             let cell = row.cells[x]
 
-            let selected: Bool = {
-                guard let sel = row.selection else { return false }
-                // A spacer tail belongs to the character before it.
-                let compare = cell.wide == .spacerTail ? UInt16(max(0, x - 1)) : UInt16(x)
-                return compare >= sel.start && compare <= sel.end
-            }()
+            // Four-way, not two: a cell may be plain, selected, a search match,
+            // or the match the find bar is standing on. Ghostty's renderer
+            // carries the same value, and the branches below are the ones
+            // selection already had with two more cases in them.
+            let paint = row.paint(at: x)
+            let highlighted = paint != .plain
 
-            // Colours as the SGR style asks for them, before selection and
+            // Colours as the SGR style asks for them, before highlighting and
             // inversion are applied.
             let bgStyle = cell.bg
             let fgStyle = cell.fg.present ? cell.fg : defaultFg
 
             let bg: PackedRGB = {
-                if selected {
+                switch paint {
+                case .selection:
                     if let c = config.selectionBackground {
                         return PackedRGB(r: c.r, g: c.g, b: c.b)
                     }
@@ -375,25 +376,40 @@ final class TerminalRenderer: @unchecked Sendable {
                     // the foreground colour, which reads correctly against
                     // any theme.
                     return defaultFg
+                case .searchMatch:
+                    let c = config.searchBackground
+                    return PackedRGB(r: c.r, g: c.g, b: c.b)
+                case .searchSelected:
+                    let c = config.searchSelectedBackground
+                    return PackedRGB(r: c.r, g: c.g, b: c.b)
+                case .plain:
+                    // Two things make us paint the foreground colour as the
+                    // background: the inverse flag, and a "covering" glyph such
+                    // as FULL BLOCK, where using fg as bg is what makes padding
+                    // extension look right. If both are true they cancel.
+                    let inverse = cell.flags.contains(.inverse)
+                    if inverse != CellRules.isCovering(cell.codepoint) { return fgStyle }
+                    return bgStyle
                 }
-                // Two things make us paint the foreground colour as the
-                // background: the inverse flag, and a "covering" glyph such
-                // as FULL BLOCK, where using fg as bg is what makes padding
-                // extension look right. If both are true they cancel.
-                let inverse = cell.flags.contains(.inverse)
-                if inverse != CellRules.isCovering(cell.codepoint) { return fgStyle }
-                return bgStyle
             }()
 
             let fg: PackedRGB = {
-                let finalBg = bgStyle.present ? bgStyle : defaultBg
-                if selected {
+                switch paint {
+                case .selection:
                     if let c = config.selectionForeground {
                         return PackedRGB(r: c.r, g: c.g, b: c.b)
                     }
                     return defaultBg
+                case .searchMatch:
+                    let c = config.searchForeground
+                    return PackedRGB(r: c.r, g: c.g, b: c.b)
+                case .searchSelected:
+                    let c = config.searchSelectedForeground
+                    return PackedRGB(r: c.r, g: c.g, b: c.b)
+                case .plain:
+                    let finalBg = bgStyle.present ? bgStyle : defaultBg
+                    return cell.flags.contains(.inverse) ? finalBg : fgStyle
                 }
-                return cell.flags.contains(.inverse) ? finalBg : fgStyle
             }()
 
             let alpha: UInt8 = cell.flags.contains(.faint) ? config.faintAlpha : 255
@@ -402,9 +418,9 @@ final class TerminalRenderer: @unchecked Sendable {
             do {
                 let rgb = bg.present ? bg : defaultBg
                 let bgAlpha: UInt8 = {
-                    // Selected and inverted cells are always opaque: they are
-                    // an explicit visual signal and shouldn't fade.
-                    if selected { return 255 }
+                    // Highlighted and inverted cells are always opaque: they
+                    // are an explicit visual signal and shouldn't fade.
+                    if highlighted { return 255 }
                     if cell.flags.contains(.inverse) { return 255 }
                     if config.backgroundOpacityCells && bgStyle.present {
                         return UInt8(
