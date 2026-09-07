@@ -517,25 +517,39 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     // thirty-test binary and dup2'ing onto a fixed slot would silently smash
     // whatever another test had there.
     // Write-only is fine even though the probe dups it for *reading*. mksh
-    // and pdksh do have an access check on `<&n`, but they pass `X_OK` to skip
-    // it -- "a kludge to disable this check for dups", their words -- and
-    // measured, both answer LEAKED on a write-only descriptor while `read -u`
-    // on that same descriptor correctly refuses. Ten shell/mode combinations,
-    // none that disagree.
+    // and oksh do have an access check on `<&n`, and both pass `X_OK` to skip
+    // it -- "a kludge to disable this check for dups (x<&1)", their comment --
+    // so both answer LEAKED on a write-only descriptor while `read -u` on that
+    // same descriptor correctly refuses. Seven shells, every fd in 3..9, both
+    // directions, none that disagree.
     const secret_fd = try sys.openAppend(secret.ptr);
     defer sys.closeFd(secret_fd);
 
-    // ...but placed into 3..9 rather than left where `open` put it, because
-    // above 9 the check below stops meaning anything, in a different way per
-    // shell. bash saves a redirected descriptor with `F_DUPFD` from 10 upward
-    // for the length of the command, and `> marker` alone takes fd 10 -- so
-    // `true <&10` succeeds and reads LEAKED however well `closeFrom` worked.
-    // dash cannot address a two-digit descriptor at all ("Syntax error: Bad fd
-    // number"), so the script dies before writing the marker and the test
-    // fails as `DetachedChildNeverRan`. zsh and ksh93 park their saves much
-    // higher and read CLEAN, which is the worst answer of the three: a leak
-    // reported as clean. Only inside 3..9 do all four agree. At or below 2 the grandchild's own stdio answers, which
-    // `detachStdio` has just pointed at /dev/null and the log.
+    // ...but placed into 3..9 rather than left where `open` put it. Measured
+    // here, on every shell that could be `/bin/sh`, asking each about fd 10
+    // with the descriptor closed -- which must answer CLEAN:
+    //
+    //     bash 3.2 (/bin/sh), bash 5.3   LEAKED, wrongly
+    //     dash                           no answer at all
+    //     zsh, ksh93, mksh, oksh         CLEAN
+    //
+    // bash puts its own save of `> marker` on fd 10, so the probe finds the
+    // shell's descriptor and calls it ours: a failure on the run where
+    // `closeFrom` worked. dash rejects a two-digit name when it evaluates the
+    // body ("Bad fd number") -- the outer redirection has already created the
+    // marker empty by then, so the test fails comparing CLEAN against "".
+    //
+    // The remaining four answer CLEAN with it closed, but none of them would
+    // let me *put* a descriptor on fd 10 to check the other direction --
+    // `exec 10>>file` fails in all four. That is the argument by itself: fd 10
+    // is not ours to use, and a probe that cannot be shown to detect a leak is
+    // not a probe. (mksh and oksh reject any fd name longer than one character
+    // outright, which would make a leak read as CLEAN -- worse than bash's
+    // false failure, since nothing would fail.)
+    //
+    // Inside 3..9 all seven answer correctly in both directions, checked.
+    // At or below 2 the grandchild's own stdio answers, which `detachStdio`
+    // has just pointed at /dev/null and the log.
     //
     // A skip was the obvious answer and the wrong one: seven descriptors
     // leaked into this binary by anything upstream would turn the only
