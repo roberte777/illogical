@@ -14,6 +14,9 @@ struct IllogicalApp: App {
 
     init() {
         Trace.log("app init")
+        // Before the first window, because the font a surface is built with
+        // comes from here and a grid cannot be rebuilt for free.
+        AppConfig.load()
         Signposts.milestone("app-init", seconds: Signposts.sinceLaunch())
     }
 

@@ -66,6 +66,8 @@ targets:
     dependencies:
       - package: IllogicalKit
         product: IllogicalProtocol
+      - package: IllogicalKit
+        product: IllogicalConfig
       # Produced by `just xcframework`. Statically linked, so it is not
       # embedded in the bundle.
       - framework: Frameworks/ghostty-vt.xcframework
