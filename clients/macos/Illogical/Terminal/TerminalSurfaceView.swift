@@ -505,16 +505,112 @@ final class TerminalSurfaceView: NSView {
     // cannot disagree about what ctrl+shift+enter is.
 
     override func keyDown(with event: NSEvent) {
+        // ⌘Home/⌘End/⌘PgUp/⌘PgDn move the viewport, and are taken *before*
+        // `KeyTranslation` and the encoder so a program speaking the Kitty
+        // protocol — which reports keys the legacy encoding would drop — never
+        // sees them. Same rule as the wheel: the viewport half of this file
+        // never synthesizes a sequence.
+        //
+        // Three things are deliberately *not* claimed. Without ⌘ these keys
+        // belong to the program, so `less` gets its own PgUp. With ⌘ and
+        // anything else they belong to it too (⇧⌘Home is a selection, ⌥⌘Home
+        // and ⌃⌘End are editor bindings). And where there is no scrollback to
+        // move through — the alternate screen — the chord would be a dead key,
+        // so it falls through as well.
+        if scrollViewport(for: event) { return }
         guard let spec = KeyTranslation.spec(for: event) else { return }
         send(encodedKey: spec, isTyping: true)
     }
 
     override func keyUp(with event: NSEvent) {
+        // The release half of a chord `keyDown` swallowed. Under the Kitty
+        // protocol's event reporting a lone key-up is a real event, so letting
+        // it through would tell the program about half a keystroke it never
+        // saw the start of.
+        //
+        // Matched on the *keycode this view actually swallowed*, never on the
+        // release event's modifiers. Letting go of ⌘ before Home — the
+        // ordinary way anyone releases a chord — produces a key-up with no
+        // ⌘ in it, and asking the event put `ESC[1;1:3H` on the wire for a
+        // press the program never saw. The mirror case is just as wrong:
+        // pressing Home alone, then ⌘ while holding it, gave a release that
+        // *looked* like a chord and swallowed the end of a keystroke the
+        // program had been told about.
+        if swallowedKeyDowns.remove(event.keyCode) != nil { return }
         guard let spec = KeyTranslation.spec(for: event) else { return }
         // Legacy encoding drops these. The Kitty protocol's event-reporting
         // flag is what makes them mean something, and whether it is set is
         // the encoder's business, not ours.
         send(encodedKey: spec)
+    }
+
+    /// Keycodes whose `keyDown` the viewport took, owed a swallowed `keyUp`.
+    ///
+    /// A set, not a single slot: two of these can be held at once, and a
+    /// key-repeat delivers many downs before the one up.
+    private var swallowedKeyDowns: Set<UInt16> = []
+
+    /// Move the viewport if this event is one of the four scroll chords.
+    ///
+    /// Returns whether it was taken. No menu item claims these, so `keyDown`
+    /// is where they land: the key-equivalent pass runs first and finds
+    /// nothing, and the chords are per-surface anyway — which viewport ⌘Home
+    /// moves is a question only the focused terminal can answer.
+    ///
+    /// Nothing is claimed when there is nowhere to scroll. On the alternate
+    /// screen — `vim`, `less`, `htop` — there is no scrollback at all, so
+    /// swallowing the chord there would make it a dead key that eats a
+    /// keystroke and does nothing; instead it falls through and belongs to the
+    /// program like any other.
+    private func scrollViewport(for event: NSEvent) -> Bool {
+        guard let engine, isViewportScroll(event), engine.scrollbar.canScroll,
+            let target = Self.viewportScroll(forKeyCode: event.keyCode, rows: engine.rows)
+        else { return false }
+        engine.scroll(target)
+        renderThread?.wake()
+        showScrollbar()
+        swallowedKeyDowns.insert(event.keyCode)
+        return true
+    }
+
+    /// Whether this is one of the four chords, on the way down.
+    ///
+    /// ⌘ **and nothing else**. `contains(.command)` also matched ⇧⌘Home,
+    /// ⌥⌘Home and ⌃⌘End — the first is macOS's "extend selection to the top of
+    /// the document" and the other two are ordinary bindings in Helix, kakoune
+    /// and neovim under the Kitty protocol. All three were being eaten.
+    ///
+    /// Compared against `deviceIndependentFlagsMask` so the caps-lock bit and
+    /// the left/right device bits AppKit also sets do not count as modifiers.
+    private func isViewportScroll(_ event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            .subtracting([.capsLock, .function, .numericPad])
+        return mods == .command && Self.viewportScrollKeys.contains(Int(event.keyCode))
+    }
+
+    private static let viewportScrollKeys = [kVK_Home, kVK_End, kVK_PageUp, kVK_PageDown]
+
+    /// Whether the position indicator is on screen. Only the tests need it:
+    /// a scroll the user cannot see happen is half a feature.
+    var isShowingScrollbarForTesting: Bool { scrollbar != nil }
+
+    /// Which way ⌘ plus a navigation key moves the viewport.
+    ///
+    /// A page is a screen less one row, the overlap every pager keeps so the
+    /// line you were reading is still there after the jump.
+    static func viewportScroll(
+        forKeyCode keyCode: UInt16, rows: UInt16
+    )
+        -> TerminalEngine.ScrollTarget?
+    {
+        let page = max(1, Int(rows) - 1)
+        switch Int(keyCode) {
+        case kVK_Home: return .top
+        case kVK_End: return .bottom
+        case kVK_PageUp: return .delta(-page)
+        case kVK_PageDown: return .delta(page)
+        default: return nil
+        }
     }
 
     override func flagsChanged(with event: NSEvent) {

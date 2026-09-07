@@ -59,12 +59,13 @@ final class SurfaceInputTests: XCTestCase {
     }
 
     private func keyDown(
-        _ keyCode: Int, characters: String, mods: NSEvent.ModifierFlags = []
+        _ keyCode: Int, characters: String, mods: NSEvent.ModifierFlags = [],
+        type: NSEvent.EventType = .keyDown
     )
         -> NSEvent?
     {
         NSEvent.keyEvent(
-            with: .keyDown,
+            with: type,
             location: .zero,
             modifierFlags: mods,
             timestamp: 0,
@@ -390,6 +391,278 @@ final class SurfaceInputTests: XCTestCase {
 
         view.performClose(nil)
         XCTAssertEqual(recorder.closeRequests, 1)
+    }
+
+    /// A refusal is still a request. #41 moved the *policy* into
+    /// `SessionStore.closeSurfacePane` and left this mechanism alone: the
+    /// delegate is asked exactly once either way, and only its answer decides
+    /// whether the window sees the event.
+    func testTheDelegateIsAskedOnceEvenWhenItDeclines() throws {
+        let (view, _, recorder) = try surface()
+        recorder.closesPane = false
+
+        view.performClose(nil)
+        XCTAssertEqual(recorder.closeRequests, 1)
+    }
+
+    /// A surface in a *closable* window, so `performClose:` can be observed.
+    /// `windowedSurface`'s bare `.titled` window has no close button, and
+    /// `performClose:` on one of those beeps instead of closing — which would
+    /// make the assertion below pass against a fall-through that was deleted.
+    private func closableSurface() throws -> (TerminalSurfaceView, Recorder, NSWindow) {
+        let engine = try TerminalEngine(cols: 80, rows: 20)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 400),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        let view = TerminalSurfaceView(frame: window.contentLayoutRect)
+        let recorder = Recorder()
+        view.delegate = recorder
+        window.contentView = view
+        view.engine = engine
+        view.layoutSubtreeIfNeeded()
+        return (view, recorder, window)
+    }
+
+    /// The other half of the mechanism, and the half that had no test at all:
+    /// when the delegate declines, the *window* is the one that closes. That
+    /// is what makes ⌘W on the last terminal do the right thing, and deleting
+    /// the fall-through used to fail nothing.
+    func testDecliningHandsTheCloseToTheWindow() throws {
+        let (view, recorder, window) = try closableSurface()
+        defer { tearDown(view, window) }
+        recorder.closesPane = false
+        window.orderFront(nil)
+        XCTAssertTrue(window.isVisible, "precondition: the window is on screen")
+
+        view.performClose(nil)
+
+        XCTAssertFalse(window.isVisible, "the window was never asked to close")
+    }
+
+    /// ...and when the pane took it, the window stays. Three unsplit tabs and
+    /// a ⌘W that closed the window with them is issue #41 itself.
+    func testAClosedPaneLeavesTheWindowAlone() throws {
+        let (view, recorder, window) = try closableSurface()
+        defer { tearDown(view, window) }
+        recorder.closesPane = true
+        window.orderFront(nil)
+        XCTAssertTrue(window.isVisible)
+
+        view.performClose(nil)
+
+        XCTAssertTrue(window.isVisible, "closing a pane took the whole window with it")
+    }
+
+    // MARK: - Keyboard scrollback
+    //
+    // ⌘Home/⌘End/⌘PgUp/⌘PgDn move the viewport. They are taken in `keyDown`
+    // before `KeyTranslation` and the encoder, so nothing about them reaches
+    // the PTY — the same rule the wheel's viewport half follows. Without ⌘
+    // the identical keys belong to the program.
+
+    private func fill(_ engine: TerminalEngine, lines: Int = 300) {
+        var text = ""
+        for i in 0..<lines { text += "line \(i)\r\n" }
+        write(engine, text)
+    }
+
+    /// The Unicode private-use characters AppKit puts in `characters` for the
+    /// navigation keys, so these events are the ones a real keyboard sends.
+    private enum FunctionKey {
+        static let home = "\u{F729}"
+        static let end = "\u{F72B}"
+        static let pageUp = "\u{F72C}"
+        static let pageDown = "\u{F72D}"
+    }
+
+    func testCommandHomeAndEndJumpTheViewport() throws {
+        let (view, engine, recorder) = try surface()
+        fill(engine)
+
+        view.keyDown(
+            with: try XCTUnwrap(
+                keyDown(kVK_Home, characters: FunctionKey.home, mods: .command)))
+        XCTAssertEqual(engine.scrollbar.offset, 0)
+        XCTAssertTrue(recorder.sent.isEmpty, "a viewport chord reached the PTY")
+
+        view.keyDown(
+            with: try XCTUnwrap(
+                keyDown(kVK_End, characters: FunctionKey.end, mods: .command)))
+        let bar = engine.scrollbar
+        XCTAssertEqual(bar.offset + bar.length, bar.total)
+        XCTAssertTrue(recorder.sent.isEmpty)
+    }
+
+    /// A page is a screen less one row — the overlap every pager keeps.
+    func testCommandPageKeysMoveByAScreen() throws {
+        let (view, engine, recorder) = try surface()
+        fill(engine)
+        let bottom = engine.scrollbar.offset
+        let page = UInt64(engine.rows - 1)
+
+        view.keyDown(
+            with: try XCTUnwrap(
+                keyDown(kVK_PageUp, characters: FunctionKey.pageUp, mods: .command)))
+        XCTAssertEqual(engine.scrollbar.offset, bottom - page)
+
+        view.keyDown(
+            with: try XCTUnwrap(
+                keyDown(kVK_PageDown, characters: FunctionKey.pageDown, mods: .command)))
+        XCTAssertEqual(engine.scrollbar.offset, bottom)
+
+        XCTAssertTrue(recorder.sent.isEmpty)
+    }
+
+    /// The regression that matters: plain Home and PgUp are the program's.
+    /// `less` gets its own page keys, and the viewport does not move behind it.
+    func testPlainNavigationKeysStillReachTheProgram() throws {
+        let (view, engine, recorder) = try surface()
+        fill(engine)
+        let before = engine.scrollbar.offset
+
+        view.keyDown(with: try XCTUnwrap(keyDown(kVK_Home, characters: FunctionKey.home)))
+        view.keyDown(with: try XCTUnwrap(keyDown(kVK_PageUp, characters: FunctionKey.pageUp)))
+
+        XCTAssertEqual(recorder.sent.count, 2, "the program was not told about its own keys")
+        XCTAssertFalse(recorder.bytes.isEmpty)
+        XCTAssertEqual(
+            engine.scrollbar.offset, before, "the viewport moved on a key it does not own")
+    }
+
+    /// And nothing leaks under the Kitty protocol, which is the case the
+    /// interception order exists for: with event reporting on, even a key-up
+    /// produces bytes, so a chord swallowed on the way down has to be
+    /// swallowed on the way up too.
+    ///
+    /// The plain key-up at the end is a positive control. Without it this test
+    /// would still pass if `CSI > 11 u` ever stopped enabling event reporting,
+    /// or if the encoder stopped emitting releases — an "asserts nothing"
+    /// green.
+    func testViewportChordsAreInvisibleToAKittyProtocolProgram() throws {
+        let (view, engine, recorder) = try surface()
+        fill(engine)
+        // disambiguate | report_events | report_all
+        write(engine, "\u{1b}[>11u")
+
+        view.keyDown(
+            with: try XCTUnwrap(
+                keyDown(kVK_Home, characters: FunctionKey.home, mods: .command)))
+        view.keyUp(
+            with: try XCTUnwrap(
+                keyDown(
+                    kVK_Home, characters: FunctionKey.home, mods: .command, type: .keyUp)))
+
+        XCTAssertTrue(recorder.sent.isEmpty, "the program saw a key the viewport took")
+        XCTAssertEqual(engine.scrollbar.offset, 0)
+
+        // The control: the same key with no ⌘ belongs to the program, and its
+        // release really does produce bytes under this mode.
+        view.keyUp(
+            with: try XCTUnwrap(
+                keyDown(kVK_Home, characters: FunctionKey.home, type: .keyUp)))
+        XCTAssertFalse(
+            recorder.sent.isEmpty,
+            "event reporting is off, so the assertion above proved nothing")
+    }
+
+    /// Letting go of ⌘ before the key — the ordinary way anyone releases a
+    /// chord — used to put `ESC[1;1:3H` on the wire for a press the program
+    /// never saw, because the key-up re-derived "was this a chord?" from the
+    /// modifiers it happened to carry.
+    func testReleasingCommandFirstDoesNotLeakTheKeyUp() throws {
+        let (view, engine, recorder) = try surface()
+        fill(engine)
+        write(engine, "\u{1b}[>11u")
+
+        view.keyDown(
+            with: try XCTUnwrap(
+                keyDown(kVK_Home, characters: FunctionKey.home, mods: .command)))
+        // ⌘ is already up by the time Home is released.
+        view.keyUp(
+            with: try XCTUnwrap(
+                keyDown(kVK_Home, characters: FunctionKey.home, type: .keyUp)))
+
+        XCTAssertTrue(
+            recorder.sent.isEmpty,
+            "a release leaked for a press the program never saw: \(recorder.text.debugDescription)"
+        )
+    }
+
+    /// And the mirror. Home pressed alone reaches the program; pressing ⌘
+    /// while still holding it must not make the release look like a chord and
+    /// swallow the end of a keystroke the program was told about.
+    func testPressingCommandMidKeystrokeDoesNotSwallowTheRelease() throws {
+        let (view, engine, recorder) = try surface()
+        fill(engine)
+        write(engine, "\u{1b}[>11u")
+
+        view.keyDown(with: try XCTUnwrap(keyDown(kVK_Home, characters: FunctionKey.home)))
+        let afterPress = recorder.sent.count
+        XCTAssertGreaterThan(afterPress, 0, "the press was the program's")
+
+        view.keyUp(
+            with: try XCTUnwrap(
+                keyDown(
+                    kVK_Home, characters: FunctionKey.home, mods: .command, type: .keyUp)))
+
+        XCTAssertGreaterThan(
+            recorder.sent.count, afterPress, "the program was left holding a key it never released")
+    }
+
+    /// ⌘ **and nothing else**. `contains(.command)` also matched ⇧⌘Home —
+    /// macOS's "extend selection to the top of the document" — and ⌥⌘Home and
+    /// ⌃⌘End, which Helix, kakoune and neovim bind under the Kitty protocol.
+    /// All three were being eaten by the viewport.
+    func testOtherModifiersWithCommandBelongToTheProgram() throws {
+        let cases: [(String, Int, String, NSEvent.ModifierFlags)] = [
+            ("⇧⌘Home", kVK_Home, FunctionKey.home, [.command, .shift]),
+            ("⌥⌘Home", kVK_Home, FunctionKey.home, [.command, .option]),
+            ("⌃⌘End", kVK_End, FunctionKey.end, [.command, .control]),
+        ]
+        for (name, code, characters, mods) in cases {
+            let (view, engine, recorder) = try surface()
+            fill(engine)
+            write(engine, "\u{1b}[>11u")
+            let before = engine.scrollbar.offset
+
+            view.keyDown(
+                with: try XCTUnwrap(keyDown(code, characters: characters, mods: mods)))
+
+            XCTAssertEqual(
+                engine.scrollbar.offset, before, "\(name) moved the viewport")
+            XCTAssertFalse(recorder.sent.isEmpty, "\(name) was eaten instead of encoded")
+        }
+    }
+
+    /// On the alternate screen — `vim`, `less`, `htop` — there is no
+    /// scrollback, so claiming the chord would make it a dead key: a keystroke
+    /// eaten for nothing. It falls through to the program instead.
+    func testTheChordsAreNotClaimedWhereThereIsNothingToScroll() throws {
+        let (view, engine, recorder) = try surface()
+        fill(engine)
+        write(engine, "\u{1b}[?1049h")
+        XCTAssertFalse(engine.scrollbar.canScroll, "the premise: no scrollback here")
+
+        view.keyDown(
+            with: try XCTUnwrap(
+                keyDown(kVK_PageUp, characters: FunctionKey.pageUp, mods: .command)))
+
+        XCTAssertFalse(recorder.sent.isEmpty, "⌘PgUp was swallowed and did nothing at all")
+    }
+
+    /// A scroll the user cannot see happen is half a feature: the position
+    /// indicator comes up with the keyboard exactly as it does with the wheel.
+    func testAChordShowsTheScrollbar() throws {
+        let (view, engine, _) = try surface()
+        fill(engine)
+        XCTAssertFalse(view.isShowingScrollbarForTesting)
+
+        view.keyDown(
+            with: try XCTUnwrap(
+                keyDown(kVK_PageUp, characters: FunctionKey.pageUp, mods: .command)))
+
+        XCTAssertTrue(view.isShowingScrollbarForTesting, "the viewport moved with no indicator")
     }
 
     /// Shift does *not* take the wheel away from the program. Ghostty's

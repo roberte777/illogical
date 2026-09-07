@@ -182,7 +182,10 @@ struct SessionButton: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Change Session (⌘⇧K)")
+        // Written the way the menu item draws it, which is the order macOS
+        // orders modifiers in. It was ⌘⇧K here and bound to nothing at all
+        // until the View menu's "Change Session" landed.
+        .help("Change Session (⇧⌘K)")
     }
 }
 
@@ -236,7 +239,14 @@ struct TerminalTab: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(Text("Close \(name)"))
-                .help("Close terminal")
+                // A slot is a tab, so this closes the tab and everything split
+                // inside it — through `requestCloseTab`, which asks first when
+                // that is more than one terminal.
+                //
+                // The chord is named only on the *active* tab, because that is
+                // the only tab ⇧⌘W acts on. This ✕ also appears on hover over
+                // an inactive one, where advertising it would be a lie.
+                .help(isActive ? "Close Tab (⇧⌘W)" : "Close Tab")
             }
         }
         .padding(.horizontal, Metrics.tabLeadingPadding)

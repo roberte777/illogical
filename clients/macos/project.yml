@@ -121,6 +121,22 @@ targets:
       - path: Illogical/Sessions/HostConnection.swift
       - path: Illogical/Sessions/Reconnect.swift
       - path: Illogical/Terminal/TerminalController.swift
+      # The pane view, for its `TerminalSurfaceDelegate` coordinator -- the one
+      # line that turns ⌘W into a store call. It was outside the target, so
+      # rewriting `surfaceShouldClose` to `return false` -- which is precisely
+      # the bug #41 fixed, one level up from where the fix went -- failed
+      # nothing at all.
+      #
+      # The rest come with it, and only because it does not compile without
+      # them: PaneHeader is half of a pane, Chrome carries `Metrics` and
+      # `TerminalLabel`, SessionMenu declares the `Palette.menu*` colours
+      # `ConnectionBanner` draws with, and WindowClose is the window half of
+      # closing that PaneHeader now routes through.
+      - path: Illogical/Terminal/TerminalPane.swift
+      - path: Illogical/Splits/PaneHeader.swift
+      - path: Illogical/App/Chrome.swift
+      - path: Illogical/App/SessionMenu.swift
+      - path: Illogical/App/WindowClose.swift
       # The font the app ships. Without it in the test bundle the renderer
       # tests would resolve the default family to the system's fixed-pitch
       # face and measure a grid the app never draws.

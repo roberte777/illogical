@@ -27,6 +27,12 @@ final class SessionStore {
     var tabs: [TabLayout] = []
     var selectedTabID: TabLayout.ID?
 
+    /// The destructive thing a dialog is currently asking about, or nil.
+    ///
+    /// One slot rather than a flag per action: only one confirmation can be on
+    /// screen at a time, and the dialog reads its wording off the value.
+    var pendingDestruction: PendingDestruction?
+
     /// The toolbar lives in a title bar accessory and the menu lives in the
     /// content view, so the open/closed state has to be somewhere both can see.
     ///
@@ -66,7 +72,13 @@ final class SessionStore {
     /// Terminals we have asked a server to kill. Their panes are already gone
     /// from the layout, so the reconcile must not put them back while the
     /// server still lists them.
-    private var closing: Set<TerminalRef> = []
+    ///
+    /// Readable so a test can assert the *absence* of a kill. "⌘W declined"
+    /// has to mean nothing was hung up: closing the window leaves every
+    /// terminal in it running, which is the promise the empty state makes in
+    /// as many words. The reconcile only consults this when *adding* tabs, so
+    /// a re-list is not a way to observe it.
+    private(set) var closing: Set<TerminalRef> = []
 
     /// Where remembered hosts are written.
     ///
@@ -407,10 +419,16 @@ final class SessionStore {
     }
 
     /// Close one pane. The last pane in a tab closes the tab.
-    func closePane(_ paneID: UUID, in tabID: TabLayout.ID) {
+    ///
+    /// Returns whether there was a pane there to close. ⌘W's answer to AppKit
+    /// is "did I handle this", and a stale pane id is a no — without the
+    /// result `closeSurfacePane` reported success for a pane it never touched,
+    /// and the keystroke vanished into nothing at all.
+    @discardableResult
+    func closePane(_ paneID: UUID, in tabID: TabLayout.ID) -> Bool {
         guard let index = tabs.firstIndex(where: { $0.id == tabID }),
             let pane = tabs[index].root.pane(paneID)
-        else { return }
+        else { return false }
 
         kill(pane.terminal)
 
@@ -425,6 +443,7 @@ final class SessionStore {
             tabs.remove(at: index)
             repairSelection(preferring: wasInFront)
         }
+        return true
     }
 
     /// Close a whole tab, and every terminal in it.
@@ -474,6 +493,183 @@ final class SessionStore {
         guard let index = tabs.firstIndex(where: { $0.id == tabID }) else { return }
         tabs[index].root = tabs[index].root.settingRatio(ratio, forSplit: splitID)
     }
+
+    // MARK: - The ⌘W policy
+    //
+    // Closing lives here rather than in `TerminalPane` so it can be tested
+    // without a window: the surface's delegate is one line over this, and this
+    // file is in the test target.
+
+    /// ⌘W, as issue #41 specifies it.
+    ///
+    /// True: a pane was closed here, and the window stays. False: this is the
+    /// last pane of the last tab, so closing it *is* closing the window — the
+    /// caller lets `performClose` fall through to `NSWindow`.
+    ///
+    /// `tabs.count`, not `visibleTabs.count`. A window whose front session has
+    /// one tab may still be holding tabs on another session, and closing the
+    /// window would take those with it; `repairSelection` moves to them
+    /// instead, which is exactly the behaviour its own doc comment describes.
+    func closeSurfacePane(_ paneID: UUID, in tabID: TabLayout.ID) -> Bool {
+        guard let tab = tabs.first(where: { $0.id == tabID }) else { return false }
+        guard tabs.count > 1 || tab.isSplit else { return false }
+        // Forwarded, not assumed. A pane id the layout no longer holds is not
+        // something this closed, and telling AppKit otherwise swallowed the
+        // keystroke entirely.
+        return closePane(paneID, in: tabID)
+    }
+
+    /// What the caller still has to do after asking for a tab to close.
+    ///
+    /// The window half cannot live in the store — there is no window here —
+    /// but the *decision* can, which is the only part worth a test.
+    enum CloseTabOutcome: Equatable {
+        /// Closed, or there was nothing there. Nothing further to do.
+        case closed
+        /// The dialog is up. `confirmPendingDestruction` finishes it.
+        case confirming
+        /// This was the window's last tab, so closing it is closing the
+        /// window. The caller sends `performClose:`; nothing was killed.
+        case closeWindow
+    }
+
+    /// ⇧⌘W and the tab strip's ✕.
+    ///
+    /// Three outcomes, and the ordering between them is the point:
+    ///
+    /// *The window's last tab closes the window*, exactly as ⌘W on its last
+    /// pane does, and like ⌘W it kills nothing — closing a window here has
+    /// always meant detaching, which is what the empty state promises in as
+    /// many words ("Sessions keep running after you close this window"). Two
+    /// chords one modifier apart used to disagree on both halves of that: ⌘W
+    /// closed the window and left the shell running, ⇧⌘W hung the shell up and
+    /// left an empty window behind. It is also what every tabbed Mac app does
+    /// with ⇧⌘W, and it is why this case needs no confirmation: nothing is
+    /// destroyed.
+    ///
+    /// *A tab with more than one pane asks first*, because `closeTab` really
+    /// does hang up every terminal in it.
+    ///
+    /// *One pane closes outright* — no shipping terminal confirms a single
+    /// close, and the one thing that would justify it, a foreground process
+    /// still running, is not something we can detect
+    /// (`TerminalSummary.command` is the child's argv[0], not the foreground
+    /// job).
+    @discardableResult
+    func requestCloseTab(_ tabID: TabLayout.ID) -> CloseTabOutcome {
+        guard let tab = tabs.first(where: { $0.id == tabID }) else { return .closed }
+        if tabs.count == 1 {
+            return .closeWindow
+        }
+        if tab.panes.count > 1 {
+            pendingDestruction = .closeTab(tabID, paneCount: tab.panes.count)
+            return .confirming
+        }
+        closeTab(tabID)
+        return .closed
+    }
+
+    /// Carry out what the dialog is asking about.
+    ///
+    /// The value is a parameter and not only a stored slot because SwiftUI
+    /// writes `isPresented = false` as the dialog dismisses, and that write is
+    /// what clears `pendingDestruction` — a confirm button that read the slot
+    /// back could find it already empty. The view hands back the value the
+    /// dialog was built from.
+    func confirmPendingDestruction(_ pending: PendingDestruction) {
+        pendingDestruction = nil
+        switch pending {
+        case .closeTab(let tabID, _): closeTab(tabID)
+        }
+    }
+
+    func confirmPendingDestruction() {
+        guard let pending = pendingDestruction else { return }
+        confirmPendingDestruction(pending)
+    }
+
+    func cancelPendingDestruction() {
+        pendingDestruction = nil
+    }
+
+    // MARK: - Tab navigation
+    //
+    // Keyboard tab switching is store state, so ⇧⌘] and ⌘1 are testable
+    // without a menu bar. All of it is scoped to `visibleTabs`: the strip only
+    // ever shows one session's tabs, and a chord must not jump the window to
+    // another machine.
+
+    func selectNextTab() { selectTab(offsetBy: 1) }
+    func selectPreviousTab() { selectTab(offsetBy: -1) }
+
+    private func selectTab(offsetBy offset: Int) {
+        let tabs = visibleTabs
+        guard tabs.count > 1, let index = tabs.firstIndex(where: { $0.id == selectedTabID })
+        else { return }
+        // Wrapping, the way Terminal.app's ⇧⌘] does at either end.
+        selectedTabID = tabs[(index + offset + tabs.count) % tabs.count].id
+    }
+
+    /// ⌘1 … ⌘9, one-based into the session in front.
+    ///
+    /// Nine is the *last* tab rather than the ninth — the convention iTerm,
+    /// Ghostty and every browser share. Anything else out of range does
+    /// nothing.
+    func selectTab(at index: Int) {
+        let tabs = visibleTabs
+        guard !tabs.isEmpty else { return }
+        if index == Self.lastTabIndex {
+            selectedTabID = tabs.last?.id
+            return
+        }
+        guard index >= 1, index <= tabs.count else { return }
+        selectedTabID = tabs[index - 1].id
+    }
+
+    /// The one-based index ⌘9 occupies, which means "last".
+    static let lastTabIndex = 9
+
+    /// Whether ⌘`index` would go anywhere, so the menu item can tell the truth.
+    ///
+    /// Honesty, not safety. A disabled item still consumes its key equivalent
+    /// — `performKeyEquivalent` reports the chord as handled and simply does
+    /// not fire the action — so ⌘5 with two tabs never reaches the surface
+    /// either way. The reason to grey it is that an enabled item which does
+    /// nothing is a lie about what the app can do.
+    func canSelectTab(at index: Int) -> Bool {
+        let tabs = visibleTabs
+        guard !tabs.isEmpty else { return false }
+        if index == Self.lastTabIndex { return true }
+        return index >= 1 && index <= tabs.count
+    }
+
+    /// ⇧⌘K. The tooltip on the session button has promised this since the
+    /// chrome landed.
+    ///
+    /// Focus is not restored here: ContentView watches `sessionMenuOpen` and
+    /// calls `focusTerminal` for *every* way the menu closes — Escape, a click
+    /// away, picking a session — and one owner of that rule is the point.
+    func toggleSessionMenu() {
+        sessionMenuOpen.toggle()
+    }
+
+    // MARK: - Focus
+
+    /// Bumped whenever the terminal should take the keyboard back.
+    ///
+    /// `TerminalSurface.updateNSView` re-asserts first responder whenever
+    /// SwiftUI re-evaluates it, so a counter read by `TerminalPane`'s body is
+    /// all it takes to make that happen on demand — which is what closing the
+    /// session menu needs: the menu's filter field held focus, and nothing in
+    /// the split tree changed when the overlay went away.
+    ///
+    /// Only the counter is tested. Everything between it and AppKit's first
+    /// responder — SwiftUI's decision to re-evaluate, `updateNSView`,
+    /// `makeFirstResponder` — needs a running app, and was **verified by
+    /// hand**, not by this suite.
+    private(set) var focusGeneration = 0
+
+    func focusTerminal() { focusGeneration &+= 1 }
 
     // MARK: - Reconciling
 
@@ -564,10 +760,27 @@ final class SessionStore {
         }
 
         repairSelection(preferring: wasInFront)
+        dismissStaleDestruction()
 
         if let direction = pendingLaunchSplit, selectedTab != nil {
             pendingLaunchSplit = nil
             split(direction)
+        }
+    }
+
+    /// Take down a confirmation whose subject has gone.
+    ///
+    /// Both terminals of a split can exit on their own while the dialog is
+    /// up — and then it is asking about a tab that is no longer on screen.
+    /// Confirming a stale one was already harmless (`closeTab` guards on
+    /// `firstIndex`, and tab ids are fresh UUIDs so nothing can inherit one);
+    /// this is about the dialog telling the truth while it is being read.
+    private func dismissStaleDestruction() {
+        switch pendingDestruction {
+        case .closeTab(let tabID, _):
+            if !tabs.contains(where: { $0.id == tabID }) { pendingDestruction = nil }
+        case nil:
+            break
         }
     }
 
@@ -602,6 +815,37 @@ final class SessionStore {
 
     func closeController(_ ref: TerminalRef) {
         host(ref.host)?.closeController(ref.terminal)
+    }
+}
+
+/// Something destructive, waiting to be confirmed.
+///
+/// The wording lives here rather than in the view so it is one thing to read
+/// and one thing to test: what the dialog says is part of the policy, not a
+/// detail of how it is drawn.
+enum PendingDestruction: Equatable {
+    /// A tab with more than one pane. `paneCount` is what the message counts.
+    case closeTab(TabLayout.ID, paneCount: Int)
+
+    var title: String {
+        switch self {
+        case .closeTab: "Close this tab?"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .closeTab(_, let paneCount):
+            "Its \(paneCount) terminals will be closed. This cannot be undone."
+        }
+    }
+
+    /// The destructive button's title. Named after what it does, not "OK":
+    /// the one thing a confirmation must not be is ambiguous.
+    var confirmTitle: String {
+        switch self {
+        case .closeTab: "Close Tab"
+        }
     }
 }
 

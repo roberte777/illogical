@@ -42,11 +42,19 @@ struct IllogicalApp: App {
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
             }
-            // Splits. ⌘W is deliberately absent: closing a pane goes through
-            // the responder chain as `performClose:`, so the surface gets
-            // first refusal and the standard Close Window item keeps working
-            // when there is only one pane. See TerminalSurfaceView.
+            // Closing and splits. ⌘W itself is deliberately absent: it goes
+            // through the responder chain as `performClose:`, so the focused
+            // surface gets first refusal and the standard Close Window item
+            // keeps working when the terminal it closed was the last one in
+            // the window. See TerminalSurfaceView and SessionStore's
+            // `closeSurfacePane`.
             CommandGroup(after: .newItem) {
+                Divider()
+                Button("Close Tab") {
+                    if let id = store.selectedTabID { WindowClose.tab(id, in: store) }
+                }
+                .keyboardShortcut("w", modifiers: [.command, .shift])
+                .disabled(store.selectedTabID == nil)
                 Divider()
                 Button("Split Right") { store.split(.columns) }
                     .keyboardShortcut("d", modifiers: .command)
@@ -59,6 +67,8 @@ struct IllogicalApp: App {
                 .disabled(store.selectedTab?.isSplit != true)
             }
             CommandGroup(after: .toolbar) {
+                Button("Change Session") { store.toggleSessionMenu() }
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
                 Button("Refresh Sessions") { store.refresh() }
                     .keyboardShortcut("r", modifiers: .command)
                 Divider()
@@ -70,6 +80,30 @@ struct IllogicalApp: App {
                     .keyboardShortcut(.upArrow, modifiers: [.command, .option])
                 Button("Focus Pane Below") { store.moveFocus(.down) }
                     .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+            }
+            // Tab switching sits in the Window menu, where Terminal.app puts
+            // it and where a user looks for it. ⌘1–⌘9 are menu items rather
+            // than a key monitor for one reason worth stating: a chord a menu
+            // claims never reaches `keyDown`, so it cannot also be typed into
+            // the terminal.
+            CommandGroup(before: .windowList) {
+                Button("Show Next Tab") { store.selectNextTab() }
+                    .keyboardShortcut("]", modifiers: [.command, .shift])
+                    .disabled(store.visibleTabs.count < 2)
+                Button("Show Previous Tab") { store.selectPreviousTab() }
+                    .keyboardShortcut("[", modifiers: [.command, .shift])
+                    .disabled(store.visibleTabs.count < 2)
+                Divider()
+                ForEach(1...SessionStore.lastTabIndex, id: \.self) { index in
+                    Button(index == SessionStore.lastTabIndex ? "Last Tab" : "Tab \(index)") {
+                        store.selectTab(at: index)
+                    }
+                    .keyboardShortcut(
+                        KeyEquivalent(Character("\(index)")), modifiers: .command
+                    )
+                    .disabled(!store.canSelectTab(at: index))
+                }
+                Divider()
             }
         }
     }
@@ -121,6 +155,31 @@ struct ContentView: View {
                 }
             }
         }
+        // The menu's filter field held the keyboard while it was open, and
+        // nothing in the split tree changed when the overlay went away — so
+        // without this, typing after Esc went nowhere. W15.
+        .onChange(of: store.sessionMenuOpen) { _, isOpen in
+            if !isOpen { store.focusTerminal() }
+        }
+        // One dialog for every destructive action, driven off the store so the
+        // wording and the policy are tested in one place. `presenting:` hands
+        // the value back to the buttons rather than making them read the slot
+        // that dismissal is about to clear.
+        .confirmationDialog(
+            store.pendingDestruction?.title ?? "",
+            isPresented: Binding(
+                get: { store.pendingDestruction != nil },
+                set: { if !$0 { store.cancelPendingDestruction() } }),
+            titleVisibility: .visible,
+            presenting: store.pendingDestruction
+        ) { pending in
+            Button(pending.confirmTitle, role: .destructive) {
+                store.confirmPendingDestruction(pending)
+            }
+            Button("Cancel", role: .cancel) { store.cancelPendingDestruction() }
+        } message: { pending in
+            Text(pending.message)
+        }
         .frame(minWidth: 720, minHeight: 460)
         .preferredColorScheme(.dark)
         .background(
@@ -167,7 +226,12 @@ struct Toolbar: View {
                             showsLeadingSeparator: index > 0 && !isActive(index)
                                 && !isActive(index - 1),
                             select: { store.selectedTabID = tab.id },
-                            close: { store.closeTab(tab.id) })
+                            // Through the same policy ⇧⌘W uses, so pointer and
+                            // keyboard cannot disagree about when closing a tab
+                            // asks first — or about the window's last tab
+                            // taking the window with it rather than emptying
+                            // it.
+                            close: { WindowClose.tab(tab.id, in: store) })
                     }
                 }
             }
