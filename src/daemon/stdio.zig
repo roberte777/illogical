@@ -516,7 +516,11 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     // Whatever number `open` gives us, rather than a hard-coded one: this is a
     // thirty-test binary and dup2'ing onto a fixed slot would silently smash
     // whatever another test had there.
-    const secret_fd = try sys.openAppend(secret.ptr);
+    // Read-write, though nothing reads it: the probe is `true <&N`, and the
+    // pdksh family checks the access mode of `<&n` rather than only whether
+    // the descriptor exists. Write-only there answers "not open for reading",
+    // which reads as CLEAN -- a leaked descriptor reported as closed.
+    const secret_fd = try sys.openReadWrite(secret.ptr);
     defer sys.closeFd(secret_fd);
 
     // ...but placed into 3..9 rather than left where `open` put it, because
@@ -524,8 +528,8 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     // the script has its own descriptor in the way: both dash and bash save a
     // redirected fd with `F_DUPFD` from 10 upward for the length of a compound
     // command, and the script's `> marker` and `2>/dev/null` are two of those,
-    // so `: <&10` succeeds and the test reads LEAKED however well `closeFrom`
-    // worked. At or below 2 the grandchild's own stdio answers, which
+    // so `true <&10` succeeds and the test reads LEAKED however well
+    // `closeFrom` worked. At or below 2 the grandchild's own stdio answers, which
     // `detachStdio` has just pointed at /dev/null and the log.
     //
     // A skip was the obvious answer and the wrong one: seven descriptors
@@ -552,10 +556,13 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
         // platforms where the code works. `true` is a regular built-in and
         // merely returns non-zero. Checked on sh, dash, bash, zsh and ksh.
         //
-        // The `2>/dev/null` suppresses nothing, incidentally: redirections
-        // apply left to right, so `<&{d}` has already failed and printed by
-        // the time it is applied. It is left because the daemon log is
-        // asserted with `indexOf`, and one more line in it costs nothing.
+        // The `2>/dev/null` does not suppress the diagnostic, incidentally --
+        // redirections apply left to right, so `<&{d}` has already failed and
+        // printed by the time it is applied, and the line lands in the daemon
+        // log on every green run. It stays because it is one of the two
+        // compound-command fd saves the 3..9 placement above is reasoned
+        // about; removing it would falsify that paragraph. The log assertion
+        // is an `indexOf`, so the extra line costs nothing.
         "sleep 0.2; echo DAEMON_COMPLAINT >&2; " ++
             "if true <&{d} 2>/dev/null; then echo LEAKED; else echo CLEAN; fi > {s}",
         .{ placed, marker },
