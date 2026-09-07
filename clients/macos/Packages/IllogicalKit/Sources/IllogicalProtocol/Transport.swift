@@ -272,17 +272,31 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     private static func whyNotRunnable(_ path: String, _ ns: NSError) -> String {
         let manager = FileManager.default
         var isDirectory: ObjCBool = false
-        guard manager.fileExists(atPath: path, isDirectory: &isDirectory) else {
-            return "is not there"
+        if manager.fileExists(atPath: path, isDirectory: &isDirectory) {
+            if isDirectory.boolValue { return "is a directory" }
+            if !manager.isExecutableFile(atPath: path) { return "is not executable" }
+            // Present, and the execute bit is on, so the objection is to the
+            // image: not a program, or built for another architecture.
+            if ns.domain == NSPOSIXErrorDomain, ns.code == Int(ENOEXEC) {
+                return "is not a program"
+            }
+            return "cannot be run"
         }
-        if isDirectory.boolValue { return "is a directory" }
-        if !manager.isExecutableFile(atPath: path) { return "is not executable" }
-        // Present, and the execute bit is on, so the objection is to the image
-        // itself: a shebang that is not a program, or the wrong architecture.
-        if ns.domain == NSPOSIXErrorDomain, ns.code == Int(ENOEXEC) {
-            return "is not a program"
+
+        // `fileExists` is false for *any* `stat` failure, not only for a
+        // missing file -- so reporting "is not there" here would tell somebody
+        // whose `ls` shows the binary that it is absent, which is the whole
+        // complaint this function was written to end, reached by a rarer door.
+        // `lstat` separates the cases: if the entry itself is there, following
+        // it is what failed.
+        var entry = stat()
+        if lstat(path, &entry) == 0 { return "is a broken symlink" }
+        switch errno {
+        case EACCES, ENOTDIR: return "is in a directory that cannot be searched"
+        case ELOOP: return "is a loop of symlinks"
+        case ENAMETOOLONG: return "is too long a path to open"
+        default: return "is not there"
         }
-        return "cannot be run"
     }
 
     public init(argv: [String]) throws {

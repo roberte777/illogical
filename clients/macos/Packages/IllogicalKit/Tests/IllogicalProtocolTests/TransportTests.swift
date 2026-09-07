@@ -386,15 +386,35 @@ struct TransportTests {
         // the search bit is on, so it gets past the pre-check.
         #expect(reasonFor(root.path) == "\(root.path) is a directory")
 
-        // Executable, but not a program: a shebang naming something absent.
+        // Executable, and not a program: bytes the kernel will not load.
+        // Deliberately not a broken shebang -- `#!/no/such/interpreter` comes
+        // back ENOENT, not ENOEXEC, so it falls through to "cannot be run"
+        // and would not exercise this branch at all.
+        //
+        // Asserted by equality. `hasPrefix` plus "not `is not there`" passes
+        // for four of the five reasons, which is how the branch this replaced
+        // shipped a case that could never fire with nothing noticing.
         let notAProgram = root.appending(path: "broken").path
         #expect(
             FileManager.default.createFile(
                 atPath: notAProgram, contents: Data("\u{7f}ELF not really\n".utf8),
                 attributes: [.posixPermissions: 0o755]))
-        let broken = try #require(reasonFor(notAProgram))
-        #expect(broken.hasPrefix(notAProgram), "\(broken)")
-        #expect(!broken.contains("is not there"), "\(broken)")
+        #expect(reasonFor(notAProgram) == "\(notAProgram) is not a program")
+
+        // A symlink to itself. `fileExists` says false for this exactly as it
+        // does for a missing file, so without asking `lstat` why, somebody
+        // whose `ls -l` shows the link would be told it is not there.
+        let loop = root.appending(path: "loop").path
+        try FileManager.default.createSymbolicLink(
+            atPath: loop, withDestinationPath: loop)
+        let looped = try #require(reasonFor(loop))
+        #expect(!looped.contains("is not there"), "\(looped)")
+
+        // And a link to something that really is gone stays honest about it.
+        let dangling = root.appending(path: "dangling").path
+        try FileManager.default.createSymbolicLink(
+            atPath: dangling, withDestinationPath: root.appending(path: "nope").path)
+        #expect(reasonFor(dangling) == "\(dangling) is a broken symlink")
 
         // And none of it is an NSError dump.
         for path in [notExecutable, absent, root.path, notAProgram] {
@@ -402,6 +422,37 @@ struct TransportTests {
             #expect(!text.contains("UserInfo="), "\(text)")
             #expect(!text.contains("NSCocoaErrorDomain"), "\(text)")
         }
+    }
+
+    /// Whether a spawn failure is worth retrying, which is the half of
+    /// `spawnError` whose failure mode is worse than bad wording: classify
+    /// `EMFILE` as permanent and a window with enough remote panes kills a
+    /// perfectly reachable host for the life of the process, because three
+    /// descriptors per connection is a limit a busy window reaches and one
+    /// closing pane clears.
+    ///
+    /// Synthetic errors here, deliberately, where the test above uses real
+    /// spawns. They are the wrong instrument for *wording* -- they cannot
+    /// reproduce Foundation's collapsing of six causes into one code -- and
+    /// the only feasible one for *classification*, because a real `EMFILE`
+    /// means exhausting the descriptor table of the test runner.
+    @Test("a spawn failure that will clear on its own is retried")
+    func transientSpawnFailuresAreRetried() {
+        func classify(_ domain: String, _ code: Int32) -> TransportError {
+            CommandTransport.spawnError(
+                NSError(domain: domain, code: Int(code)), command: "ssh", path: "/usr/bin/ssh")
+        }
+
+        for code in [EMFILE, ENFILE, EAGAIN, ENOMEM, EINTR] {
+            #expect(classify(NSPOSIXErrorDomain, code).isTransient, "errno \(code)")
+        }
+        // ...and the permanent ones stay permanent, so the guard is pinned
+        // from both sides rather than only one.
+        for code in [ENOENT, EACCES, ENOEXEC] {
+            #expect(!classify(NSPOSIXErrorDomain, code).isTransient, "errno \(code)")
+        }
+        #expect(!classify(NSCocoaErrorDomain, 4).isTransient)
+        #expect(!classify(NSCocoaErrorDomain, 257).isTransient)
     }
 
     /// `close()` is called from the main actor, once per pane. Blocking there
