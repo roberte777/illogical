@@ -520,7 +520,9 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     // and oksh do have an access check on `<&n`, and both pass `X_OK` to skip
     // it -- "a kludge to disable this check for dups (x<&1)", their comment --
     // so both answer LEAKED on a write-only descriptor, while `read -u` on
-    // that same descriptor correctly refuses in the two shells that have it.
+    // that same descriptor correctly refuses -- in all six shells that have
+    // it. Only dash lacks `read -u` entirely, and answers CLEAN there for a
+    // different reason, which is why the probe is a dup and not a read.
     // The part that holds everywhere: all seven shells, every fd in 3..9, both
     // directions, none that disagree.
     const secret_fd = try sys.openAppend(secret.ptr);
