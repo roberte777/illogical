@@ -519,8 +519,9 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     // Write-only is fine even though the probe dups it for *reading*. mksh
     // and oksh do have an access check on `<&n`, and both pass `X_OK` to skip
     // it -- "a kludge to disable this check for dups (x<&1)", their comment --
-    // so both answer LEAKED on a write-only descriptor while `read -u` on that
-    // same descriptor correctly refuses. Seven shells, every fd in 3..9, both
+    // so both answer LEAKED on a write-only descriptor, while `read -u` on
+    // that same descriptor correctly refuses in the two shells that have it.
+    // The part that holds everywhere: all seven shells, every fd in 3..9, both
     // directions, none that disagree.
     const secret_fd = try sys.openAppend(secret.ptr);
     defer sys.closeFd(secret_fd);
@@ -539,13 +540,20 @@ test "a detached daemon outlives its parent, keeps a stderr, and inherits nothin
     // body ("Bad fd number") -- the outer redirection has already created the
     // marker empty by then, so the test fails comparing CLEAN against "".
     //
-    // The remaining four answer CLEAN with it closed, but none of them would
-    // let me *put* a descriptor on fd 10 to check the other direction --
-    // `exec 10>>file` fails in all four. That is the argument by itself: fd 10
-    // is not ours to use, and a probe that cannot be shown to detect a leak is
-    // not a probe. (mksh and oksh reject any fd name longer than one character
-    // outright, which would make a leak read as CLEAN -- worse than bash's
-    // false failure, since nothing would fail.)
+    // And with a descriptor genuinely inherited on fd 10 -- placed the way
+    // this test places it, `dupFrom` then fork then exec, not the shell's own
+    // `exec 10>>` -- where the correct answer is LEAKED:
+    //
+    //     bash 3.2, bash 5.3             LEAKED, but LEAKED either way
+    //     dash                           still no answer
+    //     zsh, ksh93                     LEAKED, correct
+    //     mksh R59, oksh 7.8             CLEAN, on a descriptor that is open
+    //
+    // That last row is the one that matters and the reason the range is not a
+    // matter of taste: mksh and oksh reject any fd name longer than one
+    // character, so the `else` branch writes CLEAN over a descriptor that
+    // really did leak. Nothing fails. bash's false LEAKED at least announces
+    // itself; this is a green run on a broken `closeFrom`.
     //
     // Inside 3..9 all seven answer correctly in both directions, checked.
     // At or below 2 the grandchild's own stdio answers, which `detachStdio`
