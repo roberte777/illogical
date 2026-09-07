@@ -321,6 +321,13 @@ pub fn notifySessionsChanged(self: *Server) void {
 fn retireExited(self: *Server) void {
     var retired: std.ArrayList(*Terminal) = .empty;
     defer retired.deinit(self.gpa);
+    // Sessions the sweep below emptied out of existence. This is the *only*
+    // place a session's `meta.json` is discarded, which is what keeps the
+    // file's lifetime identical to the registry entry's: written when the
+    // session is created or renamed, removed exactly when it stops existing.
+    // Discarded outside the lock, with the terminals' park files.
+    var dropped: std.ArrayList(session.Id) = .empty;
+    defer dropped.deinit(self.gpa);
 
     {
         self.mutex.lock();
@@ -358,15 +365,32 @@ fn retireExited(self: *Server) void {
             const sid = self.sessions.keys()[si];
             var removed = self.sessions.fetchOrderedRemove(sid).?;
             removed.value.deinit(self.gpa);
+            dropped.append(self.gpa, sid) catch {};
         }
     }
 
-    if (retired.items.len == 0) return;
     for (retired.items) |t| {
         log.info("terminal {d} exited, retiring", .{t.id});
         t.store.discard(self.io, t.id);
         t.destroy();
     }
+    // Nothing is going to rebuild a session that no longer exists, so its name
+    // has no business outliving it. Named files only, never the directory
+    // wholesale: see `park.Store.discardSessionMeta`.
+    for (dropped.items) |sid| self.store.discardSessionMeta(self.io, sid);
+
+    // One broadcast, on the tick that does both. On every path reachable
+    // today `dropped` is non-empty only when `retired` is -- the loop above is
+    // the only thing that empties a session, and both loops share this one
+    // critical section -- so the OR never fires on its own and a client hears
+    // about the retirement and the session's disappearance together.
+    //
+    // It is written as "did the list change" rather than `retired.len == 0`
+    // anyway, because that invariant lives two loops away: a future path that
+    // empties a session without retiring a terminal on the same tick (pruning
+    // the registry directly, moving a terminal between sessions) would
+    // silently stop announcing itself.
+    if (retired.items.len == 0 and dropped.items.len == 0) return;
     self.notifySessionsChanged();
 }
 
@@ -437,7 +461,122 @@ fn sessionByNameLocked(self: *Server, name: []const u8) !session.Id {
         .id = id,
         .name = try self.gpa.dupe(u8, name),
     });
+    self.persistSessionName(id, name);
     return id;
+}
+
+/// Write a session's name to its `meta.json`.
+///
+/// Best effort on purpose. A name that did not reach disk is a session that
+/// forgets its label across a daemon restart -- worth a line in the log, and
+/// not worth refusing to open a terminal or rejecting a rename the registry
+/// has already accepted.
+///
+/// Both callers hold `mutex`, so this is filesystem work under the registry
+/// lock. That is not new: `createTerminal` already forks a child and opens a
+/// PTY there, and this is one small write beside it. It stays inside the lock
+/// because the alternative is a window in which the registry and the file
+/// disagree about a session's name.
+fn persistSessionName(self: *Server, id: session.Id, name: []const u8) void {
+    self.store.writeSessionMeta(self.io, id, name) catch |err|
+        log.warn("session {d}: meta.json not written: {t}", .{ id, err });
+}
+
+/// Rename a session.
+///
+/// A pure relabelling: the id is what terminals, clients and tabs key on, so
+/// nothing moves and no client loses a tab. The caller broadcasts
+/// `sessions_changed` afterwards, outside the registry lock -- the same shape
+/// `create` uses.
+pub fn renameSession(self: *Server, id: session.Id, name: []const u8) !void {
+    try session.validateName(name);
+
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
+    const s = self.sessions.getPtr(id) orelse return error.NoSuchSession;
+    // Renaming a session to the name it already has is a success with nothing
+    // to do -- not an error, and not a write.
+    if (std.mem.eql(u8, s.name, name)) return;
+
+    // Exact match, mirroring `sessionByNameLocked`. Names are how `create`
+    // finds a session, so two sessions sharing one would make which terminal
+    // lands where a question of iteration order.
+    for (self.sessions.values()) |other| {
+        if (std.mem.eql(u8, other.name, name)) return error.NameInUse;
+    }
+
+    const dup = try self.gpa.dupe(u8, name);
+    self.gpa.free(s.name);
+    s.name = dup;
+
+    self.persistSessionName(id, name);
+    log.info("session {d} renamed to {s}", .{ id, name });
+}
+
+/// What `deleteSession` does with a session that would still kill something.
+pub const DeleteMode = enum {
+    /// Close every terminal in it. What the app does, behind a confirmation.
+    cascade,
+    /// Refuse, with `error.SessionBusy`, if any child is still running. So a
+    /// script can be careful.
+    only_if_empty,
+};
+
+/// Delete a session: close its terminals and drop it from the registry.
+///
+/// Nothing is torn down here. Each terminal is hung up and then goes the way
+/// every closed terminal goes -- child exit, then `retireExited` on the
+/// maintenance tick, which discards its park state, drops the emptied session,
+/// discards its `meta.json` and broadcasts `sessions_changed`. A session that
+/// was already empty is dropped by that same sweep. Forcing it here would mean
+/// joining a terminal's reader thread from a client's dispatch, which is
+/// exactly why retirement lives on the tick in the first place.
+///
+/// So the session row survives this call by a maintenance tick or two, and a
+/// child that ignores SIGHUP lingers exactly as a killed terminal does today.
+///
+/// Nothing on disk is touched here either, and that is the point: `meta.json`
+/// is discarded by the sweep that drops the registry entry and nowhere else,
+/// so the file and the registry cannot disagree. Discarding it on acceptance
+/// would leave a nameless session behind for as long as a stubborn child took
+/// to die -- and would delete the name out from under a `create` that landed
+/// in that same window and reused the session.
+pub fn deleteSession(self: *Server, id: session.Id, mode: DeleteMode) !void {
+    var ids: std.ArrayList(session.TerminalId) = .empty;
+    defer ids.deinit(self.gpa);
+
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const s = self.sessions.getPtr(id) orelse return error.NoSuchSession;
+
+        // "Empty" means "would kill nothing", not "has no registry entries".
+        //
+        // A terminal is removed from `s.terminals` by the maintenance sweep,
+        // not by its child exiting, so a session whose last child exited is
+        // still listed for up to a tick. Counting entries would refuse
+        // precisely the state a careful script is in -- everything has exited,
+        // retirement is pending -- and a genuinely empty session is swept out
+        // of existence within that same tick, so there would be almost nothing
+        // left for the flag to succeed on. `finished` is the flag retirement
+        // itself keys on, so the two cannot disagree about which it is.
+        if (mode == .only_if_empty) {
+            for (s.terminals.items) |tid| {
+                const t = self.terminals.get(tid) orelse continue;
+                if (!t.finished.load(.acquire)) return error.SessionBusy;
+            }
+        }
+
+        try ids.appendSlice(self.gpa, s.terminals.items);
+    }
+
+    // Outside the registry lock: `killTerminal` takes it again to look the
+    // terminal up. Failures are ignored one at a time -- a terminal that
+    // retired between the copy above and here is one fewer thing to close.
+    for (ids.items) |tid| self.killTerminal(tid, 0) catch {};
+
+    log.info("session {d} deleted ({d} terminal(s) closing)", .{ id, ids.items.len });
 }
 
 pub const CreateResult = struct {
@@ -446,6 +585,17 @@ pub const CreateResult = struct {
 };
 
 pub fn createTerminal(self: *Server, req: protocol.body.Create) !CreateResult {
+    // Before the lock, and before anything is spawned. `create` is the only
+    // way into the registry besides `rename`, and a registry that accepted
+    // names the rename path refuses would be indefensible on its own -- quite
+    // apart from what unvalidated wire bytes do to `writeSessionMeta`, which
+    // now puts every session name on disk.
+    //
+    // The *terminal* name is deliberately not checked. It never reaches disk,
+    // and refusing it would break `illogical new -n "my name"` for no gain;
+    // the rule for terminal names belongs with terminal rename (#38).
+    try session.validateName(req.session_name);
+
     self.mutex.lock();
     defer self.mutex.unlock();
 
@@ -585,6 +735,501 @@ pub fn defaultSocketPath(alloc: Allocator) ![]u8 {
     }
     const home = getenv("HOME") orelse "/tmp";
     return std.fmt.allocPrint(alloc, "{s}/.local/state/illogical/server.sock", .{home});
+}
+
+/// A daemon on a socket and a state directory of its own.
+///
+/// The same shape as the two tests below, which spell it out inline; a struct
+/// because the session-lifecycle tests need four of them and the setup is
+/// twenty lines of paperwork each. Heap-allocated so `threaded` does not move:
+/// the server holds the `std.Io` it hands out.
+const TestDaemon = struct {
+    gpa: Allocator,
+    threaded: std.Io.Threaded,
+    server: *Server = undefined,
+    accepting: std.Thread = undefined,
+    root_buf: [96]u8 = undefined,
+    root: []const u8 = &.{},
+    sock_buf: [160]u8 = undefined,
+
+    fn start(gpa: Allocator, tag: []const u8) !*TestDaemon {
+        const self = try gpa.create(TestDaemon);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa, .threaded = .init(gpa, .{}) };
+        errdefer self.threaded.deinit();
+
+        const cwd_io = self.threaded.io();
+        self.root = try std.fmt.bufPrint(
+            &self.root_buf,
+            "/tmp/illogical-{s}-{d}",
+            .{ tag, std.c.getpid() },
+        );
+        std.Io.Dir.cwd().deleteTree(cwd_io, self.root) catch {};
+        try std.Io.Dir.cwd().createDirPath(cwd_io, self.root);
+
+        const sock = try std.fmt.bufPrintZ(&self.sock_buf, "{s}/server.sock", .{self.root});
+        self.server = try Server.init(gpa, cwd_io, sock, self.root);
+        errdefer self.server.deinit();
+        // `listen` is what starts the PTY poller and the maintenance thread,
+        // and retirement lives on that thread -- so the delete tests wait for
+        // it rather than ticking by hand and racing it.
+        try self.server.listen();
+        self.accepting = try std.Thread.spawn(.{}, Server.run, .{self.server});
+        return self;
+    }
+
+    fn io(self: *TestDaemon) std.Io {
+        return self.threaded.io();
+    }
+
+    /// Everything the test created, in the order that does not hang.
+    fn stop(self: *TestDaemon) void {
+        // The stub children sleep; `Terminal.destroy` closes the PTY master
+        // but does not signal, so kill the groups outright or they outlive the
+        // suite. Same reasoning as the login-shell test below.
+        self.server.mutex.lock();
+        var ids: std.ArrayList(session.TerminalId) = .empty;
+        ids.appendSlice(self.gpa, self.server.terminals.keys()) catch {};
+        self.server.mutex.unlock();
+        for (ids.items) |id| self.server.killTerminal(id, 9) catch {};
+        ids.deinit(self.gpa);
+
+        self.server.stop();
+        self.accepting.join();
+        self.server.deinit();
+        std.Io.Dir.cwd().deleteTree(self.threaded.io(), self.root) catch {};
+        self.threaded.deinit();
+        self.gpa.destroy(self);
+    }
+
+    /// A terminal running a child that does nothing and exits on SIGHUP.
+    fn spawnIdle(self: *TestDaemon, session_name: []const u8, name: []const u8) !CreateResult {
+        return self.server.createTerminal(.{
+            .session_name = session_name,
+            .name = name,
+            .argv = &.{ "/bin/sh", "-c", "sleep 30" },
+        });
+    }
+
+    /// A terminal whose child exits at once, of its own accord. What a person
+    /// typing `exit` produces, which is the ordinary way a session ends.
+    fn spawnExiting(self: *TestDaemon, session_name: []const u8, name: []const u8) !CreateResult {
+        return self.server.createTerminal(.{
+            .session_name = session_name,
+            .name = name,
+            .argv = &.{ "/bin/sh", "-c", ":" },
+        });
+    }
+
+    /// The name `list` reports for `id`, or null if it lists no such session.
+    fn sessionName(self: *TestDaemon, arena: Allocator, id: session.Id) !?[]const u8 {
+        const list = try self.server.listInto(arena);
+        for (list.sessions) |s| {
+            if (s.id == id) return s.name;
+        }
+        return null;
+    }
+
+    /// The `name` field of a session's `meta.json`, or null if there is none.
+    fn persistedName(self: *TestDaemon, gpa: Allocator, id: session.Id) !?[]u8 {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try self.server.store.sessionMetaPath(&path_buf, id);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(
+            self.io(),
+            path,
+            gpa,
+            .limited(4096),
+        ) catch return null;
+        defer gpa.free(bytes);
+        const parsed = try std.json.parseFromSlice(
+            illogical.park.Store.SessionMeta,
+            gpa,
+            bytes,
+            .{},
+        );
+        defer parsed.deinit();
+        return try gpa.dupe(u8, parsed.value.name);
+    }
+};
+
+test "renaming a session is validated, persisted, and visible in the list" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const daemon = try TestDaemon.start(gpa, "rename");
+    defer daemon.stop();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const created = try daemon.spawnIdle("work", "one");
+
+    // The name is on disk from the moment the session exists, not only after a
+    // rename: `meta.json` is what a restart would rebuild the registry from.
+    {
+        const persisted = try daemon.persistedName(gpa, created.session);
+        defer if (persisted) |p| gpa.free(p);
+        try testing.expectEqualStrings("work", persisted orelse return error.NoSessionMeta);
+    }
+
+    try daemon.server.renameSession(created.session, "done");
+
+    try testing.expectEqualStrings(
+        "done",
+        (try daemon.sessionName(arena, created.session)) orelse return error.SessionGone,
+    );
+    {
+        const persisted = try daemon.persistedName(gpa, created.session);
+        defer if (persisted) |p| gpa.free(p);
+        try testing.expectEqualStrings("done", persisted orelse return error.NoSessionMeta);
+    }
+
+    // The id is what everything keys on, so the terminal is where it was and
+    // still says so -- that is the whole property issue #37 asks to audit.
+    const list = try daemon.server.listInto(arena);
+    try testing.expectEqual(@as(usize, 1), list.terminals.len);
+    try testing.expectEqual(created.session, list.terminals[0].session);
+    try testing.expectEqual(created.terminal, list.terminals[0].id);
+}
+
+test "a rename is refused when the name is bad, taken, or names no session" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const daemon = try TestDaemon.start(gpa, "rename-refuse");
+    defer daemon.stop();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const first = try daemon.spawnIdle("work", "one");
+    const second = try daemon.spawnIdle("other", "two");
+    try testing.expect(first.session != second.session);
+
+    const server = daemon.server;
+    try testing.expectError(error.NameEmpty, server.renameSession(first.session, ""));
+    try testing.expectError(
+        error.NameInvalidChar,
+        server.renameSession(first.session, "has space"),
+    );
+    try testing.expectError(
+        error.NameInvalidChar,
+        server.renameSession(first.session, "../escape"),
+    );
+    try testing.expectError(
+        error.NameTooLong,
+        server.renameSession(first.session, "x" ** (session.max_name_len + 1)),
+    );
+    // Taken by the other session. Names are how `create` finds a session, so
+    // two of them sharing one would decide by iteration order which terminal
+    // lands where.
+    try testing.expectError(error.NameInUse, server.renameSession(first.session, "other"));
+    try testing.expectError(error.NoSuchSession, server.renameSession(9999, "anything"));
+
+    // Renaming a session to what it is already called is a success that does
+    // nothing -- the client should not have to check first.
+    try server.renameSession(first.session, "work");
+
+    try testing.expectEqualStrings(
+        "work",
+        (try daemon.sessionName(arena, first.session)) orelse return error.SessionGone,
+    );
+    const persisted = try daemon.persistedName(gpa, first.session);
+    defer if (persisted) |p| gpa.free(p);
+    try testing.expectEqualStrings("work", persisted orelse return error.NoSessionMeta);
+}
+
+test "deleting a session cascades, and takes its meta and its park files with it" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const daemon = try TestDaemon.start(gpa, "delete-cascade");
+    defer daemon.stop();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Park immediately, so both terminals have a file on disk to lose. It is
+    // also the case that makes R1 real: session 1's `meta.json` and terminal
+    // 1's `snapshot.gsnp` land in the same `sessions/1/` directory.
+    daemon.server.park_config.park_after_ns = 0;
+
+    const one = try daemon.spawnIdle("doomed", "a");
+    const two = try daemon.spawnIdle("doomed", "b");
+    try testing.expectEqual(one.session, two.session);
+
+    const io = daemon.io();
+    const store = daemon.server.store;
+    var waited: usize = 0;
+    while (waited < 10_000) : (waited += 10) {
+        if (store.snapshotSize(io, one.terminal) != null and
+            store.snapshotSize(io, two.terminal) != null) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.TerminalsNeverParked;
+
+    try daemon.server.deleteSession(one.session, .cascade);
+
+    // Accepting the delete changes nothing on disk. The name belongs to the
+    // registry entry and goes when *that* goes, not when the request is
+    // accepted -- otherwise a session whose child ignores SIGHUP sits in the
+    // list with no name behind it, and a `create` landing in that window
+    // reuses a session whose meta was just deleted.
+    {
+        const persisted = try daemon.persistedName(gpa, one.session);
+        defer if (persisted) |p| gpa.free(p);
+        try testing.expectEqualStrings("doomed", persisted orelse return error.NoSessionMeta);
+    }
+    // ...and terminal 1's park file, in that same directory, is untouched too.
+    // The terminals themselves are still on their way out.
+    try testing.expect(store.snapshotSize(io, one.terminal) != null);
+
+    // The rest is the ordinary retirement path on the maintenance tick, which
+    // `listen` is already running: SIGHUP, child exit, park state discarded,
+    // the emptied session dropped, its meta discarded, `sessions_changed`.
+    //
+    // Every condition in one wait, and deliberately: `retireExited` takes the
+    // terminals out of the registry under the lock and touches the filesystem
+    // after releasing it, so there is an instant where `list` is empty and the
+    // files are still there. Waiting on the list alone made this assertion
+    // fail about one run in ten.
+    waited = 0;
+    while (waited < 10_000) : (waited += 10) {
+        _ = arena_state.reset(.retain_capacity);
+        const persisted = try daemon.persistedName(gpa, one.session);
+        defer if (persisted) |p| gpa.free(p);
+        if ((try daemon.sessionName(arena, one.session)) == null and
+            persisted == null and
+            store.snapshotSize(io, one.terminal) == null and
+            store.snapshotSize(io, two.terminal) == null) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.SessionNeverWentAway;
+
+    _ = arena_state.reset(.retain_capacity);
+    const list = try daemon.server.listInto(arena);
+    try testing.expectEqual(@as(usize, 0), list.terminals.len);
+    try testing.expectEqual(@as(usize, 0), list.sessions.len);
+
+    // Nothing is left in the state directory either: both discards reap the
+    // directory they emptied.
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try store.sessionDir(&dir_buf, one.session);
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, dir, .{}));
+}
+
+test "a session that empties on its own loses its meta.json with it" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const daemon = try TestDaemon.start(gpa, "natural-exit");
+    defer daemon.stop();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The ordinary way a session ends: nobody deletes it, the last child just
+    // exits. `deleteSession` is not involved at all, so retirement's sweep is
+    // the only thing that can discard the name -- which is the point. Without
+    // this the daemon leaks one `meta.json` per session for the life of the
+    // machine, and every other test here still passes.
+    const created = try daemon.spawnExiting("transient", "one");
+
+    var waited: usize = 0;
+    while (waited < 10_000) : (waited += 10) {
+        _ = arena_state.reset(.retain_capacity);
+        const persisted = try daemon.persistedName(gpa, created.session);
+        defer if (persisted) |p| gpa.free(p);
+        if ((try daemon.sessionName(arena, created.session)) == null and persisted == null) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.SessionMetaOutlivedTheSession;
+
+    _ = arena_state.reset(.retain_capacity);
+    const list = try daemon.server.listInto(arena);
+    try testing.expectEqual(@as(usize, 0), list.sessions.len);
+    try testing.expectEqual(@as(usize, 0), list.terminals.len);
+}
+
+test "an only-if-empty delete refuses a session that still has terminals" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const daemon = try TestDaemon.start(gpa, "delete-busy");
+    defer daemon.stop();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const created = try daemon.spawnIdle("busy", "one");
+
+    try testing.expectError(
+        error.SessionBusy,
+        daemon.server.deleteSession(created.session, .only_if_empty),
+    );
+    try testing.expectError(
+        error.NoSuchSession,
+        daemon.server.deleteSession(9999, .cascade),
+    );
+
+    // Refused means nothing happened: the session, its terminal and its name
+    // on disk are all where they were.
+    try testing.expectEqualStrings(
+        "busy",
+        (try daemon.sessionName(arena, created.session)) orelse return error.SessionGone,
+    );
+    const list = try daemon.server.listInto(arena);
+    try testing.expectEqual(@as(usize, 1), list.terminals.len);
+    const persisted = try daemon.persistedName(gpa, created.session);
+    defer if (persisted) |p| gpa.free(p);
+    try testing.expectEqualStrings("busy", persisted orelse return error.NoSessionMeta);
+}
+
+test "an only-if-empty delete accepts a session whose children have all exited" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-ifempty-{d}", .{std.c.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+
+    var sock_buf: [160]u8 = undefined;
+    const sock = try std.fmt.bufPrintZ(&sock_buf, "{s}/server.sock", .{root});
+
+    // No `listen`, and that is the whole design of this test: the maintenance
+    // thread is what removes an exited terminal from its session, so with one
+    // running the window this asserts on closes within 250 ms and the test
+    // becomes a race. Without it the window is held open indefinitely.
+    const server = try Server.init(gpa, io, sock, root);
+    defer server.deinit();
+
+    // Two terminals in one session, and the refusal is asserted against the
+    // one that keeps running. A child that exits *needs no maintenance thread
+    // to be noticed* -- its terminal's own reader hits EOF and sets `finished`
+    // within a millisecond or two -- so asserting `SessionBusy` against a
+    // just-spawned `sh -c ':'` is a race, and a measured one: an inserted 3 ms
+    // delay is enough to lose it. The sleeper holds the busy leg open for as
+    // long as the test needs.
+    const busy = try server.createTerminal(.{
+        .session_name = "brief",
+        .name = "sleeper",
+        .argv = &.{ "/bin/sh", "-c", "sleep 30" },
+    });
+    defer server.killTerminal(busy.terminal, 9) catch {};
+    const brief = try server.createTerminal(.{
+        .session_name = "brief",
+        .name = "one",
+        .argv = &.{ "/bin/sh", "-c", ":" },
+    });
+    try testing.expectEqual(busy.session, brief.session);
+
+    // One running child is enough to refuse, whatever the other one is doing.
+    try testing.expectError(
+        error.SessionBusy,
+        server.deleteSession(busy.session, .only_if_empty),
+    );
+
+    // Now let the short-lived one go, and hang up the sleeper so that both
+    // children are finished. No maintenance thread is running, so nothing
+    // removes either terminal from the session: the window this asserts on
+    // stays open until the test closes it.
+    const short = server.terminal(brief.terminal) orelse return error.NoTerminal;
+    const sleeper = server.terminal(busy.terminal) orelse return error.NoTerminal;
+    server.killTerminal(busy.terminal, 9) catch {};
+
+    var waited: usize = 0;
+    while (waited < 10_000) : (waited += 10) {
+        if (short.finished.load(.acquire) and sleeper.finished.load(.acquire)) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.ChildrenNeverExited;
+
+    // Both still listed -- nothing has swept them -- but there is nothing left
+    // to kill, which is the only state a careful script can actually observe.
+    // Counting registry entries would refuse here, and a genuinely empty
+    // session is swept out of existence within a tick, so a `len == 0` check
+    // leaves the flag with essentially nothing it can ever succeed on.
+    server.mutex.lock();
+    const still_listed = server.sessions.getPtr(busy.session).?.terminals.items.len;
+    server.mutex.unlock();
+    try testing.expectEqual(@as(usize, 2), still_listed);
+
+    try server.deleteSession(busy.session, .only_if_empty);
+}
+
+test "a create with a name the server would refuse spawns nothing" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-badcreate-{d}", .{std.c.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+
+    var sock_buf: [160]u8 = undefined;
+    const sock = try std.fmt.bufPrintZ(&sock_buf, "{s}/server.sock", .{root});
+
+    // No `listen`: validation happens before the lock and before anything is
+    // spawned, so nothing here ever needs a poller or a PTY.
+    const server = try Server.init(gpa, io, sock, root);
+    defer server.deinit();
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // `create` is the other way into the registry, and until this existed it
+    // took raw wire bytes: a session named with a space was accepted here and
+    // then refused by `rename`, and the name went to `writeSessionMeta`
+    // unchecked.
+    try testing.expectError(
+        error.NameInvalidChar,
+        server.createTerminal(.{ .session_name = "has space" }),
+    );
+    try testing.expectError(
+        error.NameEmpty,
+        server.createTerminal(.{ .session_name = "" }),
+    );
+    try testing.expectError(
+        error.NameTooLong,
+        server.createTerminal(.{ .session_name = "x" ** (session.max_name_len + 1) }),
+    );
+    try testing.expectError(
+        error.NameInvalidChar,
+        server.createTerminal(.{ .session_name = "../escape" }),
+    );
+
+    // Refused all the way down: no session, no terminal, no id consumed.
+    const list = try server.listInto(arena);
+    try testing.expectEqual(@as(usize, 0), list.sessions.len);
+    try testing.expectEqual(@as(usize, 0), list.terminals.len);
+    try testing.expectEqual(@as(session.Id, 1), server.next_session_id);
+    try testing.expectEqual(@as(session.TerminalId, 1), server.next_terminal_id);
+
+    // The *terminal* name is deliberately untouched by this rule: it never
+    // reaches disk, and `illogical new -n "my name"` has always worked.
+    const created = try server.createTerminal(.{
+        .session_name = "fine",
+        .name = "a name with spaces",
+        .argv = &.{ "/bin/sh", "-c", ":" },
+    });
+    defer server.killTerminal(created.terminal, 9) catch {};
+    _ = arena_state.reset(.retain_capacity);
+    const after = try server.listInto(arena);
+    try testing.expectEqual(@as(usize, 1), after.terminals.len);
+    try testing.expectEqualStrings("a name with spaces", after.terminals[0].name);
 }
 
 test "a second daemon on one socket refuses to start, and leaves the first alone" {

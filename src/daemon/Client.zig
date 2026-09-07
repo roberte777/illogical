@@ -274,7 +274,19 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
         .create => {
             const req = try protocol.body.decode(protocol.body.Create, arena, payload);
             defer req.deinit();
-            const result = try self.server.createTerminal(req.value);
+            const result = self.server.createTerminal(req.value) catch |err| switch (err) {
+                // The *session* name, not the terminal's: only the session's
+                // reaches the registry and the park store, and only it is
+                // validated. Mapped here rather than left to the generic
+                // handler so a client is told `invalid_name` and the rule,
+                // exactly as it would be for a refused rename.
+                error.NameEmpty, error.NameTooLong, error.NameInvalidChar => return self.sendError(
+                    header.session,
+                    .invalid_name,
+                    "invalid session name (1-64 characters of A-Za-z0-9._-)",
+                ),
+                else => return err,
+            };
             const bytes = try protocol.body.encode(arena, protocol.body.Created{
                 .terminal = result.terminal,
                 .session = result.session,
@@ -337,6 +349,59 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
                 else => return err,
             };
             try self.send(.screen, header.session, text);
+        },
+
+        // Session-scoped, so the id is in the body: the header's u64 addresses
+        // a terminal and these two do not name one. Both are sent on the
+        // control channel; a refusal comes back on it.
+        .rename_session => {
+            const req = try protocol.body.decode(protocol.body.RenameSession, arena, payload);
+            defer req.deinit();
+            self.server.renameSession(req.value.session, req.value.name) catch |err| switch (err) {
+                error.NoSuchSession => return self.sendError(
+                    header.session,
+                    .no_such_session,
+                    "no such session",
+                ),
+                error.NameEmpty, error.NameTooLong, error.NameInvalidChar => return self.sendError(
+                    header.session,
+                    .invalid_name,
+                    "invalid session name",
+                ),
+                error.NameInUse => return self.sendError(
+                    header.session,
+                    .name_in_use,
+                    "a session with that name already exists",
+                ),
+                else => return err,
+            };
+            // The reply half of the request `sessions_changed` has always
+            // documented itself as covering. Everyone re-lists, including us.
+            self.server.notifySessionsChanged();
+        },
+
+        .delete_session => {
+            const req = try protocol.body.decode(protocol.body.DeleteSession, arena, payload);
+            defer req.deinit();
+            const mode: Server.DeleteMode =
+                if (req.value.only_if_empty) .only_if_empty else .cascade;
+            self.server.deleteSession(req.value.session, mode) catch |err| switch (err) {
+                error.NoSuchSession => return self.sendError(
+                    header.session,
+                    .no_such_session,
+                    "no such session",
+                ),
+                error.SessionBusy => return self.sendError(
+                    header.session,
+                    .session_busy,
+                    "session is not empty",
+                ),
+                else => return err,
+            };
+            // No broadcast here, deliberately: nothing has left the list yet.
+            // The terminals were hung up, and `retireExited` announces it once
+            // -- on the tick that retires the last of them and drops the
+            // emptied session together.
         },
 
         .ping => try self.send(.pong, header.session, payload),
@@ -1278,6 +1343,263 @@ test "fan-out that does not fit is refused, not buffered" {
     // came back, which is the assertion: the queue is live again.
     try testing.expect(client.queue.items.len > 0);
     try client.enqueue(.output, 7, &small, .drop);
+}
+
+// -- session-scoped frames -------------------------------------------------
+
+/// The header of the first frame in `bytes`, and the rest of the buffer.
+///
+/// The queue rather than the socket: these tests run no writer thread, so what
+/// was enqueued is exactly what a client would read, and nothing has to be
+/// woken or joined to look at it.
+fn firstFrame(bytes: []const u8) !struct { protocol.Header, []const u8 } {
+    var header_buf: [protocol.header_len]u8 = undefined;
+    if (bytes.len < protocol.header_len) return error.NoFrame;
+    @memcpy(&header_buf, bytes[0..protocol.header_len]);
+    const header = try protocol.Header.decode(&header_buf);
+    return .{ header, bytes[protocol.header_len..][0..header.len] };
+}
+
+/// The code carried by the first frame in `bytes`, which must be an `err`.
+fn firstErrorCode(gpa: Allocator, bytes: []const u8) !u16 {
+    const header, const payload = try firstFrame(bytes);
+    if (header.type != .err) return error.NotAnError;
+    const parsed = try protocol.body.decode(protocol.body.Err, gpa, payload);
+    defer parsed.deinit();
+    return parsed.value.code;
+}
+
+/// A server with a session in it and nothing else. `sessionByNameLocked` would
+/// need a PTY; these tests are about `dispatch` and its error mapping, so the
+/// registry entry is put there directly.
+fn putTestSession(server: *Server, gpa: Allocator, id: session.Id, name: []const u8) !void {
+    server.mutex.lock();
+    defer server.mutex.unlock();
+    try server.sessions.put(gpa, id, .{ .id = id, .name = try gpa.dupe(u8, name) });
+}
+
+test "a rename over the wire renames the session and tells every client" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try SocketPair.open("rename-dispatch");
+    defer pair.close();
+
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-rename-d-{d}", .{std.c.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const server = try Server.init(gpa, io, "/tmp/illogical-unused.sock", root);
+    defer server.deinit();
+
+    const client = try Client.create(server, pair.server_end);
+    // Registered, because `notifySessionsChanged` only reaches clients the
+    // server knows about -- and that means `Server.deinit` owns it now, so
+    // there is no `defer client.destroy()` to go with this.
+    server.clients_mutex.lock();
+    try server.clients.append(gpa, client);
+    server.clients_mutex.unlock();
+
+    try putTestSession(server, gpa, 1, "work");
+
+    const body_bytes = try protocol.body.encode(gpa, protocol.body.RenameSession{
+        .session = 1,
+        .name = "done",
+    });
+    defer gpa.free(body_bytes);
+    try client.dispatch(.{
+        .type = .rename_session,
+        .session = protocol.control_session,
+        .len = @intCast(body_bytes.len),
+    }, body_bytes);
+
+    try testing.expectEqualStrings("done", server.sessions.get(1).?.name);
+
+    // There is no reply frame: `sessions_changed` is the acknowledgement, and
+    // the requester gets it along with everybody else, which is what makes
+    // "re-list after the broadcast" the client's whole update path.
+    const header, const payload = try firstFrame(client.queue.items);
+    try testing.expectEqual(protocol.FrameType.sessions_changed, header.type);
+    try testing.expectEqual(protocol.control_session, header.session);
+    try testing.expectEqual(@as(usize, 0), payload.len);
+}
+
+test "a refused rename or delete answers err on the control channel" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try SocketPair.open("rename-refuse-d");
+    defer pair.close();
+
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-refuse-d-{d}", .{std.c.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const server = try Server.init(gpa, io, "/tmp/illogical-unused.sock", root);
+    defer server.deinit();
+
+    const client = try Client.create(server, pair.server_end);
+    defer client.destroy();
+
+    try putTestSession(server, gpa, 1, "work");
+    try putTestSession(server, gpa, 2, "other");
+
+    // Session 2 gets a terminal with a live child, because `only_if_empty`
+    // asks each terminal whether its child has finished rather than counting
+    // registry entries -- a phantom id would be skipped and the delete would
+    // succeed. No `start`: nothing needs the PTY read, and `finished` stays
+    // false while the child is alive, which is the whole condition under test.
+    const busy = try Terminal.create(gpa, .{
+        .io = io,
+        .store = server.store,
+        .id = 42,
+        .session_id = 2,
+        .name = "busy",
+        .argv = &.{ "/bin/sh", "-c", "sleep 30" },
+        .cols = 80,
+        .rows = 24,
+    });
+    // Hung up before `Server.deinit` destroys it: `destroy` closes the PTY but
+    // does not signal, and the child would outlive the suite by half a minute.
+    defer busy.hangup();
+    server.mutex.lock();
+    // Owned by the server from here -- `Server.deinit` destroys everything in
+    // this map, so there is no `defer busy.destroy()` to go with it.
+    try server.terminals.put(gpa, 42, busy);
+    try server.sessions.getPtr(2).?.terminals.append(gpa, 42);
+    server.mutex.unlock();
+
+    const Case = struct {
+        frame: protocol.FrameType,
+        payload: []const u8,
+        want: protocol.ErrorCode,
+    };
+    const cases = [_]Case{
+        .{
+            .frame = .rename_session,
+            .payload = "{\"session\":1,\"name\":\"has space\"}",
+            .want = .invalid_name,
+        },
+        .{
+            .frame = .rename_session,
+            .payload = "{\"session\":1,\"name\":\"\"}",
+            .want = .invalid_name,
+        },
+        .{
+            .frame = .rename_session,
+            .payload = "{\"session\":1,\"name\":\"other\"}",
+            .want = .name_in_use,
+        },
+        .{
+            .frame = .rename_session,
+            .payload = "{\"session\":9999,\"name\":\"anything\"}",
+            .want = .no_such_session,
+        },
+        .{
+            .frame = .delete_session,
+            .payload = "{\"session\":2,\"only_if_empty\":true}",
+            .want = .session_busy,
+        },
+        .{
+            .frame = .delete_session,
+            .payload = "{\"session\":9999}",
+            .want = .no_such_session,
+        },
+        // Not a session-scoped frame, but the same rule and the same code:
+        // `create` is the other way a name reaches the registry, and it is
+        // refused rather than allowed to put wire bytes on disk. The remaining
+        // `Create` fields default, so nothing is spawned before the refusal.
+        .{
+            .frame = .create,
+            .payload = "{\"session_name\":\"has space\"}",
+            .want = .invalid_name,
+        },
+        .{
+            .frame = .create,
+            .payload = "{\"session_name\":\"\"}",
+            .want = .invalid_name,
+        },
+    };
+
+    for (cases) |case| {
+        client.queue.clearRetainingCapacity();
+        try client.dispatch(.{
+            .type = case.frame,
+            .session = protocol.control_session,
+            .len = @intCast(case.payload.len),
+        }, case.payload);
+        try testing.expectEqual(
+            @intFromEnum(case.want),
+            try firstErrorCode(gpa, client.queue.items),
+        );
+    }
+
+    // Every one of those was a refusal, so nothing moved: the two sessions
+    // still have their names and the refused creates added none.
+    try testing.expectEqualStrings("work", server.sessions.get(1).?.name);
+    try testing.expectEqualStrings("other", server.sessions.get(2).?.name);
+    try testing.expectEqual(@as(usize, 2), server.sessions.count());
+    try testing.expectEqual(@as(usize, 1), server.terminals.count());
+}
+
+test "a delete announces nothing and changes nothing on disk" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var pair = try SocketPair.open("delete-quiet");
+    defer pair.close();
+
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-delete-q-{d}", .{std.c.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const server = try Server.init(gpa, io, "/tmp/illogical-unused.sock", root);
+    defer server.deinit();
+
+    const client = try Client.create(server, pair.server_end);
+    server.clients_mutex.lock();
+    try server.clients.append(gpa, client);
+    server.clients_mutex.unlock();
+
+    try putTestSession(server, gpa, 1, "doomed");
+    try server.store.writeSessionMeta(io, 1, "doomed");
+
+    const body_bytes = "{\"session\":1}";
+    try client.dispatch(.{
+        .type = .delete_session,
+        .session = protocol.control_session,
+        .len = body_bytes.len,
+    }, body_bytes);
+
+    // The terminals are on their way out and the registry still lists them, so
+    // a `sessions_changed` here would send every client to fetch a list that
+    // has not changed. `retireExited` sends it when they have actually gone.
+    try testing.expectEqual(@as(usize, 0), client.queue.items.len);
+
+    // And the name is still on disk, because the session still exists. The
+    // registry owns `meta.json`'s lifetime, not the request: discarding it
+    // here would leave a nameless session listed for as long as a child that
+    // ignores SIGHUP took to die, and would delete the name out from under a
+    // `create` that landed in that window and reused the session.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const meta = try server.store.sessionMetaPath(&path_buf, 1);
+    try std.Io.Dir.cwd().access(io, meta, .{});
+    try testing.expect(server.sessions.contains(1));
 }
 
 /// A second subscriber that just records what the terminal fanned out.

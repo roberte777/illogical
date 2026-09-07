@@ -32,6 +32,12 @@ public enum FrameType: UInt8, Sendable {
     case resize = 0x08
     case ping = 0x09
     case peek = 0x0A
+    /// Rename a session. Session-scoped: the id rides in the body, because the
+    /// header's u64 addresses a *terminal*. Sent on the control channel.
+    case renameSession = 0x0B
+    /// Delete a session and everything in it. Session-scoped, like
+    /// ``renameSession``.
+    case deleteSession = 0x0C
 
     // server -> client
     case welcome = 0x81
@@ -117,4 +123,11 @@ public enum ProtocolErrorCode: UInt16, Sendable {
     /// is missing and the server has already unsubscribed us, so the only
     /// recovery is a fresh `attach`. See docs/PROTOCOL.md.
     case desync = 7
+    /// A name the server's `session.validateName` refuses: empty, over 64
+    /// bytes, or with a character outside `[A-Za-z0-9._-]`. ``SessionName``
+    /// is the client-side copy of that rule, so this should only be reachable
+    /// from a client that did not check.
+    case invalidName = 8
+    /// A rename to a name another session already holds.
+    case nameInUse = 9
 }

@@ -365,14 +365,50 @@ $XDG_STATE_HOME/illogical/
   sessions/<sid>/terminals/<tid>/snapshot.gsnp.tmp
 ```
 
+⚠ **Today's code differs from the table above in two ways.**
+
+**Park files are at `sessions/<tid>/`, not under `sessions/<sid>/terminals/`.**
+`meta.json` is keyed by *session* id and `snapshot.gsnp` by *terminal* id, in
+the same directory level — so session 3's name can share `sessions/3/` with
+terminal 3's snapshot, which on a fresh daemon it does. The basenames never
+collide, so nothing is lost; the consequence is that **nothing may `deleteTree`
+a `sessions/<id>` directory**, because a recursive delete keyed by one id space
+would take a file from the other with it. `park.Store.discardSessionMeta` and
+`park.Store.discard` each delete named files for that reason, and then attempt a
+plain `rmdir`, which fails harmlessly for as long as the other id space still
+has something in there.
+
+**`meta.json` holds `{id, name}` only — not the terminal list the table above
+describes — and is written but never read back.** It is written when a session
+is created and on every rename, staged through `meta.json.tmp` and renamed into
+place, and discarded exactly when the session leaves the registry. Nothing
+rebuilds a session from it yet.
+
+Both gaps — the restart-read path and the layout unification, with its
+orphan-file questions — belong to one follow-up and are tracked separately.
+
+**That follow-up has one window to close before `meta.json` can be trusted on
+restart.** The directory reap inside `park.Store.discard` runs on the
+maintenance thread, *outside* `Server.mutex`, keyed by terminal id;
+`writeSessionMeta` runs on a client's dispatch thread, under that mutex, keyed
+by session id, and creates the directory and the staged file as two steps.
+Where the two ids coincide — routine, given the layout above — a reap can land
+between them and the write fails with `FileNotFound`. Today that is one warning
+in the daemon log and nothing else, because the write is best effort and
+nothing reads the file back. It becomes "the session forgot its name across a
+restart" the moment something does. Unifying the layout removes the id
+collision, and with it the window; `discardSessionMeta`'s own reap is not
+affected, being serialized with the registry drop by the mutex.
+
 `snapshot.gsnp` is exactly what is sent as `snapshot_chunk` payloads. One format,
 one encoder, one decoder, two uses.
 
 ## Crash and restart
 
-`meta.json` survives a daemon restart, so the session table can be rebuilt. The
-*children* cannot be reattached — their controlling PTY died with the daemon —
-but the last known screen is still there to show.
+`meta.json` survives a daemon restart, so the session table can be rebuilt — the
+*intent*; nothing reads it back yet (see the note above). The *children* cannot
+be reattached — their controlling PTY died with the daemon — but the last known
+screen is still there to show.
 
 Surviving a restart with live children needs the PTY masters held by something
 that outlives the daemon (fd passing, or re-exec preserving fds). Out of scope

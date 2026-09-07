@@ -49,5 +49,23 @@ struct FrameHeaderTests {
     func direction() {
         #expect(FrameType.input.isClientToServer)
         #expect(!FrameType.output.isClientToServer)
+        #expect(FrameType.renameSession.isClientToServer)
+        #expect(FrameType.deleteSession.isClientToServer)
+    }
+
+    // The numbers, not just the names. This file and src/core/protocol.zig are
+    // one protocol written twice, and a value that drifts is a frame the other
+    // side either refuses or, worse, mistakes for a different one. The Zig
+    // suite asserts the same constants.
+    @Test("the session-scoped frames carry the values the server assigns")
+    func sessionScopedFrameValues() {
+        #expect(FrameType.renameSession.rawValue == 0x0B)
+        #expect(FrameType.deleteSession.rawValue == 0x0C)
+    }
+
+    @Test("the naming error codes carry the values the server sends")
+    func namingErrorCodes() {
+        #expect(ProtocolErrorCode.invalidName.rawValue == 8)
+        #expect(ProtocolErrorCode.nameInUse.rawValue == 9)
     }
 }
