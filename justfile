@@ -70,8 +70,36 @@ xcframework MODE="native":
     ./scripts/build-xcframework.sh {{MODE}}
 
 # Regenerate Illogical.xcodeproj from project.yml.
-xcodeproj:
+#
+# Depends on `stage-daemon` because project.yml names the staged directory as a
+# source, and xcodegen refuses to generate against a path that is not there.
+# Cheap after the first time: `zig build` is a no-op and the copy is two files.
+xcodeproj: stage-daemon
     cd clients/macos && xcodegen generate
+
+# Put illogicald and illogical where Xcode will copy them into the bundle.
+#
+# A prebuilt artifact, staged here and copied by a build phase, rather than a
+# phase that shells out to zig. Three reasons, all concrete:
+# ENABLE_USER_SCRIPT_SANDBOXING (project.yml) gives a script phase only its
+# declared inputs and no network, while zig wants .zig-cache and may fetch; zig
+# is not on Xcode's PATH outside the devshell; and the devshell variables zig
+# needs -- SDKROOT, LD, CC -- are exactly the ones xcodebuild must not see,
+# which is what `xcenv` above exists to strip. A build phase would have to undo
+# that per phase.
+#
+# `just xcframework` sets the precedent: built by zig, staged into the client
+# tree, gitignored, consumed by Xcode.
+#
+# The daemon only, and not the `illogical` CLI beside it. `Contents/MacOS/`
+# already holds the app's own executable, `Illogical`, and the default macOS
+# volume is case-insensitive -- so copying a file named `illogical` in there
+# *overwrites the app*. Measured, not guessed: same inode, and the bundle then
+# failed `codesign --verify --deep` with "invalid Info.plist". The CLI ships in
+# the standalone tarball instead.
+stage-daemon: build
+    mkdir -p clients/macos/Illogical/Supporting/bin
+    cp zig-out/bin/illogicald clients/macos/Illogical/Supporting/bin/
 
 # Test the pure-Swift client core. Needs no XCFramework.
 test-swift:
@@ -79,7 +107,7 @@ test-swift:
 
 # Build the Mac app. Requires `just xcframework` and `just xcodeproj` first.
 # DerivedData is pinned so `just run-app` always launches what was just built.
-app:
+app: stage-daemon
     cd clients/macos && {{xcenv}} xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Debug -derivedDataPath .build/xcode -destination 'platform=macOS' build
 
 # Run the renderer tests. Needs `just xcframework` and `just xcodeproj` first.
@@ -110,12 +138,16 @@ bench-renderer:
 run-app: app
     open clients/macos/.build/xcode/Build/Products/Debug/Illogical.app
 
-# Start a daemon and a couple of terminals, then launch the app against them.
-demo: build app
-    ./zig-out/bin/illogicald & sleep 1
+# Launch the app and give it a couple of terminals to show.
+#
+# No daemon is started here any more: the app starts one itself when nothing is
+# listening, which is the whole point of the embedded server. So this waits for
+# *the app's* daemon rather than racing it -- `illogical list` answering is the
+# same event the app is waiting for.
+demo: run-app
+    for i in $(seq 1 100); do ./zig-out/bin/illogical list >/dev/null 2>&1 && break; sleep 0.1; done
     ./zig-out/bin/illogical new -s Demo -n shell
     ./zig-out/bin/illogical new -s Demo -n logs
-    open clients/macos/.build/xcode/Build/Products/Debug/Illogical.app
 
 fmt-swift:
     swift-format format --in-place --recursive clients/macos/Illogical clients/macos/Tests clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests
@@ -128,3 +160,4 @@ ci: fmt-check test smoke-ensure test-swift
 clean:
     rm -rf zig-out .zig-cache zig-pkg
     rm -rf clients/macos/.build clients/macos/Frameworks clients/macos/Illogical.xcodeproj
+    rm -rf clients/macos/Illogical/Supporting/bin

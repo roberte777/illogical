@@ -68,9 +68,15 @@ For the Mac client:
 ```bash
 just xcframework       # build ghostty-vt.xcframework from vendor/ghostty (~1 min)
 just xcodeproj         # generate Illogical.xcodeproj from project.yml
-just app               # build the app
+just app               # build the app, with illogicald inside it
+just run-app           # ...and launch it. No daemon to start first.
 just test-swift        # protocol tests; needs neither of the above
 ```
+
+`just app` stages `zig-out/bin/illogicald` into the bundle (`just stage-daemon`,
+which `xcodeproj` and `app` both depend on), so the app you build carries the
+server built from the same ghostty pin. Running it is enough — if nothing is
+listening on the socket, the app starts one, and that server outlives the app.
 
 `just` on its own lists every task.
 

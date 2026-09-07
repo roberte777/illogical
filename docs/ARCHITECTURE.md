@@ -172,8 +172,15 @@ describes: *"the same trade-off as other multiplexers"* [ARCH t=507].
 | Rendering | Metal, CoreText-rasterized glyph atlas |
 | Scrollback | native scroll views over the VT scrollback |
 | Transport | unix socket locally; `ssh <host> illogicald --stdio` remotely |
+| Server | `Contents/MacOS/illogicald` — the same binary as the standalone release |
 
 One connection per terminal, per [ARCH t=440]. See [CLIENT.md](CLIENT.md).
+
+The server is *in* the bundle, staged by `just stage-daemon` and copied in by a
+build phase, so a machine with the app on it has a server on it. Only the
+daemon: `Contents/MacOS/` also holds the app's own executable `Illogical`, and
+the default macOS volume is case-insensitive, so a second file named
+`illogical` in there is the same file. The CLI ships in the standalone tarball.
 
 ### `vendor/ghostty` — the pin
 
