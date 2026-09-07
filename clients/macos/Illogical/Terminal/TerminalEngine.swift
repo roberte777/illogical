@@ -65,7 +65,57 @@ final class TerminalEngine: @unchecked Sendable {
     /// Called when the engine goes from clean to dirty, so the view can
     /// restart a paused display link. An idle terminal should cost nothing,
     /// which means the display link has to actually stop.
-    var onWake: (@Sendable () -> Void)?
+    ///
+    /// Read from the reader thread and written from the main actor, the same
+    /// unguarded discipline it has always had: a torn read of a closure slot
+    /// costs at worst one missed wake on the very frame a surface is being
+    /// swapped, and taking `lock` here would deadlock — `markDirty` is called
+    /// from inside the write path that already holds it.
+    private var wake: (@Sendable () -> Void)?
+
+    /// The surface `wake` belongs to.
+    ///
+    /// One engine can be held by *two* surfaces at once, and that is the whole
+    /// reason this is not a plain settable property. Anything that changes a
+    /// tab's split tree — a pane arriving, a pane closing, a zoom — moves the
+    /// surviving pane to a new position in the view tree, so SwiftUI builds it
+    /// a fresh `TerminalSurfaceView` while keeping the outgoing one alive for
+    /// the length of the transition. Both are bound to this engine, and the
+    /// old one's teardown would otherwise clear the callback the *live* one had
+    /// already installed. The display link then pauses after a second of quiet
+    /// with nothing left to restart it, and the pane silently stops repainting
+    /// until it is clicked or typed into.
+    ///
+    /// Weak: the engine outlives any one view of it, and a surface holds the
+    /// engine strongly.
+    ///
+    /// Main-actor only. `markDirty` reads `wake` and never this.
+    private weak var boundView: AnyObject?
+
+    /// Bind `view` to this engine, displacing whatever was bound before.
+    @MainActor
+    func bind(_ view: AnyObject, wake: @escaping @Sendable () -> Void) {
+        boundView = view
+        self.wake = wake
+    }
+
+    /// Unbind `view`. A no-op unless `view` is still the bound one, which is
+    /// what stops a displaced surface taking the live callback with it.
+    @MainActor
+    func unbind(_ view: AnyObject) {
+        guard boundView === view else { return }
+        boundView = nil
+        wake = nil
+    }
+
+    /// Whether `view` is the surface this engine currently answers to.
+    ///
+    /// False for one that has been displaced but is still on screen fading
+    /// out — which is exactly the surface that must not resize the PTY.
+    @MainActor
+    func isBound(_ view: AnyObject) -> Bool {
+        boundView === view
+    }
 
     init(cols: UInt16 = 80, rows: UInt16 = 24) throws {
         self.cols = cols
@@ -420,7 +470,7 @@ final class TerminalEngine: @unchecked Sendable {
         // Only wake on the clean -> dirty edge. A terminal spewing output
         // must not post a wakeup per write.
         if !dirtyFlag.exchange(true) {
-            onWake?()
+            wake?()
         }
     }
 

@@ -201,7 +201,13 @@ final class TerminalSurfaceView: NSView {
         renderThread?.stop()
         renderThread = nil
         renderer = nil
-        engine?.onWake = nil
+        // Only if this surface is still the one the engine answers to. A split,
+        // a pane close and a zoom all move the surviving pane to a new place in
+        // the view tree, so SwiftUI builds it a new surface over the same
+        // engine and keeps this one alive until the transition finishes — an
+        // unconditional clear here would take the live surface's wake callback
+        // with it and the pane would stop repainting a second later.
+        engine?.unbind(self)
     }
 
     private func attachEngine() {
@@ -222,7 +228,7 @@ final class TerminalSurfaceView: NSView {
         // Restart a paused display link when output arrives. This is the
         // other half of stopping it when idle.
         let loop = renderThread
-        engine.onWake = { [weak loop] in loop?.wake() }
+        engine.bind(self) { [weak loop] in loop?.wake() }
         if renderer == nil {
             setupRenderingIfNeeded()
         } else {
@@ -293,6 +299,13 @@ final class TerminalSurfaceView: NSView {
     }
 
     private func reportSizeIfNeeded() {
+        // Only the surface the engine answers to may resize the PTY. A
+        // displaced one is still laid out while it fades, and it is laid out at
+        // the *old* geometry — so without this it can report a full-window grid
+        // after the half-width surface that replaced it already reported the
+        // right one, leaving the PTY's winsize larger than the pane and a
+        // full-screen program drawing off its edge.
+        if let engine, !engine.isBound(self) { return }
         let size = gridSize
         guard size != lastReportedSize else { return }
         lastReportedSize = size

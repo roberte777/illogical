@@ -111,6 +111,26 @@ struct IllogicalApp: App {
 
 struct ContentView: View {
     @Environment(SessionStore.self) private var store
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Which of the three things the content area can be.
+    ///
+    /// The crossfade is keyed on *this* rather than on the selected tab, which
+    /// is the whole point: going from one terminal to another is a tab switch
+    /// and must be instant, while going from a terminal to "no terminals" is a
+    /// different screen and should not snap. `screen` does not change on a tab
+    /// switch, so `.animation(_:value:)` never fires for one.
+    private enum Screen: Equatable {
+        case terminals
+        case unavailable
+        case empty
+    }
+
+    private var screen: Screen {
+        if store.selectedTab != nil { return .terminals }
+        if store.connectionError != nil { return .unavailable }
+        return .empty
+    }
 
     var body: some View {
         @Bindable var store = store
@@ -124,23 +144,36 @@ struct ContentView: View {
             // every surface in it on the way, which is worse than it looks:
             // the pane comes back attached to a new view with a new grid. Each
             // pane says for itself that it is reconnecting.
-            if let tab = store.selectedTab {
-                // Each pane carries its own header. There is no divider under
-                // it: it sits on the terminal's own background, as in
-                // Superlogical.
-                SplitContainer(tab: tab)
-                    .environment(store)
-                    .id(tab.id)
-            } else if let error = store.connectionError {
-                ServerUnavailable(message: error)
-            } else {
-                EmptyState()
+            ZStack {
+                if let tab = store.selectedTab {
+                    // Each pane carries its own header. There is no divider
+                    // under it: it sits on the terminal's own background, as in
+                    // Superlogical.
+                    SplitContainer(tab: tab)
+                        .environment(store)
+                        .id(tab.id)
+                } else if let error = store.connectionError {
+                    ServerUnavailable(message: error)
+                        .transition(Motion.screen.transition(reduceMotion: reduceMotion))
+                } else {
+                    EmptyState()
+                        .transition(Motion.screen.transition(reduceMotion: reduceMotion))
+                }
             }
+            // No `.transition` on the tab branch, and none is wanted: a
+            // terminal replaced by another terminal is `.id(tab.id)` swapping
+            // one subtree for another, and a transition there would fade the
+            // surface on every ⌘1/⌘2. The two placeholder screens carry the
+            // crossfade instead, so it only ever runs between screens.
+            .animation(Motion.screen.animation(reduceMotion: reduceMotion), value: screen)
         }
         .background(Palette.background)
         .overlay {
-            if store.sessionMenuOpen {
-                ZStack(alignment: .topLeading) {
+            // The ZStack is unconditional so the *removal* transition has
+            // something to run inside. With the `if` outside it, closing the
+            // menu took the container with it and the menu just vanished.
+            ZStack(alignment: .topLeading) {
+                if store.sessionMenuOpen {
                     // Dismiss on a click anywhere else, the way a menu does.
                     Color.black.opacity(0.001)
                         .contentShape(Rectangle())
@@ -152,8 +185,11 @@ struct ContentView: View {
                         // toolbar is in the title bar now, so this is measured
                         // from the top of the content view.
                         .offset(x: Metrics.contentInset - 1, y: 1)
+                        .transition(Motion.menu.transition(reduceMotion: reduceMotion))
                 }
             }
+            .animation(
+                Motion.menu.animation(reduceMotion: reduceMotion), value: store.sessionMenuOpen)
         }
         // The menu's filter field held the keyboard while it was open, and
         // nothing in the split tree changed when the overlay went away — so
@@ -193,11 +229,58 @@ struct ContentView: View {
 /// The unified toolbar: traffic lights, session button, tab strip, new-tab.
 struct Toolbar: View {
     @Environment(SessionStore.self) private var store
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// The active pill is one view that moves between slots rather than one
+    /// per slot appearing and disappearing, so selecting a tab slides it.
+    @Namespace private var pill
+
+    /// The tab being dragged along the strip, and how far it has come.
+    ///
+    /// Not `.draggable`/`.dropDestination`. Those are system drag and drop, and
+    /// on this strip most of a 197 pt slot is the select `Button`'s hit area —
+    /// a control that takes the mouse-down, which is the documented way for a
+    /// `.draggable` on macOS to never start. A reorder that silently does
+    /// nothing is worse than no reorder, so this is the `DragGesture` slot-swap
+    /// the plan named as the fallback (risk R5), attached with
+    /// `simultaneousGesture` so it runs *beside* the button rather than
+    /// competing with it. It also drops the two bugs the system path came with:
+    /// a text selection dragged in from another app no longer lights the strip
+    /// up, and a refused move no longer plays the accept animation.
+    private struct TabDrag: Equatable {
+        var id: TabLayout.ID
+        var translation: CGFloat
+    }
+    @State private var drag: TabDrag?
+
+    /// Far enough that a click with a shaky hand is still a click.
+    private static let dragThreshold: CGFloat = 8
 
     private func isActive(_ index: Int) -> Bool {
         let tabs = store.visibleTabs
         guard tabs.indices.contains(index) else { return false }
         return tabs[index].id == store.selectedTabID
+    }
+
+    /// The slot the drag currently points at, if there is one.
+    private var dragTarget: Int? {
+        guard let drag,
+            let from = store.visibleTabs.firstIndex(where: { $0.id == drag.id })
+        else { return nil }
+        let to = TabStrip.dropIndex(
+            from: from, translation: drag.translation, slotWidth: Metrics.tabWidth,
+            count: store.visibleTabs.count)
+        return to == from ? nil : to
+    }
+
+    private func drop(_ id: TabLayout.ID, translation: CGFloat) {
+        let tabs = store.visibleTabs
+        guard let from = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let to = TabStrip.dropIndex(
+            from: from, translation: translation, slotWidth: Metrics.tabWidth,
+            count: tabs.count)
+        guard to != from else { return }
+        Motion.tabs.run { store.moveTab(id, onto: tabs[to].id) }
     }
 
     var body: some View {
@@ -225,13 +308,46 @@ struct Toolbar: View {
                             isActive: isActive(index),
                             showsLeadingSeparator: index > 0 && !isActive(index)
                                 && !isActive(index - 1),
+                            isDropTarget: dragTarget == index,
+                            pill: pill,
                             select: { store.selectedTabID = tab.id },
                             // Through the same policy ⇧⌘W uses, so pointer and
                             // keyboard cannot disagree about when closing a tab
                             // asks first — or about the window's last tab
                             // taking the window with it rather than emptying
                             // it.
-                            close: { WindowClose.tab(tab.id, in: store) })
+                            close: { WindowClose.tab(tab.id, in: store) }
+                        )
+                        // The dragged slot follows the pointer and rides over
+                        // its neighbours; everything else stays put until the
+                        // drop, when the strip's own animation closes the gap.
+                        .offset(x: drag?.id == tab.id ? drag?.translation ?? 0 : 0)
+                        .zIndex(drag?.id == tab.id ? 1 : 0)
+                        // Drag to reorder — issue #38. Order is client state
+                        // and never leaves the window. `simultaneousGesture`
+                        // rather than `gesture`: the slot is mostly taken up by
+                        // the select button, and a plain gesture would have to
+                        // win against it rather than run alongside it.
+                        .simultaneousGesture(
+                            // `.global`, not the slot's own space. The slot is
+                            // offset by the very translation this reports, so
+                            // measuring in local coordinates would feed the
+                            // offset back into the next event and the tab would
+                            // either run away from the pointer or stick to it.
+                            DragGesture(
+                                minimumDistance: Self.dragThreshold, coordinateSpace: .global
+                            )
+                            .onChanged { value in
+                                drag = TabDrag(id: tab.id, translation: value.translation.width)
+                            }
+                            .onEnded { value in
+                                drag = nil
+                                drop(tab.id, translation: value.translation.width)
+                            }
+                        )
+                        // Outermost, so what fades is the whole slot rather
+                        // than the content inside a wrapper that stays.
+                        .transition(Motion.tabs.transition(reduceMotion: reduceMotion))
                     }
                 }
             }
@@ -239,6 +355,17 @@ struct Toolbar: View {
             // genuinely empty and can drag the window. When the tabs outgrow
             // the window this clamps to the available width and scrolls.
             .frame(maxWidth: CGFloat(store.visibleTabs.count) * Metrics.tabWidth)
+            // One animation for the whole strip: slots arriving and leaving,
+            // the width cap moving with them, and the active pill sliding to
+            // its new slot. Keyed on the ids rather than the tabs themselves,
+            // so a tab whose *label* changed — every `cd`, on every list —
+            // does not re-run the strip's animation.
+            .animation(
+                Motion.tabs.animation(reduceMotion: reduceMotion),
+                value: store.visibleTabs.map(\.id)
+            )
+            .animation(
+                Motion.tabs.animation(reduceMotion: reduceMotion), value: store.selectedTabID)
 
             // Bare title bar drags the window; AppKit handles it because the
             // toolbar is a title bar accessory.
