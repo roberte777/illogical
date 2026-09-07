@@ -22,6 +22,9 @@ xcuserdata/
 # Generated libghostty-vt artifacts
 clients/macos/Frameworks/
 
+# illogicald + illogical, staged into the app bundle by `just stage-daemon`
+clients/macos/Illogical/Supporting/bin/
+
 # macOS
 .DS_Store
 .zig-bench/
