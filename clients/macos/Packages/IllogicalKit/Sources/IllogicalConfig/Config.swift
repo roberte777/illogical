@@ -1,0 +1,220 @@
+//  Config.swift
+//  What the config file can say, and what saying it does.
+//
+//  Ghostty's format and Ghostty's option names, deliberately. The audience for
+//  this app is largely the audience for that one, the two files will sit next
+//  to each other on the same machine holding the same font, and a file that
+//  *looks* identical while behaving differently is worse than one that looks
+//  nothing alike. So the semantics are copied along with the syntax:
+//  `font-family` repeats to build a fallback list rather than overwriting,
+//  `key =` with nothing after it resets rather than sets empty, and an
+//  unnamed style is looked for inside the family you did name rather than in
+//  the next family down.
+//
+//  Only the font is here (#39 has the rest: scrollback cap, park threshold,
+//  colours, keybindings). Nothing about the shape below is font-specific —
+//  another option is a field, a case in `apply`, and a line in the template.
+
+import Foundation
+
+/// Everything the config file sets, after every file has been read.
+///
+/// Values only. Where they came from and what was wrong with them is
+/// `ConfigLoad`'s, so that two configs holding the same font compare equal no
+/// matter which file each was read from — which is what a reload has to ask.
+public struct Config: Equatable, Sendable {
+    public init() {}
+
+    // MARK: - Font
+
+    /// The families to draw the regular style from, in priority order. The
+    /// first that has the codepoint wins; the system's own cascade is asked
+    /// only once every one of them has missed.
+    ///
+    /// Empty means the font the app ships, which is the case for anyone who
+    /// has not written a config file.
+    ///
+    /// A list rather than one name because that is what `font-family`
+    /// repeating *means* — each line adds the next fallback:
+    ///
+    ///     font-family = Berkeley Mono
+    ///     font-family = Noto Sans CJK
+    ///
+    /// which is how a person covers a language their programming font has no
+    /// glyphs for. Since every line appends, clearing needs its own spelling:
+    /// `font-family = ""` empties the list, and lines after it start a new
+    /// one.
+    public var fontFamily: [String] = []
+
+    /// The same, for each style the terminal can ask for.
+    ///
+    /// Unset means "look inside `fontFamily`", not "fall to the next family":
+    /// `finalize()` copies the regular list into whichever of these is empty,
+    /// so a style is always searched for in the family the person actually
+    /// named. libghostty is explicit that this is deliberate, and it is the
+    /// one part of the font config that is easy to get subtly wrong — bold
+    /// text quietly drawn from a different typeface than the text around it.
+    public var fontFamilyBold: [String] = []
+    public var fontFamilyItalic: [String] = []
+    public var fontFamilyBoldItalic: [String] = []
+
+    /// Font size in points. Fractional sizes are allowed: the grid is measured
+    /// in pixels, so 13.5pt on a 2x display is a real 27px cell rather than a
+    /// rounding of 26 or 28.
+    ///
+    /// 13 rather than 12 on macOS, which is libghostty's default and its
+    /// stated reason — "this tends to look better" — and also what the app
+    /// already drew before there was a config file.
+    public var fontSize: Double = 13
+
+    // MARK: - Applying a file
+
+    /// Apply every `key = value` in `text`, appending diagnostics for
+    /// anything wrong.
+    ///
+    /// Public because it is the useful unit to test and the useful unit to
+    /// reuse: a config that came from somewhere other than a file — a future
+    /// `--config-string`, a settings UI writing a preview — goes through
+    /// exactly this. `path` is only ever printed.
+    public mutating func apply(
+        text: String,
+        path: String? = nil,
+        diagnostics: inout [ConfigDiagnostic]
+    ) {
+        for entry in ConfigSyntax.entries(of: text) {
+            apply(entry, path: path, diagnostics: &diagnostics)
+        }
+    }
+
+    /// Apply one entry.
+    ///
+    /// Every key lands in the switch below, and an unknown one is reported
+    /// rather than ignored. That has a cost worth naming: a person pasting
+    /// their Ghostty config in gets a warning per option we do not have yet.
+    /// Reporting is still right — the alternative is a typo'd `font-famly`
+    /// that silently does nothing, which is the single most common way a
+    /// config file wastes somebody's afternoon.
+    public mutating func apply(
+        _ entry: ConfigEntry,
+        path: String? = nil,
+        diagnostics: inout [ConfigDiagnostic]
+    ) {
+        func report(_ message: String) {
+            diagnostics.append(
+                ConfigDiagnostic(file: path, line: entry.line, key: entry.key, message: message))
+        }
+
+        switch entry.key {
+        case "font-family":
+            apply(entry, to: \.fontFamily, report: report)
+        case "font-family-bold":
+            apply(entry, to: \.fontFamilyBold, report: report)
+        case "font-family-italic":
+            apply(entry, to: \.fontFamilyItalic, report: report)
+        case "font-family-bold-italic":
+            apply(entry, to: \.fontFamilyBoldItalic, report: report)
+
+        case "font-size":
+            guard let value = entry.value else {
+                report("value required")
+                return
+            }
+            if value.isEmpty {
+                fontSize = Config().fontSize
+                return
+            }
+            // `Double(_:)` and not a `NumberFormatter`: this is a config file,
+            // not a locale-aware input, and `font-size = 13,5` should be
+            // rejected rather than read as 135 in a French locale.
+            guard let size = Double(value), size.isFinite, size > 0 else {
+                // libghostty accepts a zero or negative size here and lets the
+                // font stack deal with it. We do not, because our grid divides
+                // by the cell the size produces: the failure would be a window
+                // that draws nothing, a long way from the line that caused it.
+                report("invalid value \"\(value)\"")
+                return
+            }
+            fontSize = size
+
+        default:
+            report("unknown field")
+        }
+    }
+
+    /// The repeatable-string rule, which is the same for all four families.
+    ///
+    /// No `=` at all is an error rather than a reset. The difference matters:
+    /// a bare `font-family` is a line someone stopped typing halfway, and
+    /// resetting the list from it would be a silent surprise.
+    private mutating func apply(
+        _ entry: ConfigEntry,
+        to keyPath: WritableKeyPath<Config, [String]>,
+        report: (String) -> Void
+    ) {
+        guard let value = entry.value else {
+            report("value required")
+            return
+        }
+        if value.isEmpty {
+            self[keyPath: keyPath].removeAll()
+            return
+        }
+        self[keyPath: keyPath].append(value)
+    }
+
+    /// Settle the values that depend on each other. Run once, after the last
+    /// file.
+    ///
+    /// One rule so far, and it is libghostty's: a named `font-family` with no
+    /// style named alongside it fills in all three styles, so that
+    /// `font-family = Berkeley Mono` looks for Berkeley Mono's own bold and
+    /// italic rather than reaching for another family's.
+    public mutating func finalize() {
+        guard !fontFamily.isEmpty else { return }
+        if fontFamilyBold.isEmpty { fontFamilyBold = fontFamily }
+        if fontFamilyItalic.isEmpty { fontFamilyItalic = fontFamily }
+        if fontFamilyBoldItalic.isEmpty { fontFamilyBoldItalic = fontFamily }
+    }
+}
+
+/// Something wrong with a config file, in the words libghostty uses for the
+/// same mistake.
+///
+/// Warnings, every one of them: a bad line is skipped and the rest of the file
+/// is read. A config file is not a program, and refusing to start a terminal
+/// over a misspelled option would be a poor trade — especially since the
+/// terminal is often the only way to fix the file.
+public struct ConfigDiagnostic: Equatable, Sendable, CustomStringConvertible {
+    /// The file it was found in, or nil when the text came from somewhere
+    /// else.
+    public var file: String?
+    /// 1-indexed line within `file`.
+    public var line: Int?
+    /// The key that was being applied, which may be the misspelling itself.
+    public var key: String?
+    public var message: String
+
+    public init(file: String? = nil, line: Int? = nil, key: String? = nil, message: String) {
+        self.file = file
+        self.line = line
+        self.key = key
+        self.message = message
+    }
+
+    /// `path:12:font-famly: unknown field`, which is libghostty's own layout
+    /// and close enough to a compiler's that an editor will make the path
+    /// clickable.
+    public var description: String {
+        var result = ""
+        if let file {
+            result += "\(file):"
+            if let line { result += "\(line):" }
+        }
+        if let key, !key.isEmpty {
+            result += "\(key): "
+        } else if !result.isEmpty {
+            result += " "
+        }
+        return result + message
+    }
+}
