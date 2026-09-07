@@ -100,11 +100,15 @@ struct SSHCommandTests {
     /// because the two agree on every machine anyone runs this on. Only an
     /// input the test controls can tell them apart.
     ///
-    /// Overwriting only: no `unsetenv`. Removing a name and re-adding it makes
-    /// libc *grow* `environ`, freeing the old array, and the transport suite
-    /// runs concurrently with this one and hands the live `environ` to
-    /// `posix_spawn`. The no-home branch is reached through the parameter
-    /// instead, which is what the parameter is for.
+    /// Overwriting only: no `unsetenv`. Overwriting a name that is already
+    /// there cannot move the `environ` array — measured, the pointer is
+    /// unchanged even when the new value is far longer — whereas *adding* one
+    /// may reallocate it, which is what removing and re-adding amounts to.
+    /// The transport suite runs concurrently with this one and hands the live
+    /// `environ` to `posix_spawn`, so this closes a possibility rather than an
+    /// observed fault: a remove-and-re-add did not move the array here either,
+    /// because there was spare capacity. Cheap to not depend on. The no-home
+    /// branch goes through the parameter instead, which is what it is for.
     @Test("the default control path is the one src/core/conn.zig renders")
     func defaultControlPath() throws {
         // Required rather than optional-handled: restoring a `HOME` that was

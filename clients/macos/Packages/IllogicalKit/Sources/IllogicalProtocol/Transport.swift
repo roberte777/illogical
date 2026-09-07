@@ -591,10 +591,10 @@ public enum SSHCommand {
     /// masters, which is precisely what this exists to avoid. Nil when `$HOME`
     /// is unset, which is what the Zig side does too.
     /// `home` is a parameter so the no-home branch can be tested without
-    /// removing `HOME` from the process. Taking a variable out of `environ`
-    /// and putting it back makes libc grow the array, and this package spawns
-    /// children from concurrently-running tests -- `posix_spawn` walks that
-    /// same array. Production never passes it.
+    /// removing `HOME` from the process. Adding a name back to `environ` may
+    /// reallocate it, and this package spawns children from
+    /// concurrently-running tests -- `posix_spawn` walks that same array.
+    /// Production never passes it.
     static func controlPath(
         _ options: Options,
         home: String? = ProcessInfo.processInfo.environment["HOME"]
