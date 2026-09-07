@@ -392,7 +392,6 @@ struct TransportTests {
         }
     }
 
-
     /// `close()` is called from the main actor, once per pane. Blocking there
     /// while a wedged child fails to die froze the window for seconds when
     /// closing a split tab — up to four seconds per connection, and a four-pane
