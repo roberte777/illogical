@@ -22,6 +22,13 @@ jobs:
   fmt:
     name: fmt
     runs-on: macos-26
+    # Every job here carries one. The default is six hours, and a test that
+    # deadlocks rather than fails takes all six: a bug in `Server.stop` left
+    # `zig build test` wedged on the Linux runner and each push burned a
+    # six-hour job before saying so. These are several times the observed
+    # runtime -- fmt is ~2m, the Zig legs ~4m -- so a red one means stuck, not
+    # slow.
+    timeout-minutes: 15
     steps:
       # No submodules on purpose. Nothing the recipe reads lives in
       # vendor/ghostty, and `alejandra --check .` walks the whole tree — with
@@ -42,6 +49,7 @@ jobs:
   test-zig:
     name: zig test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -92,6 +100,7 @@ jobs:
   test-swift:
     name: swift test
     runs-on: macos-26
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -106,6 +115,7 @@ jobs:
   ci:
     name: ci
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     needs: [fmt, test-zig, test-swift]
     if: always()
     steps:
