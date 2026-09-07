@@ -83,10 +83,17 @@ start_daemon() {
 }
 
 # One launch against a socket. Prints "<window-visible s> <since-ready ms>".
+#
+# `ILLOGICAL_DAEMON` is set for every run, not only the cold one. It points at
+# the daemon in this tree rather than the one inside the bundle, so a benchmark
+# can never start a daemon built from some other commit -- and, in the three
+# warm scenarios, it is the seam that makes "the app started nothing" an
+# assertion rather than a hope: nothing is spawned because the socket answers.
 run() {
   local sock="$1" trace="$2"
   : >"$trace"
-  ILLOGICAL_SOCK="$sock" ILLOGICAL_TRACE="$trace" "$app" >/dev/null 2>&1 &
+  ILLOGICAL_SOCK="$sock" ILLOGICAL_DAEMON="$daemon" ILLOGICAL_TRACE="$trace" \
+    "$app" >/dev/null 2>&1 &
   local app_pid=$!
   for _ in $(seq 1 150); do
     grep -q "milestone first-frame" "$trace" 2>/dev/null && break
@@ -152,6 +159,32 @@ for group in "empty:$empty_sock" "screenful:$screenful_sock" "filled:$filled_soc
     "$(echo "$ready" | median)"
 done
 
+# --- cold: no daemon at all ----------------------------------------------
+#
+# The app starts one. This is the only scenario where that path runs, and the
+# number that matters is the same one as everywhere else: `launch -> window`
+# must not move, because nothing on screen may wait for a server (G7). While
+# `--ensure` runs the host is `.connecting`, which the window renders as
+# chrome, so a slow daemon costs `attach -> ready` and nothing before it.
+#
+# No terminal here and therefore no ready/first-frame numbers: the daemon this
+# starts is brand new and has nothing in it, and creating one would time the
+# create rather than the launch. `attach -> ready` for a cold start is
+# `--ensure`'s own wait, which `stdio.zig`'s retry loop bounds at 20ms
+# granularity and `just smoke-ensure` exercises directly.
+cold_sock="$state/cold.sock"
+rm -f "$cold_sock"
+printf '\ncold start (no daemon; the app starts one)\n'
+cold=""
+for i in $(seq 1 "$runs"); do
+  rm -f "$cold_sock"
+  pkill -f -- "--socket $cold_sock" 2>/dev/null || true
+  read -r v _ _ <<<"$(run "$cold_sock" "$state/cold-$i.log")"
+  cold="$cold $(awk -v x="$v" 'BEGIN { printf "%.1f", x * 1000 }')"
+done
+pkill -f -- "--socket $cold_sock" 2>/dev/null || true
+printf '%-8s  %11s ms\n' 'cold' "$(echo "$cold" | median)"
+
 cat <<'NOTE'
 
 The gate is "screenful" against "filled": the same screen of text with and
@@ -163,4 +196,8 @@ empty first frame has almost no glyphs to shape or rasterize.
 
 "ready->decoded" says where any difference came from. "launch->window" is a
 Debug build unless you built Release, so treat it as a ceiling.
+
+"cold" is the second gate: launching with no daemon anywhere must reach a
+window in the same time as launching against a warm one. If it does not,
+something on the launch path is waiting for the server.
 NOTE

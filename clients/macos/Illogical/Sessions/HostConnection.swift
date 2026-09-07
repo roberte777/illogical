@@ -29,6 +29,27 @@ struct SessionRef: Hashable, Sendable {
     var session: UInt64
 }
 
+/// What starts a local server when there is none.
+///
+/// A seam, and it exists for one reason: every test that reaches `connect()`
+/// with a `.local` host would otherwise run the real thing, and the real thing
+/// starts a daemon. `LocalDaemon.executable()` is nil in a test process so
+/// nothing would actually spawn, but that is a property of the host process
+/// rather than of the test, and it makes "was the launcher called?" -- which is
+/// most of what there is to assert here -- unobservable.
+protocol DaemonLauncher: Sendable {
+    /// Make sure a daemon is listening on `socketPath`, or throw saying why
+    /// not. Returns only once there is one.
+    func ensure(socketPath: String) async throws -> LocalDaemon.Outcome
+}
+
+/// The one the app uses: the `illogicald` inside this bundle.
+struct BundledDaemonLauncher: DaemonLauncher {
+    func ensure(socketPath: String) async throws -> LocalDaemon.Outcome {
+        try await LocalDaemon.ensure(LocalDaemon.Options(socketPath: socketPath))
+    }
+}
+
 @MainActor
 @Observable
 final class HostConnection: Identifiable {
@@ -134,6 +155,28 @@ final class HostConnection: Identifiable {
     /// not something to recover from.
     private var closedByUs = false
 
+    /// Starts a local server when nothing is listening on the socket.
+    private let launcher: DaemonLauncher
+    /// The `--ensure` in flight, and which one it is.
+    ///
+    /// The epoch is the identity guard the pumps use, for the same reason: the
+    /// Retry button and `disconnect()` both invalidate a start that is still
+    /// waiting, and without it a child finishing after Retry would open a
+    /// second control connection on top of the one Retry had just made.
+    private var starting: Task<Void, Never>?
+    private var startEpoch = 0
+    /// Whether a server has already been started for *this* outage.
+    ///
+    /// At most one spawn per outage, and this is the whole of that rule. A
+    /// daemon that starts and immediately dies leaves the socket refusing
+    /// connections exactly as before, so without this every backoff tick would
+    /// fork another one -- forever, at up to two a second while the backoff is
+    /// still short. Cleared by the user asking again (`connect()`) and by a
+    /// `session_list`, which is the frame that proves the outage is over --
+    /// correctly, because a daemon that ran for a day and then died deserves a
+    /// replacement. `minimumServerLifetime` is what stops that same rule from
+    /// re-arming for a daemon that has been alive for 250 ms.
+
     // MARK: - Events, for the store that owns the layout
     //
     // The host knows what exists; the window knows where it is drawn. Keeping
@@ -149,8 +192,49 @@ final class HostConnection: Identifiable {
     /// it is the safe assumption.
     var onCreatesVoided: (() -> Void)?
 
-    init(host: ServerHost) {
+    private var startedThisOutage = false
+
+    /// Why the server this app tried to start did not start, or nil if it has
+    /// not tried and failed during this outage.
+    ///
+    /// Kept because the sentence is *perishable*. `--ensure` fails, its reason
+    /// goes to the status, and 250 ms later the backoff's own retry finds the
+    /// socket still refusing and overwrites it with `describe`'s generic "No
+    /// server at <path>". From attempt 2 to the end of the outage the person
+    /// would read the sentence that says nothing, and the one sentence that
+    /// says which directory is unwritable -- the whole point of the daemon
+    /// writing it -- would have been on screen for a quarter of a second.
+    ///
+    /// Lives exactly as long as `startedThisOutage`: both are set when this
+    /// app spends its one spawn, and both are cleared by the `session_list`
+    /// that ends the outage and by Try Again.
+    private var lastStartFailure: String?
+
+    /// When the server this app started came up, or nil if it did not start
+    /// one that is still notionally alive.
+    ///
+    /// Set on the connect that follows a successful `--ensure`, cleared by the
+    /// user asking again. Read only by `openControl`'s catch, against
+    /// `minimumServerLifetime`.
+    private var serverCameUpAt: ContinuousClock.Instant?
+
+    /// How long a server this app started must survive before this app will
+    /// start another one for it.
+    ///
+    /// "One spawn per outage" ends an outage at `session_list`, and that is a
+    /// hole: a daemon that starts, lists and then dies on its first attach --
+    /// a corrupt park file, a full disk on `park.key` -- clears
+    /// `startedThisOutage` on its way past, so the 250 ms retry finds the
+    /// socket refusing and forks another one. Three forks a second of a 10 MB
+    /// binary, forever, each appending to the same log: the storm R2 exists to
+    /// prevent, reached by a different route (REVIEW F7).
+    ///
+    /// A `var` so tests can lower it; nothing in the app writes it.
+    var minimumServerLifetime: Duration = .seconds(10)
+
+    init(host: ServerHost, launcher: DaemonLauncher = BundledDaemonLauncher()) {
         self.host = host
+        self.launcher = launcher
     }
 
     var displayName: String { host.displayName }
@@ -169,6 +253,16 @@ final class HostConnection: Identifiable {
         closedByUs = false
         retry?.cancel()
         retry = nil
+        // Somebody pressed Try Again, which is a person saying "and this time
+        // start one if you have to". A start still in flight from the last
+        // attempt is superseded rather than joined: it would open a second
+        // control connection on top of the one below.
+        cancelStart()
+        startedThisOutage = false
+        lastStartFailure = nil
+        // Try Again is a person saying "once more", which is the one thing
+        // that gets past the lifetime rule below.
+        serverCameUpAt = nil
         backoff.reset()
         openControl()
     }
@@ -200,6 +294,33 @@ final class HostConnection: Identifiable {
             Trace.log("control connection to \(host.displayName) open")
         } catch let error as TransportError {
             Trace.log("connect to \(host.displayName) failed: \(error)")
+            // Nothing is listening on the local socket, and this app carries a
+            // server. Start one and come back here -- the connect above is
+            // then an ordinary one, over the socket, with no bridge and no
+            // child of ours in the middle. `.connecting` is left standing
+            // while that happens, which is the one status the "no server"
+            // screen does not take over for.
+            if canStartLocalServer(after: error) {
+                // A server we started, that died inside its first few seconds.
+                // Starting another would only produce another corpse, so stop
+                // and say where the reason is written down. Try Again clears
+                // this.
+                if case .local(let path) = host, let cameUp = serverCameUpAt,
+                    cameUp.duration(to: .now) < minimumServerLifetime
+                {
+                    retry?.cancel()
+                    retry = nil
+                    setStatus(
+                        .failed(
+                            "The server this app started on \(path) exited within "
+                                + "\(minimumServerLifetime) of starting, and is not being started "
+                                + "again. Its log is \(Self.daemonLogPath(forSocket: path))."))
+                    return
+                }
+                startedThisOutage = true
+                startLocalServer()
+                return
+            }
             // Some failures are not worth retrying every thirty seconds for
             // the life of the process. `ssh` missing from PATH, a socket path
             // that does not fit in `sockaddr_un`, a shebang that is not a
@@ -243,6 +364,7 @@ final class HostConnection: Identifiable {
         closedByUs = true
         retry?.cancel()
         retry = nil
+        cancelStart()
         closeControl()
         for id in controllers.keys { closeController(id) }
     }
@@ -264,6 +386,117 @@ final class HostConnection: Identifiable {
     /// in.
     private func voidPendingCreates() {
         onCreatesVoided?()
+    }
+
+    // MARK: - Starting a server
+    //
+    // Only for `.local`, and only when there is nothing to connect to. What it
+    // runs is `illogicald --ensure`, which makes sure a daemon is listening and
+    // exits; the daemon it leaves behind is two forks away in a session of its
+    // own and outlives this app. See `LocalDaemon` for why it is that and not a
+    // `Process` holding the daemon, an `--stdio` bridge, or a launchd agent.
+
+    /// Whether nothing is listening on a local socket, and this outage has not
+    /// already had its one spawn.
+    ///
+    /// `can`, not `should`: the caller decides whether to spend it. A server
+    /// this app started moments ago and which is already refusing connections
+    /// is a server worth *not* replacing, and only the caller has the whole of
+    /// that question in front of it.
+    private func canStartLocalServer(after error: TransportError) -> Bool {
+        guard case .local = host, !startedThisOutage else { return false }
+        // These two and no others. ECONNREFUSED is a socket file with nothing
+        // accepting on it -- a daemon that crashed, or one that never bound.
+        // ENOENT is no socket file at all, which is a machine that has never
+        // run one. Everything else `UnixSocketTransport` can throw is about
+        // *us*: a path too long for `sockaddr_un`, or a descriptor we could not
+        // allocate. Starting a daemon fixes neither, and trying to would spend
+        // a fork on every reconnect for the life of the process.
+        guard case .connectFailed(let code) = error else { return false }
+        return code == ECONNREFUSED || code == ENOENT
+    }
+
+    private func startLocalServer() {
+        guard case .local(let path) = host else { return }
+        Trace.log("no server at \(path); starting one")
+
+        startEpoch += 1
+        let epoch = startEpoch
+        let launcher = self.launcher
+        starting = Task { [weak self] in
+            do {
+                let outcome = try await launcher.ensure(socketPath: path)
+                guard let self, self.startEpoch == epoch, !self.closedByUs else { return }
+                self.starting = nil
+                Trace.log("local server: \(outcome)")
+                // Before the connect, so that a daemon which dies during that
+                // connect is already inside its probation window.
+                self.serverCameUpAt = .now
+                // Round again. The connect that failed a moment ago is the
+                // connect that succeeds now, and everything after it -- hello,
+                // list, the status -- is the path every other host takes.
+                self.openControl()
+            } catch {
+                guard let self, self.startEpoch == epoch, !self.closedByUs else { return }
+                self.starting = nil
+                let detail = self.describeStartFailure(error, socketPath: path)
+                Trace.log("could not start a server at \(path): \(detail)")
+                // Before either branch below, because the reconnecting one
+                // comes back through `describe` on every later tick and this
+                // is what it reads.
+                self.lastStartFailure = detail
+                // The same split as a transport failure, and for the same
+                // reason: a bundle with no daemon in it will not grow one, and
+                // rescanning for it every thirty seconds tells nobody anything.
+                if (error as? LocalDaemonError)?.isTransient ?? true {
+                    self.scheduleReconnect(detail: detail)
+                } else {
+                    self.setStatus(.failed(detail))
+                }
+            }
+        }
+    }
+
+    private func cancelStart() {
+        starting?.cancel()
+        starting = nil
+        startEpoch += 1
+    }
+
+    /// Where a daemon writes what it could not say to anybody.
+    ///
+    /// `stdio.zig` opens this beside the socket *before* it forks, so it is the
+    /// one place a daemon that died during startup left a reason. Naming it is
+    /// most of the value of the sentence; everything else the app can say
+    /// amounts to "it did not work".
+    private static func daemonLogPath(forSocket path: String) -> String {
+        (path as NSString).deletingLastPathComponent + "/daemon.log"
+    }
+
+    private func describeStartFailure(_ error: Error, socketPath: String) -> String {
+        switch error as? LocalDaemonError {
+        // Nothing ran, so there is no log to point at, and naming one sends
+        // somebody to a file that is not there.
+        case .notBundled, .spawn, .none:
+            return "\(error)"
+        case .failed, .timedOut:
+            let said = "\(error)"
+            // The daemon's own last line is self-contained -- it names the
+            // socket, the reason, *and* the log -- so appending to it either
+            // says "daemon.log" twice or, worse, contradicts it: the sentence
+            // for an unwritable state directory is "cannot write to <dir>,
+            // where the socket and daemon.log live", and suffixing the path of
+            // a log in that same unwritable directory sends somebody to a file
+            // that cannot exist. Which is the thing this function's other
+            // branch exists to avoid.
+            //
+            // Matched on the filename rather than the full path because the
+            // daemon writes the directory it was given and the app derives the
+            // same one from the socket; a mismatch between the two is a bug
+            // worth showing rather than papering over with a second path.
+            guard !said.contains("daemon.log") else { return said }
+            return "\(said). Its log is \(Self.daemonLogPath(forSocket: socketPath))."
+        }
     }
 
     // MARK: - Reconnecting
@@ -322,7 +555,19 @@ final class HostConnection: Identifiable {
         // start one sends them round in a circle -- so those keep the error's
         // own wording, which says what actually happened.
         if case .local(let path) = host, case .connectFailed = error as? TransportError {
-            return "No illogicald at \(path). Start one with `illogicald`."
+            // If this app already tried to start one during this outage and was
+            // told why it could not, that is the answer -- it is a reason, and
+            // this function's own sentence is only a restatement of the
+            // symptom. Without this the reason survives one 250 ms backoff tick
+            // and is then overwritten by the line below for the rest of the
+            // outage, which is most of the outage.
+            if let reason = lastStartFailure { return reason }
+            // This used to tell the user to run `illogicald` themselves, which
+            // was the gap: the app does that now. Reaching this line means it
+            // already tried once this outage and the socket is *still* refusing
+            // -- a daemon that started and died in the moment between. The only
+            // place with a reason in it is the daemon's own log.
+            return "No server at \(path). Its log is \(Self.daemonLogPath(forSocket: path))."
         }
         return "\(error)"
     }
@@ -401,6 +646,13 @@ final class HostConnection: Identifiable {
             // the 30-second ceiling for the life of the process while the
             // panes -- which do reset -- came back in 250ms.
             backoff.reset()
+            // And with it the permission to start another server. This frame is
+            // the proof that the outage is over, so the *next* one is allowed
+            // its own single spawn. Here rather than on the connect, for the
+            // same reason the backoff is: a daemon that accepts and drops would
+            // otherwise re-arm the spawn on every attempt.
+            startedThisOutage = false
+            lastStartFailure = nil
             setStatus(.connected)
             onListChanged?()
 
