@@ -558,6 +558,91 @@ final class ReconnectTests: XCTestCase {
             launcher.callCount, after, "a server was started again on the backoff's own schedule")
     }
 
+    /// The daemon's sentence is the whole point of it writing one, and it has
+    /// to survive longer than a person takes to read it. The backoff retries
+    /// 250 ms later, finds the socket still refusing, and used to overwrite the
+    /// reason with the generic "No server at <path>" for the rest of the
+    /// outage -- so the one line saying *which* directory is unwritable was on
+    /// screen for a quarter of a second and then gone.
+    func testTheReasonAServerWouldNotStartSurvivesTheBackoff() async throws {
+        let path = Self.absentSocket()
+        let launcher = RecordingLauncher(
+            .fail(
+                .failed(
+                    socket: path, status: 1,
+                    stderr: "illogicald --ensure: cannot write to /nonexistent-root-dir/x, "
+                        + "where the socket and daemon.log live")))
+        let host = try localStore(path, launcher)
+        defer { host.disconnect() }
+
+        host.connect()
+        try await waitFor("the daemon's own words to reach the status") {
+            host.status.message?.contains("cannot write to /nonexistent-root-dir/x") == true
+        }
+        // Past the first retry and several after it: the attempt counter only
+        // rises on a reconnect that has been scheduled, so this is the flow
+        // that used to do the overwriting, driven through the real thing.
+        try await waitFor("several backoff ticks") {
+            if case .reconnecting(let attempt, _) = host.status { return attempt >= 3 }
+            return false
+        }
+        let message = host.status.message ?? "nil"
+        XCTAssertTrue(
+            message.contains("cannot write to /nonexistent-root-dir/x"),
+            "the reason was replaced by the generic sentence: \(message)")
+        XCTAssertFalse(
+            message.contains("No server at"),
+            "the symptom was put in front of a person instead of the reason: \(message)")
+    }
+
+    /// And it names the log once, or not at all. The daemon's line is
+    /// self-contained -- socket, reason and log -- so the app appending its own
+    /// derived `daemon.log` either says it twice or, for an unwritable state
+    /// directory, points at a file that by definition cannot be there.
+    func testTheDaemonsLogIsNotNamedTwiceNorInventedInAnUnwritableDirectory() async throws {
+        let path = Self.absentSocket()
+        let launcher = RecordingLauncher(
+            .fail(
+                .failed(
+                    socket: path, status: 1,
+                    stderr: "illogicald --ensure: cannot write to /nonexistent-root-dir/x, "
+                        + "where the socket and daemon.log live")))
+        let host = try localStore(path, launcher)
+        defer { host.disconnect() }
+
+        host.connect()
+        try await waitFor("the daemon's own words to reach the status") {
+            host.status.message?.contains("cannot write to") == true
+        }
+        let message = host.status.message ?? "nil"
+        XCTAssertEqual(
+            message.components(separatedBy: "daemon.log").count - 1, 1,
+            "the log was named more than once: \(message)")
+        // The socket here is in /tmp, so the log the app would derive is
+        // /tmp/daemon.log -- a real, writable directory, and the wrong answer.
+        XCTAssertFalse(
+            message.contains("/tmp/daemon.log"),
+            "a log in a different directory from the daemon's was named: \(message)")
+    }
+
+    /// The other half of that rule: when the daemon left nothing to quote, the
+    /// app's derived path is all there is and must still be said. A timeout is
+    /// the case with no sentence at all behind it.
+    func testAStartWithNothingToQuoteStillNamesTheLog() async throws {
+        let path = Self.absentSocket()
+        let launcher = RecordingLauncher(.fail(.timedOut(socket: path, after: .seconds(15))))
+        let host = try localStore(path, launcher)
+        defer { host.disconnect() }
+
+        host.connect()
+        try await waitFor("the timeout to reach the status") {
+            host.status.message?.contains("did not start a server") == true
+        }
+        XCTAssertTrue(
+            host.status.message?.contains("/tmp/daemon.log") == true,
+            "no log was named at all: \(host.status.message ?? "nil")")
+    }
+
     /// ...but asking explicitly does try again. Try Again is a person saying
     /// "and this time start one if you have to".
     func testTryAgainAsksForAServerAgain() async throws {
