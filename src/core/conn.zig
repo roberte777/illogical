@@ -538,8 +538,9 @@ test "deinit gives up on a child that never stops writing" {
     // stdio writes BSD `yes` makes. That is a race between two processes'
     // syscall throughput rather than a property of the shapes, and it may well
     // go the other way elsewhere -- GNU coreutils `yes` writes a prefilled
-    // buffer of at least 8 KiB per `write`, twice what this reads per `read`,
-    // which could keep the pipe continuously non-empty and reach the deadline.
+    // buffer of `BUFSIZ` per `write`, 8 KiB on glibc against the 4 KiB this
+    // reads, which could keep the pipe continuously non-empty and reach the
+    // deadline. (On musl `BUFSIZ` is 1 KiB, so not everywhere.)
     //
     // So: do not read this test as licence to delete that deadline. On the
     // platform where it is genuinely unreached the suite stays green without
@@ -559,12 +560,17 @@ test "deinit gives up on a child that never stops writing" {
     // The grace, and then the signal. Not less, which would mean giving up on
     // a child that was merely busy.
     try testing.expect(elapsed >= Conn.child_exit_grace_ns);
-    // And bounded -- generously, because the failure this catches is an
-    // unbounded loop rather than a slow one, so a wide ceiling costs no
-    // detection power and buys immunity to a loaded machine. A 2x margin here
-    // is the sort of thing that fails once in fifty runs and gets rerun rather
-    // than read.
-    try testing.expect(elapsed < 5 * Conn.child_exit_grace_ns);
+    // And bounded tightly, because bounded-but-slow is the only regression
+    // this line can ever see: an *unbounded* one never reaches it at all, it
+    // hangs and gets killed. So a generous ceiling here would not be cautious,
+    // it would be the assertion doing nothing. At 5x it would sit green while
+    // `illogical --host box list` took nine seconds -- which is a worse
+    // version of the 2.34s complaint this file was written about.
+    //
+    // 2x over an observed ~2s, which is the grace plus a poll interval plus a
+    // wait. Widened once on the strength of a single unreproducible failure
+    // and put back: twenty-odd runs since, six of them under load, all clean.
+    try testing.expect(elapsed < 2 * Conn.child_exit_grace_ns);
     // And it is really gone, rather than left running with nobody to reap it.
     // `deinit` returns on time either way; only this notices the difference.
     try testing.expect(!sys.processExists(pid));
