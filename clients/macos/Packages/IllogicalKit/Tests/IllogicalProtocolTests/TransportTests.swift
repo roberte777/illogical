@@ -83,30 +83,6 @@ struct SSHCommandTests {
         #expect(args.suffix(4) == ["--", "build-box", "illogicald", "--stdio"])
     }
 
-    @Test("a remote binary somewhere else is respected")
-    func remoteBinary() {
-        let args = argv("me@host", remoteBinary: "/opt/illogical/bin/illogicald")
-        #expect(args.suffix(4) == ["--", "me@host", "/opt/illogical/bin/illogicald", "--stdio"])
-    }
-
-    @Test("the ssh binary can be overridden")
-    func sshOverride() {
-        // ILLOGICAL_SSH rides through `ServerHost.sshOptions`; without this the
-        // override could be dropped from the argv with nothing failing, and a
-        // user with a second OpenSSH would silently get the first on PATH.
-        #expect(argv(ssh: "/usr/bin/ssh").first == "/usr/bin/ssh")
-    }
-}
-
-/// Serialized, because three of these hold a child process — and its three
-/// descriptors — across an `await`, and `noDescriptorLeak` counts descriptors
-/// *process-wide*. Run concurrently, a spawn landing inside its five-millisecond
-/// sampling window is a +3 it reads as a leak. Waiting the children out at the
-/// end of their own tests does not fix that: the descriptors are freed
-/// asynchronously when the child exits, so the overlap is with the spawn, not
-/// with the teardown.
-@Suite("Transports", .serialized)
-struct TransportTests {
     /// The Zig CLI renders the same path, so `illogical --host` and the app
     /// share one multiplexing master. Drifting apart silently doubles the SSH
     /// connections a machine holds.
@@ -146,6 +122,30 @@ struct TransportTests {
                 == "/tmp/elsewhere/illogical-%C")
     }
 
+    @Test("a remote binary somewhere else is respected")
+    func remoteBinary() {
+        let args = argv("me@host", remoteBinary: "/opt/illogical/bin/illogicald")
+        #expect(args.suffix(4) == ["--", "me@host", "/opt/illogical/bin/illogicald", "--stdio"])
+    }
+
+    @Test("the ssh binary can be overridden")
+    func sshOverride() {
+        // ILLOGICAL_SSH rides through `ServerHost.sshOptions`; without this the
+        // override could be dropped from the argv with nothing failing, and a
+        // user with a second OpenSSH would silently get the first on PATH.
+        #expect(argv(ssh: "/usr/bin/ssh").first == "/usr/bin/ssh")
+    }
+}
+
+/// Serialized, because three of these hold a child process — and its three
+/// descriptors — across an `await`, and `noDescriptorLeak` counts descriptors
+/// *process-wide*. Run concurrently, a spawn landing inside its five-millisecond
+/// sampling window is a +3 it reads as a leak. Waiting the children out at the
+/// end of their own tests does not fix that: the descriptors are freed
+/// asynchronously when the child exits, so the overlap is with the spawn, not
+/// with the teardown.
+@Suite("Transports", .serialized)
+struct TransportTests {
     /// `cat` is the smallest thing that behaves like the far end of an SSH
     /// pipe: what goes in comes back, framed exactly as it was sent. The
     /// transport is what is under test, not the server.

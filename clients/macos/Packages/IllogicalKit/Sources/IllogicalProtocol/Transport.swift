@@ -453,29 +453,25 @@ public enum SSHCommand {
     /// The `ControlPath` template, or nil when there is nowhere short enough to
     /// put it.
     ///
-    /// `$HOME`, not `homeDirectoryForCurrentUser` — the latter reads the passwd
-    /// entry and ignores the environment, so the two disagree whenever `$HOME`
-    /// is overridden. `src/core/conn.zig` uses `getenv("HOME")`, and the pairing
-    /// only buys anything if both render the *same* path: disagree and the app
-    /// and `illogical --host` bind different control sockets and hold two ssh
-    /// masters, which is precisely what this exists to avoid. Nil when `$HOME`
-    /// is unset, which is what the Zig side does too.
-    /// Takes the *environment*, not a home directory, and that is the point.
+    /// Takes the *environment* rather than a home directory, and that is the
+    /// point. `src/core/conn.zig:291` renders this same path from
+    /// `getenv("HOME")`; a client that read the passwd entry instead — via
+    /// `homeDirectoryForCurrentUser`, the obvious-looking alternative — would
+    /// disagree whenever `$HOME` is overridden, and the app and `illogical
+    /// --host` would bind different control sockets and hold two ssh masters
+    /// per host. That pairing is the whole reason this function exists.
     ///
-    /// `src/core/conn.zig:291` renders this same path from `getenv("HOME")`,
-    /// and a client that read the passwd entry instead -- via
-    /// `homeDirectoryForCurrentUser`, the obvious-looking alternative -- would
-    /// bind a second control socket and hold a second ssh master for every
-    /// host. The two agree on every machine anyone tests on, so no assertion
-    /// can tell them apart without an input the test chooses.
+    /// The two sources agree on every machine anyone tests on, so no assertion
+    /// can tell them apart without an input the test chooses. Four earlier
+    /// versions tried to *detect* the substitution and each was a tautology in
+    /// a new place — the expectation computed the same way the code computed
+    /// the value, and once a parameter was added, the tautology moved into its
+    /// default. Setting `HOME` for real does work, and puts a write to
+    /// `environ` beside suites that walk it. Taking the dictionary makes the
+    /// mistake unrepresentable instead: there is nowhere to put
+    /// `homeDirectoryForCurrentUser` that type-checks.
     ///
-    /// Four earlier versions tried to *detect* that substitution and each was
-    /// a tautology in a new place: the expectation was computed the same way
-    /// the code computed the value, and when a parameter was added the
-    /// tautology moved into its default. Setting `HOME` for real would work
-    /// and puts a write to `environ` beside suites that walk it. Taking the
-    /// dictionary makes the mistake unrepresentable rather than detectable --
-    /// there is nowhere to put `homeDirectoryForCurrentUser` that type-checks.
+    /// Nil when `HOME` is absent, which is what the Zig side does too.
     static func controlPath(
         _ options: Options,
         environment: [String: String] = ProcessInfo.processInfo.environment
