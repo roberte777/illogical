@@ -24,6 +24,11 @@ const usage =
     \\  attach <terminal-id>     Attach this terminal to a session terminal
     \\  kill <terminal-id>       Terminate a terminal
     \\  peek <terminal-id>       Print the terminal's screen as plain text
+    \\  rename <session-id> <name>
+    \\                           Rename a session
+    \\  rm-session [--if-empty] <session-id>
+    \\                           Delete a session and close its terminals.
+    \\                           --if-empty refuses instead of cascading.
     \\
     \\Options:
     \\  --socket <path>          Control socket to connect to
@@ -156,6 +161,10 @@ pub fn main(init: std.process.Init) !void {
         return cmdKill(&conn, out, rest.items[1..]);
     } else if (std.mem.eql(u8, cmd, "peek")) {
         return cmdPeek(&conn, out, rest.items[1..]);
+    } else if (std.mem.eql(u8, cmd, "rename")) {
+        return cmdRename(&conn, arena, out, rest.items[1..]);
+    } else if (std.mem.eql(u8, cmd, "rm-session")) {
+        return cmdRmSession(&conn, arena, out, rest.items[1..]);
     } else if (std.mem.eql(u8, cmd, "attach")) {
         try out.flush();
         return cmdAttach(&conn, gpa, init.io, rest.items[1..]);
@@ -268,6 +277,87 @@ fn cmdPeek(conn: *Conn, out: *Io.Writer, args: []const []const u8) !void {
     try out.writeAll(frame.payload);
     if (frame.payload.len > 0 and frame.payload[frame.payload.len - 1] != '\n') {
         try out.writeAll("\n");
+    }
+}
+
+/// The two session-scoped commands. Both put the session id in the body,
+/// because the frame header's u64 addresses a *terminal*.
+fn cmdRename(
+    conn: *Conn,
+    arena: std.mem.Allocator,
+    out: *Io.Writer,
+    args: []const []const u8,
+) !void {
+    if (args.len < 2) {
+        try out.writeAll("usage: illogical rename <session-id> <name>\n");
+        return error.InvalidArgs;
+    }
+    const id = try std.fmt.parseInt(u64, args[0], 10);
+    try conn.sendJson(.rename_session, protocol.control_session, protocol.body.RenameSession{
+        .session = id,
+        .name = args[1],
+    });
+    return expectAck(conn, arena, out);
+}
+
+fn cmdRmSession(
+    conn: *Conn,
+    arena: std.mem.Allocator,
+    out: *Io.Writer,
+    args: []const []const u8,
+) !void {
+    const usage_line = "usage: illogical rm-session [--if-empty] <session-id>\n";
+    var only_if_empty = false;
+    var id_arg: ?[]const u8 = null;
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--if-empty")) {
+            only_if_empty = true;
+        } else if (id_arg == null) {
+            id_arg = a;
+        } else {
+            // One session, spelled once. Swallowing a second positional would
+            // make `rm-session 1 2` delete session 1 and say nothing at all
+            // about session 2 -- a destructive command is the last place to
+            // guess at what somebody meant.
+            try out.writeAll(usage_line);
+            return error.InvalidArgs;
+        }
+    }
+    const raw = id_arg orelse {
+        try out.writeAll(usage_line);
+        return error.InvalidArgs;
+    };
+    const id = try std.fmt.parseInt(u64, raw, 10);
+    try conn.sendJson(.delete_session, protocol.control_session, protocol.body.DeleteSession{
+        .session = id,
+        .only_if_empty = only_if_empty,
+    });
+    return expectAck(conn, arena, out);
+}
+
+/// Wait for the server to have finished with the frame just sent, and report
+/// its refusal if there was one.
+///
+/// Neither session-scoped frame has a reply of its own: success is the
+/// `sessions_changed` broadcast, which is addressed to nobody and, for a
+/// delete, does not go out until the children have actually exited. A `ping`
+/// behind the request is an in-order barrier instead -- one reader thread
+/// dispatches both and everything it queues stays in order -- so a `pong`
+/// means "accepted" and an `err` ahead of it is the objection. Broadcasts that
+/// arrive in between are somebody else's news.
+fn expectAck(conn: *Conn, arena: std.mem.Allocator, out: *Io.Writer) !void {
+    try conn.send(.ping, protocol.control_session, &.{});
+    while (true) {
+        const frame = try conn.recv();
+        switch (frame.header.type) {
+            .pong => return,
+            .err => {
+                const e = try protocol.body.decode(protocol.body.Err, arena, frame.payload);
+                try out.print("illogical: {s}\n", .{e.value.message});
+                return error.RequestRefused;
+            },
+            else => continue,
+        }
     }
 }
 

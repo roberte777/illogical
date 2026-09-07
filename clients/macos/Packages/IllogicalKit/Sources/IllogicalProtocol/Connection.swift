@@ -358,6 +358,41 @@ public struct ResizeBody: Codable, Sendable {
     }
 }
 
+/// Body of ``FrameType/renameSession``.
+///
+/// The session id is in the body rather than the frame header, because that
+/// header's u64 addresses a terminal. Sent on the control channel; the server
+/// answers a refusal with an `err` there and a success with the
+/// `sessions_changed` broadcast every client already re-lists on.
+public struct RenameSessionBody: Codable, Sendable {
+    public var session: UInt64
+    public var name: String
+
+    public init(session: UInt64, name: String) {
+        self.session = session
+        self.name = name
+    }
+}
+
+/// Body of ``FrameType/deleteSession``.
+public struct DeleteSessionBody: Codable, Sendable {
+    public var session: UInt64
+    /// Refuse rather than cascade when the session still has terminals. For
+    /// scripts that want to be careful; the app always cascades, behind a
+    /// confirmation.
+    public var onlyIfEmpty: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case session
+        case onlyIfEmpty = "only_if_empty"
+    }
+
+    public init(session: UInt64, onlyIfEmpty: Bool = false) {
+        self.session = session
+        self.onlyIfEmpty = onlyIfEmpty
+    }
+}
+
 public struct ErrBody: Codable, Sendable {
     public var code: UInt16
     public var message: String

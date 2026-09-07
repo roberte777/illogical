@@ -59,6 +59,43 @@ public struct TerminalSummary: Identifiable, Equatable, Codable, Sendable {
     }
 }
 
+/// The naming rule, client-side. Mirrors `session.validateName` in
+/// src/core/session.zig.
+///
+/// The server is the authority — it checks the session name on every `create`
+/// and every `rename_session`, and answers ``ProtocolErrorCode/invalidName`` —
+/// which is exactly what makes checking here load-bearing rather than
+/// cosmetic. A refused `create` produces no `created` frame at all, so a
+/// free-text session field that sends an invalid name silently does nothing; a
+/// refused rename reverts on the next list. Anything offering either must gate
+/// on this first. Both implementations carry the same cases in their tests.
+///
+/// The rule covers *session* names only. A terminal's name never reaches disk
+/// and is not validated by either side.
+public enum SessionName {
+    /// Mirrors `session.max_name_len`.
+    public static let maxLength = 64
+
+    /// One to ``maxLength`` bytes of `[A-Za-z0-9._-]`.
+    ///
+    /// Byte count, not character count: the server measures a `[]const u8` and
+    /// refuses anything outside ASCII anyway, so a name that passes here is a
+    /// name whose UTF-8 length is its character count.
+    public static func isValid(_ name: String) -> Bool {
+        let bytes = Array(name.utf8)
+        guard !bytes.isEmpty, bytes.count <= maxLength else { return false }
+        return bytes.allSatisfy { byte in
+            switch byte {
+            case UInt8(ascii: "0")...UInt8(ascii: "9"): true
+            case UInt8(ascii: "A")...UInt8(ascii: "Z"): true
+            case UInt8(ascii: "a")...UInt8(ascii: "z"): true
+            case UInt8(ascii: "-"), UInt8(ascii: "_"), UInt8(ascii: "."): true
+            default: false
+            }
+        }
+    }
+}
+
 /// A named group of terminals.
 public struct SessionSummary: Identifiable, Equatable, Codable, Sendable {
     public var id: UInt64

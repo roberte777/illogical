@@ -1,15 +1,20 @@
 //! The illogical wire protocol.
 //!
-//! One connection multiplexes every session the client cares about. Frames are
-//! length-prefixed and carry a session id so that output for many sessions can
-//! be interleaved on a single socket:
+//! One connection multiplexes every terminal the client cares about. Frames are
+//! length-prefixed and carry a terminal id so that output for many terminals
+//! can be interleaved on a single socket:
 //!
 //!     +--------+----------+--------+------------------+
-//!     | type   | session  | len    | payload          |
+//!     | type   | terminal | len    | payload          |
 //!     | u8     | u64 LE   | u32 LE | len bytes        |
 //!     +--------+----------+--------+------------------+
 //!
-//! Session id 0 is reserved for connection-level control frames.
+//! Terminal id 0 is reserved for connection-level control frames.
+//!
+//! The header addresses a *terminal*, never a session -- the field is called
+//! `session` for historical reasons and is documented on `Header`. Genuinely
+//! session-scoped frames (`rename_session`, `delete_session`) therefore carry
+//! the session id in their JSON body and are sent on the control channel.
 //!
 //! The payload of `.output` is *unprocessed* PTY bytes: the server never
 //! re-encodes what the program wrote. The payload of `.snapshot_chunk` is a
@@ -25,7 +30,8 @@ const std = @import("std");
 /// `hello` advertises a different major version.
 pub const version: u16 = 1;
 
-/// Reserved session id for connection-level control frames.
+/// Reserved terminal id for connection-level control frames. Named for the
+/// header field it goes in; see `Header.session`.
 pub const control_session: u64 = 0;
 
 pub const header_len = 13;
@@ -40,29 +46,38 @@ pub const FrameType = enum(u8) {
     hello = 0x01,
     /// Request the current session list.
     list = 0x02,
-    /// Spawn a new session.
+    /// Spawn a new terminal, creating its session if that name has none.
     create = 0x03,
-    /// Subscribe to a session: triggers the snapshot + live-output handshake.
+    /// Subscribe to a terminal: triggers the snapshot + live-output handshake.
     attach = 0x04,
-    /// Stop receiving output for a session without killing it.
+    /// Stop receiving output for a terminal without killing it.
     detach = 0x05,
-    /// Terminate a session and discard its parked state.
+    /// Terminate a terminal and discard its parked state.
     kill = 0x06,
-    /// Raw bytes destined for the session's PTY.
+    /// Raw bytes destined for the terminal's PTY.
     input = 0x07,
-    /// Window size change for this client's view of a session.
+    /// Window size change for this client's view of a terminal.
     resize = 0x08,
     ping = 0x09,
     /// Ask for the server's rendered screen as plain text. Useful for scripts
     /// and agents that want to read a terminal without attaching to it.
     peek = 0x0a,
+    /// Rename a session. Session-scoped: the session id is in the body,
+    /// because the header's u64 addresses a *terminal*. Sent on the control
+    /// channel.
+    rename_session = 0x0b,
+    /// Delete a session: kill every terminal in it, discard their parked
+    /// state, drop it from the registry. Session-scoped, like
+    /// `rename_session`.
+    delete_session = 0x0c,
 
     // ---- server -> client ------------------------------------------------
     welcome = 0x81,
     session_list = 0x82,
     created = 0x83,
-    /// A snapshot stream for `session` follows. Payload carries the snapshot
-    /// format version so the client can reject one it cannot decode.
+    /// A snapshot stream for the header's terminal follows. Payload carries
+    /// the snapshot format version so the client can reject one it cannot
+    /// decode.
     snapshot_begin = 0x84,
     /// Verbatim `GHOSTSNP` bytes. Feed directly to the libghostty-vt decoder.
     snapshot_chunk = 0x85,
@@ -74,9 +89,9 @@ pub const FrameType = enum(u8) {
     snapshot_end = 0x87,
     /// Unprocessed PTY output.
     output = 0x88,
-    /// The session's child process exited.
+    /// The terminal's child process exited.
     exited = 0x89,
-    /// The session list changed (created/killed/renamed elsewhere).
+    /// The session/terminal list changed (created/killed/renamed elsewhere).
     sessions_changed = 0x8a,
     err = 0x8b,
     pong = 0x8c,
@@ -90,6 +105,11 @@ pub const FrameType = enum(u8) {
 
 pub const Header = struct {
     type: FrameType,
+    /// The **terminal** this frame addresses, or `control_session` (0) for the
+    /// connection-level control channel. The name is historical: the field has
+    /// carried a terminal id since a session became a container of many of
+    /// them, and renaming it would touch every dispatch site for no behaviour.
+    /// Session-scoped frames put the session id in their body instead.
     session: u64,
     len: u32,
 
@@ -132,6 +152,11 @@ pub const ErrorCode = enum(u16) {
     /// only recovery is a fresh `attach` -- which is the same path as any
     /// other desync. See docs/PROTOCOL.md.
     desync = 7,
+    /// A name `session.validateName` refuses: empty, over 64 bytes, or with a
+    /// character outside `[A-Za-z0-9._-]`.
+    invalid_name = 8,
+    /// A rename to a name another session already holds.
+    name_in_use = 9,
     _,
 };
 
@@ -231,6 +256,21 @@ pub const body = struct {
         scrollback: bool = false,
     };
 
+    /// Body of `rename_session`. The id is here rather than in the header
+    /// because the header's u64 addresses a terminal.
+    pub const RenameSession = struct {
+        session: u64,
+        name: []const u8,
+    };
+
+    /// Body of `delete_session`.
+    pub const DeleteSession = struct {
+        session: u64,
+        /// Refuse rather than cascade when the session still has terminals.
+        /// For scripts that want to be careful; the app always cascades.
+        only_if_empty: bool = false,
+    };
+
     pub fn encode(alloc: std.mem.Allocator, value: anytype) ![]u8 {
         return std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     }
@@ -260,6 +300,39 @@ test "control bodies round trip through json" {
     try testing.expectEqualStrings("build", got.value.name);
     try testing.expectEqual(@as(usize, 2), got.value.argv.len);
     try testing.expectEqual(@as(u16, 120), got.value.cols);
+
+    // The session-scoped pair. Both carry the id in the body, so the round trip
+    // is the only thing standing between a rename and the wrong session.
+    const rename_bytes = try body.encode(alloc, body.RenameSession{
+        .session = 7,
+        .name = "done",
+    });
+    defer alloc.free(rename_bytes);
+    const rename = try body.decode(body.RenameSession, alloc, rename_bytes);
+    defer rename.deinit();
+    try testing.expectEqual(@as(u64, 7), rename.value.session);
+    try testing.expectEqualStrings("done", rename.value.name);
+
+    const delete_bytes = try body.encode(alloc, body.DeleteSession{ .session = 3 });
+    defer alloc.free(delete_bytes);
+    const delete = try body.decode(body.DeleteSession, alloc, delete_bytes);
+    defer delete.deinit();
+    try testing.expectEqual(@as(u64, 3), delete.value.session);
+    // Cascading is what the app wants; a careful script has to ask.
+    try testing.expect(!delete.value.only_if_empty);
+
+    // And a body from a client that predates the flag reads as cascade too.
+    const legacy = try body.decode(body.DeleteSession, alloc, "{\"session\":3}");
+    defer legacy.deinit();
+    try testing.expect(!legacy.value.only_if_empty);
+
+    const careful = try body.decode(
+        body.DeleteSession,
+        alloc,
+        "{\"session\":3,\"only_if_empty\":true}",
+    );
+    defer careful.deinit();
+    try testing.expect(careful.value.only_if_empty);
 }
 
 test "header round trip" {
@@ -292,4 +365,18 @@ test "frame direction" {
     const testing = std.testing;
     try testing.expect(FrameType.input.isClientToServer());
     try testing.expect(!FrameType.output.isClientToServer());
+    // The session-scoped pair is a request, not a notification: success is the
+    // `sessions_changed` broadcast that already exists.
+    try testing.expect(FrameType.rename_session.isClientToServer());
+    try testing.expect(FrameType.delete_session.isClientToServer());
+}
+
+test "wire values are the ones the Swift client mirrors" {
+    const testing = std.testing;
+    // Frame.swift and ProtocolErrorCode carry these same numbers; the two
+    // implementations must not skew even for one commit (docs/PROTOCOL.md).
+    try testing.expectEqual(@as(u8, 0x0b), @intFromEnum(FrameType.rename_session));
+    try testing.expectEqual(@as(u8, 0x0c), @intFromEnum(FrameType.delete_session));
+    try testing.expectEqual(@as(u16, 8), @intFromEnum(ErrorCode.invalid_name));
+    try testing.expectEqual(@as(u16, 9), @intFromEnum(ErrorCode.name_in_use));
 }

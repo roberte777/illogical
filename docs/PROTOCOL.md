@@ -51,7 +51,7 @@ no parser.
 | --- | --- | --- |
 | `0x01` | `hello` | protocol version, client name, capabilities |
 | `0x02` | `list` | — |
-| `0x03` | `create` | session id, name, argv, env, cwd, initial size |
+| `0x03` | `create` | session name (validated — see [Names](#names)), terminal name, argv, env, cwd, initial size |
 | `0x04` | `attach` | size, scrollback budget |
 | `0x05` | `detach` | — |
 | `0x06` | `kill` | signal |
@@ -59,6 +59,8 @@ no parser.
 | `0x08` | `resize` | cols, rows, cell px |
 | `0x09` | `ping` | opaque token |
 | `0x0a` | `peek` | include scrollback? |
+| `0x0b` | `rename_session` | session id, new name |
+| `0x0c` | `delete_session` | session id, `only_if_empty` |
 
 ### Server → client
 
@@ -85,6 +87,91 @@ terminal without pretending to be a client — the same idea as
 
 `input` and `output` payloads are opaque. The server never inspects `input`
 beyond forwarding it, and never rewrites `output`.
+
+### `err` codes
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| `0` | `unknown` | anything without a code of its own |
+| `1` | `version_mismatch` | refused `hello`; the connection closes behind it |
+| `2` | `no_such_session` | no terminal, or no session, with that id |
+| `3` | `session_busy` | `delete_session` asked to be careful and the session still has a running child |
+| `4` | `spawn_failed` | *reserved* — defined since v1, not currently sent |
+| `5` | `unpark_failed` | *reserved* — defined since v1, not currently sent |
+| `6` | `malformed_frame` | *reserved* — defined since v1, not currently sent |
+| `7` | `desync` | the output queue overflowed; re-attach — see below |
+| `8` | `invalid_name` | a `create` or `rename_session` carried a name `validateName` refuses: 1–64 bytes of `[A-Za-z0-9._-]` |
+| `9` | `name_in_use` | a rename to a name another session already holds |
+
+The three reserved codes are in the enum on both sides and nothing sends them
+today. Every failure without a code of its own — a spawn that failed, a park
+file that would not read back, a body that would not parse — comes back as
+`unknown` with the Zig error's name as the message: a `create` carrying
+`{this is not json` is answered `err(0) {"code":0,"message":"SyntaxError"}` and
+the connection carries on serving. A malformed **header** is the one thing not
+answered at all — the stream is a byte stream, so one wrong length makes every
+later offset wrong — and the server closes the connection instead of guessing.
+The three codes are documented so their numbers stay allocated.
+
+The enum is non-exhaustive on both sides: a client that meets a code it does not
+know reports it as a number rather than failing to decode the frame.
+
+### Names
+
+`create` and `rename_session` both carry a session name, and both are refused
+with `invalid_name` if it is not 1–64 bytes of `[A-Za-z0-9._-]`. **A refused
+`create` creates nothing** — no session, no terminal, no `created` frame — so a
+client that offers a free-text session field must validate before it sends, or
+the create silently does nothing. `IllogicalProtocol.SessionName.isValid` is
+that rule, client-side.
+
+The rule is deliberately boring because a session name is part of a path in the
+park store and part of a JSON document written to it. The *terminal* name in
+`create` is **not** validated: it never reaches disk, so `illogical new -n "my
+name"` keeps working.
+
+### Session-scoped frames
+
+Everything above addresses a *terminal*: the header's u64 is a terminal id, and
+`0` is the control channel. `rename_session` and `delete_session` do not name a
+terminal at all, so they carry the session id **in their JSON body** and are
+sent on the control channel.
+
+Neither has a reply of its own.
+
+- **Success** is the `sessions_changed` broadcast, which every client — the
+  requester included — answers with `list`. That is the frame whose own
+  description has always read "created/killed/**renamed** elsewhere"; this is
+  the request half of it. A `delete_session` broadcasts nothing at the moment it
+  is accepted, because nothing has left the list yet: its terminals are hung up
+  and go through the ordinary retirement path, which announces itself *once* —
+  on the maintenance tick that retires the last of them and drops the emptied
+  session together. Expect the session's row to outlive the click by a tick or
+  two.
+- **Failure** is an `err` on the control channel: `invalid_name`, `name_in_use`,
+  `no_such_session`, or `session_busy`.
+
+A rename to the name the session already has succeeds and does nothing. Session
+ids are stable across a rename — the name is a label, and everything that holds a
+session holds its id — so no client loses a tab to one.
+
+`delete_session` cascades by default: it closes every terminal in the session.
+`only_if_empty` makes it refuse instead, which is there so a script can be
+careful; the Mac app always cascades, behind a confirmation.
+
+**"Empty" means "would kill nothing", not "lists no terminals".** A terminal
+leaves its session's list when the maintenance tick retires it, not when its
+child exits, so a session whose last child has already exited still lists it for
+up to a tick — and a session that lists nothing is swept out of existence on
+that same tick. `only_if_empty` therefore refuses only while some terminal's
+child is *still running*; exited-but-not-yet-retired terminals do not count.
+
+A session's name is persisted to `sessions/<sid>/meta.json` when the session is
+created and again on every rename, and the file is discarded exactly when the
+session leaves the registry — which is the retirement sweep, not the moment a
+`delete_session` is accepted. A session that survives a delete (a child that
+ignores SIGHUP) keeps a truthful name until it actually goes. See
+[PARKING.md](PARKING.md#on-disk-layout).
 
 ## The attach handshake
 
