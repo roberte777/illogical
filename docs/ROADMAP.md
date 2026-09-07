@@ -333,12 +333,17 @@ shell level: SIGKILL the starter's whole process group, and the daemon keeps
 answering.
 
 **P2 — the server is one binary, embedded for local use and shippable
-standalone.** One source tree, one ghostty pin, and — in a release — one set of
-bytes. The app job stages the `macos-universal` artifact the daemon job just
+standalone.** One source tree, one ghostty pin, and — in a release — one
+compile. The app job stages the `macos-universal` artifact the daemon job just
 built, so the `illogicald` inside the bundle and the one in the tarball beside
-it are the same file. `ILLOGICAL_DAEMON_BIN` is what selects that: set, `just
-stage-daemon` copies a prebuilt binary; unset, it falls back to `zig build`,
-which is what the dev loop wants.
+it come from the same build. `ILLOGICAL_DAEMON_BIN` is what selects that: set,
+`just stage-daemon` copies a prebuilt binary; unset, it falls back to `zig
+build`, which is what the dev loop wants.
+
+Not byte-identical, and it cannot be: Xcode re-signs the daemon on the way into
+the bundle (`CodeSignOnCopy`). Measured on the first release — 14 bytes of
+4,083,294 differ, all of it signature and fat-header padding, with identical
+`__TEXT` and identical `--version` on both.
 
 That fallback is the remaining way to see the version-skew marker, and it is
 still correct when you do: a dev app against an installed release daemon really

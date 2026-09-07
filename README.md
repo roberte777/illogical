@@ -48,7 +48,7 @@ stopped.
 ## Install
 
 **The Mac app.** Download
-[`Illogical.dmg`](https://github.com/roberte777/illogical/releases/latest/download/Illogical.dmg),
+[`Illogical.dmg`](https://github.com/roberte777/illogical/releases/download/latest/Illogical.dmg),
 open it, drag Illogical to Applications. That is the whole install: the app
 carries the server inside it and starts one when there is none, so there is
 nothing to install first and nothing to start. Universal, so it runs on both
@@ -65,12 +65,19 @@ Apple Silicon and Intel.
 dependencies:
 
 ```bash
-curl -fsSL https://github.com/roberte777/illogical/releases/latest/download/illogicald-linux-x86_64.tar.gz \
+curl -fsSL https://github.com/roberte777/illogical/releases/download/latest/illogicald-linux-x86_64.tar.gz \
   | tar xz -C ~/.local/bin illogicald illogical
 ```
 
 The two binaries by name, because the tarball also carries `LICENSE` and
 `THIRD_PARTY_NOTICES` and those do not belong on a `PATH`.
+
+`releases/download/latest/…`, naming the tag, rather than the
+`releases/latest/download/…` redirect that looks equivalent and is not: that
+redirect resolves to the newest release **that is not a prerelease**, and the
+rolling one is a prerelease by definition. Every URL through it 404s until the
+first `v` tag exists. Naming the tag works in both worlds and keeps working
+after one does.
 
 Nothing needs starting after that. `illogical --host <box>` runs
 `ssh <box> illogicald --stdio`, which starts a daemon there if there is none —
@@ -99,9 +106,15 @@ stops moving.
 The trigger is CI going green rather than the push itself, so a merge that
 broke the build cannot replace a working download with one that does not run.
 
-The macOS daemon tarball is built first and the app bundle carries **that exact
-binary** rather than a second build of it — one build, both places, which is
-what stops an Intel Mac getting an app whose daemon cannot run.
+The macOS daemon tarball is built first and the app bundle carries **that same
+build** rather than a second one — which is what stops an Intel Mac getting an
+app whose daemon cannot run, and what stops every release app reporting version
+skew against the tarball beside it.
+
+Not quite byte-identical, and it cannot be: Xcode re-signs the daemon on the way
+into the bundle (`CodeSignOnCopy`), so the copy differs from the tarball's in
+its signature and fat-header padding — measured at 14 bytes in 4 MB, with
+identical `__TEXT` and an identical `--version`. Same build, two signatures.
 
 Locally: `just dist-app` builds and packages the DMG, `just dist` builds the
 three server tarballs.

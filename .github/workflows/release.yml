@@ -23,12 +23,16 @@ name: Release
 #
 # ## The app and the server are one build
 #
-# The macOS daemon tarball is built first and the app job *stages that exact
-# binary* into the bundle rather than building its own. They were two builds of
-# one source -- Debug host-arch inside the app, ReleaseFast universal in the
-# tarball -- which meant an Intel Mac got a bundle whose daemon could not run,
-# and every app reported version skew against the tarball beside it. Same
-# bytes, one build, both places.
+# The macOS daemon tarball is built first and the app job *stages that binary*
+# into the bundle rather than building its own. They were two builds of one
+# source -- Debug host-arch inside the app, ReleaseFast universal in the tarball
+# -- which meant an Intel Mac got a bundle whose daemon could not run, and every
+# app reported version skew against the tarball beside it.
+#
+# One build, two signatures: Xcode re-signs the daemon on the way in
+# (`CodeSignOnCopy`), so the bundle's copy is not byte-identical to the
+# tarball's -- 14 bytes in 4 MB, all of it signature and fat-header padding,
+# with identical `__TEXT` and `--version`.
 #
 # Linux is built *natively* rather than cross-compiled from the macOS job.
 # Cross-compiling to musl works at the current ghostty pin (and `just dist`
@@ -224,8 +228,8 @@ jobs:
   # The Mac app: the thing most people will actually install.
   app:
     name: Illogical.dmg
-    # The macOS daemon tarball, because the bundle carries that exact binary
-    # rather than a second build of it.
+    # The macOS daemon tarball, because the bundle carries that build rather
+    # than a second one of the same source.
     needs: [setup, daemon]
     runs-on: macos-26
     # The build is ~15m; the two notarization waits are Apple's and are usually
@@ -459,3 +463,33 @@ jobs:
           # already uploaded rather than refusing.
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             dist/*.tar.gz dist/*.dmg dist/SHA256SUMS
+
+      # The URLs the README actually hands people, fetched the way a person
+      # would. Publishing can succeed in every respect above and still leave
+      # every documented link 404ing, which is exactly what the first release
+      # did: `releases/latest/download/…` resolves to the newest release *that
+      # is not a prerelease*, so it cannot reach the rolling one. The fix was to
+      # name the tag instead, and this is what stops it coming back -- a broken
+      # install link is not something to find out about from a bug report.
+      - name: The download links resolve
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          fail=0
+          for asset in Illogical.dmg illogicald-macos-universal.tar.gz \
+            illogicald-linux-x86_64.tar.gz illogicald-linux-aarch64.tar.gz \
+            SHA256SUMS; do
+            # --retry, because an asset is not servable the instant the upload
+            # returns and a flaky 404 here would be worse than no check at all.
+            code=$(curl -sSL --retry 5 --retry-delay 3 --retry-all-errors \
+              -o /dev/null -w '%{http_code}' "$base/$asset")
+            if [ "$code" = "200" ]; then
+              echo "  ok    $asset"
+            else
+              echo "  FAIL  $asset -> HTTP $code"
+              fail=1
+            fi
+          done
+          exit $fail
