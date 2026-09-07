@@ -141,6 +141,12 @@ and the client's XCFramework are built from it, which is what guarantees the two
 sides agree on the snapshot format — a format that carries **no compatibility
 guarantee** yet.
 
+The pin is part of the version string, so `illogicald --version` reads
+`0.0.0-dev+g<pin>` — and the app says so when the daemon answering the socket
+was built from a different one. It is a marker in the session dropdown and
+nothing more: whatever is running owns the terminals behind it, and a snapshot
+that genuinely does not match fails loudly on its own.
+
 Bumping the submodule is a protocol change. Rebuild both sides:
 
 ```bash

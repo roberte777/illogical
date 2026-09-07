@@ -647,6 +647,35 @@ final class ReconnectTests: XCTestCase {
         try await waitFor("Try Again to start one") { launcher.callCount == 2 }
     }
 
+    /// The refusal, over a real socket, against a daemon that keeps talking
+    /// after it — which is what a daemon without branch 1's hang-up does, and
+    /// what every daemon already deployed does. `VersionSkewTests` drives the
+    /// same frames through `handleForTesting`; this one adds the connection, so
+    /// `controlClosed` on the socket we hung up on is exercised too.
+    ///
+    /// This is the test that fails against the old code by going `.connected`.
+    func testADaemonThatRefusesHelloAndKeepsTalkingIsStillTerminal() async throws {
+        let server = try HangUpServer(mode: .refuseHello)
+        defer { server.stop() }
+
+        let launcher = RecordingLauncher(.succeedSilently)
+        let host = try localStore(server.path, launcher)
+        defer { host.disconnect() }
+
+        host.connect()
+        try await waitFor("the refusal to reach the status") {
+            if case .failed(let message) = host.status { return message.contains("protocol") }
+            return false
+        }
+
+        // The `session_list` behind the `err` has landed by now, and so has the
+        // close. Neither may put the host back on its feet.
+        try await Task.sleep(for: .milliseconds(700))
+        if case .failed = host.status {} else { XCTFail("a refused daemon reconnected") }
+        XCTAssertEqual(server.accepted, 1, "the client reconnected to a daemon that refused it")
+        XCTAssertEqual(launcher.callCount, 0, "a refusal was mistaken for nothing listening")
+    }
+
 }
 
 /// A `DaemonLauncher` that starts nothing, and remembers being asked.
@@ -696,6 +725,11 @@ final class RecordingLauncher: DaemonLauncher, @unchecked Sendable {
         // child.
         try answer(socketPath)
     }
+
+    /// Nil, so nothing in this file ever compares versions. The skew notice is
+    /// `VersionSkewTests`' subject; here it would only be noise on the status
+    /// these tests assert against.
+    func bundledVersion() async -> String? { nil }
 
     private func answer(_ socketPath: String) throws -> LocalDaemon.Outcome {
         lock.lock()
@@ -751,6 +785,11 @@ final class HangUpServer: @unchecked Sendable {
         /// up and its pump still running, which is the only way to get a live
         /// superseded pump without a race.
         case errorThenHold
+        /// Refuse the `hello` over the protocol version and then keep talking:
+        /// `err(version_mismatch)` followed by a `session_list`, then close.
+        /// That is what a daemon without branch 1's hang-up did, and it is the
+        /// sequence a client pipelining `hello` and `list` really sees.
+        case refuseHello
     }
 
     let path: String
@@ -878,27 +917,43 @@ final class HangUpServer: @unchecked Sendable {
                 // connection opened and dropped without a word -- which one of
                 // these tests does deliberately -- must not be written to.
                 if spoke {
-                    sendError(client)
+                    sendError(client, code: ProtocolErrorCode.noSuchSession, session: 1)
                     state.hold(client)
                 } else {
                     Darwin.close(client)
                 }
+            case .refuseHello:
+                if spoke {
+                    sendError(
+                        client, code: ProtocolErrorCode.versionMismatch,
+                        session: Protocol.controlSession)
+                    // The frame the client had already asked for, arriving
+                    // behind the refusal because it was written before it.
+                    sendFrame(
+                        client, type: .sessionList, session: Protocol.controlSession,
+                        payload: Data(#"{"sessions":[],"terminals":[]}"#.utf8))
+                }
+                Darwin.close(client)
             }
         }
     }
 
     /// An `err` this client will not try to recover from. Deliberately not
     /// `.desync`, which is the one code that means "attach again".
-    private static func sendError(_ fd: Int32) {
+    private static func sendError(_ fd: Int32, code: ProtocolErrorCode, session: UInt64) {
         // The wire bytes, not an encoded `ErrBody`: these types are the
         // *client's* decoding of what a daemon sends, and only their
         // `Decodable` half is public. Standing in for the daemon means writing
         // what the daemon writes.
-        let payload = Data(
-            #"{"code":\#(ProtocolErrorCode.noSuchSession.rawValue),"message":"no such terminal"}"#
-                .utf8)
+        let payload = Data(#"{"code":\#(code.rawValue),"message":"refused"}"#.utf8)
+        sendFrame(fd, type: .error, session: session, payload: payload)
+    }
+
+    private static func sendFrame(
+        _ fd: Int32, type: FrameType, session: UInt64, payload: Data
+    ) {
         var frame = FrameHeader(
-            type: .error, session: 1, length: UInt32(payload.count)
+            type: type, session: session, length: UInt32(payload.count)
         ).encoded
         frame.append(payload)
         frame.withUnsafeBytes { raw in

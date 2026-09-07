@@ -29,6 +29,13 @@ struct SessionRef: Hashable, Sendable {
     var session: UInt64
 }
 
+/// A daemon that is not the build this app shipped. Both strings, because the
+/// only useful thing to say about it is which two they are.
+struct VersionSkew: Equatable, Sendable {
+    var server: String
+    var shipped: String
+}
+
 /// What starts a local server when there is none.
 ///
 /// A seam, and it exists for one reason: every test that reaches `connect()`
@@ -41,12 +48,23 @@ protocol DaemonLauncher: Sendable {
     /// Make sure a daemon is listening on `socketPath`, or throw saying why
     /// not. Returns only once there is one.
     func ensure(socketPath: String) async throws -> LocalDaemon.Outcome
+
+    /// The version of the daemon this app ships, to compare against the one it
+    /// is actually talking to. Nil when there is none to ask, or when it did
+    /// not answer -- a version we could not read is a comparison we do not
+    /// make.
+    func bundledVersion() async -> String?
 }
 
 /// The one the app uses: the `illogicald` inside this bundle.
 struct BundledDaemonLauncher: DaemonLauncher {
     func ensure(socketPath: String) async throws -> LocalDaemon.Outcome {
         try await LocalDaemon.ensure(LocalDaemon.Options(socketPath: socketPath))
+    }
+
+    func bundledVersion() async -> String? {
+        guard let executable = LocalDaemon.executable() else { return nil }
+        return await LocalDaemon.version(executable: executable)
     }
 }
 
@@ -142,6 +160,44 @@ final class HostConnection: Identifiable {
     private(set) var status: Status = .connecting
     var sessions: [SessionSummary] = []
     var terminals: [TerminalSummary] = []
+
+    /// What the daemon said it was, from `welcome.server`. Nil until the first
+    /// welcome of the current connection.
+    private(set) var serverVersion: String?
+
+    /// The daemon answering this socket is not the one the app shipped.
+    ///
+    /// Local hosts only, and it blocks nothing. A version string carries the
+    /// `vendor/ghostty` pin, which is what actually decides whether two builds
+    /// agree about a snapshot -- but "different" is not "incompatible", a
+    /// daemon somebody started by hand from another checkout usually works
+    /// fine, and a snapshot that genuinely does not match already fails loudly
+    /// at `snapshot_begin.format`. So this is a marker and a tooltip and
+    /// nothing more: the running daemon owns the terminals, and the app does
+    /// not get to end them over a string.
+    private(set) var versionSkew: VersionSkew?
+
+    /// Asked for once and remembered. Running `illogicald --version` is a
+    /// process, and a reconnect loop would otherwise start one on every
+    /// backoff tick. The flag is what distinguishes "not asked yet" from
+    /// "asked, and there was no answer" -- without it, a bundle with no daemon
+    /// in it re-runs the lookup on every welcome, forever.
+    private var shippedVersion: String?
+    private var askedForShippedVersion = false
+
+    /// This daemon refused our protocol version, so nothing it says counts.
+    ///
+    /// The refusal arrives as one frame in a stream, and a client pipelines --
+    /// `hello` and `list` go out back to back -- so the `session_list` the
+    /// daemon queued behind the `err` was already on the wire. `apply` reads a
+    /// `session_list` as "connected", which is how the app used to log the
+    /// refusal and attach to the daemon 55 ms later (REVIEW F1). The daemon now
+    /// hangs up after refusing, and this is the client's half of the same rule:
+    /// once refused, this connection is over whatever else turns up on it.
+    ///
+    /// Cleared by `connect()` -- Try Again against a daemon somebody has since
+    /// replaced is a reasonable thing to ask for.
+    private var protocolRefused = false
 
     /// Live controllers, one per open terminal on this host.
     private(set) var controllers: [UInt64: TerminalController] = [:]
@@ -242,6 +298,7 @@ final class HostConnection: Identifiable {
         // attempt is superseded rather than joined: it would open a second
         // control connection on top of the one below.
         cancelStart()
+        protocolRefused = false
         startedThisOutage = false
         // Try Again is a person saying "once more", which is the one thing
         // that gets past the lifetime rule below.
@@ -335,6 +392,11 @@ final class HostConnection: Identifiable {
         pump = nil
         control?.close()
         control = nil
+        // Both are facts about the daemon on the other end of a connection
+        // that has gone. The next `welcome` establishes them again -- and it
+        // may well be a different daemon, which is the whole point of noticing.
+        serverVersion = nil
+        versionSkew = nil
         // Here rather than only in `disconnect`, because `openControl` comes
         // through here too and a reconnect is the commonest way a `create`
         // stops being answerable. The cancelled pump's own tail cannot do it:
@@ -440,6 +502,56 @@ final class HostConnection: Identifiable {
         starting?.cancel()
         starting = nil
         startEpoch += 1
+    }
+
+    /// Set `versionSkew` if the daemon answering this socket is not the one the
+    /// app shipped.
+    ///
+    /// Local hosts only. A remote machine's daemon is *expected* to be a
+    /// different build -- it was installed from a tarball, on its own schedule,
+    /// possibly by somebody else -- and marking every one of them would make
+    /// the marker mean nothing.
+    ///
+    /// Asked of the bundled binary rather than of a version string baked into
+    /// the app at build time. One code path, and it is the one that also works
+    /// under `ILLOGICAL_DAEMON`: a developer pointing the app at a daemon from
+    /// another checkout is exactly the person this notice is for, and a baked
+    /// string would compare the wrong two things for them.
+    private func compareVersions(_ server: String) {
+        guard case .local = host else { return }
+        let launcher = self.launcher
+        // Inherits this actor, so everything but the launcher call is already
+        // where it needs to be. The launcher call is the reason there is a
+        // Task at all: it runs `illogicald --version` as a child, and the main
+        // actor may not wait for a process.
+        Task { [weak self] in
+            guard let self else { return }
+            if !self.askedForShippedVersion {
+                // Before the await, not after. A second `welcome` -- a
+                // reconnect, which is ordinary -- arriving during the lookup
+                // would otherwise find the flag still false and start a second
+                // `illogicald --version` process (REVIEW F13).
+                self.askedForShippedVersion = true
+                self.shippedVersion = await launcher.bundledVersion()
+            }
+            guard let shipped = self.shippedVersion else { return }
+            self.setVersionSkew(
+                shipped == server ? nil : VersionSkew(server: server, shipped: shipped))
+        }
+    }
+
+    private func setVersionSkew(_ skew: VersionSkew?) {
+        guard let skew else {
+            versionSkew = nil
+            return
+        }
+        // The version this is about must still be the one on the wire. The
+        // lookup above suspends, and a connection replaced while it did would
+        // otherwise get a notice about a daemon we are no longer talking to.
+        guard serverVersion == skew.server else { return }
+        Trace.log(
+            "\(host.displayName): server is \(skew.server), this app ships \(skew.shipped)")
+        versionSkew = skew
     }
 
     /// Where a daemon writes what it could not say to anybody.
@@ -569,6 +681,13 @@ final class HostConnection: Identifiable {
     /// Split out so `handleForTesting` reaches the real thing rather than a
     /// second copy of it.
     private func apply(_ frame: Frame) {
+        // A daemon we have refused gets no further say. `closeControl` below
+        // already stops the real connection -- `handle`'s identity guard sends
+        // everything home once `control` is nil -- so this is what covers
+        // `handleForTesting`, which has no connection to be identified against,
+        // and a `created` or `sessions_changed` racing the close.
+        guard !protocolRefused else { return }
+
         switch frame.type {
         case .sessionList:
             guard let list = try? JSONDecoder().decode(SessionListBody.self, from: frame.payload)
@@ -612,6 +731,17 @@ final class HostConnection: Identifiable {
             setStatus(.connected)
             onListChanged?()
 
+        case .welcome:
+            // On the wire since the first version of the protocol, decoded by
+            // `WelcomeBody` since the client existed, and until now read by
+            // nobody. It carries the daemon's build, which is the only way to
+            // notice that the server answering this socket is not the one this
+            // app shipped.
+            guard let welcome = try? JSONDecoder().decode(WelcomeBody.self, from: frame.payload)
+            else { return }
+            serverVersion = welcome.server
+            compareVersions(welcome.server)
+
         case .created:
             guard let created = try? JSONDecoder().decode(CreatedBody.self, from: frame.payload)
             else { return }
@@ -638,6 +768,32 @@ final class HostConnection: Identifiable {
             Trace.log(
                 "\(host.displayName): control error: " + (body?.message ?? "unknown"))
             voidPendingCreates()
+
+            // One of them is not merely a failed request. A daemon that
+            // refuses `hello` over the protocol version will refuse the next
+            // one too: the problem is fixed and unchanging, so retrying it on a
+            // timer says nothing. Say it once and stop.
+            if body?.code == ProtocolErrorCode.versionMismatch.rawValue {
+                protocolRefused = true
+                setStatus(
+                    .failed(
+                        "The server at \(host.displayName) speaks a different protocol version "
+                            + "than this app (\(Protocol.version)). Restart it with the "
+                            + "illogicald this app shipped."))
+                // Nothing scheduled: `scheduleReconnect` is what the backoff
+                // runs on, and reaching `.failed` has to mean the retries have
+                // stopped. Try Again still works.
+                retry?.cancel()
+                retry = nil
+                cancelStart()
+                // And hang up, rather than sit on a connection we have just
+                // decided we cannot speak. This is also what drops the
+                // `session_list` already queued behind this `err`: `control` is
+                // nil afterwards, so both `handle`'s identity guard and
+                // `controlClosed`'s discard what is left on this connection
+                // rather than scheduling a reconnect against it.
+                closeControl()
+            }
 
         default:
             break
