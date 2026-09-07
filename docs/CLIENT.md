@@ -469,7 +469,7 @@ never be typed into a terminal.
 | ⇧⌘] / ⇧⌘[ | Show Next / Previous Tab, wrapping | Window |
 | ⌘1 … ⌘8 | Select that tab | Window |
 | ⌘9 | Last tab (the iTerm/Ghostty/browser convention, not the ninth) | Window |
-| Esc | Dismiss the session menu | `SessionMenu`'s `onExitCommand` — key events go where focus is, and the filter field has it |
+| Esc | Dismiss the session menu | `SessionMenu`'s `onEscape` — a local `NSEvent` monitor, alive only while the menu is |
 | ⌘Home / ⌘End | Scroll to the top / bottom of the scrollback | `TerminalSurfaceView.keyDown` |
 | ⌘PgUp / ⌘PgDn | Scroll one page (a screen less a row of overlap) | `TerminalSurfaceView.keyDown` |
 | ⌘C / ⌘V / ⌘A | Copy / Paste / Select All | system Edit menu → responder chain |
@@ -512,6 +512,30 @@ went away, so `SessionStore.focusGeneration` is bumped instead — a counter
 re-run `updateNSView`, which is where first responder is re-asserted. Only the
 counter is under test; the rest of that chain needs a running app and was
 checked by hand.
+
+**Escape does not go where focus is, because focus is not in the menu.** W10
+shipped Escape as `.onExitCommand` on `SessionMenu`'s root, on the stated
+assumption that the filter field takes first responder as the menu appears. It
+does not: with the menu open the app's `AXFocusedUIElement` is still the
+terminal surface underneath and the field's `AXFocused` is `false`, so nothing
+in the menu was ever in the focus chain, `.onExitCommand` never fired, and
+Escape went to the terminal. (Click the field first and Escape *does* close the
+menu — which is how the mechanism was pinned down, against the running app.) So
+Escape is a local `NSEvent` monitor instead — `View.onEscape`, in
+`EscapeKey.swift` — which runs inside `NSApplication.sendEvent(_:)` and does not
+care what holds first responder. It is installed by the menu's `onAppear` and
+removed by its `onDisappear`, so Escape belongs to the terminal the rest of the
+time, and it returns `nil` so the keystroke that closed the menu is not also
+delivered underneath it. Both halves were checked against a terminal running
+`cat -v`: with the menu closed, Escape puts `^[` on its screen; with the menu
+open, the menu closes and the screen does not change.
+
+Clicking away *does* dismiss the menu and always did — the full-window
+`Color.black.opacity(0.001)` layer under it works. A report that it does not is
+worth re-checking with a real click: a synthetic one built from `leftMouseDown`,
+a run of `leftMouseDragged` at the same point, and `leftMouseUp` fails SwiftUI's
+`TapGesture`, which is movement-sensitive, and looks exactly like a broken
+dismiss layer.
 
 ## Session and terminal switching
 
@@ -650,6 +674,34 @@ pane is spliced into a tab whose `SessionRef` still points at the renamed one.
 Closing it means a session id on `create` (and `sessionByNameLocked` refusing
 to invent a session for a `create` that named one), which is server work and a
 protocol change. Until then this is a known residual, not a fixed bug.
+**A tab slot has to claim its own mouse-down, or the title bar takes it.** The
+toolbar is an `NSTitlebarAccessoryViewController` (see `WindowChrome.swift`),
+and AppKit decides what in a title bar drags the window per *view*, from
+`mouseDownCanMoveWindow`. Every view an `NSHostingView` puts there answers
+`true` — the default for anything not opaque, which nothing SwiftUI draws is —
+so the whole accessory was window chrome. The window's drag loop took the
+mouse-down, the `simultaneousGesture` never started, and drag-to-reorder as
+shipped in #64 moved the *window* by the drag delta and reordered nothing; a
+drag begun on `+` moved the window and made a terminal on the mouse-up.
+`View.claimsMouseDown()` puts a one-line `NSView` behind the slot, the session
+button and `+`, whose only job is to answer `false`.
+`window.isMovableByWindowBackground` is a different knob and was already
+`false`, which is why the terminal body ignored a drag while the strip above it
+did not. The `Spacer` between the strip and `+` is deliberately left un-claimed:
+empty toolbar drags the window, and that is a feature.
+
+The ✕ is hidden on the slot being dragged. The dragged slot rides under the
+pointer, so its ✕ rides with it, and the mouse-up that ends the drag lands
+inside the close button — dragging a tab by its ✕ closed it. With the ✕ gone for
+the length of the drag the mouse-up lands on the select button instead, which is
+what the strip wants anyway.
+
+None of that is unit-testable: a draggable region needs a window on a screen.
+`ClaimsMouseDown.BackingView.mouseDownCanMoveWindow` is asserted, and it is
+honest about covering one line. Everything else here was checked by driving the
+built app with synthetic `CGEvent`s and reading window and button geometry back
+through the accessibility API — always normalising button x by the *window's*
+position, because a bug that moves the window hides in coordinates that do not.
 
 ## Motion
 

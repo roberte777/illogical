@@ -137,6 +137,14 @@ targets:
       - path: Illogical/App/Chrome.swift
       - path: Illogical/App/SessionMenu.swift
       - path: Illogical/App/WindowClose.swift
+      # The two bits of AppKit event plumbing the chrome needs, and the only
+      # part of either a test can hold without a window: `ClaimsMouseDown`'s
+      # backing view answers `mouseDownCanMoveWindow` with `false`, which is the
+      # whole of the tab-drag fix, and SessionMenu does not compile without
+      # `onEscape`. Neither the title bar's drag region nor a key monitor can be
+      # driven from a unit test -- both were checked against the running app.
+      - path: Illogical/App/WindowChrome.swift
+      - path: Illogical/App/EscapeKey.swift
       # The font the app ships. Without it in the test bundle the renderer
       # tests would resolve the default family to the system's fixed-pitch
       # face and measure a grid the app never draws.
