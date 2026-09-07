@@ -257,11 +257,16 @@ struct SessionMenu: View {
         // Nothing outlives the menu. A flag left set here is a rename armed
         // against a session the person has since stopped looking at.
         .onDisappear { store.pendingRename = nil }
-        // Escape closes the menu, the way it closes an NSMenu. It has to be
-        // here rather than on the overlay: key events go where focus is, and
-        // the filter field takes it as the menu appears. Closing hands the
+        // Escape closes the menu, the way it closes an NSMenu. Not
+        // `.onExitCommand`, which was W10's bug: that fires only for the
+        // *focused* view, and the focus the line above asks for does not
+        // reliably land -- with the menu open the app's focused element was
+        // still the terminal surface underneath, so Escape went to the
+        // terminal and the menu stayed. `onEscape` watches the event rather
+        // than the focus, so it works wherever first responder happens to
+        // be. Closing hands the
         // keyboard back to the terminal (SessionStore.focusTerminal).
-        .onExitCommand { isPresented = false }
+        .onEscape { isPresented = false }
         .sheet(isPresented: $addingHost) {
             AddRemoteHost(destination: $newHost) { destination in
                 store.addHost(.ssh(destination: destination))

@@ -182,6 +182,10 @@ struct SessionButton: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        // The toolbar is a title bar accessory, so without this a drag begun on
+        // the button moved the window and *then* opened the menu on the
+        // mouse-up. See `WindowChrome`.
+        .claimsMouseDown()
         // Written the way the menu item draws it, which is the order macOS
         // orders modifiers in. It was ⌘⇧K here and bound to nothing at all
         // until the View menu's "Change Session" landed.
@@ -201,6 +205,8 @@ struct TerminalTab: View {
     let showsLeadingSeparator: Bool
     /// A tab is being dragged over this slot, so say where it would land.
     var isDropTarget: Bool = false
+    /// This slot is the one being dragged.
+    var isDragging: Bool = false
     /// The strip's namespace for the active pill. One pill moves between slots
     /// rather than one per slot fading in and out, which is what makes
     /// selecting a tab slide rather than blink.
@@ -218,7 +224,14 @@ struct TerminalTab: View {
 
     /// Always on the active tab, on hover for the rest — the way tab bars
     /// everywhere behave. Hover-only made it undiscoverable.
-    private var showsClose: Bool { isActive || isHovering }
+    ///
+    /// Never on the slot being dragged. The dragged slot rides under the
+    /// pointer, so the ✕ rides with it and the mouse-up that ends the drag
+    /// lands *inside* the close button — dragging a tab by its ✕ closed it,
+    /// measured. Taking the ✕ away for the length of the drag leaves the
+    /// mouse-up on the select button instead, which is the behaviour the strip
+    /// already wants: a dragged tab comes to the front.
+    private var showsClose: Bool { (isActive || isHovering) && !isDragging }
 
     private var name: String { terminal?.name ?? "terminal" }
     private var residency: Residency { terminal?.residency ?? .live }
@@ -261,6 +274,13 @@ struct TerminalTab: View {
         }
         .padding(.horizontal, Metrics.tabLeadingPadding)
         .frame(width: Metrics.tabWidth, height: Metrics.tabHeight)
+        // A slot is a control, not window chrome. Without this the title bar
+        // takes the mouse-down and drags the window with it, so the drag
+        // gesture the strip attaches below never starts and reordering (#38)
+        // did nothing at all. Sized to the whole slot, so the ✕ inside it is
+        // covered too. See `WindowChrome` for why the title bar behaves this
+        // way and why the *empty* toolbar must keep doing so.
+        .claimsMouseDown()
         .background {
             if isActive {
                 RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)

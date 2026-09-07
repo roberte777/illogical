@@ -8,6 +8,7 @@
 //  is not — the same reason `TabReconcileTests` drives the store rather than a
 //  socket.
 
+import AppKit
 import IllogicalProtocol
 import SwiftUI
 import XCTest
@@ -224,6 +225,32 @@ final class TabOrderTests: XCTestCase {
         XCTAssertEqual(TabStrip.dropIndex(from: 0, translation: 500, slotWidth: 200, count: 0), 0)
         XCTAssertEqual(TabStrip.dropIndex(from: 2, translation: 500, slotWidth: 0, count: 4), 2)
         XCTAssertEqual(TabStrip.dropIndex(from: 2, translation: .nan, slotWidth: 200, count: 4), 2)
+    }
+
+    // MARK: - Drag plumbing
+
+    /// The one line of the drag *plumbing* a test can hold, and it is worth
+    /// being plain about how little that is.
+    ///
+    /// The arithmetic above was already right when drag-to-reorder did nothing
+    /// at all: the toolbar is an `NSTitlebarAccessoryViewController`, every view
+    /// SwiftUI puts in one answers `mouseDownCanMoveWindow` with `true`, and so
+    /// AppKit's window drag took the mouse-down before the gesture could start.
+    /// `ClaimsMouseDown` is the fix and this is its whole contract.
+    ///
+    /// What this does *not* cover: that the modifier is actually applied to the
+    /// tab slots, the session button and `+`; that AppKit really subtracts the
+    /// view's frame from the title bar's draggable region; or that the buttons
+    /// drawn over it still get their clicks. None of that exists without a
+    /// window on a screen, and all of it was checked by driving the running app
+    /// with `CGEvent`s and reading geometry back through the accessibility API.
+    /// A test that asserted the reorder itself would have passed with the bug
+    /// present, which is the trap this branch exists to get out of.
+    func testATabSlotIsNotWindowChrome() {
+        XCTAssertFalse(ClaimsMouseDown.BackingView(frame: .zero).mouseDownCanMoveWindow)
+        // Against the default, so the assertion above is known to be saying
+        // something: a plain view in a hosting view is what drags the window.
+        XCTAssertTrue(NSView(frame: .zero).mouseDownCanMoveWindow)
     }
 
     // MARK: - The reduce-motion gate

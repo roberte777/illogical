@@ -329,6 +329,7 @@ struct Toolbar: View {
                             showsLeadingSeparator: index > 0 && !isActive(index)
                                 && !isActive(index - 1),
                             isDropTarget: dragTarget == index,
+                            isDragging: drag?.id == tab.id,
                             pill: pill,
                             select: { store.selectedTabID = tab.id },
                             // Through the same policy ⇧⌘W uses, so pointer and
@@ -388,7 +389,9 @@ struct Toolbar: View {
                 Motion.tabs.animation(reduceMotion: reduceMotion), value: store.selectedTabID)
 
             // Bare title bar drags the window; AppKit handles it because the
-            // toolbar is a title bar accessory.
+            // toolbar is a title bar accessory. This `Spacer` is deliberately
+            // the *only* part of the strip that still does -- every control
+            // around it calls `claimsMouseDown()`.
             Spacer(minLength: 8)
 
             Button {
@@ -401,6 +404,9 @@ struct Toolbar: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            // Without this a drag begun on `+` moved the window and made a
+            // terminal when it ended, which is two surprises for one gesture.
+            .claimsMouseDown()
             .help("New Terminal (⌘T)")
             .padding(.trailing, Metrics.plusTrailing)
         }
