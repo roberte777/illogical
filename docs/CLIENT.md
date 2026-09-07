@@ -15,6 +15,8 @@ connecting client be a very smart, high-functioning, compliant client"*
 Illogical.app
 ├── App/            window, menus, session dropdown
 ├── Sessions/       connection state, session + terminal lists
+├── Supporting/
+│   └── Fonts/      JetBrains Mono, shipped as the default face
 ├── Terminal/
 │   ├── TerminalEngine.swift     libghostty-vt wrapper + snapshot extraction
 │   ├── SnapshotRestore.swift    two-phase attach decode
@@ -221,6 +223,17 @@ coordinates and folded into the drawing transform, so a glyph that wants to
 sit at x=3.4 is rasterized *as* 3.4 rather than snapped. Metrics come from the
 OpenType tables directly: CoreText rounds to points and hides whether the font
 specified an underline position at all.
+
+**Fonts.** The default face is not whatever `.userFixedPitch` returns — the
+app ships JetBrains Mono in its bundle, from the same tarball at the same hash
+that ghostty pins, and uses it when no family is configured. Two variable
+files cover four styles: bold is the upright face with the `wght` axis at 700,
+bold-italic the italic face with the same, which is what `SharedGridSet.zig`
+does. Italic needs its own file because asking CoreText for the italic trait
+on a variable upright face hands the upright face straight back. The faces are
+built from their bytes and never registered with `CTFontManager`, so they are
+private to the process and never turn up in the user's font list. A named
+family still wins; there is just nothing yet that can name one (#42).
 
 **Sprites.** Cursors, the five underline styles, strikethrough, overline, box
 drawing, block elements, braille, powerline separators, sextants, octants and
