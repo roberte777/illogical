@@ -128,6 +128,25 @@ final class FontFace {
         return FontFace(font: copy, syntheticBold: max(Double(points) / 14.0, 1))
     }
 
+    /// A copy of this face with one OpenType variation axis pinned.
+    ///
+    /// Ported from libghostty's `face/coretext.zig` `setVariations`, and
+    /// used for one thing: `wght = 700` is how a variable family's bold is
+    /// reached. Bold is a point on an axis there, not a separate file, and
+    /// `CTFontCreateCopyWithSymbolicTraits` is not a dependable way to get
+    /// to it — it happens to resolve `wght`, and does nothing whatsoever for
+    /// italic, which JetBrains Mono keeps in a file of its own.
+    func withVariation(axis: UInt32, value: Double) -> FontFace {
+        let descriptor = CTFontDescriptorCreateCopyWithVariation(
+            CTFontCopyFontDescriptor(font), NSNumber(value: axis) as CFNumber, CGFloat(value))
+        // Size 0 keeps the size this face already has.
+        let varied = CTFontCreateCopyWithAttributes(font, 0, nil, descriptor)
+        // `syntheticBold` deliberately does not carry over: a pinned weight
+        // axis *is* a real weight, and keeping the stroke would draw a bold
+        // on top of a bold.
+        return FontFace(font: varied)
+    }
+
     var hasColor: Bool { colorState != nil }
 
     func isColorGlyph(_ glyphID: UInt32) -> Bool {
