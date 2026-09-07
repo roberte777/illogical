@@ -21,11 +21,58 @@ Illogical.app
 │   ├── TerminalController.swift one connection, one terminal
 │   ├── TerminalSurfaceView.swift  NSView host, layer, input
 │   └── Renderer/                Metal renderer, atlases, fonts, sprites
-└── Transport/      unix socket, ssh stdio, framing
 
 Packages/IllogicalKit/
 └── IllogicalProtocol           pure Swift, no libghostty — testable alone
+    ├── Frame.swift             the wire header
+    ├── Connection.swift        reader thread, frame stream, serialized writes
+    ├── Transport.swift         unix socket, or `ssh <dest> illogicald --stdio`
+    └── Session.swift           sessions, terminals, hosts
 ```
+
+Transport is in the package rather than the app on purpose: it is the half of
+remote support that can be tested without a window, a GPU or a daemon, and
+`just test-swift` runs it in under a second.
+
+## Several machines in one window
+
+A window holds one `HostConnection` per machine: the local daemon, plus any
+number of remote ones. Each owns **what exists** on its machine — its control
+connection, its sessions, its terminals, its per-terminal controllers.
+`SessionStore` owns **where that is drawn**: the tabs, the split trees, the
+selection, across every host at once.
+
+```
+SessionStore                      tabs, splits, selection
+├── HostConnection  Local         sessions, terminals, controllers
+├── HostConnection  build-box     sessions, terminals, controllers
+└── HostConnection  gpu-01        sessions, terminals, controllers
+```
+
+That split is what makes the rest of the client indifferent to where a terminal
+is. The one thing it forces is that **a terminal is a `TerminalRef`, not an id**:
+every daemon numbers its terminals from 1, so two machines both have a terminal
+1, and a `UInt64` in a pane would draw one machine's terminal in the other's
+pane rather than merely losing a tab. The same goes for a `SessionRef`.
+
+A tab belongs to one session, and a session lives on one machine, so a tab never
+spans two hosts. Splitting inside it creates a terminal on that same machine.
+Which machine you are looking at is on the session button; which machine a
+*pane* is on is in its own header, because a tab has one strip entry and a split
+tab could otherwise say nothing about it.
+
+Hosts are remembered in `UserDefaults`, and there is no credential among them:
+`ssh` reads the user's own config, so a `Host` alias out of it is a perfectly
+good answer. Only what the *user* added is written — hosts injected by
+`ILLOGICAL_HOSTS` are deliberately not, so a session started with that variable
+does not quietly make them permanent the first time you add or forget anything
+else.
+
+**One unreachable machine is not a broken window.** A failed host is a marker in
+the dropdown with `ssh`'s own complaint behind it and a button to try again; the
+"no server" screen only takes over when *every* host is down. `ILLOGICAL_HOSTS`
+adds destinations at launch without remembering them, so a two-machine window
+can be inspected without driving the mouse.
 
 ## One connection per terminal
 
@@ -364,6 +411,10 @@ The dropdown lists sessions; a session expands to its terminals. Each row shows
 residency — live, parked, rehydrating, exited — because parked is normal and
 should look normal, not like an error.
 
+With more than one machine connected it grows a header per host and the sessions
+under it are that machine's. One host is the common case, so the headers only
+appear when there is something to disambiguate.
+
 Switching to a parked terminal is **not** an unpark: the server streams its
 snapshot straight from disk and the terminal stays parked [MEM t=660]. From the
 client's side this is indistinguishable from attaching to a live one, which is
@@ -373,10 +424,91 @@ the point. Do not add a spinner for it.
 
 `ssh <dest> illogicald --stdio`, with the frame stream on the pipe. The user's
 existing SSH config, keys, jump hosts and agent forwarding apply. No credential
-handling of our own, and nothing to store.
+handling of our own, and nothing to store but the destination string.
+
+A **`Transport`** is a pair of descriptors and whatever holds them open — one
+socket for a local host, two pipe ends and a child process for a remote one.
+`Connection` reads and writes those descriptors and knows nothing else, so
+`TerminalController`, the snapshot decode and the renderer are all identical
+either way. The only line in the client with an opinion is
+`ServerHost.makeTransport()`.
+
+```
+ServerHost.local ──► UnixSocketTransport ──┐
+                                           ├──► Connection ──► frames
+ServerHost.ssh   ──► CommandTransport ─────┘
+                     ssh -T … dest illogicald --stdio
+```
+
+Two details that are not decoration:
+
+- **`-T`.** A pty in the middle would put a line discipline on a binary frame
+  stream and rewrite every `0x0a` byte a snapshot chunk carried.
+- **`ControlMaster=auto`.** One connection per terminal means four splits on one
+  host open five SSH connections; multiplexing makes the four after the first
+  cost a channel rather than a handshake. The `ControlPath` is the one
+  `src/core/conn.zig` renders, so the app and `illogical --host` share a master.
+
+The child's stderr is drained and kept — an undrained pipe fills at 64 KiB and
+wedges `ssh` — so "could not resolve hostname" survives as itself rather than as
+a closed connection. It is reported only once the child has actually gone: `ssh`
+writes to stderr on perfectly good connections too (the known-hosts warning on a
+first connect, banners, the remote daemon's own logging), and treating any of
+that as a failure made a healthy host render as the broken one.
 
 Superlogical's server additionally has built-in Tailscale/Headscale support and
 acts as a node ([MASTO]). Out of scope for us; SSH first.
+
+## Losing the network, and getting it back
+
+**Reconnecting needed almost no new machinery, and that is the point.** A
+connection that goes away is a client that has missed output; the protocol
+already recovers from that by throwing the terminal state away and replaying
+the attach handshake, which is O(screen). So the only new question is *when* —
+an exponential backoff from 250 ms to a 30-second ceiling, retried forever. A
+laptop closed overnight should find its terminals in the morning, and "give up
+after five minutes" is exactly the case where that fails; the ceiling is what
+makes forever cheap.
+
+```
+connection closes ─► .reconnecting ─► attach ─► snapshot_begin ─► PAINT
+                       (backoff)                 tears down the old terminal,
+                                                 the same way a desync does
+```
+
+Three things this deliberately does **not** do:
+
+- **It does not blank the screen.** The last thing a terminal showed is still
+  the best guess at what it shows, and the far side never stopped. A dropped
+  packet should not look like a crash. A pill over the terminal says what is
+  happening, with a Retry that skips the backoff.
+- **It does not drop the host's session list.** Clearing it when a control
+  connection closes would take every tab on that machine with it through the
+  reconcile — closing panes and their connections over a blip. The `list` after
+  the reconnect corrects it, because the *server* is what remembers. Which is
+  the premise of the whole project.
+- **It does not treat a first failure differently from a later one.** A host
+  that was never reachable and one that went away are the same question.
+
+There is one exception to "retried forever", and it is about the *kind* of failure rather than how many there have been: a host that cannot be dialled at all — `ssh` not on `PATH`, a socket path too long for `sockaddr_un`, an `ssh` that is not an executable program — is marked `failed` and left alone, because rescanning `PATH` on a thirty-second timer tells nobody anything. Everything else keeps trying.
+
+The line between the two is drawn on the errno rather than on the shape of the failure, and that matters more than it sounds: `Process.run()` throwing is `EMFILE` as readily as it is a broken shebang. A remote connection costs three descriptors, so a window with enough panes open reaches `EMFILE` by itself and recovers the moment one closes — calling that a verdict would kill a perfectly reachable machine for the life of the process. `CommandTransport.spawnError` is where the two are told apart.
+
+A resize during an outage is remembered and carried into the re-attach, so a
+window resized while disconnected comes back at the size it is now.
+
+Over SSH the control connection and every terminal's share one TCP connection
+underneath, so a network coming back recovers them together and only whichever
+gets there first pays for a handshake. `ServerAliveInterval` is what makes a
+dead network *become* a closed connection at all — without it a laptop that
+changed networks waits indefinitely on a socket with nobody behind it.
+
+One thing that had to be fixed before any of this worked: a write to a socket
+or pipe whose far end has gone raises `SIGPIPE`, and the default disposition is
+to kill the process. A daemon going away with a keystroke in flight is the
+ordinary case here, so the recovery path was the one that killed the app.
+`SO_NOSIGPIPE` on the socket; the process-wide disposition for the pipe, which
+has no per-descriptor equivalent.
 
 ## Not sandboxed
 

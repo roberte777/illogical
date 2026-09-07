@@ -83,6 +83,12 @@ bench-launch runs="5" lines="20000":
 bench-attach runs="5" *lines="200 20000 200000":
     ./scripts/bench-attach.sh {{runs}} {{lines}}
 
+# The M5 gate: what `illogicald --stdio` costs against a direct unix socket.
+# Stands something in for ssh, so it bounds the bridge, not a network.
+# Needs `zig build` and `just app` first.
+bench-remote runs="5" lines="20000":
+    ./scripts/bench-remote.sh {{runs}} {{lines}}
+
 # Renderer benchmarks. Only meaningful with optimization, so Release.
 bench-renderer:
     cd clients/macos && {{xcenv}} xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Release -derivedDataPath .build/xcode-rel -destination 'platform=macOS' test

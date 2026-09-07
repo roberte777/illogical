@@ -6,6 +6,10 @@
 //  user input come from different threads.
 //
 //  One connection per terminal, per docs/PROTOCOL.md.
+//
+//  Nothing here knows whether the daemon is on this machine or another one.
+//  That is a `Transport`: a unix socket locally, `ssh <dest> illogicald
+//  --stdio` remotely, with the same frames on a pipe. See Transport.swift.
 
 import Darwin
 import Foundation
@@ -22,54 +26,43 @@ public struct Frame: Sendable {
     }
 }
 
+/// What a *connection* can fail at, once it exists.
+///
+/// Connecting throws `TransportError` now, so the three cases that used to
+/// duplicate it — `socketFailed`, `connectFailed`, `pathTooLong` — became
+/// unreachable when the transport took over opening. They are gone rather than
+/// left to rot: a `catch ConnectionError.connectFailed` that silently stops
+/// matching is worse than one that stops compiling, and the two rendered
+/// differently anyway (`TransportError` describes itself; this did not).
 public enum ConnectionError: Error, Equatable {
-    case socketFailed(Int32)
-    case connectFailed(Int32)
-    case pathTooLong
     case closed
     case handshakeFailed(String)
     case unexpectedFrame(FrameType)
 }
 
 public final class Connection: @unchecked Sendable {
-    private let fd: Int32
+    private let transport: Transport
+    private let readFD: Int32
+    private let writeFD: Int32
     private let writeLock = NSLock()
     private var readerThread: Thread?
     private let closed = ManagedAtomicFlag()
+    /// Signalled when `readLoop` leaves, so `close` can free the descriptors
+    /// only once nothing is on them. `Thread` has no join.
+    private let readerFinished = DispatchSemaphore(value: 0)
 
     /// Frames from the server. Finishes when the connection closes.
     public let frames: AsyncStream<Frame>
     private let continuation: AsyncStream<Frame>.Continuation
 
-    public init(socketPath: String) throws {
-        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw ConnectionError.socketFailed(errno) }
+    /// Why the connection died, when the transport can say — `ssh`'s own
+    /// complaint about a host it could not reach. Nil for a unix socket.
+    public var failureDescription: String? { transport.failureDescription }
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(socketPath.utf8)
-        let capacity = MemoryLayout.size(ofValue: addr.sun_path)
-        guard pathBytes.count < capacity else {
-            Darwin.close(fd)
-            throw ConnectionError.pathTooLong
-        }
-        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
-            raw.copyBytes(from: pathBytes)
-        }
-        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-
-        let result = withUnsafePointer(to: &addr) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        guard result == 0 else {
-            let code = errno
-            Darwin.close(fd)
-            throw ConnectionError.connectFailed(code)
-        }
-
-        self.fd = fd
+    public init(transport: Transport) {
+        self.transport = transport
+        self.readFD = transport.readDescriptor
+        self.writeFD = transport.writeDescriptor
         var captured: AsyncStream<Frame>.Continuation?
         self.frames = AsyncStream(bufferingPolicy: .unbounded) { captured = $0 }
         // AsyncStream runs its build closure synchronously, so this is set.
@@ -77,6 +70,16 @@ public final class Connection: @unchecked Sendable {
             preconditionFailure("AsyncStream did not provide a continuation")
         }
         self.continuation = continuation
+    }
+
+    public convenience init(socketPath: String) throws {
+        self.init(transport: try UnixSocketTransport(path: socketPath))
+    }
+
+    /// Connect to whichever machine `host` names. This is the only line in the
+    /// client that has an opinion about local versus remote.
+    public convenience init(host: ServerHost) throws {
+        self.init(transport: try host.makeTransport())
     }
 
     deinit {
@@ -87,14 +90,54 @@ public final class Connection: @unchecked Sendable {
         let thread = Thread { [weak self] in self?.readLoop() }
         thread.name = "illogical.connection"
         thread.stackSize = 512 * 1024
-        thread.start()
+        // Recorded *before* the thread runs. Assigned after `start()`, a
+        // `close()` racing this read nil, skipped the wait entirely, and freed
+        // the descriptors with the reader already inside `read`.
         readerThread = thread
+        thread.start()
     }
 
+    /// Tear the connection down, in the one order that is safe.
+    ///
+    /// `shutdown` breaks the connection while the descriptor numbers are still
+    /// ours; they are freed only once the reader has left. Freeing first hands
+    /// the number back with a thread still blocked on it, and the next
+    /// connection in the process is handed the same number -- one terminal's
+    /// keystrokes arriving in another's PTY.
+    ///
+    /// The waiting happens *off* the caller's thread. `close()` is called from
+    /// the main actor, once per pane, and blocking there for a wedged child
+    /// froze the window for seconds while closing a split tab. Nothing above
+    /// needs to observe the free: `closed` is set synchronously, so every
+    /// later `send` already fails.
     public func close() {
         guard closed.testAndSet() == false else { return }
-        Darwin.close(fd)
+        transport.shutdown()
         continuation.finish()
+
+        // A `Bool`, not the `Thread`: the block only ever asks whether there
+        // was a reader, and `Thread` is not `Sendable`, so capturing it is a
+        // strict-concurrency warning for nothing.
+        let hasReader = readerThread != nil
+        readerThread = nil
+        let transport = self.transport
+        let finished = readerFinished
+        let lock = writeLock
+
+        DispatchQueue.global(qos: .utility).async {
+            // Deliberately leaked if the reader never comes back: a child that
+            // ignores SIGTERM and keeps its inherited write end open means we
+            // never see end-of-file, and freeing the number then is the bug
+            // this ordering exists to prevent. `shutdown` has already made the
+            // descriptor inert.
+            if hasReader, finished.wait(timeout: .now() + 2) != .success { return }
+
+            // Under the write lock, so a `send` that was already inside it has
+            // finished with the descriptor before the number goes back.
+            lock.lock()
+            defer { lock.unlock() }
+            transport.close()
+        }
     }
 
     // MARK: - Sending
@@ -111,10 +154,16 @@ public final class Connection: @unchecked Sendable {
 
         writeLock.lock()
         defer { writeLock.unlock() }
+        // Under the lock, and re-checked here rather than at the top: `close`
+        // frees the descriptor while holding this same lock, so a `send` that
+        // passed an unlocked check could still be handed a number that now
+        // belongs to another connection.
+        guard !closed.isSet else { throw ConnectionError.closed }
         try frame.withUnsafeBytes { raw in
             var offset = 0
             while offset < raw.count {
-                let n = Darwin.write(fd, raw.baseAddress!.advanced(by: offset), raw.count - offset)
+                let n = Darwin.write(
+                    writeFD, raw.baseAddress!.advanced(by: offset), raw.count - offset)
                 if n < 0 {
                     if errno == EINTR { continue }
                     throw ConnectionError.closed
@@ -136,9 +185,20 @@ public final class Connection: @unchecked Sendable {
     // MARK: - Reading
 
     private func readLoop() {
+        // Signalled last, and unconditionally: `close` waits on it before it
+        // frees the descriptors this loop is reading.
+        defer {
+            continuation.finish()
+            readerFinished.signal()
+        }
+
         var header = [UInt8](repeating: 0, count: Protocol.headerLength)
         while !closed.isSet {
             guard readExact(into: &header, count: Protocol.headerLength) else { break }
+            // A frame we cannot parse is not something to keep reading past --
+            // the stream is a byte stream, so one bad header means every later
+            // offset is wrong. It happens for real: a remote login shell that
+            // echoes a line from `.bashrc` puts it ahead of the first frame.
             guard let parsed = try? FrameHeader.decode(header) else { break }
 
             var payload = Data()
@@ -150,14 +210,20 @@ public final class Connection: @unchecked Sendable {
             continuation.yield(
                 Frame(type: parsed.type, terminal: parsed.session, payload: payload))
         }
-        continuation.finish()
+
+        // The far end went, or said something unparseable. Break the transport
+        // rather than leaving it: an `ssh` child whose stdin pipe we still hold
+        // stays alive, pinning its ControlPersist master and three descriptors,
+        // and every reconnect adds another. `shutdown` only -- freeing the
+        // numbers is `close`'s job, and this is the thread it waits for.
+        transport.shutdown()
     }
 
     private func readExact(into buf: inout [UInt8], count: Int) -> Bool {
         var offset = 0
         while offset < count {
             let n = buf.withUnsafeMutableBytes { raw in
-                Darwin.read(fd, raw.baseAddress!.advanced(by: offset), count - offset)
+                Darwin.read(readFD, raw.baseAddress!.advanced(by: offset), count - offset)
             }
             if n < 0 {
                 if errno == EINTR { continue }

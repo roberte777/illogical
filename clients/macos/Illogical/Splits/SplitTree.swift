@@ -18,13 +18,16 @@ import Foundation
 /// the same terminal could in principle appear twice, and a pane outlives the
 /// moment its terminal is created — a split shows a pane before the server has
 /// answered with an id.
+///
+/// A `TerminalRef` rather than an id, because a window can be looking at more
+/// than one machine and both of them have a terminal 1.
 struct Pane: Identifiable, Equatable {
     let id: UUID
-    var terminalID: UInt64
+    var terminal: TerminalRef
 
-    init(id: UUID = UUID(), terminalID: UInt64) {
+    init(id: UUID = UUID(), terminal: TerminalRef) {
         self.id = id
-        self.terminalID = terminalID
+        self.terminal = terminal
     }
 }
 
@@ -78,8 +81,8 @@ indirect enum SplitNode: Identifiable, Equatable {
         panes.first { $0.id == id }
     }
 
-    func pane(forTerminal terminalID: UInt64) -> Pane? {
-        panes.first { $0.terminalID == terminalID }
+    func pane(forTerminal terminal: TerminalRef) -> Pane? {
+        panes.first { $0.terminal == terminal }
     }
 
     // MARK: - Editing
@@ -151,16 +154,16 @@ indirect enum SplitNode: Identifiable, Equatable {
 
     /// Point a pane at a different terminal — used when the server answers a
     /// split with the id of the terminal it made.
-    func setting(terminalID: UInt64, forPane paneID: UUID) -> SplitNode {
+    func setting(terminal: TerminalRef, forPane paneID: UUID) -> SplitNode {
         switch self {
         case .leaf(var pane):
             guard pane.id == paneID else { return self }
-            pane.terminalID = terminalID
+            pane.terminal = terminal
             return .leaf(pane)
 
         case .split(var split):
-            split.first = split.first.setting(terminalID: terminalID, forPane: paneID)
-            split.second = split.second.setting(terminalID: terminalID, forPane: paneID)
+            split.first = split.first.setting(terminal: terminal, forPane: paneID)
+            split.second = split.second.setting(terminal: terminal, forPane: paneID)
             return .split(split)
         }
     }

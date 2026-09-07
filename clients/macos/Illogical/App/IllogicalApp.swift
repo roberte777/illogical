@@ -35,7 +35,10 @@ struct IllogicalApp: App {
                 Button("New Terminal") { store.createTerminal() }
                     .keyboardShortcut("t", modifiers: .command)
                 Button("New Session") {
-                    store.createTerminal(sessionName: "session-\(store.sessions.count + 1)")
+                    // On the machine in front, which is where ⌘T would put a
+                    // terminal too.
+                    let count = store.selectedHost?.sessions.count ?? 0
+                    store.createTerminal(sessionName: "session-\(count + 1)")
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
             }
@@ -80,15 +83,22 @@ struct ContentView: View {
         VStack(spacing: 0) {
             Rectangle().fill(Palette.divider).frame(height: 1)
 
-            if let error = store.connectionError {
-                ServerUnavailable(message: error)
-            } else if let tab = store.selectedTab {
+            // A tab wins over an error, and that order is load-bearing. A
+            // server that goes away is reconnected to and the terminals on the
+            // far side never stopped, so replacing the screen with "no server"
+            // would blank a live window over a dropped packet — and tear down
+            // every surface in it on the way, which is worse than it looks:
+            // the pane comes back attached to a new view with a new grid. Each
+            // pane says for itself that it is reconnecting.
+            if let tab = store.selectedTab {
                 // Each pane carries its own header. There is no divider under
                 // it: it sits on the terminal's own background, as in
                 // Superlogical.
                 SplitContainer(tab: tab)
                     .environment(store)
                     .id(tab.id)
+            } else if let error = store.connectionError {
+                ServerUnavailable(message: error)
             } else {
                 EmptyState()
             }

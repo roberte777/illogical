@@ -10,15 +10,17 @@ import Foundation
 
 struct TabLayout: Identifiable, Equatable {
     let id: UUID
-    var session: UInt64
+    /// The session this tab belongs to, on the machine that session lives on.
+    /// A tab never spans two hosts: a session is a thing that exists on one.
+    var session: SessionRef
     var root: SplitNode
     /// The pane input goes to, and whose terminal names the tab.
     var focused: UUID
     /// A pane temporarily filling the tab, hiding the rest of the tree.
     var zoomed: UUID?
 
-    init(session: UInt64, terminalID: UInt64) {
-        let pane = Pane(terminalID: terminalID)
+    init(session: SessionRef, terminal: TerminalRef) {
+        let pane = Pane(terminal: terminal)
         self.id = UUID()
         self.session = session
         self.root = .leaf(pane)
@@ -28,7 +30,7 @@ struct TabLayout: Identifiable, Equatable {
 
     var panes: [Pane] { root.panes }
     var isSplit: Bool { !root.isLeaf }
-    var focusedTerminal: UInt64? { root.pane(focused)?.terminalID }
+    var focusedTerminal: TerminalRef? { root.pane(focused)?.terminal }
 
     /// Put focus somewhere valid after the tree changed under it.
     mutating func repairFocus() {

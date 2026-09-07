@@ -152,15 +152,27 @@ struct SessionButton: View {
     @Environment(SessionStore.self) private var store
     @Binding var isPresented: Bool
 
+    /// The machine the front session is on, when it is not this one. A window
+    /// can be looking at several at once, so which one is not a detail.
+    private var remote: String? {
+        guard let host = store.selectedSession?.host, host.isRemote else { return nil }
+        return host.displayName
+    }
+
+    private var name: String { store.selectedSessionSummary?.name ?? "no session" }
+
     var body: some View {
         Button {
             isPresented.toggle()
         } label: {
             HStack(spacing: Metrics.iconToTitle) {
-                Image(systemName: "rectangle.stack")
+                Image(systemName: remote == nil ? "rectangle.stack" : "globe")
                     .font(.system(size: 13, weight: .regular))
                     .traceFrame("session-icon")
-                Text(store.selectedSession?.name ?? "no session")
+                // The host is dim and the session bright, the same way a tab
+                // label dims the path and brightens the command.
+                (Text(remote.map { $0 + " " } ?? "").foregroundColor(Palette.textDim)
+                    + Text(name).foregroundColor(Palette.textBright))
                     .font(.system(size: Metrics.labelSize, weight: .semibold))
                     .lineLimit(1)
             }

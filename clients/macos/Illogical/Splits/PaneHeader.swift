@@ -15,15 +15,31 @@ struct PaneHeader: View {
     let tab: TabLayout.ID
     let isFocused: Bool
 
-    private var terminal: TerminalSummary? { store.terminal(pane.terminalID) }
+    private var terminal: TerminalSummary? { store.terminal(pane.terminal) }
     private var isSplit: Bool { store.tabs.first { $0.id == tab }?.isSplit ?? false }
     private var isZoomed: Bool { store.tabs.first { $0.id == tab }?.zoomed == pane.id }
 
+    /// Nil for the local machine: "Local" in front of every breadcrumb on a
+    /// laptop is noise. On a remote pane it is the first thing worth knowing,
+    /// and the breadcrumb is the only place that can say it per pane — a tab
+    /// with a split has one strip entry and two machines' worth of panes is
+    /// not a thing a tab can express.
+    private var remote: String? {
+        pane.terminal.host.isRemote ? pane.terminal.host.displayName : nil
+    }
+
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: "apple.terminal")
+            Image(systemName: remote == nil ? "apple.terminal" : "globe")
                 .font(.system(size: 12))
                 .foregroundStyle(Palette.textFaint)
+
+            if let remote {
+                Text(remote)
+                    .font(.system(size: Metrics.labelSize, weight: .medium))
+                    .foregroundStyle(isFocused ? Palette.textDim : Palette.textFaint)
+                    .lineLimit(1)
+            }
 
             if let terminal {
                 TerminalLabel(

@@ -76,14 +76,90 @@ public struct SessionSummary: Identifiable, Equatable, Codable, Sendable {
 
 /// Where a client connects. Local is a unix socket; remote is the same
 /// protocol tunnelled over `ssh <host> illogicald --stdio`.
-public enum ServerHost: Hashable, Sendable {
+///
+/// `Codable` because the window remembers which remote hosts you added. The
+/// local one is never stored: it is wherever this machine puts its socket.
+public enum ServerHost: Hashable, Sendable, Codable {
     case local(socketPath: String)
     case ssh(destination: String, remoteBinary: String = "illogicald")
+
+    // Hand-written rather than synthesized, for one reason: the synthesized
+    // `init(from:)` uses `decode(_:forKey:)`, which does *not* honour the
+    // `= "illogicald"` default above. A stored blob without that key threw
+    // `keyNotFound` — and because the whole array is decoded in one `try?`,
+    // one such entry silently forgot every remembered host, not one field.
+
+    private enum CodingKeys: String, CodingKey { case local, ssh }
+    private enum LocalKeys: String, CodingKey { case socketPath }
+    private enum SSHKeys: String, CodingKey { case destination, remoteBinary }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.local) {
+            let nested = try container.nestedContainer(keyedBy: LocalKeys.self, forKey: .local)
+            self = .local(socketPath: try nested.decode(String.self, forKey: .socketPath))
+            return
+        }
+        let nested = try container.nestedContainer(keyedBy: SSHKeys.self, forKey: .ssh)
+        self = .ssh(
+            destination: try nested.decode(String.self, forKey: .destination),
+            // The one line this whole override exists for.
+            remoteBinary: try nested.decodeIfPresent(String.self, forKey: .remoteBinary)
+                ?? "illogicald")
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .local(let socketPath):
+            var nested = container.nestedContainer(keyedBy: LocalKeys.self, forKey: .local)
+            try nested.encode(socketPath, forKey: .socketPath)
+        case .ssh(let destination, let remoteBinary):
+            var nested = container.nestedContainer(keyedBy: SSHKeys.self, forKey: .ssh)
+            try nested.encode(destination, forKey: .destination)
+            try nested.encode(remoteBinary, forKey: .remoteBinary)
+        }
+    }
 
     public var displayName: String {
         switch self {
         case .local: "Local"
         case .ssh(let destination, _): destination
+        }
+    }
+
+    public var isRemote: Bool {
+        if case .ssh = self { return true }
+        return false
+    }
+
+    /// The `ssh` this host would run. Nil for a local one.
+    public var sshOptions: SSHCommand.Options? {
+        guard case .ssh(let destination, let remoteBinary) = self else { return nil }
+        return SSHCommand.Options(
+            destination: destination,
+            remoteBinary: remoteBinary,
+            // For a second OpenSSH, and so a test can stand something else in
+            // its place. The same variable the Zig CLI reads.
+            ssh: ProcessInfo.processInfo.environment["ILLOGICAL_SSH"] ?? "ssh")
+    }
+
+    /// Open a transport to this host.
+    ///
+    /// The only place in the client with an opinion about local versus remote.
+    /// Everything above it sees frames and cannot tell the difference — which
+    /// is what makes "the dropdown lists terminals on other machines" a change
+    /// to the session store rather than to the terminal.
+    public func makeTransport() throws -> Transport {
+        switch self {
+        case .local(let path):
+            return try UnixSocketTransport(path: path)
+        case .ssh:
+            guard let options = sshOptions else {
+                preconditionFailure("an ssh host always has ssh options")
+            }
+            SSHCommand.prepareControlDirectory(options)
+            return try CommandTransport(argv: SSHCommand.argv(options))
         }
     }
 }

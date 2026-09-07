@@ -108,7 +108,8 @@ The Mac client specifically must:
 
 - **Launch in half a bounce.** Chrome appears before any network work completes.
 - **Switch sessions and terminals from a dropdown**, showing residency inline.
-- **Connect to remote hosts.**
+- **Connect to remote hosts**, several at once, over the user's own SSH config —
+  and get them back on its own when a network goes away.
 - **Own its own viewport.** ⚠ Scroll position and selection are per-client. In
   tmux, one client scrolling scrolls everyone's window — *"very annoying"*
   [ARCH t=323]. Not here.

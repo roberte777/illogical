@@ -40,7 +40,12 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
+    // `initStreaming`, not `init`. The default writes positionally, at the
+    // writer's own offset starting from zero, ignoring the file offset the
+    // shell and every other writer share. Here that is the startup banner, so
+    // `illogicald >> log` would overwrite the head of the log rather than
+    // append to it. The CLI has the same line for a louder reason; see there.
+    var stdout_file_writer: Io.File.Writer = .initStreaming(.stdout(), init.io, &stdout_buffer);
     const out = &stdout_file_writer.interface;
 
     var socket_path: ?[]const u8 = null;

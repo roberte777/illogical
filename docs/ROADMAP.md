@@ -116,10 +116,12 @@ is one call). And the client decodes history once it has all arrived rather
 than page by page, because the decoder reads inside `next()`, under the
 engine's lock; the reasoning is in [CLIENT.md](CLIENT.md#the-attach-path-and-the-launch-budget).
 
-## M3 — The renderer (in progress)
+## M3 — The renderer ✅
 
 **Ends at:** the Mac app is a terminal you would actually use. See
-[CLIENT.md](CLIENT.md).
+[CLIENT.md](CLIENT.md). Its gate is met and measured below; the open items it
+spawned — IME, search, links, Kitty graphics — are tracked as issues rather
+than as an unfinished milestone.
 
 Landed so far: the Metal renderer described in [CLIENT.md](CLIENT.md), ported
 from libghostty's own; the Superlogical-style chrome (session button,
@@ -213,13 +215,87 @@ caused rather than only here:
   it, because every park test called `park` from the test runner's own thread.
   One of them now runs it on the stack the daemon actually gives it.
 
-## M5 — Remote
+## M5 — Remote ✅
 
-**Ends at:** the dropdown lists terminals on other machines.
+**Ends at:** the dropdown lists terminals on other machines. **Done.**
 
-- `illogicald --stdio`; SSH transport reusing the user's SSH config.
-- Multiple simultaneous hosts in one window.
-- Reconnect-and-reattach on network loss (which is just desync recovery).
+The id-collision case — two daemons that both number their terminals from 1 —
+is covered by `TabReconcileTests`, and the bridge by `stdio.zig`'s own tests.
+Both running *at once*, with one reached through the bridge, was checked by
+hand and is not reproducible from the repo; `scripts/bench-remote.sh` starts two
+daemons but gives the second no terminals.
+
+| | Work |
+| --- | --- |
+| ✅ | `illogicald --stdio`, and the SSH transport under it, reusing the user's own config |
+| ✅ | Multiple simultaneous hosts in one window |
+| ✅ | Reconnect-and-reattach on network loss (which is just desync recovery) |
+
+**`--stdio` is a bridge, not a server**, and that is the decision this milestone
+turned on. `ssh host illogicald --stdio` starts a process per connection; a
+*server* started that way would die with the SSH session and take every terminal
+in it — the one thing this project exists to prevent. So the process SSH starts
+owns nothing. It connects to that host's own long-lived daemon, starting one
+detached if there is none, and splices bytes between that socket and the pipe.
+
+Nothing in the bridge parses a frame. A splice over a reliable, ordered
+transport preserves the stream exactly, so it cannot desynchronize a client no
+matter what the two ends say to each other, and a `snapshot_chunk` crossing it
+costs one copy rather than a decode and a re-encode.
+
+**Gate: the dropdown lists terminals on other machines. Met**, and the transport
+costs what a splice should — `scripts/bench-remote.sh 9 20000`, Debug build,
+M-series, median of 9:
+
+| transport | attach → ready | attach → end |
+| --- | --- | --- |
+| direct, unix socket | 33.7 ms | 148.1 ms |
+| through the bridge | 34.1 ms | 162.4 ms |
+
+`attach → ready` is the M2 gate seen from the far side of an SSH pipe, and it
+does not move between the rows: 0.4 ms on a number that varies by more than
+that between runs. `attach → end` carries the whole 20,000-line snapshot and
+costs 10% more — that is the copy, and it is the only thing the bridge adds. At
+200 lines the two columns collapse into each other (33.0 against 34.5 ms)
+because there is nothing left to copy.
+
+The script waits for the filler to go idle and refuses to run against a
+terminal that is not `live`, for the reason `bench-attach.sh` gives: the reader
+thread holds the terminal lock while it applies output, so attaching to a
+terminal that is still writing measures the writer. Review caught that this one
+did neither; re-measuring with the check in place moved the numbers by less
+than the run-to-run spread, so the earlier table was right by luck rather than
+by construction.
+
+⚠ **`ssh` itself is stood in for.** The benchmark runs the bridge over a local
+pipe, so what it says is "the bridge is not the bottleneck" and *nothing* about
+latency across a real network. There is no reference number for that and no
+repeatable way to get one.
+
+Three things the work turned up that the milestone did not anticipate:
+
+- **A terminal id stopped being enough.** Every daemon numbers its terminals
+  from 1, so two machines both have a terminal 1 — and a bare `UInt64` in a pane
+  does not merely lose a tab, it draws one machine's terminal in the other's
+  pane. `Pane`, `TabLayout`, the split tree and the store all carry a
+  `TerminalRef` now.
+- **Reconnecting needed almost no new machinery**, which is the strongest
+  evidence yet that "recovery is re-attach, not reconciliation" was the right
+  rule to pick in M0.5. A connection that goes away is a client that has missed
+  output; the protocol already recovers from that, and the terminal on the far
+  side never stopped. What was left was deciding *when*: 250 ms doubling to a
+  30-second ceiling, retried forever, because a laptop closed overnight should
+  find its terminals in the morning.
+- **A write to a dead connection killed the app.** SIGPIPE's default disposition
+  terminates the process, and a daemon going away with a keystroke in flight is
+  the ordinary case — so the recovery path was the one that crashed. It predates
+  this milestone; reconnecting made it reachable every time rather than rarely.
+  Found by a test that took the runner down instead of failing.
+
+`illogical --host <dest>` runs the same transport from the CLI. Not a
+convenience: it is what makes the remote path testable from a shell rather than
+only from a window, and `ILLOGICAL_SSH` stands something else in for `ssh` so
+both halves can be exercised without a second machine.
 
 ## M6 — Beyond
 
@@ -295,6 +371,10 @@ Also measure, where no reference number exists:
   one of them is hot. `scripts/bench-pty.sh`, measured in M4.
 - p99 input latency at 200 attachments.
 - Client cold launch to window. **148 ms**, Debug, measured above.
+- What the remote transport costs. **Nothing on the gate** — 33.7 against
+  34.1 ms to `snapshot_ready` — and 10% on the whole snapshot, which is the
+  copy. `scripts/bench-remote.sh`, measured in M5. It stands `ssh` in for
+  itself, so it bounds the bridge and says nothing about a real network.
 
 ---
 
