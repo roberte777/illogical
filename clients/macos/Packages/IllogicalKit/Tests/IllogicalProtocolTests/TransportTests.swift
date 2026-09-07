@@ -72,6 +72,25 @@ struct SSHCommandTests {
         #expect(args.suffix(4) == ["--", "build-box", "illogicald", "--stdio"])
     }
 
+    /// The same guard from the `HOME` side, which is the one production takes
+    /// — `ServerHost.sshOptions` never sets a control directory. Asserted at
+    /// the boundary rather than far past it: `home + "/.ssh/illogical-%C"` is
+    /// `home + 18`, and the guard allows `count - 2 + 40 <= 100`, so 44 bytes
+    /// of home is the last that fits. Only a pair either side of that pins the
+    /// constant; a single far-over case leaves it free to be anything from 84
+    /// to 116, and above 104 it accepts paths `bind` cannot hold, which is the
+    /// warning the guard exists to prevent.
+    @Test("the budget is measured from the home directory too")
+    func controlPathBudgetFromHome() {
+        func path(homeLength: Int) -> String? {
+            SSHCommand.controlPath(
+                SSHCommand.Options(destination: "h"),
+                environment: ["HOME": "/" + String(repeating: "x", count: homeLength - 1)])
+        }
+        #expect(path(homeLength: 44) != nil)
+        #expect(path(homeLength: 45) == nil)
+    }
+
     @Test("a control path that would not fit a unix socket is not asked for")
     func controlPathBudget() {
         // The shape a macOS TMPDIR has: deep enough that the rendered hash
@@ -98,7 +117,7 @@ struct SSHCommandTests {
     /// that no in-process test can pin, and the last assertion here says what
     /// it can about that.
     @Test("the control path comes from the environment, not the passwd entry")
-    func controlPathComesFromTheEnvironment() {
+    func controlPathComesFromTheEnvironment() throws {
         #expect(
             SSHCommand.controlPath(
                 SSHCommand.Options(destination: "h"),
@@ -123,26 +142,40 @@ struct SSHCommandTests {
                 environment: ["HOME": "/tmp/illogical-not-your-home"])
                 == "/tmp/elsewhere/illogical-%C")
 
-        // A home too long to leave room for the rendered `%C` is no path at
-        // all, rather than one ssh would warn about on every connection. This
-        // is the branch a user with a deep home actually hits; the budget test
-        // above covers only the explicit-directory side of the same guard.
-        #expect(
-            SSHCommand.controlPath(
-                SSHCommand.Options(destination: "h"),
-                environment: ["HOME": "/Users/" + String(repeating: "x", count: 90)]) == nil)
-
         // And the default really is the process environment. This cannot tell
         // the passwd entry apart — the two agree here, which is the whole
         // problem — but it does catch a default that is empty, filtered, or
         // hardcoded to something else, any of which silently drops
         // `ControlMaster` from every real connection and costs a handshake per
-        // pane. Nothing else touches the default at all.
+        // pane. Nothing else pins its *value*; the two callers use it without
+        // asserting what it produced.
+        //
+        // Required non-nil first, or the comparison is `nil == nil` on any
+        // machine whose home is over 44 bytes — a container or temp-dir home
+        // on CI is past that — and an empty or filtered default would pass
+        // silently, which is the case it is here to catch.
         let options = SSHCommand.Options(destination: "h")
-        #expect(
-            SSHCommand.controlPath(options)
-                == SSHCommand.controlPath(options, environment: ProcessInfo.processInfo.environment)
-        )
+        let live = try #require(
+            SSHCommand.controlPath(options, environment: ProcessInfo.processInfo.environment),
+            "this machine's home is too long for a control path; the checks below cannot run")
+        #expect(SSHCommand.controlPath(options) == live)
+    }
+
+    /// The shape production actually builds. `ServerHost.sshOptions` never
+    /// sets `controlDirectory`, so every real connection renders the path from
+    /// the environment — and every other test here passes an explicit
+    /// directory, so the call site was free to pass anything (or nothing) to
+    /// `controlPath` with the suite still green, losing `ControlMaster` on
+    /// every connection.
+    @Test("with no control directory, argv still multiplexes off the home")
+    func multiplexingWithoutAnExplicitDirectory() throws {
+        let options = SSHCommand.Options(destination: "build-box", controlDirectory: nil)
+        let expected = try #require(
+            SSHCommand.controlPath(options),
+            "this machine's home is too long for a control path")
+        let args = SSHCommand.argv(options)
+        #expect(args.contains("ControlPath=" + expected))
+        #expect(args.contains("ControlMaster=auto"))
     }
 
     @Test("a remote binary somewhere else is respected")
