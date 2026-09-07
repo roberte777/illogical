@@ -256,8 +256,15 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// here at all means it *did* return. Making a recoverable condition
     /// terminal bought nothing, and cost the laptop that lost its NAS.
     ///
-    /// (The main-actor blocking is worth fixing on its own, and is not this
-    /// function's to fix.)
+    /// That disposes of the sub-case it was argued from, not of the objection.
+    /// For a mount that times out rather than hanging -- soft NFS, autofs,
+    /// smbfs -- retrying stalls the main actor for that timeout on every
+    /// backoff tick, and `whyNotRunnable` adds three more blocking calls on
+    /// the same path. Auto-recovery is still the right default for a volume
+    /// that comes back, and `.failed` is not a dead end either way: the
+    /// dropdown's marker and the no-server screen both retry. But until
+    /// `Connection(host:)` is off the main actor this verdict buys a window
+    /// that stalls periodically, and that is the thing to fix next.
     ///
     /// Unrecognised failures are transient. Retrying something permanent costs
     /// one connection attempt every thirty seconds; giving up on something
@@ -279,15 +286,24 @@ public final class CommandTransport: Transport, @unchecked Sendable {
             return .spawnFailed(command: command, reason: ns.localizedDescription)
         }
 
-        let (reason, retryable) = whyNotRunnable(path, ns)
-        // Each sentence is written for the template it lands in:
-        // `.notExecutable` renders "<command> <reason>", `.spawnFailed`
-        // renders "could not run <command>: <reason>". Routing a predicate
-        // into the second is what produced "could not run ssh: is on a volume
-        // that is not responding" the last time this was retryable.
-        return retryable
-            ? .spawnFailed(command: command, reason: reason)
-            : .notExecutable(command: command, reason: reason)
+        return route(command: command, whyNotRunnable(path, ns))
+    }
+
+    /// Send a verdict to the case whose template its wording was written for.
+    ///
+    /// `.notExecutable` renders "<command> <reason>" and wants a predicate;
+    /// `.spawnFailed` renders "could not run <command>: <reason>" and wants a
+    /// clause. Routing a predicate into the second produced "could not run
+    /// ssh: is on a volume that is not responding". A named function rather
+    /// than a ternary inside `spawnError`, because every condition a test can
+    /// construct is permanent -- so inlined, dropping the retryable side
+    /// passed the whole suite.
+    static func route(
+        command: String, _ verdict: (reason: String, retryable: Bool)
+    ) -> TransportError {
+        verdict.retryable
+            ? .spawnFailed(command: command, reason: verdict.reason)
+            : .notExecutable(command: command, reason: verdict.reason)
     }
 
     /// Why a file named in somebody's config cannot be run, and whether
@@ -330,6 +346,11 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     static func imageReason(_ ns: NSError) -> String {
         guard ns.domain == NSPOSIXErrorDomain else { return "cannot be run" }
         switch Int32(ns.code) {
+        // Endpoint Security or an MDM policy refusing the exec. The file is
+        // there and runnable; something above the filesystem said no. This is
+        // the case that actually arrives as a POSIX `EPERM` -- a TCC denial
+        // fails Foundation's pre-check first and comes back as Cocoa 4.
+        case EPERM: return "is not permitted to run on this machine"
         case ENOEXEC: return "is not a program"
         case EBADARCH: return "is built for another processor"
         case ESHLIBVERS: return "needs a library version that is not installed"
@@ -347,12 +368,22 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         case ENOENT: return ("is a broken symlink", false)
         case ELOOP: return ("is a loop of symlinks", false)
         case EACCES: return ("points into a directory that cannot be searched", false)
-        case EPERM: return ("points somewhere this app has not been granted access to", false)
+        case EPERM:
+            return (
+                "points somewhere this app has not been granted access to"
+                    + " (Privacy & Security ▸ Files and Folders)", false
+            )
         case ENOTDIR: return ("points under something that is not a directory", false)
         case ENAMETOOLONG: return ("points at too long a path to open", false)
         // Written as a clause, not a predicate: this one renders through
         // "could not run <command>: …" rather than "<command> …".
-        case EIO, ESTALE, ETIMEDOUT, ENXIO:
+        // NFS gives `ESTALE`/`ETIMEDOUT`; smbfs gives `ENOTCONN` when the
+        // server drops; Wi-Fi going away gives `ENETDOWN`/`ENETUNREACH`, and a
+        // force-ejected volume `ENODEV`. Listing only the NFS ones left the
+        // commonest case -- a laptop losing an SMB share -- on the permanent
+        // side, which is the bug this arm exists for.
+        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, EHOSTDOWN, EHOSTUNREACH,
+            ENETDOWN, ENETUNREACH, ENODEV:
             return ("the volume its target is on is not responding", true)
         default: return ("points at something that could not be checked", false)
         }
@@ -373,7 +404,11 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         // an external or network volume, or in Desktop/Documents/Downloads.
         // The remedy is Privacy & Security, so the sentence has to point there
         // rather than at the network.
-        case EPERM: return ("is somewhere this app has not been granted access to", false)
+        case EPERM:
+            return (
+                "is somewhere this app has not been granted access to"
+                    + " (Privacy & Security ▸ Files and Folders)", false
+            )
         // Not the same fault as EACCES, and not the same advice: there is no
         // unsearchable directory to go and look at, because a component of the
         // path is not a directory at all -- `/usr/local/bin/ssh` where
@@ -382,7 +417,13 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         case ELOOP: return ("is a loop of symlinks", false)
         case ENAMETOOLONG: return ("is too long a path to open", false)
         // A clause, for the "could not run <command>: …" template.
-        case EIO, ESTALE, ETIMEDOUT, ENXIO:
+        // NFS gives `ESTALE`/`ETIMEDOUT`; smbfs gives `ENOTCONN` when the
+        // server drops; Wi-Fi going away gives `ENETDOWN`/`ENETUNREACH`, and a
+        // force-ejected volume `ENODEV`. Listing only the NFS ones left the
+        // commonest case -- a laptop losing an SMB share -- on the permanent
+        // side, which is the bug this arm exists for.
+        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, EHOSTDOWN, EHOSTUNREACH,
+            ENETDOWN, ENETUNREACH, ENODEV:
             return ("the volume it is on is not responding", true)
         // Anything not established says so. Naming a cause we have not
         // determined is how a file somebody was looking at came to be
