@@ -101,11 +101,23 @@ struct SSHCommandTests {
     @Test("the default control path is the one src/core/conn.zig renders")
     func defaultControlPath() throws {
         let home = try #require(ProcessInfo.processInfo.environment["HOME"])
-        let path = SSHCommand.controlPath(SSHCommand.Options(destination: "h"))
-        #expect(path == home + "/.ssh/illogical-%C")
-        // And `homeDirectoryForCurrentUser` is *not* what we use: it reads the
-        // passwd entry and ignores the environment.
-        #expect(!home.isEmpty)
+        #expect(
+            SSHCommand.controlPath(SSHCommand.Options(destination: "h"))
+                == home + "/.ssh/illogical-%C")
+
+        // And it is really the *environment* that decides, not the passwd
+        // entry `homeDirectoryForCurrentUser` reads. Asserted with a home that
+        // is not this process's own, because the two agree on every machine
+        // anyone runs this on -- so comparing `$HOME` against itself, which is
+        // what this did before, stayed green with the bug reintroduced. The
+        // bug is real: `src/core/conn.zig` renders the same path from
+        // `getenv("HOME")`, and a client that disagreed would bind a second
+        // control socket and hold a second ssh master for every host.
+        #expect(
+            SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: "/tmp/elsewhere")
+                == "/tmp/elsewhere/.ssh/illogical-%C")
+        // No home at all is not a path, rather than a path rooted at nothing.
+        #expect(SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: nil) == nil)
     }
 
     @Test("the ssh binary can be overridden")

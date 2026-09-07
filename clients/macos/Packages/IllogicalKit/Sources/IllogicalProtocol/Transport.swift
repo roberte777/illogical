@@ -183,9 +183,11 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// `closeOnDealloc` is what eventually frees it -- once *all three* holders
     /// let go: this property, the `Pipe` reachable through
     /// `process.standardError`, and the drain closure. So the bound is the
-    /// later of "the caller released the transport" and "the drain returned",
-    /// and in the timeout branch it is always the second, because timing out
-    /// is what "the drain is still inside its read" means.
+    /// later of "the caller released the transport" and "the drain returned".
+    /// Which of those is last depends on the caller: `Connection.close` drops
+    /// the transport as soon as `close` returns, so there it is the drain --
+    /// but `failureDescription` exists to be read *after* a failure, and a
+    /// caller holding a failed transport to poll it holds this descriptor too.
     private let stderrHandle: FileHandle
     private let shutdownFlag = ManagedAtomicFlag()
     private let closedFlag = ManagedAtomicFlag()
@@ -419,10 +421,9 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         // `Pipe` handles close on dealloc and three things hold this one --
         // the stored property, the `Pipe` under `process.standardError`, and
         // the drain closure -- so the descriptor comes back on the *later* of
-        // the transport being released and the drain returning. In this branch
-        // that is always the drain, because timing out is what "the drain is
-        // still inside its read" means. This line is what makes the ordinary
-        // case, where the child is already gone, immediate instead.
+        // the transport being released and the drain returning. This line is
+        // what makes the ordinary case, where the child is already gone,
+        // immediate instead.
         if drainFinished.wait(timeout: .now() + Self.drainGrace) == .success {
             try? stderrHandle.close()
         }
@@ -559,12 +560,21 @@ public enum SSHCommand {
     /// and `illogical --host` bind different control sockets and hold two ssh
     /// masters, which is precisely what this exists to avoid. Nil when `$HOME`
     /// is unset, which is what the Zig side does too.
-    static func controlPath(_ options: Options) -> String? {
+    /// `home` is a parameter so a test can pass one that differs from this
+    /// process's own. Without that the assertion can only compare `$HOME`
+    /// against itself, and the bug it exists for -- reading the passwd entry
+    /// instead of the environment, so the app and `illogical --host` bind
+    /// different control sockets and hold two masters -- is invisible on any
+    /// machine where the two agree, which is every machine anyone tests on.
+    static func controlPath(
+        _ options: Options,
+        home: String? = ProcessInfo.processInfo.environment["HOME"]
+    ) -> String? {
         let directory: String
         if let explicit = options.controlDirectory {
             directory = explicit
         } else {
-            guard let home = ProcessInfo.processInfo.environment["HOME"] else { return nil }
+            guard let home else { return nil }
             directory = home + "/.ssh"
         }
         let path = directory + "/illogical-%C"
