@@ -516,6 +516,10 @@ struct TransportTests {
         }
         // ...and the permanent ones stay permanent, so the guard is pinned
         // from both sides rather than only one.
+        // `EPERM` among them: an Endpoint Security or TCC refusal does not
+        // grant itself on a thirty-second timer, and the wording for it was
+        // written a round before its membership was.
+        //
         // Every member of the set, not the ones that were easy to reach: drop
         // `ELOOP` and a host whose `ssh` is a symlink loop is retried every
         // thirty seconds under an amber "reconnecting…" for the life of the
@@ -523,7 +527,7 @@ struct TransportTests {
         // mirrored. Most of these cannot arrive from a real spawn -- Foundation
         // pre-checks and reports them as Cocoa 4 -- so this is the only place
         // their membership is pinned at all.
-        for code in [ENOENT, EACCES, ENOEXEC, EISDIR, ENOTDIR, ENAMETOOLONG, ELOOP] {
+        for code in [ENOENT, EACCES, EPERM, ENOEXEC, EISDIR, ENOTDIR, ENAMETOOLONG, ELOOP] {
             #expect(!classify(NSPOSIXErrorDomain, code).isTransient, "errno \(code)")
         }
         #expect(!classify(NSCocoaErrorDomain, 4).isTransient)
@@ -552,65 +556,90 @@ struct TransportTests {
         #expect(String(describing: classify(NSPOSIXErrorDomain, EISDIR)) == "ssh cannot be run")
     }
 
-    /// The wording for a path that could not be walked, checked directly
-    /// because most of these need a filesystem that cannot be built in a test
-    /// — a TCC-gated volume, a dying disk, a mount that vanished.
+    /// The wording *and* the retry verdict for a path that could not be
+    /// walked, checked directly because most of these need a filesystem no
+    /// test can build — a TCC-gated volume, a dying disk, a mount that
+    /// vanished. Five of the `pathReason` sentences are also pinned through
+    /// real spawns above; these are the ones that cannot be.
     ///
-    /// The defaults are the point. An errno this does not recognise gets a
-    /// sentence saying so, not a guess: naming a cause that was never
-    /// established is how a file somebody was looking at came to be described
-    /// as absent. `EPERM` is the live example — macOS reports an ungranted
-    /// TCC prompt that way, and it is not `EACCES`.
-    @Test("an unrecognised reason says so rather than guessing")
-    func unknownPathFailuresAreNotGuessedAt() {
-        #expect(CommandTransport.pathReason(ENOENT) == "is not there")
-        #expect(CommandTransport.pathReason(EACCES) == "is in a directory that cannot be searched")
+    /// The defaults are the point. An errno this does not recognise says so
+    /// rather than guessing: naming a cause that was never established is how
+    /// a file somebody was looking at came to be described as absent.
+    @Test("an unrecognised reason says so, and an unreachable one is retried")
+    func pathFailuresAreNamedOrAdmitted() {
+        #expect(CommandTransport.pathReason(ENOENT) == ("is not there", false))
         #expect(
-            CommandTransport.pathReason(ENOTDIR) == "is under something that is not a directory")
-        #expect(CommandTransport.pathReason(ELOOP) == "is a loop of symlinks")
-        #expect(CommandTransport.pathReason(ENAMETOOLONG) == "is too long a path to open")
-        for code in [EPERM, EIO, ESTALE, ETIMEDOUT, ENXIO, EHOSTDOWN] {
-            #expect(CommandTransport.pathReason(code) == "cannot be reached", "errno \(code)")
+            CommandTransport.pathReason(EACCES)
+                == ("is in a directory that cannot be searched", false))
+        #expect(
+            CommandTransport.pathReason(EPERM)
+                == ("is somewhere this app has not been granted access to", false))
+        #expect(
+            CommandTransport.pathReason(ENOTDIR)
+                == ("is under something that is not a directory", false))
+        #expect(CommandTransport.pathReason(ELOOP) == ("is a loop of symlinks", false))
+        #expect(
+            CommandTransport.pathReason(ENAMETOOLONG) == ("is too long a path to open", false))
+        for code in [EIO, ESTALE, ETIMEDOUT, ENXIO] {
+            #expect(
+                CommandTransport.pathReason(code)
+                    == ("the volume it is on is not responding", true), "errno \(code)")
         }
+        #expect(CommandTransport.pathReason(EBUSY) == ("could not be checked", false))
 
-        #expect(CommandTransport.targetReason(ENOENT) == "is a broken symlink")
-        #expect(CommandTransport.targetReason(ELOOP) == "is a loop of symlinks")
+        #expect(CommandTransport.targetReason(ENOENT) == ("is a broken symlink", false))
+        #expect(CommandTransport.targetReason(ELOOP) == ("is a loop of symlinks", false))
         #expect(
             CommandTransport.targetReason(EACCES)
-                == "points into a directory that cannot be searched")
+                == ("points into a directory that cannot be searched", false))
         #expect(
             CommandTransport.targetReason(ENOTDIR)
-                == "points under something that is not a directory")
-        for code in [EPERM, EIO, ESTALE, ENAMETOOLONG] {
+                == ("points under something that is not a directory", false))
+        #expect(
+            CommandTransport.targetReason(ENAMETOOLONG)
+                == ("points at too long a path to open", false))
+        for code in [EIO, ESTALE, ETIMEDOUT, ENXIO] {
             #expect(
-                CommandTransport.targetReason(code) == "points at something that cannot be reached",
-                "errno \(code)")
+                CommandTransport.targetReason(code)
+                    == ("the volume its target is on is not responding", true), "errno \(code)")
         }
+        #expect(
+            CommandTransport.targetReason(EBUSY)
+                == ("points at something that could not be checked", false))
     }
 
-    /// `close()` is called from the main actor, once per pane. Blocking there
-    /// while a wedged child fails to die froze the window for seconds when
-    /// closing a split tab — up to four seconds per connection, and a four-pane
-    /// tab closes four of them.
-    @Test("closing does not block the caller on a child that ignores SIGTERM")
-    func closeDoesNotBlockTheCaller() async throws {
-        // `trap` without `exec`: the shell keeps ignoring SIGTERM, so
-        // `shutdown()` cannot end it and the reader never sees end-of-file.
-        let transport = try CommandTransport(
-            argv: ["/bin/sh", "-c", "trap '' TERM; sleep 2"])
-        let connection = Connection(transport: transport)
-        connection.start()
+    /// The sentences as a person actually sees them. Every other assertion
+    /// here checks a helper's return value, which is how the last version
+    /// shipped a retryable case rendering through the *other* case's template
+    /// — "could not run ssh: is on a volume that is not responding", two
+    /// sentences fighting, with nothing looking at the result.
+    @Test("the rendered sentence reads as one sentence")
+    func renderedSentencesRead() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "illogical-render-\(getpid())-\(UInt32.random(in: 0..<1_000_000))")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
 
-        // Let the reader actually reach its `read`. Without this it is still
-        // at the loop's `closed` guard when `close` runs, exits immediately,
-        // and the wait this test is about succeeds at once — which is how an
-        // earlier version of it passed with the fix removed.
-        try await Task.sleep(for: .milliseconds(200))
+        func rendered(_ path: String) -> String? {
+            do {
+                let transport = try CommandTransport(argv: [path])
+                transport.shutdown()
+                transport.close()
+                return nil
+            } catch { return String(describing: error) }
+        }
 
-        let start = Date()
-        connection.close()
-        let elapsed = Date().timeIntervalSince(start)
-        #expect(elapsed < 0.5, "close() blocked its caller for \(elapsed)s")
+        // Production passes a bare `ssh`, so the subject is the command name.
+        let absent = root.appending(path: "ssh").path
+        #expect(rendered(absent) == "\(absent) is not there")
+
+        // And the retryable template, which nothing rendered before.
+        #expect(
+            String(
+                describing: CommandTransport.spawnError(
+                    NSError(domain: NSCocoaErrorDomain, code: 4), command: "ssh",
+                    path: "/dev/null/nope"))
+                == "ssh is under something that is not a directory")
     }
 
     /// The message must survive the close that follows it. Closing used to

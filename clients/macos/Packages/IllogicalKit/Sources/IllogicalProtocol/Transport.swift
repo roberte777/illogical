@@ -242,17 +242,22 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// dropdown and, when it is the only host, the full-window message. It is
     /// also what decides whether the host is retried at all.
     ///
-    /// The errno chooses the branch; the filesystem chooses the wording.
+    /// The errno chooses the branch; the filesystem chooses the wording, and
+    /// can send a case back to retryable — a volume that stopped answering
+    /// arrives here as `NSCocoaErrorDomain` 4 like everything else that fails
+    /// Foundation's pre-check, and is the most recoverable thing there is.
     ///
-    /// Deliberately *not* the other way round for a stalled network volume,
-    /// which arrives here as `NSCocoaErrorDomain` 4 like everything else that
-    /// fails Foundation's pre-check. Retrying it sounds right and is not: the
-    /// pre-check and the probe below both block, `HostConnection` is main-actor
-    /// isolated, and a hard-mounted NFS export whose server is gone does not
-    /// time out — so a thirty-second retry loop is a window that beachballs
-    /// forever rather than one showing an amber reconnect. It gets a sentence
-    /// saying it could not be reached, and the Retry button, which is honest
-    /// and costs nobody a frozen window.
+    /// A previous version made that case permanent, arguing that retrying it
+    /// re-enters a blocking probe on the main actor. The blocking is real —
+    /// `HostConnection` is main-actor isolated and calls `Connection(host:)`
+    /// synchronously — but the argument does not hold: if the probe never
+    /// returns, `Process.run()` never throws and this function is never
+    /// reached, so the window is already frozen on the first attempt. Reaching
+    /// here at all means it *did* return. Making a recoverable condition
+    /// terminal bought nothing, and cost the laptop that lost its NAS.
+    ///
+    /// (The main-actor blocking is worth fixing on its own, and is not this
+    /// function's to fix.)
     ///
     /// Unrecognised failures are transient. Retrying something permanent costs
     /// one connection attempt every thirty seconds; giving up on something
@@ -260,7 +265,7 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     static func spawnError(_ error: Error, command: String, path: String) -> TransportError {
         let ns = error as NSError
         let permanent: Set<Int32> = [
-            ENOENT, EACCES, ENOEXEC, EISDIR, ENOTDIR, ENAMETOOLONG, ELOOP,
+            ENOENT, EACCES, EPERM, ENOEXEC, EISDIR, ENOTDIR, ENAMETOOLONG, ELOOP,
             // Darwin's own exec refusals, every one of them about the image
             // and none of them survivable by waiting. `EBADARCH` is an
             // Intel-only build on Apple Silicon with no Rosetta -- an ordinary
@@ -274,11 +279,19 @@ public final class CommandTransport: Transport, @unchecked Sendable {
             return .spawnFailed(command: command, reason: ns.localizedDescription)
         }
 
-        return .notExecutable(command: command, reason: whyNotRunnable(path, ns))
+        let (reason, retryable) = whyNotRunnable(path, ns)
+        // Each sentence is written for the template it lands in:
+        // `.notExecutable` renders "<command> <reason>", `.spawnFailed`
+        // renders "could not run <command>: <reason>". Routing a predicate
+        // into the second is what produced "could not run ssh: is on a volume
+        // that is not responding" the last time this was retryable.
+        return retryable
+            ? .spawnFailed(command: command, reason: reason)
+            : .notExecutable(command: command, reason: reason)
     }
 
-    /// Why a file named in somebody's config cannot be run, asked of the
-    /// filesystem rather than of the error, and whether waiting could help.
+    /// Why a file named in somebody's config cannot be run, and whether
+    /// waiting could help — asked of the filesystem rather than of the error.
     ///
     /// The error cannot answer either question. Foundation pre-checks
     /// `isExecutableFile` and collapses missing, present-but-not-executable,
@@ -287,16 +300,18 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// sentence is "The file … doesn't exist." — true for one of them.
     ///
     /// The app is not sandboxed, so these calls see what the spawn saw.
-    private static func whyNotRunnable(_ path: String, _ ns: NSError) -> String {
+    private static func whyNotRunnable(
+        _ path: String, _ ns: NSError
+    ) -> (reason: String, retryable: Bool) {
         var followed = stat()
         if stat(path, &followed) == 0 {
-            if (followed.st_mode & S_IFMT) == S_IFDIR { return "is a directory" }
+            if (followed.st_mode & S_IFMT) == S_IFDIR { return ("is a directory", false) }
             if !FileManager.default.isExecutableFile(atPath: path) {
-                return "is not executable"
+                return ("is not executable", false)
             }
             // Present, and the execute bit is on, so the objection is to the
             // image: not a program, or built for another architecture.
-            return imageReason(ns)
+            return (imageReason(ns), false)
         }
         let followError = errno
 
@@ -327,39 +342,52 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// what it *points at*. A link that resolves to nothing is broken; one
     /// whose target merely cannot be reached is not, and calling it broken
     /// sends somebody to inspect a symlink that is perfectly fine.
-    static func targetReason(_ code: Int32) -> String {
+    static func targetReason(_ code: Int32) -> (reason: String, retryable: Bool) {
         switch code {
-        case ENOENT: return "is a broken symlink"
-        case ELOOP: return "is a loop of symlinks"
-        case EACCES: return "points into a directory that cannot be searched"
-        case ENOTDIR: return "points under something that is not a directory"
-        // Everything else -- a permission the system has not granted, a volume
-        // that stopped answering, a name too long to open -- gets the honest
-        // one rather than a guess. Naming a cause we have not established is
-        // how "is not there" ended up in front of somebody looking at the file.
-        default: return "points at something that cannot be reached"
+        case ENOENT: return ("is a broken symlink", false)
+        case ELOOP: return ("is a loop of symlinks", false)
+        case EACCES: return ("points into a directory that cannot be searched", false)
+        case EPERM: return ("points somewhere this app has not been granted access to", false)
+        case ENOTDIR: return ("points under something that is not a directory", false)
+        case ENAMETOOLONG: return ("points at too long a path to open", false)
+        // Written as a clause, not a predicate: this one renders through
+        // "could not run <command>: …" rather than "<command> …".
+        case EIO, ESTALE, ETIMEDOUT, ENXIO:
+            return ("the volume its target is on is not responding", true)
+        default: return ("points at something that could not be checked", false)
         }
     }
 
-    /// Why a path could not be walked.
+    /// Why a path could not be walked, and whether waiting could help.
     ///
-    /// Internal rather than private, like its two siblings, so the wording can
-    /// be checked without constructing the filesystem that produces it.
-    static func pathReason(_ code: Int32) -> String {
+    /// Internal rather than private so the wording and the retry verdict can
+    /// be checked without building the filesystem that produces them — a
+    /// TCC-gated volume, a dying disk, a mount that vanished. An unpinned
+    /// retry decision is what has twice left a host reconnecting every thirty
+    /// seconds for the life of the process.
+    static func pathReason(_ code: Int32) -> (reason: String, retryable: Bool) {
         switch code {
-        case ENOENT: return "is not there"
-        case EACCES: return "is in a directory that cannot be searched"
-        // Not the same fault, and not the same advice: there is no
+        case ENOENT: return ("is not there", false)
+        case EACCES: return ("is in a directory that cannot be searched", false)
+        // What macOS reports for a TCC prompt nobody has granted — a binary on
+        // an external or network volume, or in Desktop/Documents/Downloads.
+        // The remedy is Privacy & Security, so the sentence has to point there
+        // rather than at the network.
+        case EPERM: return ("is somewhere this app has not been granted access to", false)
+        // Not the same fault as EACCES, and not the same advice: there is no
         // unsearchable directory to go and look at, because a component of the
         // path is not a directory at all -- `/usr/local/bin/ssh` where
         // `/usr/local/bin` is a leftover regular file.
-        case ENOTDIR: return "is under something that is not a directory"
-        case ELOOP: return "is a loop of symlinks"
-        case ENAMETOOLONG: return "is too long a path to open"
-        // As above: `EPERM` from an ungranted TCC prompt, `EIO` from a dying
-        // disk, `ESTALE` from a vanished mount. All permanent as far as this
-        // attempt is concerned, and none of them "not there".
-        default: return "cannot be reached"
+        case ENOTDIR: return ("is under something that is not a directory", false)
+        case ELOOP: return ("is a loop of symlinks", false)
+        case ENAMETOOLONG: return ("is too long a path to open", false)
+        // A clause, for the "could not run <command>: …" template.
+        case EIO, ESTALE, ETIMEDOUT, ENXIO:
+            return ("the volume it is on is not responding", true)
+        // Anything not established says so. Naming a cause we have not
+        // determined is how a file somebody was looking at came to be
+        // described as absent.
+        default: return ("could not be checked", false)
         }
     }
 
