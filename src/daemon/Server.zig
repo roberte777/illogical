@@ -459,7 +459,7 @@ pub fn createTerminal(self: *Server, req: protocol.body.Create) !CreateResult {
     else
         try std.fmt.bufPrint(&name_buf, "{d}", .{tid});
 
-    const default_argv = [_][]const u8{defaultShell()};
+    const default_argv = defaultArgv();
     const argv: []const []const u8 = if (req.argv.len > 0) req.argv else &default_argv;
 
     // A terminal always has a working directory, because clients label tabs
@@ -547,6 +547,36 @@ fn defaultShell() []const u8 {
     return getenv("SHELL") orelse "/bin/sh";
 }
 
+/// What a terminal runs when the client named no command: the user's shell, as
+/// a **login** shell.
+///
+/// The `-l` is the whole of this function, and it is not a nicety. Every child
+/// inherits the daemon's environment, and where the daemon got that
+/// environment depends entirely on who started it. Started from a terminal it
+/// already has a full interactive PATH and nothing here is visible. Started by
+/// the Mac app -- which is now the ordinary case, not the exotic one -- it
+/// inherits launchd's GUI environment, where PATH is
+/// `/usr/bin:/bin:/usr/sbin:/sbin` and that is all. A non-login shell reads
+/// neither `/etc/zprofile` (where `path_helper` runs) nor `~/.zprofile`, so
+/// every terminal in the app would open with no brew, no `~/.cargo/bin`, and
+/// nothing else the user installed -- a first-run experience of "where is
+/// everything?".
+///
+/// This is the same class of problem `pty.zig` already fixes for LANG, and it
+/// is fixed the same way: repair what a GUI launch failed to provide, using
+/// the configuration the user already has rather than guessing at paths.
+/// Terminal.app and Ghostty both spawn login shells for exactly this reason,
+/// which is why a shell opened there has a working PATH and one opened from a
+/// GUI subprocess does not.
+///
+/// `-l` is understood by sh, bash, zsh, fish, nushell and tcsh. It is not
+/// imposed on anyone: a client that wants something else -- `illogical new --
+/// htop`, or a non-login shell -- names it in `create.argv`, which this does
+/// not touch.
+fn defaultArgv() [2][]const u8 {
+    return .{ defaultShell(), "-l" };
+}
+
 /// Default control socket path.
 pub fn defaultSocketPath(alloc: Allocator) ![]u8 {
     if (getenv("ILLOGICAL_SOCK")) |p| return alloc.dupe(u8, p);
@@ -600,4 +630,85 @@ test "a second daemon on one socket refuses to start, and leaves the first alone
     // the first daemon afterwards.
     const probe = try sys.connectUnix(sock_path);
     sys.closeFd(probe);
+}
+
+test "a terminal with no command of its own gets a login shell" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pid = std.c.getpid();
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-loginsh-{d}", .{pid});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+
+    var shell_buf: [160]u8 = undefined;
+    const shell = try std.fmt.bufPrintZ(&shell_buf, "{s}/shell", .{root});
+    var argv_buf: [160]u8 = undefined;
+    const argv_file = try std.fmt.bufPrint(&argv_buf, "{s}/argv", .{root});
+
+    // A stub $SHELL that writes down how it was invoked, because that is the
+    // only way to observe it: `Terminal` records argv[0] and nothing else, and
+    // a real shell's PATH is whatever this machine's dotfiles say.
+    //
+    // The shebang makes the kernel run `/bin/sh <shell> -l`, so `$1` here is
+    // argv[1] as the daemon passed it. It then sleeps rather than exiting, so
+    // the terminal is still alive when the assertion runs.
+    var script_buf: [400]u8 = undefined;
+    const script = try std.fmt.bufPrint(
+        &script_buf,
+        "#!/bin/sh\nprintf '%s' \"$1\" > {s}\nsleep 30\n",
+        .{argv_file},
+    );
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = shell,
+        .data = script,
+        .flags = .{ .permissions = .executable_file },
+    });
+
+    // Process-wide, and restored below. `defaultShell` is the only reader of
+    // SHELL in the daemon, and the tests in this binary all pass argv
+    // explicitly, so nothing else can see this.
+    const had_shell = sys.getenv("SHELL");
+    var saved_buf: [512]u8 = undefined;
+    const saved: ?[:0]const u8 = if (had_shell) |v|
+        std.fmt.bufPrintZ(&saved_buf, "{s}", .{v}) catch null
+    else
+        null;
+    sys.setenvVar("SHELL", shell.ptr);
+    defer if (saved) |v| sys.setenvVar("SHELL", v.ptr);
+
+    var sock_buf: [160]u8 = undefined;
+    const sock_path = try std.fmt.bufPrintZ(&sock_buf, "{s}/server.sock", .{root});
+
+    const server = try Server.init(gpa, io, sock_path, root);
+    defer server.deinit();
+    try server.listen();
+    const accepting = try std.Thread.spawn(.{}, Server.run, .{server});
+    defer accepting.join();
+    defer server.stop();
+
+    const created = try server.createTerminal(.{ .session_name = "login", .name = "one" });
+    // `hangup` closes the PTY; the stub is sleeping, so kill its group too or
+    // it outlives the suite by half a minute.
+    defer server.killTerminal(created.terminal, 9) catch {};
+    defer server.killTerminal(created.terminal, 0) catch {};
+
+    var waited: usize = 0;
+    while (waited < 5000) : (waited += 10) {
+        if (std.Io.Dir.cwd().access(io, argv_file, .{})) |_| break else |_| {}
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.ShellNeverRan;
+
+    const recorded = try std.Io.Dir.cwd().readFileAlloc(io, argv_file, gpa, .limited(64));
+    defer gpa.free(recorded);
+    // The line that gives an app-started daemon a PATH. Without it every
+    // terminal the Mac app opens has launchd's four directories in PATH and
+    // nothing the user ever installed.
+    try testing.expectEqualStrings("-l", recorded);
 }
