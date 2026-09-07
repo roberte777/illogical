@@ -572,9 +572,10 @@ struct TransportTests {
         }
         // ...and the permanent ones stay permanent, so the guard is pinned
         // from both sides rather than only one.
-        // `EPERM` among them: an Endpoint Security or TCC refusal does not
-        // grant itself on a thirty-second timer, and the wording for it was
-        // written a round before its membership was.
+        // `EPERM` among them, from an Endpoint Security or MDM refusal, which
+        // does not reverse itself on a thirty-second timer. Not from TCC: that
+        // fails Foundation's `isExecutableFile` pre-check and arrives as Cocoa
+        // 4, which was always on the permanent side.
         //
         // Every member of the set, not the ones that were easy to reach: drop
         // `ELOOP` and a host whose `ssh` is a symlink loop is retried every
@@ -608,6 +609,19 @@ struct TransportTests {
         #expect(
             String(describing: classify(NSPOSIXErrorDomain, EBADMACHO))
                 == "ssh is not a valid executable")
+        // Endpoint Security or an MDM policy refusing the exec: the file is
+        // present and runnable, so this lands in `imageReason`, and it is the
+        // one arm of that pair that changes what a person reads.
+        #expect(
+            String(describing: classify(NSPOSIXErrorDomain, EPERM))
+                == "ssh is not permitted to run on this machine")
+        // The generic one the doc singles out, and the co-case of `EBADMACHO`
+        // that was only ever asserted through its sibling.
+        #expect(String(describing: classify(NSPOSIXErrorDomain, ENOEXEC)) == "ssh is not a program")
+        #expect(
+            String(describing: classify(NSPOSIXErrorDomain, EBADEXEC))
+                == "ssh is not a valid executable")
+
         // The fallthrough, which had no assertion at all.
         #expect(String(describing: classify(NSPOSIXErrorDomain, EISDIR)) == "ssh cannot be run")
     }
@@ -721,7 +735,8 @@ struct TransportTests {
         let predicate = ["is ", "points ", "could not be ", "cannot be ", "needs "]
         for code in [
             ENOENT, EACCES, EPERM, ENOTDIR, ELOOP, ENAMETOOLONG, EIO, ESTALE, ETIMEDOUT,
-            ENXIO, EBUSY, EINVAL, ENOSPC,
+            ENXIO, ENOTCONN, ECONNRESET, ENETRESET, EHOSTDOWN, EHOSTUNREACH, ENETDOWN,
+            ENETUNREACH, ENODEV, EPWROFF, EDEVERR, EBUSY, EINVAL, ENOSPC,
         ] {
             for (reason, retryable) in [
                 CommandTransport.pathReason(code), CommandTransport.targetReason(code),
