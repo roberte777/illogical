@@ -242,12 +242,17 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// dropdown and, when it is the only host, the full-window message. It is
     /// also what decides whether the host is retried at all.
     ///
-    /// The errno chooses the *branch*; the filesystem chooses the wording and
-    /// can still send a case back to retryable. That last part matters: the
-    /// permanent branch is entered on `NSCocoaErrorDomain` 4, which Foundation
-    /// raises whenever its `isExecutableFile` pre-check fails — including when
-    /// the check failed because a network volume stopped answering, which is
-    /// the most retryable thing there is.
+    /// The errno chooses the branch; the filesystem chooses the wording.
+    ///
+    /// Deliberately *not* the other way round for a stalled network volume,
+    /// which arrives here as `NSCocoaErrorDomain` 4 like everything else that
+    /// fails Foundation's pre-check. Retrying it sounds right and is not: the
+    /// pre-check and the probe below both block, `HostConnection` is main-actor
+    /// isolated, and a hard-mounted NFS export whose server is gone does not
+    /// time out — so a thirty-second retry loop is a window that beachballs
+    /// forever rather than one showing an amber reconnect. It gets a sentence
+    /// saying it could not be reached, and the Retry button, which is honest
+    /// and costs nobody a frozen window.
     ///
     /// Unrecognised failures are transient. Retrying something permanent costs
     /// one connection attempt every thirty seconds; giving up on something
@@ -269,10 +274,7 @@ public final class CommandTransport: Transport, @unchecked Sendable {
             return .spawnFailed(command: command, reason: ns.localizedDescription)
         }
 
-        let verdict = whyNotRunnable(path, ns)
-        return verdict.retryable
-            ? .spawnFailed(command: command, reason: verdict.reason)
-            : .notExecutable(command: command, reason: verdict.reason)
+        return .notExecutable(command: command, reason: whyNotRunnable(path, ns))
     }
 
     /// Why a file named in somebody's config cannot be run, asked of the
@@ -285,18 +287,16 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// sentence is "The file … doesn't exist." — true for one of them.
     ///
     /// The app is not sandboxed, so these calls see what the spawn saw.
-    private static func whyNotRunnable(
-        _ path: String, _ ns: NSError
-    ) -> (reason: String, retryable: Bool) {
+    private static func whyNotRunnable(_ path: String, _ ns: NSError) -> String {
         var followed = stat()
         if stat(path, &followed) == 0 {
-            if (followed.st_mode & S_IFMT) == S_IFDIR { return ("is a directory", false) }
+            if (followed.st_mode & S_IFMT) == S_IFDIR { return "is a directory" }
             if !FileManager.default.isExecutableFile(atPath: path) {
-                return ("is not executable", false)
+                return "is not executable"
             }
             // Present, and the execute bit is on, so the objection is to the
             // image: not a program, or built for another architecture.
-            return (imageReason(ns), false)
+            return imageReason(ns)
         }
         let followError = errno
 
@@ -324,50 +324,42 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     }
 
     /// The entry is there and resolving it failed, so the sentence is about
-    /// what it *points at*. Written out rather than composed from
-    /// `pathReason`: "points at what is a loop of symlinks" is what assembling
-    /// them gets you, and the preposition differs per case anyway.
-    ///
-    /// A link that resolves to nothing is broken. A link whose target merely
-    /// cannot be reached is not, and calling it broken sends somebody to
-    /// inspect a symlink that is perfectly fine.
-    static func targetReason(_ code: Int32) -> (reason: String, retryable: Bool) {
+    /// what it *points at*. A link that resolves to nothing is broken; one
+    /// whose target merely cannot be reached is not, and calling it broken
+    /// sends somebody to inspect a symlink that is perfectly fine.
+    static func targetReason(_ code: Int32) -> String {
         switch code {
-        case ENOENT: return ("is a broken symlink", false)
-        case ELOOP: return ("is a loop of symlinks", false)
-        case EACCES: return ("points into a directory that cannot be searched", false)
-        case ENOTDIR: return ("points under something that is not a directory", false)
-        case ENAMETOOLONG: return ("points at too long a path to open", false)
-        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENETDOWN, ENETUNREACH:
-            return ("points at a volume that is not responding", true)
-        default: return ("is a broken symlink", false)
+        case ENOENT: return "is a broken symlink"
+        case ELOOP: return "is a loop of symlinks"
+        case EACCES: return "points into a directory that cannot be searched"
+        case ENOTDIR: return "points under something that is not a directory"
+        // Everything else -- a permission the system has not granted, a volume
+        // that stopped answering, a name too long to open -- gets the honest
+        // one rather than a guess. Naming a cause we have not established is
+        // how "is not there" ended up in front of somebody looking at the file.
+        default: return "points at something that cannot be reached"
         }
     }
 
-    /// Why a path could not be walked, and whether that is worth retrying.
+    /// Why a path could not be walked.
     ///
-    /// Internal rather than private, like its two siblings: the retryable arms
-    /// are a stalled network volume, which no test can produce without a mount
-    /// to unplug. Reaching them directly is the only way they are pinned at
-    /// all, and an unpinned retry decision is what put a host into a
-    /// thirty-second loop for the life of the process twice already.
-    static func pathReason(_ code: Int32) -> (reason: String, retryable: Bool) {
+    /// Internal rather than private, like its two siblings, so the wording can
+    /// be checked without constructing the filesystem that produces it.
+    static func pathReason(_ code: Int32) -> String {
         switch code {
-        case EACCES: return ("is in a directory that cannot be searched", false)
+        case ENOENT: return "is not there"
+        case EACCES: return "is in a directory that cannot be searched"
         // Not the same fault, and not the same advice: there is no
-        // unsearchable directory to go and look at, because a component of
-        // the path is not a directory at all -- `/usr/local/bin/ssh` where
+        // unsearchable directory to go and look at, because a component of the
+        // path is not a directory at all -- `/usr/local/bin/ssh` where
         // `/usr/local/bin` is a leftover regular file.
-        case ENOTDIR: return ("is under something that is not a directory", false)
-        case ELOOP: return ("is a loop of symlinks", false)
-        case ENAMETOOLONG: return ("is too long a path to open", false)
-        // A volume that stopped answering is the most retryable failure there
-        // is, and it arrives here wearing the same Cocoa code as a missing
-        // file. Calling it permanent means a laptop that lost its NAS never
-        // reconnects that host again, and is told the binary is absent.
-        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENETDOWN, ENETUNREACH:
-            return ("is on a volume that is not responding", true)
-        default: return ("is not there", false)
+        case ENOTDIR: return "is under something that is not a directory"
+        case ELOOP: return "is a loop of symlinks"
+        case ENAMETOOLONG: return "is too long a path to open"
+        // As above: `EPERM` from an ungranted TCC prompt, `EIO` from a dying
+        // disk, `ESTALE` from a vanished mount. All permanent as far as this
+        // attempt is concerned, and none of them "not there".
+        default: return "cannot be reached"
         }
     }
 

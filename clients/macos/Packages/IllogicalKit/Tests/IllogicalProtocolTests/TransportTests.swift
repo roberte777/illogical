@@ -521,11 +521,14 @@ struct TransportTests {
         }
         // ...and the permanent ones stay permanent, so the guard is pinned
         // from both sides rather than only one.
-        // All six, not the three that were easy to reach: drop `ELOOP` from the
-        // set and a host whose `ssh` is a symlink loop is retried every thirty
-        // seconds under an amber "reconnecting…" for the life of the process,
-        // which is the `EMFILE` regression this test exists for, mirrored.
-        for code in [ENOENT, EACCES, ENOEXEC, EISDIR, ENAMETOOLONG, ELOOP] {
+        // Every member of the set, not the ones that were easy to reach: drop
+        // `ELOOP` and a host whose `ssh` is a symlink loop is retried every
+        // thirty seconds under an amber "reconnecting…" for the life of the
+        // process, which is the `EMFILE` regression this test exists for,
+        // mirrored. Most of these cannot arrive from a real spawn -- Foundation
+        // pre-checks and reports them as Cocoa 4 -- so this is the only place
+        // their membership is pinned at all.
+        for code in [ENOENT, EACCES, ENOEXEC, EISDIR, ENOTDIR, ENAMETOOLONG, ELOOP] {
             #expect(!classify(NSPOSIXErrorDomain, code).isTransient, "errno \(code)")
         }
         #expect(!classify(NSCocoaErrorDomain, 4).isTransient)
@@ -554,36 +557,40 @@ struct TransportTests {
         #expect(String(describing: classify(NSPOSIXErrorDomain, EISDIR)) == "ssh cannot be run")
     }
 
-    /// A volume that stopped answering is the most retryable failure there is,
-    /// and it reaches this code wearing the same `NSCocoaErrorDomain` 4 as a
-    /// missing file — because Foundation's `isExecutableFile` pre-check fails
-    /// either way. Classifying it permanent means a laptop that lost its NAS
-    /// is told the binary is absent and never retries that host again.
+    /// The wording for a path that could not be walked, checked directly
+    /// because most of these need a filesystem that cannot be built in a test
+    /// — a TCC-gated volume, a dying disk, a mount that vanished.
     ///
-    /// Driven against the two classifiers directly. Every other arm of these
-    /// is reachable from a real spawn and is tested that way; these are not,
-    /// without a mount to unplug, and an unpinned retry decision is exactly
-    /// what has twice put a host into a thirty-second loop for good.
-    @Test("a path that is merely unreachable stays retryable")
-    func unreachablePathsAreRetried() {
-        for code in [EIO, ESTALE, ETIMEDOUT, ENXIO, ENETDOWN, ENETUNREACH] {
-            let walked = CommandTransport.pathReason(code)
-            #expect(walked.retryable, "errno \(code) walking the path")
-            #expect(walked.reason == "is on a volume that is not responding")
-
-            let target = CommandTransport.targetReason(code)
-            #expect(target.retryable, "errno \(code) through a symlink")
-            #expect(target.reason == "points at a volume that is not responding")
+    /// The defaults are the point. An errno this does not recognise gets a
+    /// sentence saying so, not a guess: naming a cause that was never
+    /// established is how a file somebody was looking at came to be described
+    /// as absent. `EPERM` is the live example — macOS reports an ungranted
+    /// TCC prompt that way, and it is not `EACCES`.
+    @Test("an unrecognised reason says so rather than guessing")
+    func unknownPathFailuresAreNotGuessedAt() {
+        #expect(CommandTransport.pathReason(ENOENT) == "is not there")
+        #expect(CommandTransport.pathReason(EACCES) == "is in a directory that cannot be searched")
+        #expect(
+            CommandTransport.pathReason(ENOTDIR) == "is under something that is not a directory")
+        #expect(CommandTransport.pathReason(ELOOP) == "is a loop of symlinks")
+        #expect(CommandTransport.pathReason(ENAMETOOLONG) == "is too long a path to open")
+        for code in [EPERM, EIO, ESTALE, ETIMEDOUT, ENXIO, EHOSTDOWN] {
+            #expect(CommandTransport.pathReason(code) == "cannot be reached", "errno \(code)")
         }
 
-        // ...and the permanent ones stay permanent through both, so the
-        // override cannot leak into cases that will never fix themselves.
-        for code in [EACCES, ENOTDIR, ELOOP, ENAMETOOLONG] {
-            #expect(!CommandTransport.pathReason(code).retryable, "errno \(code)")
-            #expect(!CommandTransport.targetReason(code).retryable, "errno \(code)")
+        #expect(CommandTransport.targetReason(ENOENT) == "is a broken symlink")
+        #expect(CommandTransport.targetReason(ELOOP) == "is a loop of symlinks")
+        #expect(
+            CommandTransport.targetReason(EACCES)
+                == "points into a directory that cannot be searched")
+        #expect(
+            CommandTransport.targetReason(ENOTDIR)
+                == "points under something that is not a directory")
+        for code in [EPERM, EIO, ESTALE, ENAMETOOLONG] {
+            #expect(
+                CommandTransport.targetReason(code) == "points at something that cannot be reached",
+                "errno \(code)")
         }
-        #expect(!CommandTransport.targetReason(ENOENT).retryable)
-        #expect(CommandTransport.targetReason(ENOENT).reason == "is a broken symlink")
     }
 
     /// `close()` is called from the main actor, once per pane. Blocking there
