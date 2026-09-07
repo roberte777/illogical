@@ -528,6 +528,83 @@ snapshot straight from disk and the terminal stays parked [MEM t=660]. From the
 client's side this is indistinguishable from attaching to a live one, which is
 the point. Do not add a spinner for it.
 
+Tab **order** is this window's and nothing else's. The server has no opinion
+about it — a session is a set of terminals, not a list — so dragging a tab along
+the strip is `SessionStore.moveTab` and nothing about it leaves the process
+(issue #38). A drag across two sessions is refused rather than reordered: the
+strip only ever draws one session's tabs, so a cross-session order is one it
+could not show. Order does not **survive a relaunch** either: `reconcileTabs`
+builds the list from each host's `session_list`, so a new window is back to the
+server's order. #38 argues that is right — layout is per-window client state —
+and persisting it is a feature rather than polish.
+
+The drag is a `DragGesture`, not `.draggable`/`.dropDestination`. Most of a
+197 pt slot is the select button's hit area, and a control that takes the
+mouse-down is the documented way for a `.draggable` on macOS to never start at
+all; a reorder that silently does nothing would be worse than none. The gesture
+is attached with `simultaneousGesture` so it runs beside the button rather than
+against it, which also means the button still fires on the mouse-up that ends a
+drag — a dragged tab comes to the front, the way it does in every tabbed app.
+`TabStrip.dropIndex` turns the translation into a slot and is the one part of
+this that is unit-tested; the gesture plumbing around it cannot be simulated.
+
+## Motion
+
+The chrome animates. The terminal does not.
+
+| Surface | What it does | Duration |
+|---|---|---|
+| Session dropdown | fades and grows from its top-left anchor | 120 ms, ease-out |
+| Tab strip | slots fade in and out; the active pill slides between them | 180 ms, snappy |
+| Tab drag | the dragged slot tracks the pointer un-animated; the drop-target outline fades in | 180 ms, snappy |
+| Splits | a pane fades in while the frames grow around it; zoom likewise | 160 ms, ease-out |
+| Reconnect banner | slides down from the top edge and fades | 200 ms, ease-out |
+| Content area | crossfades between terminals, "no terminals" and "no server" | 150 ms, ease-in-out |
+| Residency badge | fades, so parked does not pop | 120 ms, ease-out |
+
+Three things deliberately do **not** animate:
+
+- **Switching tabs.** It is what this app does most often, and it has to feel
+  like nothing happened. The only motion when you click another tab is the pill
+  sliding; the surface underneath swaps between two frames. That is also why the
+  content area's crossfade is keyed on *which screen* is showing rather than on
+  the selected tab, and why a split that arrives in a background tab brings that
+  tab forward outside the animation.
+- **The divider drag, and the tab drag.** Both track the pointer 1:1, so neither
+  `setRatio` nor the dragged slot's offset is ever wrapped in an animation. Only
+  the split tree's *topology* changes are — a pane appearing, closing, zooming —
+  which animate because `SplitPair`'s frames are a pure function of ratio and
+  topology.
+- **Anything before the first frame.** Every animation here hangs off a state
+  change that cannot happen until the window is on screen, which is what keeps
+  the launch budget (G7) where it was.
+
+All of it is gated on `accessibilityReduceMotion`: with the system setting on,
+every duration becomes `nil` — SwiftUI's "do it now" — and every transition
+becomes a plain crossfade. Two pure functions carry that,
+`Motion.animation(reduceMotion:)` and `Motion.entrance(reduceMotion:)`, and both
+are pinned by the tests. They are not merely a convention views are trusted to
+follow: `Motion`'s stored entrance is private and the only way to an
+`AnyTransition` is through the gate, because `AnyTransition` is opaque enough
+that a check living inside one could be deleted with every test still green.
+Views read the setting from the SwiftUI environment; `SessionStore`, which has
+none, reads the same setting through
+`NSWorkspace.accessibilityDisplayShouldReduceMotion`. Durations live in `Motion`
+rather than at the call sites, so the app has a vocabulary instead of eleven
+magic numbers.
+
+One consequence of animating the split tree is worth knowing about, because it
+bit once. A topology change moves the surviving pane to a new position in the
+view tree, so SwiftUI builds it a **new** `TerminalSurfaceView` over the *same*
+`TerminalEngine` and keeps the old one alive for the length of the transition.
+Anything the engine holds per-view therefore has two claimants at once, and the
+teardown of the outgoing one used to clear the wake callback the live one had
+just installed — after which the display link paused on schedule and the pane
+stopped repainting until it was clicked. `TerminalEngine.bind`/`unbind` are
+keyed on view identity for that reason, and `reportSizeIfNeeded` checks the same
+thing so a displaced surface cannot resize the PTY out from under its
+replacement.
+
 ## Remote hosts
 
 `ssh <dest> illogicald --stdio`, with the frame stream on the pipe. The user's

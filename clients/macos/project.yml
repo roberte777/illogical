@@ -146,6 +146,11 @@ targets:
       # The renderer and the controller both emit launch signposts.
       - path: Illogical/App/Signposts.swift
       - path: Illogical/App/Palette.swift
+      # The motion vocabulary. `SessionStore` animates its split-tree mutations
+      # through it, so the store no longer compiles without it -- and the
+      # reduce-motion gate is the one part of the app's animation a test can
+      # hold, which is why it is a pure function in a file of its own.
+      - path: Illogical/App/Motion.swift
       - path: Illogical/App/Trace.swift
       - path: Tests
     dependencies:

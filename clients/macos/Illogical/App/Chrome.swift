@@ -199,12 +199,22 @@ struct TerminalTab: View {
     /// Draw the hairline on this tab's leading edge. Only between two inactive
     /// tabs — the active pill provides its own edge.
     let showsLeadingSeparator: Bool
+    /// A tab is being dragged over this slot, so say where it would land.
+    var isDropTarget: Bool = false
+    /// The strip's namespace for the active pill. One pill moves between slots
+    /// rather than one per slot fading in and out, which is what makes
+    /// selecting a tab slide rather than blink.
+    let pill: Namespace.ID
     let select: () -> Void
     let close: () -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovering = false
 
     private let closeWidth: CGFloat = 16
+    /// One id for the whole strip, not one per tab: the pill is a single view
+    /// moving between slots.
+    private static let pillID = "active-pill"
 
     /// Always on the active tab, on hover for the rest — the way tab bars
     /// everywhere behave. Hover-only made it undiscoverable.
@@ -261,6 +271,10 @@ struct TerminalTab: View {
                         )
                         .strokeBorder(Palette.tabActiveStroke, lineWidth: 1)
                     )
+                    // Exactly one slot carries this at a time, so SwiftUI has a
+                    // source and a destination and slides the pill between
+                    // them instead of fading one out and another in.
+                    .matchedGeometryEffect(id: Self.pillID, in: pill)
             } else if isHovering {
                 RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
                     .fill(Palette.tabHoverFill)
@@ -269,6 +283,17 @@ struct TerminalTab: View {
         .overlay(alignment: .leading) {
             if showsLeadingSeparator { TabSeparator() }
         }
+        // Where a dragged tab would land. An outline rather than a moving gap:
+        // the slots are a fixed width laid edge to edge, so opening one would
+        // shove every tab after it sideways for the length of the drag.
+        .overlay {
+            if isDropTarget {
+                RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
+                    .strokeBorder(Palette.menuHighlight, lineWidth: 2)
+                    .padding(1)
+            }
+        }
+        .animation(Motion.tabs.animation(reduceMotion: reduceMotion), value: isDropTarget)
         .onHover { isHovering = $0 }
         .traceFrame("tab-\(traceID)")
     }
@@ -286,8 +311,14 @@ struct TerminalTab: View {
                         .padding(1.5)
                         .background(Circle().fill(Palette.toolbar))
                         .offset(x: 9, y: -8)
+                        // Parking is a normal thing that happens on its own, on
+                        // a timer nobody asked about. A marker that pops into
+                        // existence reads as an error; one that fades reads as
+                        // a state.
+                        .transition(Motion.badge.transition(reduceMotion: reduceMotion))
                 }
             }
+            .animation(Motion.badge.animation(reduceMotion: reduceMotion), value: residency)
 
             if let terminal {
                 TerminalLabel(

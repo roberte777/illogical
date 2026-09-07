@@ -436,14 +436,91 @@ final class SessionStore {
         // confirm: the connection is already closed, so the pane would render
         // a dead terminal in the meantime.
         if let root = tabs[index].root.removing(paneID) {
-            tabs[index].root = root
-            tabs[index].repairFocus()
+            // The tree's topology changed, so the surviving panes' frames do
+            // too. `SplitPair` computes those frames from ratio and topology
+            // alone, so animating the mutation animates the geometry.
+            Motion.splits.run {
+                tabs[index].root = root
+                tabs[index].repairFocus()
+            }
         } else {
             let wasInFront = selectedTab?.session
             tabs.remove(at: index)
             repairSelection(preferring: wasInFront)
         }
         return true
+    }
+
+    // MARK: - Ordering
+    //
+    // Tab order is this window's, and nothing else's. The server has no
+    // opinion about it -- a session is a set of terminals, not a list -- and
+    // splits are already per-window state, so a reorder never leaves the
+    // process. Nor does it survive one: `reconcileTabs` builds the list from
+    // each host's `session_list`, so a relaunch is back to the server's order.
+    // Issue #38 argues that is right -- layout is per-window client state, and
+    // there is only one window -- and persisting it is a feature, not polish.
+
+    /// Move `id` into the slot before `target`, or to the end of its session's
+    /// run when `target` is nil.
+    ///
+    /// Refuses a move across two sessions. The strip only ever draws one
+    /// session's tabs (`visibleTabs`), so a cross-session drop is not something
+    /// the UI can produce; refusing it here means the model cannot be talked
+    /// into an order the strip could not show.
+    ///
+    /// Selection is deliberately untouched *here*. Reordering is not switching,
+    /// and keeping the two apart is what lets the strip's own select button
+    /// decide: it fires on the mouse-up that ends a drag, so a dragged tab does
+    /// come to the front, the way it does in every tabbed app — but that is the
+    /// button's doing and can change without touching this.
+    func moveTab(_ id: TabLayout.ID, before target: TabLayout.ID?) {
+        guard id != target, let from = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let session = tabs[from].session
+
+        // Where it lands, as an index into the array *before* the removal.
+        let destination: Int
+        if let target {
+            guard let to = tabs.firstIndex(where: { $0.id == target }) else { return }
+            guard tabs[to].session == session else { return }
+            destination = to
+        } else {
+            // The end of this session's tabs rather than the end of the array:
+            // `visibleTabs` filters `tabs` and keeps its order, so this is the
+            // end of the strip, and another session's tabs stay where they are.
+            guard let last = tabs.lastIndex(where: { $0.session == session }) else { return }
+            destination = last + 1
+        }
+
+        let tab = tabs.remove(at: from)
+        tabs.insert(tab, at: from < destination ? destination - 1 : destination)
+    }
+
+    /// A drop of `id` onto `target`'s slot: the dragged tab takes that slot and
+    /// the others close up around it.
+    ///
+    /// Which side of `target` that is depends on which way the tab travelled,
+    /// which is why this is not `moveTab(_:before:)` with the drop target
+    /// passed straight through: dragging left, "onto" means before; dragging
+    /// right, it means after, or the tab would land one slot short of where it
+    /// was dropped.
+    func moveTab(_ id: TabLayout.ID, onto target: TabLayout.ID) {
+        guard id != target,
+            let from = tabs.firstIndex(where: { $0.id == id }),
+            let to = tabs.firstIndex(where: { $0.id == target })
+        else { return }
+        // Checked here as well as in `moveTab(_:before:)`, not instead of it.
+        // Travelling right the call below passes the tab *after* the target,
+        // and the last tab of a session has none — so the move would arrive as
+        // `before: nil`, which is a perfectly legal within-session append, and
+        // a cross-session drop would go through.
+        guard tabs[from].session == tabs[to].session else { return }
+        guard from < to else { return moveTab(id, before: target) }
+        // Travelling right: land after the target, which is "before whatever
+        // follows it in the same session" — the next tab in the *array* may
+        // belong to another session, and `moveTab(_:before:)` would refuse it.
+        let next = tabs[(to + 1)...].first { $0.session == tabs[to].session }?.id
+        moveTab(id, before: next)
     }
 
     /// Close a whole tab, and every terminal in it.
@@ -465,7 +542,9 @@ final class SessionStore {
         guard let index = tabs.firstIndex(where: { $0.id == tabID }), tabs[index].isSplit else {
             return
         }
-        tabs[index].zoomed = tabs[index].zoomed == paneID ? nil : paneID
+        Motion.splits.run {
+            tabs[index].zoomed = tabs[index].zoomed == paneID ? nil : paneID
+        }
         tabs[index].focused = paneID
     }
 
@@ -704,9 +783,14 @@ final class SessionStore {
             return
         }
         let pane = Pane(terminal: ref)
-        tabs[tab].root = tabs[tab].root.splitting(
-            pending.pane, with: pane, direction: pending.direction)
-        tabs[tab].focused = pane.id
+        Motion.splits.run {
+            tabs[tab].root = tabs[tab].root.splitting(
+                pending.pane, with: pane, direction: pending.direction)
+            tabs[tab].focused = pane.id
+        }
+        // Outside the animation on purpose. A split can land in a tab that is
+        // not in front, and bringing it forward is a *tab switch* — the one
+        // thing in this app that must not animate.
         selectedTabID = pending.tab
     }
 

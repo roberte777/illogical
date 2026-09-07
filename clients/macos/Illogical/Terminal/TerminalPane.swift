@@ -57,6 +57,8 @@ struct ConnectionBanner: View {
     let host: ServerHost
     let retry: () -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     private var text: String? {
         switch state {
         case .reconnecting:
@@ -67,32 +69,44 @@ struct ConnectionBanner: View {
     }
 
     var body: some View {
-        if let text {
-            HStack(spacing: 8) {
-                if state.isReconnecting {
-                    ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.7)
-                }
-                Text(text)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Palette.textBright)
-                    .lineLimit(1)
-                Button("Retry", action: retry)
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(Palette.menuHighlight)
+        // The container is unconditional so the pill has something to leave
+        // from: with the `if` at the top of `body` the view is simply gone the
+        // instant the connection comes back, and a removal transition has
+        // nowhere to run.
+        ZStack(alignment: .top) {
+            if let text {
+                pill(text)
+                    .transition(Motion.banner.transition(reduceMotion: reduceMotion))
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(
-                Capsule().fill(Palette.toolbar)
-                    .overlay(Capsule().strokeBorder(Palette.divider, lineWidth: 1))
-                    .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
-            )
-            .padding(.top, 10)
-            .accessibilityLabel(Text(text))
         }
+        .animation(Motion.banner.animation(reduceMotion: reduceMotion), value: text)
+    }
+
+    private func pill(_ text: String) -> some View {
+        HStack(spacing: 8) {
+            if state.isReconnecting {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.7)
+            }
+            Text(text)
+                .font(.system(size: 11))
+                .foregroundStyle(Palette.textBright)
+                .lineLimit(1)
+            Button("Retry", action: retry)
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Palette.menuHighlight)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(
+            Capsule().fill(Palette.toolbar)
+                .overlay(Capsule().strokeBorder(Palette.divider, lineWidth: 1))
+                .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+        )
+        .padding(.top, 10)
+        .accessibilityLabel(Text(text))
     }
 }
 

@@ -26,13 +26,21 @@ struct SplitContainer: View {
 
 struct SplitNodeView: View {
     @Environment(SessionStore.self) private var store
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let node: SplitNode
     let tab: TabLayout.ID
 
     var body: some View {
         switch node {
         case .leaf(let pane):
-            TerminalPane(pane: pane, tab: tab).environment(store)
+            TerminalPane(pane: pane, tab: tab)
+                .environment(store)
+                // A pane arriving fades in while the frames animate around it,
+                // rather than a terminal appearing at full strength inside a
+                // slot that is still growing. The animation comes from the
+                // `withAnimation` the store wraps the tree mutation in — this
+                // says what to do with it, not when. See `Motion`.
+                .transition(Motion.splits.transition(reduceMotion: reduceMotion))
         case .split(let split):
             SplitPair(split: split, tab: tab).environment(store)
         }
@@ -106,6 +114,11 @@ struct SplitPair: View {
                             NSCursor.pop()
                         }
                     }
+                    // Deliberately not animated. A pane appearing or closing is
+                    // motion; a divider under the pointer is not. `setRatio` is
+                    // never wrapped in a `withAnimation` — an animated divider
+                    // lags the mouse by its own duration, which reads as the
+                    // window being slow rather than as polish.
                     .gesture(
                         DragGesture(minimumDistance: 0)
                             .onChanged { value in
