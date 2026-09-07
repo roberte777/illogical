@@ -204,6 +204,18 @@ fn run(self: *Client) void {
             // already been sent `desync` and unsubscribed; another `err` on
             // top of it would say nothing new.
             error.ClientBehind => continue,
+            // A client whose protocol version we refused. `stopWriter` first,
+            // so the `err` frame that is still queued reaches the wire -- the
+            // writer loop returns only on an empty queue -- and then break
+            // both directions, which is what turns "we stopped answering"
+            // into an end-of-file the client sees now rather than at the next
+            // maintenance tick. `destroy` finds `writer == null` later and its
+            // own `shutdownFd` returns ENOTCONN; both are harmless.
+            error.ProtocolRefused => {
+                self.stopWriter();
+                sys.shutdownFd(self.fd);
+                break;
+            },
             else => {
                 log.warn("frame {t} failed: {t}", .{ header.type, err });
                 self.sendError(header.session, .unknown, @errorName(err)) catch break;
@@ -231,11 +243,21 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
             const req = try protocol.body.decode(protocol.body.Hello, arena, payload);
             defer req.deinit();
             if (req.value.version != protocol.version) {
-                return self.sendError(
+                try self.sendError(
                     protocol.control_session,
                     .version_mismatch,
                     "unsupported protocol version",
                 );
+                // And nothing else on this connection, ever. Refusing the
+                // `hello` and then carrying on is not a refusal: a client
+                // sends `hello` and `list` back to back, so the daemon
+                // answered the `err` and then the `session_list` behind it,
+                // and the app -- which reads a `session_list` as "connected"
+                // -- attached 55 ms after being told its protocol was
+                // unsupported. Whatever the version difference actually is
+                // then surfaces as garbage or a hang somewhere downstream,
+                // instead of as the sentence this refusal exists to produce.
+                return error.ProtocolRefused;
             }
             const bytes = try protocol.body.encode(arena, protocol.body.Welcome{
                 .server = illogical.version,

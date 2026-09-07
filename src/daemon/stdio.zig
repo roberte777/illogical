@@ -21,6 +21,15 @@
 //! There is no authentication and no listening socket, by design: access is
 //! whatever SSH decided, and the unix socket at the far end is filesystem
 //! permissions. See docs/PROTOCOL.md, "Transport".
+//!
+//! The Mac app's local path is `ensure` below: this same dial-or-start, with
+//! the bridge left off. The app connects to the socket directly, exactly as it
+//! always has, and only when that fails does it run
+//! `illogicald --ensure --socket <path>` and connect again. So the local fast
+//! path stays one `connect()` with no process and no copy on it, while
+//! *starting* a daemon is one implementation, in one language, shared by SSH
+//! and by the app and tested on both platforms in CI. Two copies of a double
+//! fork would drift apart; one cannot.
 
 const std = @import("std");
 const illogical = @import("illogical");
@@ -63,7 +72,24 @@ pub const Error = error{
     NoServer,
     SpawnFailed,
     PathTooLong,
+    /// The directory that would hold the socket and `daemon.log` cannot be
+    /// written. Its own error rather than a `NoServer` ten seconds later:
+    /// without it the grandchild fails to open the log, exits 1 where nobody
+    /// can see it, and the caller -- the app -- sits in `.connecting` for the
+    /// whole startup timeout and then names a log file that was never created.
+    StateDirUnwritable,
+    /// A relative socket path, which we will not start a daemon on. See
+    /// `spawnDaemon`.
+    SocketPathNotAbsolute,
 };
+
+/// Which of the two things `ensure` did. Only the caller can say whether the
+/// difference matters: to `--ensure` it is the one line it prints, and to the
+/// app it is nothing at all -- either way there is a daemon now.
+pub const Started = enum { already_running, started };
+
+/// A connected socket, and how it came to be there.
+const Dialled = struct { fd: sys.fd_t, how: Started };
 
 /// Bridge stdin/stdout to the daemon at `socket_path`. Returns when either end
 /// closes.
@@ -79,13 +105,41 @@ pub fn serve(socket_path: []const u8, opts: Options) !void {
 }
 
 /// Connect to the daemon, starting one if there is none and we are allowed to.
-pub fn dial(socket_path: []const u8, opts: Options) !sys.fd_t {
-    if (sys.connectUnix(socket_path)) |fd| return fd else |_| {}
+pub fn dial(socket_path: []const u8, opts: Options) Error!sys.fd_t {
+    return (try dialReporting(socket_path, opts)).fd;
+}
+
+/// Make sure a daemon is listening on `socket_path`, and say which of the two
+/// ways that came about. Owns no descriptor when it returns.
+///
+/// This is `dial` without the bridge, and it exists for the Mac app: the app
+/// runs `illogicald --ensure` as a short-lived child when its own `connect()`
+/// gets ECONNREFUSED, then connects again itself. The daemon that comes out of
+/// it is not the app's child -- `spawnDetached` saw to that two forks ago --
+/// so it survives ⌘Q, a crash, and Xcode's Stop button, which is the whole
+/// point (docs/CLIENT.md, "Starting the server").
+///
+/// The connect *is* the probe. Nothing here reads the socket file's existence
+/// or a pid file: a socket left behind by a crashed daemon exists and answers
+/// nothing, and `Server.listen` already unlinks that case out from under
+/// itself.
+pub fn ensure(socket_path: []const u8, opts: Options) Error!Started {
+    const dialled = try dialReporting(socket_path, opts);
+    // The caller wanted a daemon, not a connection to one. Holding this open
+    // would cost the daemon a client slot for as long as `--ensure` took to
+    // exit, and the app is about to open its own.
+    sys.closeFd(dialled.fd);
+    return dialled.how;
+}
+
+fn dialReporting(socket_path: []const u8, opts: Options) Error!Dialled {
+    if (sys.connectUnix(socket_path)) |fd| return .{ .fd = fd, .how = .already_running } else |_| {}
     if (!opts.spawn) return error.NoServer;
 
     try spawnDaemon(socket_path, opts.exe);
-    return connectWithin(socket_path, opts.startup_timeout_ns, opts.retry_interval_ns) orelse
-        error.NoServer;
+    const fd = connectWithin(socket_path, opts.startup_timeout_ns, opts.retry_interval_ns) orelse
+        return error.NoServer;
+    return .{ .fd = fd, .how = .started };
 }
 
 /// Retry `connect` until it succeeds or the deadline passes.
@@ -105,6 +159,15 @@ fn connectWithin(socket_path: []const u8, timeout_ns: u64, interval_ns: u64) ?sy
 
 /// Start `illogicald` on this machine, detached, listening on `socket_path`.
 fn spawnDaemon(socket_path: []const u8, exe_override: ?[]const u8) !void {
+    // Before anything else, because of the `chdir("/")` in `spawnDetached`:
+    // a daemon started on `x/server.sock` would bind `/x/server.sock` and the
+    // caller would then wait ten seconds for a socket at a path that will
+    // never exist. Only *starting* one needs this -- `dialReporting` connects
+    // to a relative path perfectly well, from whatever directory the caller is
+    // in -- so the refusal is here and not there. Every script and every
+    // caller in the repo already passes an absolute path.
+    if (!std.fs.path.isAbsolute(socket_path)) return error.SocketPathNotAbsolute;
+
     // Everything the child needs must be NUL-terminated before the fork: a
     // forked child may not allocate.
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -134,6 +197,15 @@ fn spawnDaemon(socket_path: []const u8, exe_override: ?[]const u8) !void {
     var log_z: [std.fs.max_path_bytes]u8 = undefined;
     const dir = std.fs.path.dirname(socket_path) orelse ".";
     sys.makeDirPath(dir);
+    // And check it, before the fork rather than after. `makeDirPath` ignores
+    // its failures on purpose, so a state root under a directory we cannot
+    // create -- `ILLOGICAL_SOCK=/nonexistent-root-dir/x/server.sock`, or a
+    // state dir left root-owned -- gets this far silently. Past the fork the
+    // failure has nowhere to go: the grandchild cannot open `daemon.log`, so
+    // it has no stderr, and it dies unheard while the caller waits out the
+    // full `startup_timeout_ns` and then points a person at a log that does
+    // not exist. Here it is a sentence, in microseconds.
+    if (!sys.isWritableDir(dir)) return error.StateDirUnwritable;
     const log_path = std.fmt.bufPrintZ(&log_z, "{s}/daemon.log", .{dir}) catch
         return error.PathTooLong;
 
@@ -174,6 +246,14 @@ fn spawnDetached(
         // spawns; an `~/.ssh/rc` or `authorized_keys command=` wrapper that
         // opened a credential file before exec'ing us is enough to leak one.
         sys.closeFrom(sys.STDERR + 1);
+        // The last thing this process inherits that outlives its usefulness:
+        // a working directory. The daemon runs for days, and the cwd it starts
+        // with is whatever the app or the ssh session happened to be in --
+        // verified in review as a worktree, which `wt remove` then deletes out
+        // from under it, and which would equally be an external volume nobody
+        // can eject. Terminals are unaffected: `createTerminal` sets its own
+        // cwd from `req.cwd` or `$HOME`.
+        sys.chdirPath("/");
         sys.exec(file, argv);
         sys.exitProcess(127);
     }
@@ -486,6 +566,73 @@ test "the bridge carries a whole conversation in both directions" {
     _ = std.c.shutdown(pipe.client_end, 1);
 }
 
+test "a hello the daemon refuses ends the connection, and nothing after it is answered" {
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var sock_buf: [96]u8 = undefined;
+    const sock_path = try std.fmt.bufPrintZ(
+        &sock_buf,
+        "/tmp/illogical-refuse-{d}.sock",
+        .{std.c.getpid()},
+    );
+    defer sys.unlinkPath(sock_path.ptr);
+
+    var state_buf: [96]u8 = undefined;
+    const state_root = try std.fmt.bufPrint(
+        &state_buf,
+        "/tmp/illogical-refuse-state-{d}",
+        .{std.c.getpid()},
+    );
+    defer std.Io.Dir.cwd().deleteTree(io, state_root) catch {};
+
+    const server = try Server.init(gpa, io, sock_path, state_root);
+    defer server.deinit();
+    try server.listen();
+    const accepting = try std.Thread.spawn(.{}, Server.run, .{server});
+    defer accepting.join();
+    defer server.stop();
+
+    // Straight at the socket: no bridge, because what is under test is what
+    // the daemon does with a connection, not what a splice does with bytes.
+    const fd = try sys.connectUnix(sock_path);
+    defer sys.closeFd(fd);
+
+    const hello = try protocol.body.encode(gpa, protocol.body.Hello{
+        .client = "old",
+        .version = 99,
+    });
+    defer gpa.free(hello);
+
+    // Both frames before reading anything, which is what `openControl` does
+    // and is the whole reason this bug existed. Writing them together also
+    // keeps this test process off SIGPIPE: the daemon cannot have shut the
+    // socket down before the second write is on the wire.
+    try sendFrame(fd, .hello, protocol.control_session, hello);
+    try sendFrame(fd, .list, protocol.control_session, &.{});
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+
+    const refusal = try recvFrame(fd, gpa, &payload);
+    try testing.expectEqual(protocol.FrameType.err, refusal.type);
+    const err_body = try protocol.body.decode(protocol.body.Err, gpa, payload.items);
+    defer err_body.deinit();
+    try testing.expectEqual(
+        @intFromEnum(protocol.ErrorCode.version_mismatch),
+        err_body.value.code,
+    );
+
+    // And then end-of-file. A `session_list` here is the bug (the daemon
+    // refused and served anyway); a hang here is the other half of it (the
+    // daemon stopped answering but never let go, so the client waits for the
+    // maintenance tick to notice).
+    try testing.expectError(error.ReadFailed, recvFrame(fd, gpa, &payload));
+}
+
 test "a detached daemon outlives its parent, keeps a stderr, and inherits nothing" {
     const gpa = testing.allocator;
 
@@ -704,4 +851,243 @@ test "auto-start makes the daemon's state directory before it forks" {
     var dir_buf: [160]u8 = undefined;
     const dir = try std.fmt.bufPrint(&dir_buf, "{s}/state", .{root});
     try std.Io.Dir.cwd().access(io, dir, .{});
+}
+
+/// A listener on `path`, bound now, accepting one connection and then gone.
+/// Stands in for a daemon in the `ensure` tests below, which care about
+/// whether something answers `connect` and not at all about what it says.
+const Listener = struct {
+    fd: sys.fd_t,
+
+    fn open(path: [:0]const u8) !Listener {
+        const addr = try sys.unixAddr(path);
+        const fd = try sys.unixSocket();
+        errdefer sys.closeFd(fd);
+        try sys.bindUnix(fd, &addr);
+        // A backlog rather than an accept loop: `ensure` connects and closes
+        // without writing, so the connection never has to be accepted at all
+        // for the connect to succeed.
+        try sys.listenFd(fd, 4);
+        return .{ .fd = fd };
+    }
+
+    fn close(self: Listener) void {
+        sys.closeFd(self.fd);
+    }
+};
+
+test "ensure on an absent socket with spawn off reports NoServer" {
+    var buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&buf, "/tmp/illogical-ensure-off-{d}.sock", .{std.c.getpid()});
+    sys.unlinkPath(path.ptr);
+
+    // The `--no-spawn` composition, and the answer the app must never see as a
+    // hang: nothing is listening, we may not start anything, so say so.
+    try testing.expectError(error.NoServer, ensure(path, .{ .spawn = false }));
+}
+
+test "ensure against a live daemon reports already_running" {
+    var buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&buf, "/tmp/illogical-ensure-live-{d}.sock", .{std.c.getpid()});
+    sys.unlinkPath(path.ptr);
+    defer sys.unlinkPath(path.ptr);
+
+    const listener = try Listener.open(path);
+    defer listener.close();
+
+    // `.spawn = true` deliberately: the assertion is that a daemon which is
+    // already there stops `ensure` before the fork, not that we remembered to
+    // pass a flag. A second daemon here would take the socket from the first
+    // and orphan every terminal behind it -- D3.1, and the reason
+    // `Server.listen` probes as well.
+    try testing.expectEqual(Started.already_running, try ensure(path, .{}));
+}
+
+test "ensure returns started once a slow listener binds" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A directory of its own, because `spawnDaemon` writes a `daemon.log`
+    // beside the socket and `/tmp/daemon.log` is not ours to create.
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-ensure-late-{d}", .{std.c.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(io, root);
+
+    var buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&buf, "{s}/server.sock", .{root});
+
+    // The real shape of an auto-start: the fork is away long before the socket
+    // exists, and `connectWithin` is what covers the gap. `/usr/bin/true`
+    // stands in for the daemon so that the *only* thing that ever binds is the
+    // thread below, on a delay this test controls.
+    const Late = struct {
+        fn listen(p: [:0]const u8) void {
+            sys.sleepNs(150 * std.time.ns_per_ms);
+            const l = Listener.open(p) catch return;
+            sys.sleepNs(2 * std.time.ns_per_s);
+            l.close();
+        }
+    };
+    const late = try std.Thread.spawn(.{}, Late.listen, .{path});
+    defer late.join();
+
+    try testing.expectEqual(
+        Started.started,
+        try ensure(path, .{ .exe = "/usr/bin/true", .startup_timeout_ns = 5 * std.time.ns_per_s }),
+    );
+}
+
+test "ensure with an exe that never binds times out" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-ensure-dead-{d}", .{std.c.getpid()});
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&buf, "{s}/server.sock", .{root});
+
+    // `/usr/bin/true` exits without binding anything, which is what a daemon
+    // that dies on startup looks like from here. The answer must be the
+    // timeout and not a wait forever: the app runs this as a child and blocks
+    // a reconnect on it.
+    const before = sys.monotonicNs();
+    try testing.expectError(error.NoServer, ensure(path, .{
+        .exe = "/usr/bin/true",
+        .startup_timeout_ns = 200 * std.time.ns_per_ms,
+        .retry_interval_ns = 10 * std.time.ns_per_ms,
+    }));
+    // Bounded by the timeout, not by the default ten seconds.
+    try testing.expect(sys.monotonicNs() - before < 5 * std.time.ns_per_s);
+}
+
+test "a detached daemon is in a session of its own, and not in our directory" {
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pid = std.c.getpid();
+    var marker_buf: [96]u8 = undefined;
+    const marker = try std.fmt.bufPrintZ(&marker_buf, "/tmp/illogical-session-{d}", .{pid});
+    defer sys.unlinkPath(marker.ptr);
+    std.Io.Dir.cwd().deleteFile(io, marker) catch {};
+
+    var log_buf: [96]u8 = undefined;
+    const log_path = try std.fmt.bufPrintZ(&log_buf, "/tmp/illogical-session-{d}.log", .{pid});
+    defer sys.unlinkPath(log_path.ptr);
+
+    // Deliberately a second, simpler stub rather than more assertions on the
+    // `closeFrom` test above: that one's descriptor reasoning is delicate
+    // enough that adding to it would put two unrelated properties in one
+    // failure message.
+    //
+    // Written to a temp name and renamed, so a poll that catches the file
+    // mid-write cannot read half a line. `pwd -P` and not `$PWD`: the latter
+    // is inherited from this process's environment and a shell is allowed to
+    // trust it, which would report our directory no matter what the chdir did.
+    var script_buf: [512]u8 = undefined;
+    const script = try std.fmt.bufPrintZ(
+        &script_buf,
+        "printf '%s %s\\n' \"$$\" \"$(pwd -P)\" > {s}.tmp; mv {s}.tmp {s}; sleep 3",
+        .{ marker, marker, marker },
+    );
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", @ptrCast(script.ptr) };
+    try spawnDetached("/bin/sh", &argv, log_path.ptr);
+
+    var waited: usize = 0;
+    while (waited < 5000) : (waited += 10) {
+        if (std.Io.Dir.cwd().access(io, marker, .{})) |_| break else |_| {}
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.DetachedChildNeverRan;
+
+    const reported = try std.Io.Dir.cwd().readFileAlloc(io, marker, gpa, .limited(4096));
+    defer gpa.free(reported);
+    var it = std.mem.tokenizeAny(u8, std.mem.trim(u8, reported, " \n"), " ");
+    const child_pid = try std.fmt.parseInt(sys.pid_t, it.next() orelse return error.NoPid, 10);
+    const child_cwd = it.next() orelse return error.NoCwd;
+    // Not our child -- `spawnDetached` saw to that -- so there is nothing to
+    // reap and a signal is the only way to end it.
+    defer sys.signal(child_pid, sys.SIGTERM);
+
+    // The `setsid()` in the intermediate child, asserted rather than assumed.
+    // Deleting that call leaves the whole unit suite green without this, and
+    // only `scripts/smoke-ensure.sh` -- which nothing ran automatically --
+    // noticed (REVIEW F5). A session id is a deterministic fact about a
+    // process: no `ps`, no sleeps, nothing to race.
+    try testing.expect(sys.sessionOf(child_pid) != sys.sessionOf(0));
+    try testing.expect(sys.processGroupOf(child_pid) != sys.processGroupOf(0));
+    // And it is the *grandchild* that survives, not the session leader: a
+    // process that is not a session leader can never reacquire a controlling
+    // terminal, so nothing can ever send this one SIGHUP.
+    try testing.expect(sys.sessionOf(child_pid) != child_pid);
+
+    // The chdir. A daemon that kept the app's cwd holds a worktree open
+    // against `wt remove` and a volume against unmount, for days.
+    try testing.expectEqualStrings("/", child_cwd);
+}
+
+test "ensure fails at once when the state directory cannot be written" {
+    // Root ignores the permission bits, so the directory below is writable and
+    // the daemon really would be spawned.
+    if (std.c.geteuid() == 0) return;
+
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [96]u8 = undefined;
+    const root = try std.fmt.bufPrintZ(
+        &root_buf,
+        "/tmp/illogical-unwritable-{d}",
+        .{std.c.getpid()},
+    );
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    defer {
+        // Back to writable first, or the tree cannot be walked to delete it.
+        _ = std.c.chmod(root.ptr, 0o700);
+        std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    }
+    // Read and execute, no write: `makeDirPath` cannot create `sub` inside it.
+    if (std.c.chmod(root.ptr, 0o500) != 0) return error.ChmodFailed;
+
+    var buf: [160]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&buf, "{s}/sub/server.sock", .{root});
+
+    // The reviewer's `/nonexistent-root-dir/x/server.sock`, reachable without
+    // being root: `makeDirPath` cannot create `sub`, so nothing could ever
+    // open `sub/daemon.log`. Before this the answer was `NoServer` after the
+    // full five seconds, naming a log that does not exist.
+    const before = sys.monotonicNs();
+    try testing.expectError(error.StateDirUnwritable, ensure(path, .{
+        .exe = "/usr/bin/true",
+        .startup_timeout_ns = 5 * std.time.ns_per_s,
+    }));
+    try testing.expect(sys.monotonicNs() - before < std.time.ns_per_s);
+}
+
+test "ensure refuses to start a daemon on a relative socket path" {
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var buf: [96]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&buf, "illogical-rel-{d}.sock", .{std.c.getpid()});
+
+    // The daemon `chdir`s to `/`, so a relative path here means it binds
+    // somewhere the caller will never look, and the caller waits out the whole
+    // startup timeout for a socket that will never appear where it asked.
+    try testing.expectError(error.SocketPathNotAbsolute, ensure(path, .{ .exe = "/usr/bin/true" }));
+
+    // And nothing was written on the way to finding that out.
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, "daemon.log", .{}));
 }

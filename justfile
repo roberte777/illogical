@@ -8,6 +8,14 @@
 # them per-recipe instead of dropping them from the devshell.
 xcenv := "env -u LD -u CC -u CXX -u AR -u NM -u RANLIB -u STRIP -u SDKROOT -u DEVELOPER_DIR -u MACOSX_DEPLOYMENT_TARGET -u LD_DYLD_PATH"
 
+# The vendor/ghostty revision the binaries are built against, stamped into
+# `--version` and into the `server` field of every `welcome` frame. It is what
+# decides whether two builds agree about a snapshot -- format v1 promises
+# nothing across pins -- so the Mac client can only notice a mismatched daemon
+# if the pin is in the string. `unknown` on a tree whose submodule is not
+# checked out, where the compile is about to fail for a better reason anyway.
+ghostty_pin := `git -C vendor/ghostty rev-parse --short=12 HEAD 2>/dev/null || echo unknown`
+
 default:
     @just --list
 
@@ -15,15 +23,20 @@ default:
 
 # Build illogicald + illogical.
 build:
-    zig build
+    zig build -Dghostty-pin={{ghostty_pin}}
 
 # Build with optimizations.
 build-release:
-    zig build -Doptimize=ReleaseFast
+    zig build -Doptimize=ReleaseFast -Dghostty-pin={{ghostty_pin}}
 
 # Run the whole Zig test suite.
 test:
     zig build test
+
+# The G1 proof, at the level the unit tests cannot reach: a daemon started by
+# `--ensure` survives its starter's whole process group being SIGKILLed.
+smoke-ensure: build
+    ./scripts/smoke-ensure.sh
 
 # Run illogicald in the foreground.
 serve *ARGS:
@@ -110,7 +123,7 @@ fmt-swift:
 # --- housekeeping -----------------------------------------------------------
 
 # Everything CI runs.
-ci: fmt-check test test-swift
+ci: fmt-check test smoke-ensure test-swift
 
 clean:
     rm -rf zig-out .zig-cache zig-pkg

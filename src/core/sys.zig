@@ -48,6 +48,9 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 extern "c" fn pipe(fds: *[2]fd_t) c_int;
 extern "c" fn getdtablesize() c_int;
 extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
+extern "c" fn getsid(pid: pid_t) pid_t;
+extern "c" fn getpgid(pid: pid_t) pid_t;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, size: usize) isize;
 extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
@@ -241,6 +244,27 @@ pub fn makeDirPath(path: []const u8) void {
         buf[i] = saved;
     }
 }
+
+/// `access(dir, W_OK | X_OK)`: whether this process could create a file in
+/// `dir`.
+///
+/// Only ever asked before a fork, and only to fail fast. It is a real-uid
+/// check and it races anything that chmods the directory a microsecond later,
+/// neither of which matters for that: the caller that gets `true` here still
+/// has to handle the open failing, and the caller that gets `false` has saved
+/// a person ten seconds of watching a spinner.
+pub fn isWritableDir(path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len == 0 or path.len >= buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    // X_OK as well as W_OK: a directory that cannot be searched cannot have a
+    // file created in it either, whatever its write bit says.
+    return access(@ptrCast(&buf), W_OK | X_OK) == 0;
+}
+
+const W_OK: c_int = 2;
+const X_OK: c_int = 1;
 
 /// Turn non-blocking mode on or off.
 ///
@@ -496,6 +520,20 @@ pub fn chdirPath(path: [*:0]const u8) void {
 
 pub fn newSession() bool {
     return setsid() >= 0;
+}
+
+/// The session id of `pid`, or of this process for 0. Negative on failure.
+///
+/// Here so that `setsid()` in `spawnDetached` has an assertion a unit test can
+/// make: a session id is a deterministic fact about a process, unlike the
+/// timing games the alternatives need.
+pub fn sessionOf(pid: pid_t) pid_t {
+    return getsid(pid);
+}
+
+/// The process group of `pid`, or of this process for 0. Negative on failure.
+pub fn processGroupOf(pid: pid_t) pid_t {
+    return getpgid(pid);
 }
 
 pub const SIGHUP: c_int = 1;

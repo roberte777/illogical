@@ -87,6 +87,12 @@ jobs:
 
       - run: nix develop -c just test
 
+      # The G1 proof, on every PR rather than only when someone remembers to
+      # run it. `zig build test` stayed green with `setsid()` deleted; this
+      # script did not (REVIEW F5). On Linux it is also the only place the
+      # built binary's `--ensure` -> `list` path is executed before a release.
+      - run: nix develop -c just smoke-ensure
+
   # `just test-swift`: IllogicalKit is pure Swift and builds without the
   # XCFramework, so this needs neither the submodule nor a generated
   # .xcodeproj. Package.swift declares swift-tools-version 6.2, which is why
