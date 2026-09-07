@@ -333,19 +333,23 @@ shell level: SIGKILL the starter's whole process group, and the daemon keeps
 answering.
 
 **P2 — the server is one binary, embedded for local use and shippable
-standalone.** One source tree and one ghostty pin in both places today; not yet
-one set of bytes. `just stage-daemon` embeds the Debug host-arch binary from
-`just build`, which is what the dev loop wants, while `just dist-daemon
-universal` produces ReleaseFast, stripped and lipo'd. They become the same build
-when #47's app job stages the release workflow's `macos-universal` artifact
-instead of `zig-out`. Until then, installing the release tarball and starting it
-by hand under a dev app shows the version-skew marker — correctly: it really is
-a different build of the same commit.
+standalone.** One source tree, one ghostty pin, and — in a release — one set of
+bytes. The app job stages the `macos-universal` artifact the daemon job just
+built, so the `illogicald` inside the bundle and the one in the tarball beside
+it are the same file. `ILLOGICAL_DAEMON_BIN` is what selects that: set, `just
+stage-daemon` copies a prebuilt binary; unset, it falls back to `zig build`,
+which is what the dev loop wants.
+
+That fallback is the remaining way to see the version-skew marker, and it is
+still correct when you do: a dev app against an installed release daemon really
+is a different build of the same commit.
 
 | | Work |
 | --- | --- |
 | ✅ | `just dist-daemon` / `just dist` — ReleaseFast, stripped, tarred |
-| ✅ | `.github/workflows/release.yml` — tag-triggered, three targets, every artifact smoke-run on the machine that built it |
+| ✅ | `.github/workflows/release.yml` — rolling `latest` on every green merge, `v*` for a release that stops moving |
+| ✅ | `just dist-app` — the app as a DMG, signed and notarized when the Developer ID secrets exist |
+| ✅ | The bundle carries the release daemon, not a second build of it — checked with `lipo -archs` before it is packaged |
 | ✅ | `apple_sdk` from the ghostty submodule, so `-Dtarget=x86_64-macos` compiles at all |
 
 Two findings worth keeping:

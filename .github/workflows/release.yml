@@ -1,41 +1,136 @@
 name: Release
 
-# The server ships on its own. A tag builds `illogicald` and the `illogical`
-# CLI for macOS (universal), Linux x86_64 and Linux aarch64, smoke-runs every
-# artifact on the machine that built it, and publishes the tarballs plus
-# SHA256SUMS to the release.
+# Everything a person installs, built and published from one place: the Mac app
+# as a signed, notarized DMG, and `illogicald` plus the `illogical` CLI as
+# tarballs for macOS (universal), Linux x86_64 and Linux aarch64.
 #
-# The macOS artifact is *not yet* what the Mac app embeds. `just stage-daemon`
-# copies the Debug host-arch binary from `just build`, which is the dev loop;
-# this job produces ReleaseFast, stripped and lipo'd. Same source, same ghostty
-# pin, different bytes — so the app's version marker calls a release daemon
-# under a dev app skew, which it is. They become one build when #47's app job
-# stages the `macos-universal` artifact from here instead of `zig-out`, which is
-# what "one server, embedded for local use and shippable standalone" needs to
-# actually mean the same binary.
+# ## Two channels, one pipeline
+#
+# **`latest`** — every merge to main, once CI is green. A rolling prerelease
+# whose tag is moved to each new commit, so the download URLs in the README are
+# permanent and always point at the newest build. This is the channel that
+# exists today: there are no version numbers to speak of yet, and asking
+# somebody to pick a release when there has only ever been one is ceremony
+# around nothing.
+#
+# **`v*`** — a tag builds the same artifacts and publishes them as a real,
+# non-prerelease GitHub release, which stops moving. Nothing needs to change
+# here when the first one is cut; the tag is the whole difference.
+#
+# The trigger for `latest` is `workflow_run` on CI rather than `push`, so a
+# merge that broke the build does not replace a working download with one that
+# does not run. `push` would race CI and win about half the time.
+#
+# ## The app and the server are one build
+#
+# The macOS daemon tarball is built first and the app job *stages that exact
+# binary* into the bundle rather than building its own. They were two builds of
+# one source -- Debug host-arch inside the app, ReleaseFast universal in the
+# tarball -- which meant an Intel Mac got a bundle whose daemon could not run,
+# and every app reported version skew against the tarball beside it. Same
+# bytes, one build, both places.
 #
 # Linux is built *natively* rather than cross-compiled from the macOS job.
 # Cross-compiling to musl works at the current ghostty pin (and `just dist`
 # does exactly that locally), but a native build gets the smoke run for free,
 # the Linux runners and their warm zig cache already exist in ci.yml, and the
 # aarch64 leg is the only place the epoll poller is ever exercised on ARM.
+#
+# ## Signing
+#
+# The DMG is signed and notarized when the Developer ID secrets are set, and
+# built ad-hoc signed when they are not -- see scripts/dist-app.sh for the list
+# and for what each one buys. The pipeline is the same either way, so the
+# packaging path is exercised on every run rather than only once a certificate
+# exists. Until those secrets are set the DMG is a build artifact rather than
+# something to hand anybody, and the release notes say so.
 
 on:
+  # Green CI on main. `workflow_run` fires on completion whatever the
+  # conclusion, so the `success` check is in `setup` below rather than here.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   push:
     tags: ["v*"]
   workflow_dispatch:
 
-# Never cancelled: a half-published release is worse than a slow one.
+# Never cancelled: a half-published release is worse than a slow one. Not keyed
+# on the ref either -- two merges landing a minute apart are two runs racing to
+# move one tag, and the loser wins about as often as not.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  # What is being built, what it is called, and whether it gets published.
+  # Every other job reads these rather than re-deriving them from the event,
+  # which is what kept the tag and the version out of step.
+  setup:
+    name: setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # A CI run that failed, or one on a fork, must not publish. Tag pushes and
+    # manual dispatches have no workflow_run to check.
+    if: |
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      # `workflow_run` starts from the default branch, not from the commit CI
+      # ran on. Everything downstream checks out `sha` explicitly for the same
+      # reason: a merge that lands while this is running would otherwise be
+      # built halfway.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve the channel
+        id: resolve
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            # A real release. The tag names it and it does not move again.
+            tag="$GITHUB_REF_NAME"
+            version="${tag#v}"
+            prerelease=false
+            publish=true
+          else
+            # The rolling one. `git describe` rather than the bare sha so the
+            # version still says how far past the last tag this is, which is
+            # the only ordering information available before there are tags.
+            tag="latest"
+            version="$(git describe --tags --always 2>/dev/null || echo 0.0.0)"
+            version="${version#v}"
+            prerelease=true
+            # A manual dispatch builds everything and publishes nothing, so the
+            # pipeline can be exercised without moving a tag people download.
+            publish=${{ github.event_name == 'workflow_run' }}
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+          echo "building $version as '$tag' (prerelease=$prerelease, publish=$publish)"
+
   daemon:
     name: illogicald (${{ matrix.label }})
+    needs: setup
     runs-on: ${{ matrix.os }}
     # A cold `zig build` of three targets is minutes, not tens of them. The
     # bound is here so a hung build fails the release rather than holding a
@@ -57,6 +152,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The commit `setup` resolved, not whatever main points at now.
+          ref: ${{ needs.setup.outputs.sha }}
           # build.zig resolves ghostty-vt out of the submodule and returns null
           # without it, which builds an illogicald missing its terminal rather
           # than failing.
@@ -83,8 +180,11 @@ jobs:
             zig-global-${{ matrix.os }}-${{ steps.pin.outputs.sha }}-
             zig-global-${{ matrix.os }}-
 
+      # The version is passed rather than left to the script's own `git
+      # describe`, so all four artifacts in a release agree about what they
+      # are -- including the DMG, which is built on a different runner.
       - name: Build
-        run: nix develop -c just dist-daemon ${{ matrix.target }}
+        run: nix develop -c just dist-daemon ${{ matrix.target }} ${{ needs.setup.outputs.version }}
 
       # The artifact that was just built, run on the machine that built it. A
       # release whose binaries have never been executed is a release nobody has
@@ -121,26 +221,163 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  # The Mac app: the thing most people will actually install.
+  app:
+    name: Illogical.dmg
+    # The macOS daemon tarball, because the bundle carries that exact binary
+    # rather than a second build of it.
+    needs: [setup, daemon]
+    runs-on: macos-26
+    # The build is ~15m; the two notarization waits are Apple's and are usually
+    # a few minutes each but have no upper bound worth trusting.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.setup.outputs.sha }}
+          # The XCFramework is built from the submodule, so this one needs it
+          # for the same reason the daemon job does.
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Resolve the ghostty pin
+        id: pin
+        run: echo "sha=$(git rev-parse HEAD:vendor/ghostty)" >> "$GITHUB_OUTPUT"
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: accept-flake-config = true
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/global
+          key: zig-global-macos-26-${{ steps.pin.outputs.sha }}-${{ hashFiles('build.zig.zon', 'flake.lock') }}
+          restore-keys: |
+            zig-global-macos-26-${{ steps.pin.outputs.sha }}-
+            zig-global-macos-26-
+
+      # Shaders.metal compiles into the bundle's default.metallib, and since
+      # Xcode 16 the Metal compiler is a separate download that the runner
+      # image does not carry. Without it the app target fails to build at all.
+      - name: Download the Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      # Universal, not native: an arm64-only XCFramework cannot link the
+      # x86_64 slice of the app, and `app-release` builds both.
+      - name: Build the XCFramework
+        run: nix develop -c just xcframework universal
+
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: illogicald-macos-universal
+          path: ${{ runner.temp }}/daemon
+
+      - name: Unpack the daemon the bundle will carry
+        id: daemon
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/daemon"
+          tar -xzf "$out"/illogicald-macos-universal.tar.gz -C "$out"
+          # Proof it is the universal one before it goes into a bundle that
+          # claims to run everywhere. `lipo -archs` prints the slices; an
+          # arm64-only daemon here is an app that half its users cannot use,
+          # and nothing downstream would notice.
+          archs="$(lipo -archs "$out/illogicald")"
+          echo "illogicald: $archs"
+          case "$archs" in
+            *arm64*x86_64* | *x86_64*arm64*) ;;
+            *) echo "error: expected a universal illogicald, got '$archs'" >&2; exit 1 ;;
+          esac
+          echo "bin=$out/illogicald" >> "$GITHUB_OUTPUT"
+
+      # xcodegen names the staged directory as a source and refuses to generate
+      # against a path that is not there, so the daemon is staged first.
+      - name: Generate the project
+        env:
+          ILLOGICAL_DAEMON_BIN: ${{ steps.daemon.outputs.bin }}
+        run: nix develop -c just xcodeproj
+
+      - name: Build, sign, notarize and package
+        env:
+          ILLOGICAL_DAEMON_BIN: ${{ steps.daemon.outputs.bin }}
+          # Absent on a fork or before the certificate exists. dist-app.sh
+          # builds an ad-hoc signed DMG in that case and says so loudly.
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_CERTIFICATE_NAME: ${{ secrets.MACOS_CERTIFICATE_NAME }}
+          MACOS_KEYCHAIN_PWD: ${{ secrets.MACOS_KEYCHAIN_PWD }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        # Under `nix develop` like every other recipe -- `just` itself comes
+        # from the devshell. The devshell also exports SDKROOT, LD and CC for
+        # zig, which xcodebuild reads as build-setting overrides and xcrun
+        # reads as an SDK; the `xcenv` wrapper on both `app-release` and
+        # `dist-app` is what strips them back off.
+        run: nix develop -c just dist-app ${{ needs.setup.outputs.version }}
+
+      # The app that was just packaged, launched on the machine that built it.
+      # Every check above is about the signature; this one is about whether it
+      # runs -- a bundle can be perfectly signed and still crash on launch
+      # because a dylib it needs was never embedded.
+      - name: Smoke-run the packaged app
+        run: |
+          set -euo pipefail
+          mnt="$RUNNER_TEMP/mnt"
+          hdiutil attach dist/Illogical.dmg -mountpoint "$mnt" -nobrowse -quiet
+
+          app="$mnt/Illogical.app"
+          # Universal, for the same reason the daemon is checked above.
+          archs="$(lipo -archs "$app/Contents/MacOS/Illogical")"
+          echo "Illogical: $archs"
+          case "$archs" in
+            *arm64*x86_64* | *x86_64*arm64*) ;;
+            *) echo "error: expected a universal app, got '$archs'" >&2; exit 1 ;;
+          esac
+
+          # The signature, whatever it is, must at least be internally
+          # consistent -- this catches a bundle modified after signing, which
+          # is the failure the staging order exists to prevent.
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          # The embedded daemon is the reason the app works on first launch,
+          # so it has to be there and it has to run.
+          "$app/Contents/MacOS/illogicald" --version
+
+          hdiutil detach "$mnt" -quiet
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: illogical-dmg
+          path: dist/*.dmg
+          if-no-files-found: error
+
   # Only this job can write, and it is the only one that needs to.
   release:
     name: publish
-    needs: daemon
+    needs: [setup, daemon, app]
     runs-on: ubuntu-24.04
-    # A manual run builds and smoke-runs everything and publishes nothing;
-    # there is no release to publish to.
-    if: startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 15
+    # A manual dispatch builds and smoke-runs everything and publishes nothing,
+    # so the whole pipeline can be exercised without moving a tag people
+    # download.
+    if: needs.setup.outputs.publish == 'true'
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.setup.outputs.sha }}
+
       - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           path: dist
-          pattern: illogicald-*
+          pattern: illogical*
           merge-multiple: true
 
       # Rebuilt here rather than taken from any one job's dist/, so the file
-      # covers all three tarballs and its hashes are over the bytes actually
-      # being published.
+      # covers every artifact and its hashes are over the bytes actually being
+      # published.
       - name: Checksums
         working-directory: dist
         run: |
@@ -149,23 +386,76 @@ jobs:
           # Bare names, not `./name`: `sha256sum -c SHA256SUMS` compares the
           # path as written, and `./illogicald-linux-x86_64.tar.gz` does not
           # match the file somebody downloaded under its own name.
-          sha256sum -- *.tar.gz > SHA256SUMS
+          sha256sum -- *.tar.gz *.dmg > SHA256SUMS
           cat SHA256SUMS
+
+      # The rolling tag has to be moved before the release is touched: `gh
+      # release create` against a tag that does not exist creates it at the
+      # default branch's head, which is *usually* this commit and is exactly
+      # wrong the one time it is not.
+      - name: Move the rolling tag
+        if: needs.setup.outputs.tag == 'latest'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -fa latest -m "Latest build from main" "${{ needs.setup.outputs.sha }}"
+          git push --force origin latest
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.setup.outputs.tag }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          PRERELEASE: ${{ needs.setup.outputs.prerelease }}
+          SIGNED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.APPLE_API_KEY != '' }}
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          # Created only if it is not there. `|| true` on the create swallowed
-          # an auth or permission failure too, and the upload below then failed
-          # with "release not found" — which sends whoever is reading the log
-          # to entirely the wrong place.
-          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
-              --title "$tag" --generate-notes --verify-tag
+
+          # The rolling release's notes are rewritten each time, because the
+          # release itself is not an event -- it is a pointer at whatever main
+          # is now, and notes describing the commit before it are worse than
+          # none. A tagged release keeps GitHub's generated changelog.
+          if [ "$TAG" = "latest" ]; then
+            notes="$(cat <<EOF
+          The newest build from \`main\`, rebuilt on every merge. Version \`$VERSION\`, commit ${{ needs.setup.outputs.sha }}.
+
+          **Install the Mac app:** download \`Illogical.dmg\`, open it, drag Illogical to Applications. The server is inside the app and starts itself; there is nothing else to install.
+
+          **Install the server on another box:** take the tarball for its platform, and put \`illogicald\` and \`illogical\` on a \`PATH\`.
+
+          This tag moves. For something that does not, wait for a \`v\` release.
+          EOF
+          )"
+            if [ "$SIGNED" != "true" ]; then
+              notes="$notes
+
+          > **The DMG is not signed or notarized yet.** macOS will refuse to open it normally: right-click Illogical → Open, once, to get past Gatekeeper. Tracked in #47."
+            fi
+            # Edited in place rather than deleted and recreated. Both end up
+            # with the right notes; only this one has no window in which the
+            # URLs in the README 404, and a rolling release is the one people
+            # are most likely to be downloading exactly when it is rebuilt.
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --title "Latest" --notes "$notes" --prerelease \
+                --target "${{ needs.setup.outputs.sha }}"
+            else
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --title "Latest" --notes "$notes" --prerelease \
+                --target "${{ needs.setup.outputs.sha }}"
+            fi
+          else
+            # Created only if it is not there. `|| true` on the create
+            # swallowed an auth or permission failure too, and the upload below
+            # then failed with "release not found" — which sends whoever is
+            # reading the log to entirely the wrong place.
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --title "$TAG" --generate-notes --verify-tag
+          fi
+
           # `--clobber` so re-running a failed publish replaces the assets it
           # already uploaded rather than refusing.
-          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
-            dist/*.tar.gz dist/SHA256SUMS
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            dist/*.tar.gz dist/*.dmg dist/SHA256SUMS
