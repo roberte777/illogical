@@ -1,5 +1,7 @@
 # illogical
 
+[![CI](https://github.com/roberte777/illogical/actions/workflows/ci.yml/badge.svg)](https://github.com/roberte777/illogical/actions/workflows/ci.yml)
+
 A terminal multiplexer with persistent sessions, built on
 [libghostty-vt](https://github.com/ghostty-org/ghostty).
 
