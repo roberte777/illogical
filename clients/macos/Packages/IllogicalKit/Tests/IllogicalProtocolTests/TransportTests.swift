@@ -456,6 +456,31 @@ struct TransportTests {
         let throughCycle = cycle.appending(path: "ssh").path
         #expect(reasonFor(throughCycle) == "\(throughCycle) is a loop of symlinks")
 
+        // A component longer than a filesystem allows. Nothing is created --
+        // the name cannot exist, which is the point.
+        let tooLong = root.appending(path: String(repeating: "a", count: 300)).path
+        #expect(reasonFor(tooLong) == "\(tooLong) is too long a path to open")
+
+        // A symlink whose target is fine but unreachable is not "broken". The
+        // link resolves, the directory above the target does not.
+        if geteuid() != 0 {
+            let shut = root.appending(path: "shut")
+            let behind = shut.appending(path: "ssh").path
+            try FileManager.default.createDirectory(at: shut, withIntermediateDirectories: true)
+            #expect(
+                FileManager.default.createFile(
+                    atPath: behind, contents: Data(), attributes: [.posixPermissions: 0o755]))
+            let via = root.appending(path: "via").path
+            try FileManager.default.createSymbolicLink(atPath: via, withDestinationPath: behind)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o000], ofItemAtPath: shut.path)
+            defer {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o755], ofItemAtPath: shut.path)
+            }
+            #expect(reasonFor(via) == "\(via) points into a directory that cannot be searched")
+        }
+
         // And none of it is an NSError dump.
         for path in [notExecutable, absent, root.path, notAProgram] {
             let text = try #require(reasonFor(path))
@@ -497,6 +522,28 @@ struct TransportTests {
         }
         #expect(!classify(NSCocoaErrorDomain, 4).isTransient)
         #expect(!classify(NSCocoaErrorDomain, 257).isTransient)
+
+        // Darwin's own exec refusals. Every one is about the image and none
+        // survives waiting -- `EBADARCH` is an Intel-only build on Apple
+        // Silicon with no Rosetta, which is an ordinary way for a Homebrew
+        // `ssh` to stop working after a machine move. Left out of the set,
+        // they fell through to "retry every thirty seconds, forever".
+        for code in [EBADEXEC, EBADARCH, ESHLIBVERS, EBADMACHO] {
+            #expect(!classify(NSPOSIXErrorDomain, code).isTransient, "errno \(code)")
+        }
+        // ...and each says which, rather than all sharing one sentence. The
+        // path here exists and is executable, so these reach `imageReason`.
+        #expect(
+            String(describing: classify(NSPOSIXErrorDomain, EBADARCH))
+                == "ssh is built for another processor")
+        #expect(
+            String(describing: classify(NSPOSIXErrorDomain, ESHLIBVERS))
+                == "ssh needs a library version that is not installed")
+        #expect(
+            String(describing: classify(NSPOSIXErrorDomain, EBADMACHO))
+                == "ssh is not a valid executable")
+        // The fallthrough, which had no assertion at all.
+        #expect(String(describing: classify(NSPOSIXErrorDomain, EISDIR)) == "ssh cannot be run")
     }
 
     /// `close()` is called from the main actor, once per pane. Blocking there

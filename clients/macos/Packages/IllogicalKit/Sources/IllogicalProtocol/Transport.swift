@@ -242,76 +242,126 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// dropdown and, when it is the only host, the full-window message. It is
     /// also what decides whether the host is retried at all.
     ///
+    /// The errno chooses the *branch*; the filesystem chooses the wording and
+    /// can still send a case back to retryable. That last part matters: the
+    /// permanent branch is entered on `NSCocoaErrorDomain` 4, which Foundation
+    /// raises whenever its `isExecutableFile` pre-check fails — including when
+    /// the check failed because a network volume stopped answering, which is
+    /// the most retryable thing there is.
+    ///
     /// Unrecognised failures are transient. Retrying something permanent costs
     /// one connection attempt every thirty seconds; giving up on something
     /// temporary costs the machine for the life of the process.
     static func spawnError(_ error: Error, command: String, path: String) -> TransportError {
         let ns = error as NSError
-        let permanent: Set<Int32> = [ENOENT, EACCES, ENOEXEC, EISDIR, ENAMETOOLONG, ELOOP]
+        let permanent: Set<Int32> = [
+            ENOENT, EACCES, ENOEXEC, EISDIR, ENOTDIR, ENAMETOOLONG, ELOOP,
+            // Darwin's own exec refusals, every one of them about the image
+            // and none of them survivable by waiting. `EBADARCH` is an
+            // Intel-only build on Apple Silicon with no Rosetta -- an ordinary
+            // way for a Homebrew `ssh` to stop working after a machine move.
+            EBADEXEC, EBADARCH, ESHLIBVERS, EBADMACHO,
+        ]
         let isPermanent =
             (ns.domain == NSCocoaErrorDomain && (ns.code == 4 || ns.code == 257))
             || (ns.domain == NSPOSIXErrorDomain && permanent.contains(Int32(ns.code)))
         guard isPermanent else {
             return .spawnFailed(command: command, reason: ns.localizedDescription)
         }
-        return .notExecutable(command: command, reason: whyNotRunnable(path, ns))
+
+        let verdict = whyNotRunnable(path, ns)
+        return verdict.retryable
+            ? .spawnFailed(command: command, reason: verdict.reason)
+            : .notExecutable(command: command, reason: verdict.reason)
     }
 
-    /// Why a file that exists in somebody's config cannot be run, asked of the
-    /// filesystem rather than of the error.
+    /// Why a file named in somebody's config cannot be run, asked of the
+    /// filesystem rather than of the error, and whether waiting could help.
     ///
-    /// The error cannot answer it. Foundation pre-checks `isExecutableFile`
-    /// and collapses missing, present-but-not-executable, unreadable,
-    /// unsearchable-parent, too-long and symlink-loop into a single
-    /// `NSCocoaErrorDomain` 4 whose sentence is "The file … doesn't exist." —
-    /// true for one of those and false for the rest. Only what survives that
-    /// pre-check reaches `posix_spawn` and arrives with a real errno, and even
-    /// then a directory comes back `EACCES` rather than `EISDIR`. Deriving the
-    /// wording from the code therefore tells a user with a `chmod +x` problem
-    /// to go looking for a missing file, or the reverse — which is the whole
-    /// complaint this function exists to answer, so it asks `stat` instead.
+    /// The error cannot answer either question. Foundation pre-checks
+    /// `isExecutableFile` and collapses missing, present-but-not-executable,
+    /// unreadable, unsearchable-parent, too-long, symlink-loop *and a
+    /// stalled network mount* into a single `NSCocoaErrorDomain` 4 whose
+    /// sentence is "The file … doesn't exist." — true for one of them.
     ///
     /// The app is not sandboxed, so these calls see what the spawn saw.
-    private static func whyNotRunnable(_ path: String, _ ns: NSError) -> String {
-        // `stat` directly rather than `FileManager.fileExists`, which answers
-        // false for *any* failure and keeps the reason to itself. Reporting
-        // "is not there" for all of them would tell somebody whose `ls` shows
-        // the binary that it is absent -- the whole complaint this function
-        // exists to end, reached by a rarer door.
+    private static func whyNotRunnable(
+        _ path: String, _ ns: NSError
+    ) -> (reason: String, retryable: Bool) {
         var followed = stat()
         if stat(path, &followed) == 0 {
-            if (followed.st_mode & S_IFMT) == S_IFDIR { return "is a directory" }
+            if (followed.st_mode & S_IFMT) == S_IFDIR { return ("is a directory", false) }
             if !FileManager.default.isExecutableFile(atPath: path) {
-                return "is not executable"
+                return ("is not executable", false)
             }
             // Present, and the execute bit is on, so the objection is to the
             // image: not a program, or built for another architecture.
-            if ns.domain == NSPOSIXErrorDomain, ns.code == Int(ENOEXEC) {
-                return "is not a program"
-            }
-            return "cannot be run"
+            return (imageReason(ns), false)
         }
         let followError = errno
 
         // Following the path failed. `lstat` says whether the entry itself is
-        // there, which separates "the link is unresolvable" from "the path to
-        // it is". Measured, because the two are easy to get backwards: a
-        // self-referential symlink is `stat` ELOOP and `lstat` OK, while a
+        // there, which separates "what it points at is unreachable" from "the
+        // path to it is". Measured, because the two are easy to get backwards:
+        // a self-referential symlink is `stat` ELOOP and `lstat` OK, while a
         // loop in a *parent* component fails both.
         var entry = stat()
-        if lstat(path, &entry) == 0 {
-            return followError == ELOOP ? "is a loop of symlinks" : "is a broken symlink"
+        if lstat(path, &entry) == 0 { return targetReason(followError) }
+        return pathReason(errno)
+    }
+
+    /// The image itself was refused. Darwin distinguishes these; `ENOEXEC` is
+    /// the generic one.
+    private static func imageReason(_ ns: NSError) -> String {
+        guard ns.domain == NSPOSIXErrorDomain else { return "cannot be run" }
+        switch Int32(ns.code) {
+        case ENOEXEC: return "is not a program"
+        case EBADARCH: return "is built for another processor"
+        case ESHLIBVERS: return "needs a library version that is not installed"
+        case EBADEXEC, EBADMACHO: return "is not a valid executable"
+        default: return "cannot be run"
         }
-        switch errno {
-        case EACCES: return "is in a directory that cannot be searched"
+    }
+
+    /// The entry is there and resolving it failed, so the sentence is about
+    /// what it *points at*. Written out rather than composed from
+    /// `pathReason`: "points at what is a loop of symlinks" is what assembling
+    /// them gets you, and the preposition differs per case anyway.
+    ///
+    /// A link that resolves to nothing is broken. A link whose target merely
+    /// cannot be reached is not, and calling it broken sends somebody to
+    /// inspect a symlink that is perfectly fine.
+    private static func targetReason(_ code: Int32) -> (reason: String, retryable: Bool) {
+        switch code {
+        case ENOENT: return ("is a broken symlink", false)
+        case ELOOP: return ("is a loop of symlinks", false)
+        case EACCES: return ("points into a directory that cannot be searched", false)
+        case ENOTDIR: return ("points under something that is not a directory", false)
+        case ENAMETOOLONG: return ("points at too long a path to open", false)
+        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENETDOWN, ENETUNREACH:
+            return ("points at a volume that is not responding", true)
+        default: return ("is a broken symlink", false)
+        }
+    }
+
+    /// Why a path could not be walked, and whether that is worth retrying.
+    private static func pathReason(_ code: Int32) -> (reason: String, retryable: Bool) {
+        switch code {
+        case EACCES: return ("is in a directory that cannot be searched", false)
         // Not the same fault, and not the same advice: there is no
-        // unsearchable directory to go and look at, because a component of the
-        // path is not a directory at all. `/usr/local/bin/ssh` where
+        // unsearchable directory to go and look at, because a component of
+        // the path is not a directory at all -- `/usr/local/bin/ssh` where
         // `/usr/local/bin` is a leftover regular file.
-        case ENOTDIR: return "is under something that is not a directory"
-        case ELOOP: return "is a loop of symlinks"
-        case ENAMETOOLONG: return "is too long a path to open"
-        default: return "is not there"
+        case ENOTDIR: return ("is under something that is not a directory", false)
+        case ELOOP: return ("is a loop of symlinks", false)
+        case ENAMETOOLONG: return ("is too long a path to open", false)
+        // A volume that stopped answering is the most retryable failure there
+        // is, and it arrives here wearing the same Cocoa code as a missing
+        // file. Calling it permanent means a laptop that lost its NAS never
+        // reconnects that host again, and is told the binary is absent.
+        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENETDOWN, ENETUNREACH:
+            return ("is on a volume that is not responding", true)
+        default: return ("is not there", false)
         }
     }
 
