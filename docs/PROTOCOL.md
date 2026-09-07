@@ -240,6 +240,57 @@ document.
 No listening TCP socket, no TLS, no authentication of our own. Access to the
 socket is filesystem permissions; remote access is whatever SSH decided.
 
+### `--stdio` is a bridge, not a server
+
+⚠ The process SSH starts owns **no terminals**. It connects to the host's own
+long-lived daemon — starting one, detached, if there is none — and splices bytes
+between that socket and the pipe SSH gave it
+([`src/daemon/stdio.zig`](../src/daemon/stdio.zig)).
+
+```
+         ssh dest illogicald --stdio
+client ────────────────────────────► bridge ──────► illogicald
+                                  one per session   one per host
+```
+
+It has to be this way round. A server started by SSH would die with the SSH
+session and take every terminal in it, which is the one thing this project
+exists to prevent.
+
+Nothing in the bridge parses a frame. The protocol is a byte stream over a
+reliable, ordered transport and a splice preserves it exactly, so the bridge
+cannot desynchronize a client no matter what the two ends say to each other —
+and a `snapshot_chunk` crossing it costs one copy rather than a decode and a
+re-encode. The test pushes a maximum-size frame through and compares it byte for
+byte.
+
+Two consequences worth stating:
+
+- **The remote daemon prints nothing on stdout.** That descriptor is the client's
+  frame stream. A daemon the bridge starts gets `/dev/null` for all three
+  standard streams and refuses to exec if it cannot get it — injected text would
+  reach the client as a malformed frame. Diagnostics go to stderr, which SSH
+  keeps on a channel of its own.
+- **Two bridges arriving together do not start two daemons.** `Server.listen`
+  probes the socket first and returns `AlreadyRunning` rather than unlinking a
+  live daemon's socket out from under it, which would have left every terminal
+  behind that daemon alive and unreachable.
+
+### Multiplexing SSH
+
+One connection per terminal means a window with four splits opens five SSH
+connections to that host. So the client asks for `ControlMaster=auto` with a
+`ControlPath` under `~/.ssh`: the four after the first cost a channel rather than
+a handshake, and `ControlPersist` keeps the master briefly after the last one
+closes. If the rendered path would not fit in a unix socket name the option is
+dropped rather than passed and warned about on every connection.
+
+`ServerAliveInterval=15` with `ServerAliveCountMax=3` is what turns a dead
+network into a *closed connection*, in about forty-five seconds. Without it a
+client on a laptop that changed networks waits indefinitely on a socket nobody
+is on the other end of. The client turns the close into a reconnect, which is
+the same path as any other desync.
+
 ## Open questions
 
 - **Resize with disagreeing clients.** The terminal has one size; clients may

@@ -27,8 +27,16 @@ const usage =
     \\
     \\Options:
     \\  --socket <path>          Control socket to connect to
+    \\  --host <ssh-dest>        Talk to the daemon on another machine, through
+    \\                           `ssh <dest> illogicald --stdio`. Anything ssh
+    \\                           accepts works, including a Host alias.
+    \\  --remote-bin <path>      The daemon to run there (default: illogicald)
     \\  --version                Print version and exit
     \\  --help                   Print this help and exit
+    \\
+    \\Environment:
+    \\  ILLOGICAL_SOCK           Default control socket
+    \\  ILLOGICAL_SSH            The ssh to run for --host (default: ssh)
     \\
 ;
 
@@ -49,6 +57,8 @@ pub fn main(init: std.process.Init) !void {
 
     // Global options may appear anywhere.
     var socket_path: ?[]const u8 = null;
+    var host: ?[]const u8 = null;
+    var remote_bin: []const u8 = "illogicald";
     var rest: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -56,6 +66,16 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--socket") and i + 1 < args.len) {
             i += 1;
             socket_path = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--host") and i + 1 < args.len) {
+            i += 1;
+            host = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--remote-bin") and i + 1 < args.len) {
+            i += 1;
+            remote_bin = args[i];
             continue;
         }
         try rest.append(arena, arg);
@@ -76,18 +96,52 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const path = socket_path orelse try defaultSocketPath(arena);
-    var conn = Conn.connect(gpa, path) catch |err| {
-        try out.print(
-            "illogical: cannot reach a server at {s} ({t})\n" ++
-                "           start one with: illogicald\n",
-            .{ path, err },
-        );
-        try out.flush();
-        return error.NoServer;
+    // A remote daemon is the same protocol over a different pipe. Everything
+    // below this line is identical for both, which is the point of the design:
+    // there is no "remote mode", only a different transport.
+    var conn = if (host) |dest| conn: {
+        // `--socket` still means something remotely: it is the path the far
+        // side's bridge dials, on that machine. Left unset it uses that
+        // machine's default rather than imposing this one's.
+        const remote_argv = try (illogical.conn.Ssh{
+            .destination = dest,
+            .remote_binary = remote_bin,
+            .socket = socket_path,
+            // For a second OpenSSH, and for the tests that stand something
+            // else in its place.
+            .ssh = sys.getenv("ILLOGICAL_SSH") orelse "ssh",
+        }).argv(arena);
+        break :conn illogical.conn.Conn.spawn(gpa, remote_argv) catch |err| {
+            try out.print("illogical: cannot run ssh for {s} ({t})\n", .{ dest, err });
+            try out.flush();
+            return error.NoServer;
+        };
+    } else conn: {
+        const path = socket_path orelse try defaultSocketPath(arena);
+        break :conn Conn.connect(gpa, path) catch |err| {
+            try out.print(
+                "illogical: cannot reach a server at {s} ({t})\n" ++
+                    "           start one with: illogicald\n",
+                .{ path, err },
+            );
+            try out.flush();
+            return error.NoServer;
+        };
     };
     defer conn.deinit();
-    _ = try conn.hello(arena, "illogical-cli");
+
+    _ = conn.hello(arena, "illogical-cli") catch |err| {
+        if (host) |dest| {
+            try out.print(
+                "illogical: no illogicald on {s} ({t})\n" ++
+                    "           it must be on the PATH of a login shell there,\n" ++
+                    "           or named with --remote-bin\n",
+                .{ dest, err },
+            );
+            try out.flush();
+        }
+        return err;
+    };
 
     if (std.mem.eql(u8, cmd, "list")) {
         return cmdList(&conn, arena, out);

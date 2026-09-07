@@ -145,7 +145,24 @@ pub fn listen(self: *Server) !void {
         // If it genuinely is missing, bind reports it clearly enough.
         cwd.createDirPath(self.io, dir) catch {};
     }
-    // A stale socket from a crashed daemon would make bind fail.
+    // A daemon that is already accepting on this socket owns every terminal
+    // behind it, and the unlink below would take its socket away without
+    // taking its terminals: two daemons, one of them unreachable, and a
+    // client's session list quietly missing half of itself.
+    //
+    // This matters now because auto-starting is on a hot path. `illogicald
+    // --stdio` starts a daemon whenever it cannot connect to one, so two SSH
+    // connections arriving together on a machine with no daemon both try. A
+    // probe closes that: it is not a lock, and two daemons could still pass
+    // each other inside the microsecond between this and `bind`, but the case
+    // it does cover is the one that actually happens.
+    if (sys.connectUnix(self.socket_path)) |probe| {
+        sys.closeFd(probe);
+        return error.AlreadyRunning;
+    } else |_| {}
+
+    // A stale socket from a *crashed* daemon, which nothing answers on, would
+    // make bind fail.
     cwd.deleteFile(self.io, self.socket_path) catch {};
 
     const addr = try sys.unixAddr(self.socket_path);
@@ -523,4 +540,49 @@ pub fn defaultSocketPath(alloc: Allocator) ![]u8 {
     }
     const home = getenv("HOME") orelse "/tmp";
     return std.fmt.allocPrint(alloc, "{s}/.local/state/illogical/server.sock", .{home});
+}
+
+test "a second daemon on one socket refuses to start, and leaves the first alone" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var sock_buf: [96]u8 = undefined;
+    const sock_path = try std.fmt.bufPrintZ(
+        &sock_buf,
+        "/tmp/illogical-second-{d}.sock",
+        .{std.c.getpid()},
+    );
+    defer sys.unlinkPath(sock_path.ptr);
+
+    var state_buf: [96]u8 = undefined;
+    const state_root = try std.fmt.bufPrint(
+        &state_buf,
+        "/tmp/illogical-second-state-{d}",
+        .{std.c.getpid()},
+    );
+    defer std.Io.Dir.cwd().deleteTree(io, state_root) catch {};
+
+    const first = try Server.init(gpa, io, sock_path, state_root);
+    defer first.deinit();
+    try first.listen();
+    const accepting = try std.Thread.spawn(.{}, Server.run, .{first});
+    defer accepting.join();
+    defer first.stop();
+
+    // What `illogicald --stdio` does when two SSH connections race to
+    // auto-start a daemon. Before the probe in `listen` this succeeded, and
+    // the winner unlinked the loser's socket while every terminal behind it
+    // stayed alive and unreachable.
+    const second = try Server.init(gpa, io, sock_path, state_root);
+    defer second.deinit();
+    try testing.expectError(error.AlreadyRunning, second.listen());
+
+    // The refusal is not enough on its own: the socket has to still lead to
+    // the first daemon afterwards.
+    const probe = try sys.connectUnix(sock_path);
+    sys.closeFd(probe);
 }

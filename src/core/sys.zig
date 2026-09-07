@@ -20,6 +20,8 @@ pub const F_GETFD: c_int = 1;
 pub const F_SETFD: c_int = 2;
 pub const F_GETFL: c_int = 3;
 pub const F_SETFL: c_int = 4;
+/// Duplicate onto the lowest free descriptor at or above the argument.
+pub const F_DUPFD: c_int = 0;
 pub const FD_CLOEXEC: c_int = 1;
 pub const O_NONBLOCK: c_int = if (builtin.os.tag == .linux) 0o4000 else 4;
 
@@ -44,6 +46,11 @@ extern "c" fn fcntl(fd: fd_t, cmd: c_int, ...) c_int;
 extern "c" fn unlink(path: [*:0]const u8) c_int;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn pipe(fds: *[2]fd_t) c_int;
+extern "c" fn getdtablesize() c_int;
+extern "c" fn mkdir(path: [*:0]const u8, mode: c_uint) c_int;
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, size: usize) isize;
+extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
 
 pub const Error = error{
     SocketFailed,
@@ -61,6 +68,9 @@ pub const Error = error{
     /// Nothing to read on a non-blocking descriptor.
     WouldBlock,
     PipeFailed,
+    OpenFailed,
+    /// This process cannot say where its own executable is. See `selfExePath`.
+    NoSelfExe,
 };
 
 pub fn errno() c_int {
@@ -135,6 +145,103 @@ pub fn setCloexec(fd: fd_t) void {
     _ = fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 }
 
+pub fn clearCloexec(fd: fd_t) void {
+    const flags = fcntl(fd, F_GETFD);
+    if (flags == -1) return;
+    _ = fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+}
+
+/// Duplicate `fd` onto the lowest free descriptor at or above `lowest`.
+///
+/// For a caller that needs a descriptor in a *particular range* rather than
+/// wherever `open` happened to put it, without `dup2`'s habit of silently
+/// closing whatever was already on the target.
+///
+/// Deliberately not close-on-exec: `F_DUPFD` clears `FD_CLOEXEC` on the new
+/// descriptor, and the one caller is a test that needs it inherited in order
+/// to observe whether `closeFrom` closed it. Anything that duplicates a
+/// descriptor the daemon keeps -- a listening socket, a park file -- wants
+/// `setCloexec` on the result, or it is handed to every shell the daemon ever
+/// spawns.
+pub fn dupFrom(fd: fd_t, lowest: fd_t) Error!fd_t {
+    const next = fcntl(fd, F_DUPFD, lowest);
+    if (next < 0) return error.OpenFailed;
+    return next;
+}
+
+/// Close every descriptor from `lowest` upward.
+///
+/// For a forked child that is about to become a long-lived daemon: it inherits
+/// everything its parent had open that was not marked close-on-exec, and a
+/// daemon started by `illogicald --stdio` outlives the SSH session by days,
+/// handing each one on to every shell it ever spawns. `~/.ssh/rc` or an
+/// `authorized_keys command=` wrapper that opens a log or a credential file
+/// before exec'ing us is enough to leak one.
+///
+/// A loop rather than `closefrom`/`close_range`, which differ between macOS
+/// and Linux and by version. `close` is async-signal-safe, which is what makes
+/// this legal between `fork` and `exec`.
+pub fn closeFrom(lowest: fd_t) void {
+    // Clamped, because `getdtablesize` is the *soft* `RLIMIT_NOFILE` and that
+    // is the caller's environment to set: it can be 2^30 under a service
+    // manager, where the loop would run for minutes between `fork` and `exec`
+    // and the bridge would give up waiting for a daemon that turns up anyway.
+    //
+    // An ordinary mac reads 138,240 here and a distro sshd is typically
+    // configured to 65,536, both well under the ceiling. It was 4096 before,
+    // which is *below* both -- so on the systemd `LimitNOFILE=65536`
+    // configuration this function's own doc comment describes, anything the
+    // ssh wrapper had parked at a high descriptor survived into the daemon.
+    //
+    // A failing `close` measured ~96ns here, so the full million is ~100ms on
+    // this machine and several times that on an x86-64 kernel with mitigations
+    // -- which a container reaches routinely rather than pathologically, since
+    // Docker's default is exactly 1,048,576. Nobody waits on it: this runs
+    // between `fork` and `exec` in a child, and the parent's own timeout for
+    // the daemon to appear is ten seconds.
+    //
+    // Still best-effort, and the clamp is not the only reason: `getdtablesize`
+    // is the soft limit *now*, so a wrapper that opens a descriptor and then
+    // lowers `ulimit -n` before exec'ing us leaves it above the limit and
+    // therefore untouched.
+    const limit = @min(getdtablesize(), 1 << 20);
+    var fd = lowest;
+    while (fd < limit) : (fd += 1) _ = close(fd);
+}
+
+/// Create `path` and any missing parents, like `mkdir -p`. Best effort.
+///
+/// `std.Io.Dir.createDirPath` needs an `Io`, and the one caller is about to
+/// `fork`: the bridge has to make the daemon's state directory *before* the
+/// grandchild tries to open a log inside it, because the daemon does not
+/// create that directory until it is already running.
+///
+/// 0700 because of what ends up in there: the park store, a terminal's
+/// scrollback and the key it is encrypted with. Only a preference, though --
+/// the daemon creates this same directory itself through
+/// `std.Io.Dir.createDirPath`, which is 0777 before umask, so on a host where
+/// `illogicald` was ever started by hand the mode is whatever that left. The
+/// protection that does not depend on who got there first is the key file's
+/// own 0600, in crypt.zig.
+pub fn makeDirPath(path: []const u8) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len == 0 or path.len >= buf.len) return;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+
+    // Each prefix in turn, so missing intermediates are created too. Failures
+    // are ignored: the usual one is EEXIST, and a real one surfaces when the
+    // caller opens the file.
+    var i: usize = 1;
+    while (i <= path.len) : (i += 1) {
+        if (i != path.len and buf[i] != '/') continue;
+        const saved = buf[i];
+        buf[i] = 0;
+        _ = mkdir(@ptrCast(&buf), 0o700);
+        buf[i] = saved;
+    }
+}
+
 /// Turn non-blocking mode on or off.
 ///
 /// A PTY toggles this as it migrates between IO regimes: blocking while a
@@ -142,10 +249,21 @@ pub fn setCloexec(fd: fd_t) void {
 /// of many descriptors in the shared poller, where a `read` that turned out to
 /// have nothing behind it would stall every other terminal.
 pub fn setNonblock(fd: fd_t, on: bool) void {
+    _ = trySetNonblock(fd, on);
+}
+
+/// The same, reporting whether it took.
+///
+/// For the one caller that cannot proceed without it: a "non-blocking" drain
+/// on a descriptor that is still blocking is an unbounded wait on a child that
+/// may never write again, which is precisely what the caller's deadline exists
+/// to prevent. Everything else toggles a descriptor it just created and has
+/// nothing to do about a failure, so `setNonblock` stays void.
+pub fn trySetNonblock(fd: fd_t, on: bool) bool {
     const flags = fcntl(fd, F_GETFL);
-    if (flags == -1) return;
+    if (flags == -1) return false;
     const next = if (on) flags | O_NONBLOCK else flags & ~O_NONBLOCK;
-    _ = fcntl(fd, F_SETFL, next);
+    return fcntl(fd, F_SETFL, next) != -1;
 }
 
 /// A pipe, used only to wake a thread blocked in the poller.
@@ -155,6 +273,56 @@ pub fn pipeFds() Error![2]fd_t {
     setCloexec(fds[0]);
     setCloexec(fds[1]);
     return fds;
+}
+
+const O_RDWR: c_int = 2;
+
+/// `/dev/null`, opened read-write.
+///
+/// Deliberately not close-on-exec: the one caller is a forked child about to
+/// `dup2` this over its standard streams and then exec, and the whole point is
+/// that the streams survive.
+pub fn openDevNull() Error!fd_t {
+    const fd = open("/dev/null", O_RDWR);
+    if (fd < 0) return error.OpenFailed;
+    return fd;
+}
+
+const O_WRONLY: c_int = 1;
+const O_CREAT: c_int = if (builtin.os.tag == .linux) 0o100 else 0x0200;
+const O_APPEND: c_int = if (builtin.os.tag == .linux) 0o2000 else 0x0008;
+
+/// Open `path` for appending, creating it 0600. Not close-on-exec, for the
+/// same reason as `openDevNull`.
+pub fn openAppend(path: [*:0]const u8) Error!fd_t {
+    const fd = open(path, O_WRONLY | O_CREAT | O_APPEND, @as(c_uint, 0o600));
+    if (fd < 0) return error.OpenFailed;
+    return fd;
+}
+
+/// Path to this executable, written into `buf`.
+///
+/// `std.fs.selfExePath` went away in Zig 0.16, and the stdio bridge needs it:
+/// starting the host's daemon means starting *this* binary again. Resolving it
+/// by name through `PATH` instead would be a different question with a
+/// different answer, since the SSH command that started us was resolved
+/// against a login shell's `PATH` and the daemon it starts outlives that shell.
+pub fn selfExePath(buf: []u8) Error![]const u8 {
+    if (builtin.os.tag.isDarwin()) {
+        // On success the path is NUL-terminated and `size` is left alone; on
+        // failure it is set to the length required, which is a bigger buffer
+        // than `std.fs.max_path_bytes` and so not worth retrying for.
+        var size: u32 = @intCast(@min(buf.len, std.math.maxInt(u32)));
+        if (_NSGetExecutablePath(buf.ptr, &size) != 0) return error.NoSelfExe;
+        return std.mem.sliceTo(buf, 0);
+    }
+    const n = readlink("/proc/self/exe", buf.ptr, buf.len);
+    if (n <= 0) return error.NoSelfExe;
+    const len: usize = @intCast(n);
+    // `readlink` does not terminate, and it truncates silently rather than
+    // failing -- a path that exactly filled the buffer may have been cut.
+    if (len >= buf.len) return error.NoSelfExe;
+    return buf[0..len];
 }
 
 // -- unix sockets ----------------------------------------------------------
@@ -262,6 +430,58 @@ pub fn exec(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) void {
     _ = execvp(file, argv);
 }
 
+pub const PipedChild = struct {
+    pid: pid_t,
+    /// Write here to reach the child's stdin.
+    stdin: fd_t,
+    /// Read here for the child's stdout.
+    stdout: fd_t,
+};
+
+/// Run `argv` with pipes on its standard input and output.
+///
+/// Used for exactly one thing: `ssh <dest> illogicald --stdio`, where the two
+/// pipes carry the wire protocol. The child keeps *our* stderr, so ssh's own
+/// diagnostics -- a bad host key, a missing binary -- reach a person instead of
+/// being decoded as frames.
+///
+/// `pipeFds` marks both ends close-on-exec, so the four originals do not
+/// survive the exec. The two the child keeps are cleared explicitly below --
+/// `dup2` clears the flag on the descriptor it *creates*, but `dup2(fd, fd)` is
+/// a no-op and clears nothing, which is reachable whenever the caller was
+/// started without a standard stream and `pipe` handed back fd 0 or 1.
+pub fn spawnPiped(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) Error!PipedChild {
+    const to_child = try pipeFds();
+    errdefer {
+        closeFd(to_child[0]);
+        closeFd(to_child[1]);
+    }
+    const from_child = try pipeFds();
+    errdefer {
+        closeFd(from_child[0]);
+        closeFd(from_child[1]);
+    }
+
+    const pid = try forkProcess();
+    if (pid == 0) {
+        // Child. Nothing here may allocate or return.
+        dup2Fd(to_child[0], STDIN);
+        dup2Fd(from_child[1], STDOUT);
+        // Unconditional, and load-bearing when `dup2` above was a no-op: run
+        // `illogical --host …` with stdin closed and `pipe` hands back fd 0,
+        // so the child would exec with its stdin closed-on-exec and fail with
+        // "Bad file descriptor" -- reported as the *remote* being unreachable.
+        clearCloexec(STDIN);
+        clearCloexec(STDOUT);
+        exec(file, argv);
+        exitProcess(127);
+    }
+
+    closeFd(to_child[0]);
+    closeFd(from_child[1]);
+    return .{ .pid = pid, .stdin = to_child[1], .stdout = from_child[0] };
+}
+
 pub fn exitProcess(code: u8) noreturn {
     _exit(code);
 }
@@ -284,6 +504,15 @@ pub const SIGKILL: c_int = 9;
 
 pub fn signal(pid: pid_t, sig: c_int) void {
     _ = kill(pid, sig);
+}
+
+/// Whether `pid` still exists. Signal 0 checks without sending anything.
+///
+/// Only meaningful for a child this process has not yet reaped: once `wait`
+/// has collected it the pid is free to be reused, so a `true` from a stale pid
+/// means nothing. Used by a test that has just reaped, to assert it did.
+pub fn processExists(pid: pid_t) bool {
+    return kill(pid, 0) == 0;
 }
 
 /// Signal a whole process group. The child is a session leader (we call
@@ -398,6 +627,20 @@ test "monotonic clock advances" {
     while (spin < 100_000) : (spin += 1) std.mem.doNotOptimizeAway(spin);
     const b = monotonicNs();
     try std.testing.expect(b >= a);
+}
+
+test "this process can say where its own executable is" {
+    const testing = std.testing;
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
+    defer threaded.deinit();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try selfExePath(&buf);
+    try testing.expect(path.len > 0);
+    // The stdio bridge execs this, so a name is not enough: it has to be a
+    // path that resolves without a `PATH` search, and it has to be there.
+    try testing.expectEqual(@as(u8, '/'), path[0]);
+    try std.Io.Dir.cwd().access(threaded.io(), path, .{});
 }
 
 test "unix address rejects an over-long path" {

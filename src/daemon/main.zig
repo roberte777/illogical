@@ -8,6 +8,7 @@ const Io = std.Io;
 const posix = std.posix;
 const illogical = @import("illogical");
 const Server = @import("Server.zig");
+const stdio = @import("stdio.zig");
 
 const usage =
     \\illogicald — the illogical session server
@@ -16,6 +17,11 @@ const usage =
     \\
     \\Options:
     \\  --socket <path>          Control socket (default: $XDG_STATE_HOME/illogical/server.sock)
+    \\  --stdio                  Speak the protocol on stdin/stdout instead of
+    \\                           listening: bridge to this host's daemon, starting
+    \\                           one if there is none. What `ssh <host> illogicald
+    \\                           --stdio` runs.
+    \\  --no-spawn               With --stdio, fail rather than start a daemon
     \\  --park-after <s>         PTY-read idle time before a terminal parks to disk (default: 60)
     \\  --pty-park-after <s>     Unobserved time before a PTY leaves its dedicated
     \\                           thread for the shared poller (default: 5)
@@ -41,12 +47,22 @@ pub fn main(init: std.process.Init) !void {
     var park_after_s: ?u64 = null;
     var pty_park_after_s: ?u64 = null;
     var client_park_after_s: ?u64 = null;
+    var stdio_mode = false;
+    var spawn_daemon = true;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try out.writeAll(usage);
             return out.flush();
+        }
+        if (std.mem.eql(u8, arg, "--stdio")) {
+            stdio_mode = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--no-spawn")) {
+            spawn_daemon = false;
+            continue;
         }
         if (std.mem.eql(u8, arg, "--version")) {
             try out.print("illogicald {s}\n", .{illogical.version});
@@ -114,6 +130,30 @@ pub fn main(init: std.process.Init) !void {
     else
         try Server.defaultSocketPath(arena);
 
+    // A client disconnecting mid-write must not take the daemon down, and the
+    // stdio bridge writing to a stdout SSH has already closed must not take
+    // *it* down either. Before both branches, so neither is a special case.
+    const ignore: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &ignore, null);
+
+    if (stdio_mode) {
+        // Nothing on stdout but frames from here on: it is the client's
+        // transport. Diagnostics go to stderr, which SSH keeps separate.
+        stdio.serve(path, .{ .spawn = spawn_daemon }) catch |err| {
+            std.log.err(
+                "illogicald --stdio: no daemon at {s} ({t}); " ++
+                    "check that illogicald can start on this host",
+                .{ path, err },
+            );
+            return err;
+        };
+        return;
+    }
+
     // The park store lives beside the socket.
     const state_root = std.fs.path.dirname(path) orelse ".";
 
@@ -130,14 +170,6 @@ pub fn main(init: std.process.Init) !void {
     }
     global_server = server;
 
-    // A client disconnecting mid-write must not take the daemon down.
-    const ignore: posix.Sigaction = .{
-        .handler = .{ .handler = posix.SIG.IGN },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    };
-    posix.sigaction(posix.SIG.PIPE, &ignore, null);
-
     const shutdown: posix.Sigaction = .{
         .handler = .{ .handler = onSignal },
         .mask = posix.sigemptyset(),
@@ -146,7 +178,16 @@ pub fn main(init: std.process.Init) !void {
     posix.sigaction(posix.SIG.INT, &shutdown, null);
     posix.sigaction(posix.SIG.TERM, &shutdown, null);
 
-    try server.listen();
+    server.listen() catch |err| switch (err) {
+        // Not a failure worth a stack trace: somebody -- or an SSH bridge --
+        // has already started one, and it owns the terminals.
+        error.AlreadyRunning => {
+            try out.print("illogicald is already running on {s}\n", .{path});
+            try out.flush();
+            return;
+        },
+        else => return err,
+    };
     try out.print(
         "illogicald {s} listening on {s} (park after {d}s, {d} poller threads)\n",
         .{
@@ -168,6 +209,7 @@ fn onSignal(_: std.c.SIG) callconv(.c) void {
 test {
     _ = illogical;
     _ = Server;
+    _ = stdio;
     _ = @import("Terminal.zig");
     _ = @import("Client.zig");
 }
