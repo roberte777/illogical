@@ -141,7 +141,10 @@ final class FontFace {
             CTFontCopyFontDescriptor(font), NSNumber(value: axis) as CFNumber, CGFloat(value))
         // Size 0 keeps the size this face already has.
         let varied = CTFontCreateCopyWithAttributes(font, 0, nil, descriptor)
-        return FontFace(font: varied, syntheticBold: syntheticBold)
+        // `syntheticBold` deliberately does not carry over: a pinned weight
+        // axis *is* a real weight, and keeping the stroke would draw a bold
+        // on top of a bold.
+        return FontFace(font: varied)
     }
 
     var hasColor: Bool { colorState != nil }

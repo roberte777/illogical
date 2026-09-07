@@ -125,10 +125,23 @@ final class FontGrid: @unchecked Sendable {
         atlasColor = Atlas(size: Self.initialAtlasSize, format: .bgra)
     }
 
+    /// The named family, or nil when nothing on the system provides it.
+    ///
+    /// The nil is the point. `CTFontCreateWithFontDescriptor` cannot fail:
+    /// handed a family nothing matches it returns Helvetica — proportional,
+    /// so every cell would be measured off the wrong advance — rather than
+    /// saying so. Matching first is what turns an uninstalled family into a
+    /// miss, so `primaryFaces` can fall through to the font we ship instead
+    /// of quietly drawing the terminal in Helvetica.
     private static func font(named name: String, size: Double) -> CTFont? {
         let descriptor = CTFontDescriptorCreateWithAttributes(
             [kCTFontFamilyNameAttribute: name] as CFDictionary)
-        return CTFontCreateWithFontDescriptor(descriptor, size, nil)
+        // The family has to be mandatory, or the match is free to satisfy
+        // none of it and we are back to Helvetica.
+        let mandatory = Set([kCTFontFamilyNameAttribute as String]) as NSSet as CFSet
+        guard let matched = CTFontDescriptorCreateMatchingFontDescriptor(descriptor, mandatory)
+        else { return nil }
+        return CTFontCreateWithFontDescriptor(matched, size, nil)
     }
 
     /// The four styles of the primary family, in `FontStyle` order.

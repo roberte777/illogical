@@ -22,12 +22,24 @@ final class EmbeddedFontTests: XCTestCase {
         try XCTUnwrap(defaultGrid().face(FontIndex(slot: UInt16(style.rawValue))))
     }
 
+    /// The face's `wght`, falling back to the axis default when the face
+    /// carries no variation dictionary — an unvaried face sits at its
+    /// default, and reporting nil for it would make "no weight axis at all"
+    /// and "not bold" the same answer.
     private func weight(_ face: FontFace) -> Double? {
-        guard let variation = CTFontCopyVariation(face.font) as? [CFNumber: CFNumber]
+        if let variation = CTFontCopyVariation(face.font) as? [CFNumber: CFNumber] {
+            for (axis, value) in variation
+            where (axis as NSNumber).uint32Value == EmbeddedFont.weightAxis {
+                return (value as NSNumber).doubleValue
+            }
+        }
+        guard let axes = CTFontCopyVariationAxes(face.font) as? [[CFString: Any]]
         else { return nil }
-        for (axis, value) in variation
-        where (axis as NSNumber).uint32Value == EmbeddedFont.weightAxis {
-            return (value as NSNumber).doubleValue
+        for axis in axes
+        where (axis[kCTFontVariationAxisIdentifierKey] as? NSNumber)?.uint32Value
+            == EmbeddedFont.weightAxis
+        {
+            return (axis[kCTFontVariationAxisDefaultValueKey] as? NSNumber)?.doubleValue
         }
         return nil
     }
@@ -35,7 +47,15 @@ final class EmbeddedFontTests: XCTestCase {
     /// The bundle actually carries the files. Everything below would fall
     /// back to the system's fixed-pitch face without them and still pass
     /// some of its assertions, so check this first and on its own.
-    func testBundleCarriesBothVariableFaces() throws {
+    ///
+    /// Walking `allCases` rather than the two named properties so that a
+    /// face added to `Resource` — the nerd-font symbols fallback is the next
+    /// one — is covered the moment it exists.
+    func testBundleCarriesEveryEmbeddedFace() throws {
+        for resource in EmbeddedFont.Resource.allCases {
+            XCTAssertNotNil(
+                EmbeddedFont.font(resource), "\(resource.rawValue).ttf is not in the bundle")
+        }
         XCTAssertNotNil(EmbeddedFont.variable)
         XCTAssertNotNil(EmbeddedFont.variableItalic)
     }
@@ -57,6 +77,20 @@ final class EmbeddedFontTests: XCTestCase {
         XCTAssertEqual(CTFontCopyFamilyName(regular.font) as String, "Menlo")
     }
 
+    /// A family the system does not have falls through to the font we ship
+    /// rather than to CoreText's substitute.
+    ///
+    /// `CTFontCreateWithFontDescriptor` cannot fail — asked for a family
+    /// nothing matches it hands back Helvetica, which is proportional, so
+    /// without the match check every cell in the grid would be measured off
+    /// the wrong advance.
+    func testAnUnavailableFamilyFallsBackToWhatWeShip() throws {
+        let grid = FontGridSet.grid(
+            family: "ThisFontIsNotInstalled12345", pointSize: Self.pointSize, scale: Self.scale)
+        let regular = try XCTUnwrap(grid.face(FontIndex(slot: 0)))
+        XCTAssertEqual(CTFontCopyFamilyName(regular.font) as String, "JetBrains Mono")
+    }
+
     /// Bold is the upright face with `wght` at 700 — a drawn bold, not an
     /// outline stroked to look like one.
     func testBoldIsTheWeightAxisAndNotSynthetic() throws {
@@ -65,9 +99,12 @@ final class EmbeddedFontTests: XCTestCase {
         XCTAssertTrue(CTFontGetSymbolicTraits(bold.font).contains(.traitBold))
         XCTAssertNil(bold.syntheticBold, "bold should not be stroked")
 
-        // Regular sits at the axis default, wherever the file puts it.
+        // Regular sits at the axis default, wherever the file puts it —
+        // but it does have to *have* the axis, or the face is not the
+        // variable one we shipped.
         let regular = try face(.regular)
-        XCTAssertNotEqual(weight(regular), EmbeddedFont.boldWeight)
+        let regularWeight = try XCTUnwrap(weight(regular), "regular has no weight axis")
+        XCTAssertLessThan(regularWeight, EmbeddedFont.boldWeight)
         XCTAssertNil(regular.syntheticBold)
     }
 
@@ -122,6 +159,13 @@ final class EmbeddedFontTests: XCTestCase {
     /// up in the user's font list. Registering them would leak the app's
     /// font into every other program on the machine.
     func testEmbeddedFacesAreNotRegisteredWithTheSystem() throws {
+        // Force the faces to exist first. Without this the test asserts
+        // nothing when run on its own: nothing has parsed a font, so there
+        // is no registration to catch, and it would pass against an
+        // implementation that registers on load.
+        XCTAssertNotNil(EmbeddedFont.variable)
+        XCTAssertNotNil(EmbeddedFont.variableItalic)
+
         // A descriptor matching by family, resolved against what is
         // installed. The embedded face is not, so this finds nothing —
         // unless the developer happens to have JetBrains Mono installed,

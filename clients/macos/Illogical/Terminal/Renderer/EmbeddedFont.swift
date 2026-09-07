@@ -28,8 +28,14 @@ enum EmbeddedFont {
     /// Bold is not a third file. libghostty pins the `wght` axis to 700 on
     /// these same two faces, so the bundle carries two files where a static
     /// family would need four.
-    static var variable: CTFont? { load(.variable) }
-    static var variableItalic: CTFont? { load(.variableItalic) }
+    static var variable: CTFont? { font(.variable) }
+    static var variableItalic: CTFont? { font(.variableItalic) }
+
+    /// One embedded face, at the nominal size. The two properties above are
+    /// what the grid asks for by name; this is what a test walking
+    /// `Resource.allCases` uses, so that conformance stays honest as more
+    /// faces are embedded.
+    static func font(_ resource: Resource) -> CTFont? { load(resource) }
 
     /// The `wght` OpenType variation axis, as a four-byte tag. 700 is bold.
     static let weightAxis: UInt32 = 0x7767_6874  // 'wght'
@@ -65,14 +71,17 @@ enum EmbeddedFont {
     private static func parse(_ resource: Resource) -> CTFont? {
         // `Bundle(for:)` rather than `.main`: the renderer's sources are
         // compiled into the unit-test bundle too, and there the fonts are
-        // the test bundle's resources, not the host app's.
+        // the test bundle's resources, not the host app's. No subdirectory —
+        // Xcode's resources phase flattens the copy, so `Supporting/Fonts/`
+        // is a source-tree layout and not a bundle one.
         guard
             let url = Bundle(for: FontFace.self).url(
-                forResource: resource.rawValue, withExtension: "ttf",
-                subdirectory: "Fonts")
-                ?? Bundle(for: FontFace.self).url(
-                    forResource: resource.rawValue, withExtension: "ttf"),
-            let data = try? Data(contentsOf: url),
+                forResource: resource.rawValue, withExtension: "ttf"),
+            // Mapped rather than read: CoreText holds these bytes for as
+            // long as the face lives, which is the life of the process, and
+            // mapped pages are file-backed and evictable where a read is
+            // 300 KB of dirty memory that never comes back.
+            let data = try? Data(contentsOf: url, options: .mappedIfSafe),
             let descriptor = CTFontManagerCreateFontDescriptorFromData(data as CFData)
         else { return nil }
         return CTFontCreateWithFontDescriptor(descriptor, nominalSize, nil)
