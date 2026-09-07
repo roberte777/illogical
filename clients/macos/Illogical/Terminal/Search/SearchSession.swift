@@ -55,9 +55,16 @@ final class SearchSession {
     /// True while there is scrollback still to look through.
     private(set) var isSearching = false
 
-    /// The matches on screen, in the surface's own coordinates, for the bar to
-    /// dodge. Empty whenever the surface is not on screen to measure against.
-    private(set) var matchRects: [CGRect] = []
+    /// Where the selected match is, in the surface's own coordinates, for the
+    /// bar to dodge. Nil when nothing is selected or there is no surface on
+    /// screen to measure against.
+    ///
+    /// The selected one only. The bar keeps clear of the match it took you to;
+    /// the other hits on screen are context, and context may sit behind a
+    /// floating bar. A match that wraps a line is several spans on several
+    /// rows, so this is their union — dodging half of one would be worse than
+    /// not dodging at all.
+    private(set) var selectedMatchRect: CGRect?
 
     private let engine: TerminalEngine
 
@@ -111,7 +118,7 @@ final class SearchSession {
         total = 0
         position = nil
         isSearching = false
-        matchRects = []
+        selectedMatchRect = nil
         lastSpans = []
     }
 
@@ -186,8 +193,10 @@ final class SearchSession {
         if isSearching != working { isSearching = working }
 
         let spans = query.isEmpty ? [] : engine.searchViewportSpans()
-        let rects = surface?.rects(for: spans) ?? []
-        if matchRects != rects { matchRects = rects }
+        let selected = surface?.rects(for: spans.filter(\.isSelected))
+            .reduce(CGRect.null) { $0.union($1) }
+        let rect = (selected?.isNull ?? true) ? nil : selected
+        if selectedMatchRect != rect { selectedMatchRect = rect }
         if spans != lastSpans {
             lastSpans = spans
             // The renderer is looking at the same terminal and will find the

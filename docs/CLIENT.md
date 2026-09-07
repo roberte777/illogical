@@ -446,14 +446,18 @@ took its own space would resize the PTY every time ⌘F was pressed — a
 very screen being searched.
 
 The price of floating is that it covers something, and the one thing it must
-not cover is a match. So it moves: `SearchNudge` walks the bar down, a match at
-a time, until nothing the search found is underneath it, and `SearchBar`
-animates the difference. Down rather than sideways, because what it is dodging
-is text on a grid — moving left would put the bar over the middle of a line,
-which is where output actually lives, while moving down lands it in the gap
-between two rows. It gives up rather than walking off: past a fraction of the
-surface, a find bar in the middle of the screen is worse than one covering a
-hit it has already scrolled you to.
+not cover is the match it has just taken you to. So it moves: `SearchNudge`
+steps the bar down past that match, and `SearchBar` animates the difference.
+Down rather than sideways, because what it is dodging is text on a grid —
+moving left would put the bar over the middle of a line, which is where output
+actually lives, while moving down lands it in the gap between two rows.
+
+The *selected* match, and no other. Dodging every hit on screen was the first
+shape this had and it is the wrong one: a query with a column of matches down
+the right-hand side walks the bar past all of them and halfway down the window,
+to keep clear of hits nobody is looking at. The selected match is the one the
+search scrolled to and the one the count is counting; the rest are context, and
+context is allowed to be behind a floating bar.
 
 That geometry is a pure function of two rectangles and a list, which is what
 makes "the bar gets out of the way" something a test holds rather than

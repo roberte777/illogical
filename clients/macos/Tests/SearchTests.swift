@@ -293,52 +293,55 @@ final class SearchTests: XCTestCase {
         CGRect(x: x, y: CGFloat(row) * 20, width: width, height: 20)
     }
 
-    func testNothingUnderneathMeansNoNudge() {
-        XCTAssertEqual(
-            SearchNudge.offset(bar: bar, matches: [], limit: limit), 0)
+    func testNothingSelectedMeansNoNudge() {
+        XCTAssertEqual(SearchNudge.offset(bar: bar, match: nil, limit: limit), 0)
     }
 
     func testAMatchOnTheOtherSideOfTheScreenIsNotInTheWay() {
-        // Same rows as the bar, but at the left margin.
-        let matches = [match(row: 0, x: 0), match(row: 1, x: 0)]
-        XCTAssertEqual(SearchNudge.offset(bar: bar, matches: matches, limit: limit), 0)
+        // The bar's own rows, but at the left margin.
+        XCTAssertEqual(
+            SearchNudge.offset(bar: bar, match: match(row: 0, x: 0), limit: limit), 0)
     }
 
-    func testTheBarStepsBelowAMatchItWouldCover() {
+    func testTheBarStepsBelowTheMatchItWouldCover() {
         // Row 1 is y 20...40, and the bar's home is y 10...40.
-        let matches = [match(row: 1, x: 700)]
-        let offset = SearchNudge.offset(bar: bar, matches: matches, limit: limit)
+        let selected = match(row: 1, x: 700)
+        let offset = SearchNudge.offset(bar: bar, match: selected, limit: limit)
 
         XCTAssertGreaterThan(offset, 0)
-        XCTAssertFalse(bar.offsetBy(dx: 0, dy: offset).intersects(matches[0]))
+        XCTAssertFalse(bar.offsetBy(dx: 0, dy: offset).intersects(selected))
         // Cleared the match's bottom edge with the gap, and no further.
         XCTAssertEqual(offset, 40 + SearchNudge.gap - bar.minY)
     }
 
-    func testItKeepsGoingPastASecondMatchInItsNewPlace() {
-        let matches = [match(row: 1, x: 700), match(row: 3, x: 640)]
-        let offset = SearchNudge.offset(bar: bar, matches: matches, limit: limit)
+    /// The behaviour this exists to have: a screenful of hits down the
+    /// right-hand side moves the bar past *one* of them. Dodging all of them
+    /// walked it halfway down the window to keep clear of matches nobody was
+    /// looking at.
+    func testOnlyTheSelectedMatchMovesIt() {
+        let selected = match(row: 1, x: 700)
+        let offset = SearchNudge.offset(bar: bar, match: selected, limit: limit)
 
+        // Rows 2 and 3 are also hits and also under the bar's home, and the
+        // bar comes to rest over them without a second thought.
         let moved = bar.offsetBy(dx: 0, dy: offset)
-        XCTAssertFalse(moved.intersects(matches[0]))
-        XCTAssertFalse(moved.intersects(matches[1]))
+        XCTAssertTrue(moved.intersects(match(row: 2, x: 700)))
+        XCTAssertFalse(moved.intersects(selected))
     }
 
-    /// A find bar halfway down the window is worse than one covering a hit it
-    /// has already scrolled you to, so the dodge gives up rather than running
-    /// away.
-    func testItStopsRatherThanWalkingOffTheScreen() {
-        let matches = (0..<20).map { match(row: $0, x: 700) }
-        let offset = SearchNudge.offset(bar: bar, matches: matches, limit: limit)
-
-        XCTAssertGreaterThanOrEqual(offset, 0)
-        XCTAssertLessThanOrEqual(bar.minY + offset + bar.height, limit)
-    }
-
-    /// A match taller than the whole bar, starting above it: there is no offset
-    /// that clears it in one step and nothing to be gained by trying.
+    /// A needle long enough to wrap across many rows makes a match taller than
+    /// the room there is to dodge into. A find bar halfway down the window is
+    /// worse than one overlapping a match that already covers half the screen.
     func testAMatchItCannotClearLeavesItWhereItIs() {
         let tall = CGRect(x: 700, y: 0, width: 60, height: 400)
-        XCTAssertEqual(SearchNudge.offset(bar: bar, matches: [tall], limit: limit), 0)
+        XCTAssertEqual(SearchNudge.offset(bar: bar, match: tall, limit: limit), 0)
+    }
+
+    func testItNeverLeavesTheTopOfTheWindow() {
+        for row in 0..<8 {
+            let offset = SearchNudge.offset(bar: bar, match: match(row: row, x: 700), limit: limit)
+            XCTAssertGreaterThanOrEqual(offset, 0)
+            XCTAssertLessThanOrEqual(bar.minY + offset + bar.height, limit)
+        }
     }
 }

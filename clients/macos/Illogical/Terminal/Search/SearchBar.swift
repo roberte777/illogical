@@ -1,9 +1,17 @@
 //  SearchBar.swift
 //  The find bar, floating over the terminal it is searching.
 //
-//      ┌──────────────────────────────────────────────┐
-//      │ ⌕  open                    1/2   ∧  ∨    ✕   │
-//      └──────────────────────────────────────────────┘
+//      ╭──────────────────────────────────────────────╮
+//      │ open                       1/2 │  ∧   ∨   ✕  │
+//      ╰──────────────────────────────────────────────╯
+//
+//  Matched to the find bar in the reference recording, down to the parts that
+//  are easy to get backwards: the query sits at the left with nothing in front
+//  of it (no magnifying glass), the count and the three buttons are at the
+//  right with a hairline between them, and the panel is a flat fill that is
+//  *lighter* than the terminal under it. That last one is what makes it read
+//  as floating; a first draft used the toolbar colour, which is darker than
+//  the terminal because it sits outside it, and the bar looked like a hole.
 //
 //  Over the surface rather than above it, and that is the whole design: a bar
 //  that pushed the grid down would resize the PTY — a `winsize` change, an
@@ -12,10 +20,10 @@
 //  reflows nothing.
 //
 //  The price of floating is that the bar covers something, and the one thing
-//  it must not cover is a match. So it dodges: `SearchNudge` says how far down
-//  it has to go to be clear of everything the search found, and the move is
-//  animated because a bar that teleports as you type reads as a glitch rather
-//  than as a bar getting out of the way.
+//  it must not cover is the match it has just taken you to. So it dodges:
+//  `SearchNudge` says how far down it has to go to be clear of that match, and
+//  the move is animated because a bar that teleports as you type reads as a
+//  glitch rather than as a bar getting out of the way.
 
 import SwiftUI
 
@@ -24,20 +32,21 @@ struct SearchBar: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     let session: SearchSession
-    /// The surface's own size, which is the space `session.matchRects` are in.
+    /// The surface's own size, which is the space `selectedMatchRect` is in.
     let surface: CGSize
 
     @FocusState private var fieldFocused: Bool
 
     enum Metrics {
-        static let width: CGFloat = 296
-        static let height: CGFloat = 30
+        static let width: CGFloat = 300
+        static let height: CGFloat = 32
         /// From the top and trailing edges of the surface.
         static let inset: CGFloat = 10
-        static let cornerRadius: CGFloat = 8
+        static let cornerRadius: CGFloat = 10
+        static let button: CGFloat = 22
         /// How far down the bar may be pushed, as a fraction of the surface.
-        /// Past this the top of the screen is hopelessly busy and a find bar in
-        /// the middle of it is worse than one covering a hit.
+        /// Only reachable by a match that wraps across many rows; see
+        /// `SearchNudge.offset`.
         static let dodgeLimit: CGFloat = 0.45
     }
 
@@ -50,11 +59,11 @@ struct SearchBar: View {
             height: Metrics.height)
     }
 
-    /// How far down the matches are pushing it.
+    /// How far down the selected match is pushing it.
     private var dodge: CGFloat {
         SearchNudge.offset(
             bar: home,
-            matches: session.matchRects,
+            match: session.selectedMatchRect,
             limit: max(home.maxY, surface.height * Metrics.dodgeLimit))
     }
 
@@ -71,14 +80,10 @@ struct SearchBar: View {
     }
 
     private var bar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(Palette.textDim)
-
+        HStack(spacing: 0) {
             TextField("Find", text: Binding(get: { session.query }, set: { session.query = $0 }))
                 .textFieldStyle(.plain)
-                .font(.system(size: 12))
+                .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(Palette.textBright)
                 .focused($fieldFocused)
                 .onSubmit { session.selectNext() }
@@ -88,50 +93,44 @@ struct SearchBar: View {
                 .onChange(of: session.focusRequests) { fieldFocused = true }
 
             Text(count)
-                .font(.system(size: 11).monospacedDigit())
+                .font(.system(size: 12).monospacedDigit())
                 .foregroundStyle(
                     session.total == 0 && !session.query.isEmpty
-                        ? Palette.textFaint : Palette.textDim
+                        ? Palette.textFaint : Palette.textBright
                 )
                 .lineLimit(1)
                 .accessibilityLabel(Text(countLabel))
+                .padding(.trailing, 10)
+
+            Rectangle()
+                .fill(Palette.searchBarDivider)
+                .frame(width: 1, height: Metrics.height - 14)
 
             step(icon: "chevron.up", help: "Previous Match (⇧⌘G)", action: session.selectPrevious)
             step(icon: "chevron.down", help: "Next Match (⌘G)", action: session.selectNext)
-
-            Button(action: dismiss) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(Palette.textDim)
-                    .frame(width: 18, height: 18)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Close (esc)")
+            step(icon: "xmark", help: "Close (esc)", action: dismiss)
         }
-        .padding(.leading, 10)
-        .padding(.trailing, 6)
+        .padding(.leading, 12)
+        .padding(.trailing, 4)
         .background(
             RoundedRectangle(cornerRadius: Metrics.cornerRadius, style: .continuous)
-                .fill(Palette.toolbar)
-                .overlay(
-                    RoundedRectangle(cornerRadius: Metrics.cornerRadius, style: .continuous)
-                        .strokeBorder(Palette.divider, lineWidth: 1)
-                )
-                .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+                .fill(Palette.searchBar)
         )
     }
 
+    /// One of the three buttons on the right. `xmark` is one of them rather
+    /// than a special case: in the reference they are one evenly spaced group.
     private func step(icon: String, help: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+        let enabled = icon == "xmark" || session.canStep
+        return Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(session.canStep ? Palette.textDim : Palette.textFaint)
-                .frame(width: 18, height: 18)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(enabled ? Palette.textDim : Palette.textFaint)
+                .frame(width: Metrics.button, height: Metrics.button)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!session.canStep)
+        .disabled(!enabled)
         .help(help)
     }
 
