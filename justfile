@@ -154,7 +154,8 @@ xcodeproj: stage-daemon
 # build of the same source -- `zig build` is Debug and host-arch, while the
 # tarball is ReleaseFast, stripped and lipo'd -- so an Intel Mac got a bundle
 # whose daemon could not run, and every release app reported version skew
-# against its own tarball. Same bytes, one build, both places.
+# against its own tarball. One build, both places -- not byte-identical, because
+# Xcode re-signs it on the way into the bundle, but the same compile.
 stage-daemon:
     #!/usr/bin/env bash
     set -euo pipefail

@@ -7,13 +7,16 @@
 # `ssh <box> illogicald --stdio` starts a daemon there when there is none, and
 # `illogicald --ensure` does the same by hand.
 #
-# The app embeds the same *source* at the same pin, not yet the same bytes:
-# `just stage-daemon` copies the Debug host-arch binary `just build` produced,
-# which is the dev loop, while this script produces ReleaseFast, stripped and
-# lipo'd. They become one build when #47's app job stages this workflow's
-# `macos-universal` artifact instead of `zig-out`. Until then a release daemon
-# under a dev app reads as version skew in the app's dropdown, which is correct
-# — it really is a different build.
+# In a release the app embeds this script's output: the app job stages the
+# `macos-universal` artifact rather than building its own, so the daemon in the
+# bundle and the one in the tarball are the same compile. (Not byte-identical —
+# Xcode re-signs it on the way into the bundle.)
+#
+# Locally they still differ, and should: `just stage-daemon` falls back to the
+# Debug host-arch binary `just build` produced, which is what the dev loop
+# wants, while this script produces ReleaseFast, stripped and lipo'd. A release
+# daemon under a dev app reads as version skew in the app's dropdown, which is
+# correct — it really is a different build.
 #
 # **musl, not gnu, for Linux.** Statically linked against musl runs on any
 # distribution and imposes no glibc floor. For something whose install story is
