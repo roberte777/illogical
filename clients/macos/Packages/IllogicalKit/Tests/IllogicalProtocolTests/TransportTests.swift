@@ -87,14 +87,16 @@ struct SSHCommandTests {
     /// share one multiplexing master. Drifting apart silently doubles the SSH
     /// connections a machine holds.
     ///
-    /// The environment is handed in. Four earlier versions tried to *catch*
+    /// The environment is handed in. Five earlier versions tried to *catch*
     /// `homeDirectoryForCurrentUser` being substituted for the environment
     /// read, and each computed its expectation the same way the code computed
     /// the value — so each passed with the substitution in place, the last
     /// because the tautology had moved into a default argument. Setting `HOME`
     /// for real does work, and puts a write to `environ` beside suites that
-    /// walk it. Passing the dictionary removes the question instead: the
-    /// passwd entry is not a `[String: String]`, so there is nowhere to put it.
+    /// walk it. Passing the dictionary secures the derivation, which is the
+    /// part that can be secured; the default argument is one line of wiring
+    /// that no in-process test can pin, and the last assertion here says what
+    /// it can about that.
     @Test("the control path comes from the environment, not the passwd entry")
     func controlPathComesFromTheEnvironment() {
         #expect(
@@ -120,6 +122,27 @@ struct SSHCommandTests {
                 SSHCommand.Options(destination: "h", controlDirectory: "/tmp/elsewhere"),
                 environment: ["HOME": "/tmp/illogical-not-your-home"])
                 == "/tmp/elsewhere/illogical-%C")
+
+        // A home too long to leave room for the rendered `%C` is no path at
+        // all, rather than one ssh would warn about on every connection. This
+        // is the branch a user with a deep home actually hits; the budget test
+        // above covers only the explicit-directory side of the same guard.
+        #expect(
+            SSHCommand.controlPath(
+                SSHCommand.Options(destination: "h"),
+                environment: ["HOME": "/Users/" + String(repeating: "x", count: 90)]) == nil)
+
+        // And the default really is the process environment. This cannot tell
+        // the passwd entry apart — the two agree here, which is the whole
+        // problem — but it does catch a default that is empty, filtered, or
+        // hardcoded to something else, any of which silently drops
+        // `ControlMaster` from every real connection and costs a handshake per
+        // pane. Nothing else touches the default at all.
+        let options = SSHCommand.Options(destination: "h")
+        #expect(
+            SSHCommand.controlPath(options)
+                == SSHCommand.controlPath(options, environment: ProcessInfo.processInfo.environment)
+        )
     }
 
     @Test("a remote binary somewhere else is respected")
