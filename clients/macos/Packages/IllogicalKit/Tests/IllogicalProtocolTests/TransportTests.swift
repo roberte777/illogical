@@ -654,8 +654,8 @@ struct TransportTests {
         #expect(
             CommandTransport.pathReason(ENAMETOOLONG) == ("is too long a path to open", false))
         for code in [
-            EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, EHOSTDOWN, EHOSTUNREACH, ENETDOWN,
-            ENETUNREACH, ENODEV,
+            EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET, EHOSTDOWN,
+            EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV, EPWROFF, EDEVERR,
         ] {
             #expect(
                 CommandTransport.pathReason(code)
@@ -684,8 +684,8 @@ struct TransportTests {
                     false
                 ))
         for code in [
-            EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, EHOSTDOWN, EHOSTUNREACH, ENETDOWN,
-            ENETUNREACH, ENODEV,
+            EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET, EHOSTDOWN,
+            EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV, EPWROFF, EDEVERR,
         ] {
             #expect(
                 CommandTransport.targetReason(code)
