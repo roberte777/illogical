@@ -1,0 +1,14 @@
+version: 2
+
+updates:
+  # The workflows pin actions by commit SHA, which is only safe if something
+  # moves the pins. This is that something.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: chore
+    groups:
+      actions:
+        patterns: ["*"]

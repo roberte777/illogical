@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Every commit on main gets built; on a branch only the newest push survives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # `just fmt-check`: zig fmt, alejandra, swift-format lint.
+  #
+  # Has to be macOS: flake.nix only puts swift-format in the devshell on
+  # darwin, and the recipe lints Swift.
+  fmt:
+    name: fmt
+    runs-on: macos-26
+    steps:
+      # No submodules on purpose. Nothing the recipe reads lives in
+      # vendor/ghostty, and `alejandra --check .` walks the whole tree — with
+      # the submodule checked out it lints ghostty's 32 .nix files as if they
+      # were ours, so a pin bump could turn this job red over someone else's
+      # formatting.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: accept-flake-config = true
+
+      - run: nix develop -c just fmt-check
+
+  # `just test`, on both backends. src/core/poller.zig carries a kqueue and an
+  # epoll implementation and sys.zig branches on the OS, so the Linux runner is
+  # the only thing that ever compiles the epoll half.
+  test-zig:
+    name: zig test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # build.zig resolves ghostty-vt out of the submodule, and returns
+          # null without it — which builds an illogicald that is missing its
+          # terminal rather than failing. fetch-depth 1 makes the submodule
+          # shallow too; ghostty's history is not small.
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Resolve the ghostty pin
+        id: pin
+        run: echo "sha=$(git rev-parse HEAD:vendor/ghostty)" >> "$GITHUB_OUTPUT"
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: accept-flake-config = true
+
+      # flake.nix pins Zig's caches inside the repo. Only the global one is
+      # carried between runs: it holds the fetched packages, so a green build
+      # does not depend on deps.files.ghostty.org being up that minute. The
+      # local cache is build output, and a cold `zig build test` is only ~1m30s
+      # from nothing, so there is little left to buy and a stale tree to lose.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/global
+          key: zig-global-${{ matrix.os }}-${{ steps.pin.outputs.sha }}-${{ hashFiles('build.zig.zon', 'flake.lock') }}
+          restore-keys: |
+            zig-global-${{ matrix.os }}-${{ steps.pin.outputs.sha }}-
+            zig-global-${{ matrix.os }}-
+
+      - run: nix develop -c just test
+
+  # `just test-swift`: IllogicalKit is pure Swift and builds without the
+  # XCFramework, so this needs neither the submodule nor a generated
+  # .xcodeproj. Package.swift declares swift-tools-version 6.2, which is why
+  # the runner is macos-26 — macos-15 still defaults to Xcode 16.
+  test-swift:
+    name: swift test
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: accept-flake-config = true
+
+      - run: nix develop -c just test-swift
+
+  # One status to require in branch protection, so adding a matrix leg later
+  # does not mean editing the rule.
+  ci:
+    name: ci
+    runs-on: ubuntu-24.04
+    needs: [fmt, test-zig, test-swift]
+    if: always()
+    steps:
+      - name: Check that every job passed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1

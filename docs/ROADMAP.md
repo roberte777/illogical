@@ -187,7 +187,7 @@ milestone the whole architecture exists for. See [PARKING.md](PARKING.md).
 | ✅ | Streaming unpark: `ready()` on the hot path, history on a background thread |
 | ✅ | **A2** — attach to a parked terminal streams from disk and does **not** unpark |
 | ✅ | **A5** — live scrollback compression: activity token, incremental steps on idle, never `MODE_FULL` on a hot path |
-| ✅ | The benchmark, as `scripts/bench-memory.sh` and `scripts/bench-pty.sh` (not in CI — there is no CI) |
+| ✅ | The benchmark, as `scripts/bench-memory.sh` and `scripts/bench-pty.sh` (run by hand; CI does not gate on them) |
 | ✅ | **F2** — flow control: bounded per-client queue, overflow ⇒ forced re-attach |
 | ✅ | **A3** (second half) — PTY fd migration between dedicated thread and shared poller, with hysteresis |
 | ✅ | **A4** — client buffer parking |
