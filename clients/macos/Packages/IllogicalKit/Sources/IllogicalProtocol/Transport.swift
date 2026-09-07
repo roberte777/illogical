@@ -52,7 +52,8 @@ public enum TransportError: Error, Equatable, CustomStringConvertible {
     case pathTooLong
     case notOnPath(String)
     /// The spawn failed for a reason that will clear on its own: out of
-    /// descriptors, out of processes, out of memory. Retryable.
+    /// descriptors, processes or memory, or a volume that stopped answering.
+    /// Retryable.
     case spawnFailed(command: String, reason: String)
     /// The spawn failed for a reason retrying cannot help with: something
     /// about the file -- not there, not executable, not a program -- or a
@@ -274,6 +275,7 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// contradiction: by then the error has already been matched against the
     /// permanent set, and the probe is only being asked which sentence to
     /// use. Only the errnos named as recoverable send it back.
+    ///
     /// `verdict` is injectable because the composition below cannot otherwise
     /// be checked: every condition a test can build on a real filesystem is
     /// permanent, so `spawnError` discarding the retryable half -- which is
@@ -303,15 +305,39 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         return route(command: command, verdict(path, ns))
     }
 
+    /// Errnos from a `stat` that mean "try again later" rather than "this is
+    /// what is wrong with the file".
+    ///
+    /// One list because it was five -- two switches, two membership loops and
+    /// a rule loop -- and drift between the copies is exactly how `ECONNRESET`
+    /// came to be dropped from one of them without a test noticing. Membership
+    /// is structural now.
+    ///
+    /// NFS: `ESTALE`, `ETIMEDOUT`. smbfs, whose session can die several ways:
+    /// `ENOTCONN`, `ECONNRESET`, `ENETRESET`, `ECONNABORTED`, `ESHUTDOWN`,
+    /// `EPIPE`. The server itself unreachable: `EHOSTDOWN`, `EHOSTUNREACH`.
+    /// The network gone: `ENETDOWN`, `ENETUNREACH`. Removable media:
+    /// `ENODEV`, and Darwin's own `EPWROFF`/`EDEVERR` for a disk unpowered or
+    /// failed. `EIO` for a disk that is merely failing.
+    ///
+    /// It has to be right, because the default beside it is *permanent*: an
+    /// errno missing from here is a host that never comes back on its own,
+    /// which is the bug this whole mechanism exists for.
+    static let recoverable: Set<Int32> = [
+        EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET, ECONNABORTED,
+        ESHUTDOWN, EPIPE, EHOSTDOWN, EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV,
+        EPWROFF, EDEVERR,
+    ]
+
     /// Send a verdict to the case whose template its wording was written for.
     ///
     /// `.notExecutable` renders "<command> <reason>" and wants a predicate;
     /// `.spawnFailed` renders "could not run <command>: <reason>" and wants a
     /// clause. Routing a predicate into the second produced "could not run
-    /// ssh: is on a volume that is not responding". A named function rather
-    /// than a ternary inside `spawnError`, because every condition a test can
-    /// construct is permanent -- so inlined, dropping the retryable side
-    /// passed the whole suite.
+    /// ssh: is on a volume that is not responding". A named function so both
+    /// branches can be rendered and read; pinning the *composition* -- that
+    /// `spawnError` uses this rather than discarding the flag -- is what the
+    /// injectable verdict is for, and extracting this did not do it.
     static func route(
         command: String, _ verdict: (reason: String, retryable: Bool)
     ) -> TransportError {
@@ -378,6 +404,9 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// whose target merely cannot be reached is not, and calling it broken
     /// sends somebody to inspect a symlink that is perfectly fine.
     static func targetReason(_ code: Int32) -> (reason: String, retryable: Bool) {
+        if recoverable.contains(code) {
+            return ("the volume its target is on is not responding", true)
+        }
         switch code {
         case ENOENT: return ("is a broken symlink", false)
         case ELOOP: return ("is a loop of symlinks", false)
@@ -389,25 +418,6 @@ public final class CommandTransport: Transport, @unchecked Sendable {
             )
         case ENOTDIR: return ("points under something that is not a directory", false)
         case ENAMETOOLONG: return ("points at too long a path to open", false)
-        // Written as a clause, not a predicate: this one renders through
-        // "could not run <command>: …" rather than "<command> …".
-        // NFS gives `ESTALE`/`ETIMEDOUT`; smbfs gives `ENOTCONN` when the
-        // server drops; Wi-Fi going away gives `ENETDOWN`/`ENETUNREACH`, and a
-        // force-ejected volume `ENODEV`. Listing only the NFS ones left the
-        // commonest case -- a laptop losing an SMB share -- on the permanent
-        // side, which is the bug this arm exists for.
-        // NFS: `ESTALE`, `ETIMEDOUT`. smbfs: `ENOTCONN` when the session
-        // drops, `ECONNRESET`/`ENETRESET` when it dies mid-operation. The
-        // server itself unreachable: `EHOSTDOWN`, `EHOSTUNREACH`. The network
-        // gone: `ENETDOWN`, `ENETUNREACH`. Removable media: `ENODEV`, and
-        // Darwin's own `EPWROFF`/`EDEVERR` for a disk unpowered or failed.
-        //
-        // The list has to be right because the default below is *permanent*:
-        // an errno missing from here is a host that never comes back on its
-        // own, which is the bug this arm exists for.
-        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET,
-            EHOSTDOWN, EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV, EPWROFF, EDEVERR:
-            return ("the volume its target is on is not responding", true)
         default: return ("points at something that could not be checked", false)
         }
     }
@@ -420,45 +430,20 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// retry decision is what has twice left a host reconnecting every thirty
     /// seconds for the life of the process.
     static func pathReason(_ code: Int32) -> (reason: String, retryable: Bool) {
+        if recoverable.contains(code) { return ("the volume it is on is not responding", true) }
         switch code {
         case ENOENT: return ("is not there", false)
         case EACCES: return ("is in a directory that cannot be searched", false)
-        // What macOS reports for a TCC prompt nobody has granted — a binary on
-        // an external or network volume, or in Desktop/Documents/Downloads.
-        // The remedy is Privacy & Security, so the sentence has to point there
         // rather than at the network.
         case EPERM:
             return (
                 "is somewhere this app has not been granted access to"
                     + " (Privacy & Security ▸ Files and Folders)", false
             )
-        // Not the same fault as EACCES, and not the same advice: there is no
-        // unsearchable directory to go and look at, because a component of the
-        // path is not a directory at all -- `/usr/local/bin/ssh` where
         // `/usr/local/bin` is a leftover regular file.
         case ENOTDIR: return ("is under something that is not a directory", false)
         case ELOOP: return ("is a loop of symlinks", false)
         case ENAMETOOLONG: return ("is too long a path to open", false)
-        // A clause, for the "could not run <command>: …" template.
-        // NFS gives `ESTALE`/`ETIMEDOUT`; smbfs gives `ENOTCONN` when the
-        // server drops; Wi-Fi going away gives `ENETDOWN`/`ENETUNREACH`, and a
-        // force-ejected volume `ENODEV`. Listing only the NFS ones left the
-        // commonest case -- a laptop losing an SMB share -- on the permanent
-        // side, which is the bug this arm exists for.
-        // NFS: `ESTALE`, `ETIMEDOUT`. smbfs: `ENOTCONN` when the session
-        // drops, `ECONNRESET`/`ENETRESET` when it dies mid-operation. The
-        // server itself unreachable: `EHOSTDOWN`, `EHOSTUNREACH`. The network
-        // gone: `ENETDOWN`, `ENETUNREACH`. Removable media: `ENODEV`, and
-        // Darwin's own `EPWROFF`/`EDEVERR` for a disk unpowered or failed.
-        //
-        // The list has to be right because the default below is *permanent*:
-        // an errno missing from here is a host that never comes back on its
-        // own, which is the bug this arm exists for.
-        case EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET,
-            EHOSTDOWN, EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV, EPWROFF, EDEVERR:
-            return ("the volume it is on is not responding", true)
-        // Anything not established says so. Naming a cause we have not
-        // determined is how a file somebody was looking at came to be
         // described as absent.
         default: return ("could not be checked", false)
         }

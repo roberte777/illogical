@@ -622,6 +622,33 @@ struct TransportTests {
             String(describing: classify(NSPOSIXErrorDomain, EBADEXEC))
                 == "ssh is not a valid executable")
 
+        // The transient branch's own sentence, which nothing asserted: it is
+        // the one that relays Foundation's wording, so it is the one that can
+        // become an NSError dump -- the exact thing `spawnError` opens by
+        // saying it exists to prevent, on the commoner side of the guard.
+        let busy = String(
+            describing: CommandTransport.spawnError(
+                NSError(domain: NSPOSIXErrorDomain, code: Int(EMFILE)), command: "ssh",
+                path: "/usr/bin/ssh"))
+        #expect(busy.hasPrefix("could not run ssh: "))
+        #expect(!busy.contains("Domain="), "\(busy)")
+        #expect(!busy.contains("UserInfo="), "\(busy)")
+
+        // The two halves of the permanence guard, each of which survived a
+        // one-token mutation: without the domain check, any error whose code
+        // collides with a member of the set becomes permanent; without the
+        // code check, every Cocoa error does.
+        #expect(
+            CommandTransport.spawnError(
+                NSError(domain: "SomeOtherDomain", code: Int(ENOENT)), command: "ssh",
+                path: "/usr/bin/ssh"
+            ).isTransient)
+        #expect(
+            CommandTransport.spawnError(
+                NSError(domain: NSCocoaErrorDomain, code: 260), command: "ssh",
+                path: "/usr/bin/ssh"
+            ).isTransient)
+
         // The fallthrough, which had no assertion at all.
         #expect(String(describing: classify(NSPOSIXErrorDomain, EISDIR)) == "ssh cannot be run")
     }
@@ -653,10 +680,7 @@ struct TransportTests {
         #expect(CommandTransport.pathReason(ELOOP) == ("is a loop of symlinks", false))
         #expect(
             CommandTransport.pathReason(ENAMETOOLONG) == ("is too long a path to open", false))
-        for code in [
-            EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET, EHOSTDOWN,
-            EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV, EPWROFF, EDEVERR,
-        ] {
+        for code in CommandTransport.recoverable {
             #expect(
                 CommandTransport.pathReason(code)
                     == ("the volume it is on is not responding", true), "errno \(code)")
@@ -683,10 +707,7 @@ struct TransportTests {
                         + " (Privacy & Security ▸ Files and Folders)",
                     false
                 ))
-        for code in [
-            EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET, EHOSTDOWN,
-            EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV, EPWROFF, EDEVERR,
-        ] {
+        for code in CommandTransport.recoverable {
             #expect(
                 CommandTransport.targetReason(code)
                     == ("the volume its target is on is not responding", true), "errno \(code)")
