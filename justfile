@@ -16,6 +16,23 @@ xcenv := "env -u LD -u CC -u CXX -u AR -u NM -u RANLIB -u STRIP -u SDKROOT -u DE
 # checked out, where the compile is about to fail for a better reason anyway.
 ghostty_pin := `git -C vendor/ghostty rev-parse --short=12 HEAD 2>/dev/null || echo unknown`
 
+# What a build calls itself. The same rule scripts/dist-daemon.sh uses, so the
+# app's CFBundleShortVersionString and the daemon's `--version` agree: a tag
+# when there is one, the short sha when there is not. The leading `v` is
+# stripped because a `v` in the middle of a version string is a thing every
+# tool that parses one has to be told about.
+#
+# The fallback is inside the parentheses on purpose: with `git ... | sed || echo`
+# the `||` binds to sed, which succeeds on empty input, so a tree with no git
+# produced an empty version rather than the default.
+repo_version := `(git describe --tags --always --dirty 2>/dev/null || echo 0.0.0-dev) | sed 's/^v//'`
+
+# CFBundleVersion: commits on this branch. Monotonic across every release,
+# which is the one property Sparkle needs to decide that an update is newer
+# (#47). A sha is not orderable and a date is not either once two land in a
+# minute.
+build_number := `git rev-list --count HEAD 2>/dev/null || echo 0`
+
 default:
     @just --list
 
@@ -53,6 +70,21 @@ dist-daemon target="native" version="":
 # the current ghostty pin and fails loudly if a pin bump breaks it; CI builds
 # those two natively, which is also where they get smoke-run.
 dist version="": (dist-daemon "universal" version) (dist-daemon "x86_64-linux-musl" version) (dist-daemon "aarch64-linux-musl" version)
+
+# --- releasing the app ------------------------------------------------------
+
+# Sign, notarize and package Illogical.app into dist/Illogical.dmg.
+#
+# Signing and notarization happen only when the Developer ID secrets are in the
+# environment; without them this still produces a DMG, ad-hoc signed, which
+# Gatekeeper will refuse on any machine that did not build it. See
+# scripts/dist-app.sh for the variables and for what each step buys.
+#
+# Through `xcenv` for the same reason xcodebuild is: the script drives codesign
+# and `xcrun notarytool`, and the devshell's DEVELOPER_DIR and SDKROOT point
+# xcrun at nix's SDK rather than at Xcode's.
+dist-app version=repo_version: (app-release version)
+    {{xcenv}} ./scripts/dist-app.sh {{version}}
 
 clean-dist:
     rm -rf dist
@@ -116,9 +148,25 @@ xcodeproj: stage-daemon
 # *overwrites the app*. Measured, not guessed: same inode, and the bundle then
 # failed `codesign --verify --deep` with "invalid Info.plist". The CLI ships in
 # the standalone tarball instead.
-stage-daemon: build
+#
+# ILLOGICAL_DAEMON_BIN names a prebuilt illogicald to stage instead of building
+# one, and is what the release sets. Without it the app would carry a second
+# build of the same source -- `zig build` is Debug and host-arch, while the
+# tarball is ReleaseFast, stripped and lipo'd -- so an Intel Mac got a bundle
+# whose daemon could not run, and every release app reported version skew
+# against its own tarball. Same bytes, one build, both places.
+stage-daemon:
+    #!/usr/bin/env bash
+    set -euo pipefail
     mkdir -p clients/macos/Illogical/Supporting/bin
-    cp zig-out/bin/illogicald clients/macos/Illogical/Supporting/bin/
+    if [ -n "${ILLOGICAL_DAEMON_BIN:-}" ]; then
+        echo "==> staging prebuilt $ILLOGICAL_DAEMON_BIN"
+        cp "$ILLOGICAL_DAEMON_BIN" clients/macos/Illogical/Supporting/bin/illogicald
+    else
+        zig build -Dghostty-pin={{ghostty_pin}}
+        cp zig-out/bin/illogicald clients/macos/Illogical/Supporting/bin/illogicald
+    fi
+    chmod +x clients/macos/Illogical/Supporting/bin/illogicald
 
 # Test the pure-Swift client core. Needs no XCFramework.
 test-swift:
@@ -128,6 +176,19 @@ test-swift:
 # DerivedData is pinned so `just run-app` always launches what was just built.
 app: stage-daemon
     cd clients/macos && {{xcenv}} xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Debug -derivedDataPath .build/xcode -destination 'platform=macOS' build
+
+# The app as it ships: Release, and carrying a version rather than the 0.0.0
+# placeholder project.yml holds.
+#
+# DerivedData of its own, so a release build never overwrites the Debug bundle
+# `just run-app` and the benchmarks launch. Signing is not here -- it needs
+# secrets and a keychain, which is scripts/dist-app.sh's problem.
+#
+# ONLY_ACTIVE_ARCH=NO because Xcode defaults it to YES and would give an Apple
+# Silicon runner an arm64-only app. The daemon inside it is universal; the app
+# around it has to be too, or an Intel Mac cannot launch what it downloaded.
+app-release version=repo_version: stage-daemon
+    cd clients/macos && {{xcenv}} xcodebuild -project Illogical.xcodeproj -scheme Illogical -configuration Release -derivedDataPath .build/xcode-release -destination 'platform=macOS' ONLY_ACTIVE_ARCH=NO MARKETING_VERSION={{version}} CURRENT_PROJECT_VERSION={{build_number}} build
 
 # Run the renderer tests. Needs `just xcframework` and `just xcodeproj` first.
 test-renderer:

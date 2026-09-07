@@ -47,11 +47,19 @@ stopped.
 
 ## Install
 
-**The Mac app.** Download it, open it, get a terminal. It carries the server
-inside it and starts one when there is none — nothing to install first and
-nothing to start. Signing, notarization and updates are
-[#47](https://github.com/roberte777/illogical/issues/47); until that lands,
-build it from source below.
+**The Mac app.** Download
+[`Illogical.dmg`](https://github.com/roberte777/illogical/releases/latest/download/Illogical.dmg),
+open it, drag Illogical to Applications. That is the whole install: the app
+carries the server inside it and starts one when there is none, so there is
+nothing to install first and nothing to start. Universal, so it runs on both
+Apple Silicon and Intel.
+
+> The DMG is not signed or notarized yet — that needs an Apple Developer ID,
+> and the pipeline turns both on the moment one exists (see **Releases**
+> below). Until then macOS refuses it on the first open: right-click Illogical
+> → **Open**, once, and it will launch normally afterwards. Tracked in
+> [#47](https://github.com/roberte777/illogical/issues/47) along with
+> auto-updates.
 
 **The server, on any other box.** One tarball, two static binaries, no runtime
 dependencies:
@@ -77,6 +85,48 @@ they impose no glibc floor. Locally, `just dist` builds all three.
 already holds the app's own `Illogical` executable and the default macOS volume
 is case-insensitive, so a file called `illogical` in there *is* that file. Take
 it from the tarball, or from `zig-out/bin` in a build tree.
+
+## Releases
+
+Every merge to `main` rebuilds everything and moves the
+[`latest`](https://github.com/roberte777/illogical/releases/tag/latest)
+prerelease onto it, so the download links above are permanent and always point
+at the newest build. There are no version numbers yet on purpose: there is one
+release, and asking somebody to choose between one thing is ceremony around
+nothing. Pushing a `v*` tag publishes the same artifacts as a real release that
+stops moving.
+
+The trigger is CI going green rather than the push itself, so a merge that
+broke the build cannot replace a working download with one that does not run.
+
+The macOS daemon tarball is built first and the app bundle carries **that exact
+binary** rather than a second build of it — one build, both places, which is
+what stops an Intel Mac getting an app whose daemon cannot run.
+
+Locally: `just dist-app` builds and packages the DMG, `just dist` builds the
+three server tarballs.
+
+### Signing
+
+`scripts/dist-app.sh` signs and notarizes when these repository secrets exist
+and builds an ad-hoc signed DMG when they do not, so the packaging path runs on
+every build rather than only where a certificate lives:
+
+| Secret | What it is |
+| --- | --- |
+| `MACOS_CERTIFICATE` | base64 of the Developer ID Application `.p12` |
+| `MACOS_CERTIFICATE_PWD` | its export password |
+| `MACOS_CERTIFICATE_NAME` | the identity, `Developer ID Application: … (TEAM)` |
+| `MACOS_KEYCHAIN_PWD` | any password; names the throwaway CI keychain |
+| `APPLE_API_ISSUER` | App Store Connect API issuer UUID |
+| `APPLE_API_KEY_ID` | its key id |
+| `APPLE_API_KEY` | base64 of the `AuthKey_<id>.p8` |
+
+Set all seven and the next merge produces a DMG that opens with a double-click.
+The app and the DMG are notarized and stapled separately — a ticket is fetched
+by the cdhash of the artifact it is stapled to, so stapling only the DMG leaves
+the app a user drags to Applications needing Apple's servers on first launch.
+The reasoning for each step is in the script's header.
 
 ## Getting started
 
@@ -164,7 +214,7 @@ clients/macos/
   Illogical/Supporting/Fonts/  JetBrains Mono, shipped as the default face
   Packages/IllogicalKit/   pure-Swift protocol core
 
-scripts/                   build-xcframework.sh
+scripts/                   build-xcframework.sh, dist-daemon.sh, dist-app.sh
 vendor/ghostty             submodule — the pin for both sides
 docs/
 ```
