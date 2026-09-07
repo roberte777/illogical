@@ -608,6 +608,33 @@ struct TransportTests {
                 == ("points at something that could not be checked", false))
     }
 
+    /// The pairing between a reason and the case it is routed to, as a rule
+    /// rather than by example.
+    ///
+    /// `.notExecutable` renders "<command> <reason>" and wants a predicate;
+    /// `.spawnFailed` renders "could not run <command>: <reason>" and wants a
+    /// clause. Getting that backwards is what produced "could not run ssh: is
+    /// on a volume that is not responding", and an example-based test only
+    /// catches the examples it happens to name. Every permanent reason must
+    /// begin as a predicate; every retryable one must not.
+    @Test("a predicate never lands in the clause template")
+    func reasonsMatchTheirTemplate() {
+        let predicate = ["is ", "points ", "could not be ", "cannot be ", "needs "]
+        for code in [
+            ENOENT, EACCES, EPERM, ENOTDIR, ELOOP, ENAMETOOLONG, EIO, ESTALE, ETIMEDOUT,
+            ENXIO, EBUSY, EINVAL, ENOSPC,
+        ] {
+            for (reason, retryable) in [
+                CommandTransport.pathReason(code), CommandTransport.targetReason(code),
+            ] {
+                let readsAsPredicate = predicate.contains { reason.hasPrefix($0) }
+                #expect(
+                    readsAsPredicate != retryable,
+                    "errno \(code): \(retryable ? "retryable" : "permanent") reason \"\(reason)\"")
+            }
+        }
+    }
+
     /// The sentences as a person actually sees them. Every other assertion
     /// here checks a helper's return value, which is how the last version
     /// shipped a retryable case rendering through the *other* case's template
