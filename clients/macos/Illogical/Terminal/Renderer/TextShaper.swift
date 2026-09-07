@@ -178,6 +178,7 @@ final class TextShaper {
         graphemes: [UInt32],
         cols: Int,
         selection: (start: UInt16, end: UInt16)?,
+        search: [SearchHighlight] = [],
         cursorX: UInt16?
     ) -> [TextRun] {
         runBuf.removeAll(keepingCapacity: true)
@@ -204,7 +205,7 @@ final class TextShaper {
 
             if let run = nextRun(
                 row: row, graphemes: graphemes, start: &i, maxCol: maxCol,
-                selection: selection, cursorX: cursorX)
+                selection: selection, search: search, cursorX: cursorX)
             {
                 runBuf.append(run)
             } else {
@@ -221,6 +222,7 @@ final class TextShaper {
         start: inout Int,
         maxCol: Int,
         selection: (start: UInt16, end: UInt16)?,
+        search: [SearchHighlight],
         cursorX: UInt16?
     ) -> TextRun? {
         let i = start
@@ -247,6 +249,20 @@ final class TextShaper {
             if let sel = selection, j > i {
                 if sel.start > 0 && j == Int(sel.start) { break }
                 if sel.end > 0 && j == Int(sel.end) + 1 { break }
+            }
+
+            // The edge of a search match is the same kind of boundary, and it
+            // is the one that shows: a match sits *inside* a word far more
+            // often than a selection does, so a run that spanned the edge
+            // would paint the whole word the match's colour. Looped rather
+            // than compared against a range because a row may hold several.
+            if j > i {
+                var split = false
+                for highlight in search {
+                    if highlight.start > 0 && j == Int(highlight.start) { split = true }
+                    if highlight.end > 0 && j == Int(highlight.end) + 1 { split = true }
+                }
+                if split { break }
             }
 
             // Spacers carry no glyph of their own.

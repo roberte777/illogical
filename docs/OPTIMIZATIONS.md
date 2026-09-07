@@ -483,11 +483,23 @@ under live resize.
 
 ### D3. Incremental, caller-driven search
 
-**Status: Free.** Milestone M7.
+**Status: Adapt.** Landed after M6, in the Mac client (#16, #36).
 
 Terminal search over a large scrollback is split into small steps the caller
 drives, so it never blocks a frame. Results survive resize, reflow, primary/alt
 screen switches and scrollback pruning (`search.h`).
+
+We drive it from the find bar rather than from the render thread, and only
+while that bar is on screen: `SearchSession` feeds and ticks on the main actor
+at frame rate until the search reports complete and slowly after that, because
+feeding is the only way a search hears about new output or a moved viewport. A
+terminal with no find bar over it does no search work at all.
+
+The renderer's half is the four-way `{ plain, selection, search, search
+selected }` value Ghostty's own renderer carries where ours had a
+`selected: Bool`. Mapping matches onto per-row cell ranges is ours: the C API
+stops at "a match is a selection over two grid references" and does not expose
+Ghostty's `RenderState.Highlight`.
 
 ### D4. Everything else libghostty has already optimized
 

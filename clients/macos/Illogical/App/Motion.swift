@@ -131,6 +131,16 @@ extension Motion {
     /// The reconnect pill over a terminal.
     static let banner = Motion(duration: 0.2, curve: .easeOut, entrance: .fromTop)
 
+    /// The find bar arriving and leaving. From the top edge, like the banner:
+    /// it is the same kind of thing in the same place.
+    static let search = Motion(duration: 0.18, curve: .easeOut, entrance: .fromTop)
+
+    /// The find bar stepping out of the way of a match underneath it. Shorter
+    /// than its own arrival, and shorter than anything else here, because it
+    /// fires while you are typing — it has to read as the bar moving rather
+    /// than as the bar being slow.
+    static let searchDodge = Motion(duration: 0.14, curve: .snappy, entrance: .fade)
+
     /// Swapping the whole content area between terminals, "no terminals" and
     /// "no server". Not tab-to-tab: that stays instant.
     static let screen = Motion(duration: 0.15, curve: .easeInOut, entrance: .fade)

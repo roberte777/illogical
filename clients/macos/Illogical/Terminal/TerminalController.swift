@@ -60,6 +60,14 @@ final class TerminalController {
     // declared at READY and counted down as pages land.
 
     let engine: TerminalEngine
+
+    /// The find bar over this terminal, and the loop that drives its search.
+    ///
+    /// Here rather than on the pane because a search is bound to the terminal's
+    /// own screens: two views of one terminal are two views of one search, and
+    /// a pane moving in the split tree must not restart it.
+    let search: SearchSession
+
     private var connection: Connection?
     private var pump: Task<Void, Never>?
     private var historyTask: Task<Void, Never>?
@@ -99,7 +107,9 @@ final class TerminalController {
         self.host = host
         self.cols = cols
         self.rows = rows
-        self.engine = try TerminalEngine(cols: cols, rows: rows)
+        let engine = try TerminalEngine(cols: cols, rows: rows)
+        self.engine = engine
+        self.search = SearchSession(engine: engine)
     }
 
     // No deinit teardown: `pump` and `connection` are main-actor state and
@@ -214,6 +224,10 @@ final class TerminalController {
 
     func disconnect() {
         closedByUs = true
+        // Nothing is going to search a terminal that is going away, and the
+        // pump is a timer: left running it would keep waking the main actor for
+        // a pane that is no longer on screen.
+        search.close()
         retry?.cancel()
         retry = nil
         stopHistoryRestore()

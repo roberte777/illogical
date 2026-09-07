@@ -31,10 +31,31 @@ final class TerminalEngine: @unchecked Sendable {
     /// terminal before it is freed — see `adopt`.
     let selectionGesture = SelectionGesture()
 
+    /// Incremental search over this terminal and its scrollback.
+    ///
+    /// Owned here for the same reason the gesture is: it registers state
+    /// *inside* the terminal it was created with, so it has to be rebound when
+    /// `adopt` swaps that terminal and released before either is freed. Not
+    /// `private` only because `TerminalEngine+Search` is the API over it —
+    /// every method on it wants `lock` held, and that extension is where that
+    /// happens.
+    let search = TerminalSearch()
+
     /// Reused across frames so extraction allocates nothing.
     private var rowIterator: GhosttyRenderStateRowIterator?
     private var rowCells: GhosttyRenderStateRowCells?
     private var graphemeScratch = [UInt32](repeating: 0, count: 64)
+
+    /// Search matches on the viewport, as of this frame and the last.
+    ///
+    /// Render-thread only, like `rowIterator`: `updateSnapshot` fills the first
+    /// under the lock and `extractRow` reads it after that lock is released,
+    /// and nothing else touches either. The previous frame's copy is kept so a
+    /// frame where the matches did not move costs a comparison instead of a
+    /// full repaint — highlights change no cell, so libghostty's own dirty
+    /// flags cannot see them.
+    private var searchSpans: [SearchMatchSpan] = []
+    private var lastSearchSpans: [SearchMatchSpan] = []
 
     private(set) var cols: UInt16
     private(set) var rows: UInt16
@@ -141,6 +162,11 @@ final class TerminalEngine: @unchecked Sendable {
         }
         self.rowCells = cells
 
+        // Cheap, and it reads nothing: creating a search only registers it with
+        // the terminal so the two can be freed in either order. It stays idle
+        // until a find bar gives it a needle.
+        search.rebind(to: term)
+
         applyThemeLocked()
     }
 
@@ -166,8 +192,10 @@ final class TerminalEngine: @unchecked Sendable {
     }
 
     deinit {
-        // Before the terminal: the gesture's tracked references belong to it.
+        // Before the terminal: the gesture's tracked references belong to it,
+        // and so does the state the search registered inside it.
         selectionGesture.free(terminal: terminal)
+        search.free()
         if let rowCells { ghostty_render_state_row_cells_free(rowCells) }
         if let rowIterator { ghostty_render_state_row_iterator_free(rowIterator) }
         if let renderState { ghostty_render_state_free(renderState) }
@@ -181,12 +209,18 @@ final class TerminalEngine: @unchecked Sendable {
     func adopt(terminal newTerminal: GhosttyTerminal, cols: UInt16, rows: UInt16) {
         lock.lock()
         if let terminal {
-            // Tracked references into a terminal do not survive it, and the
-            // gesture cannot find that out on its own.
+            // Tracked references into a terminal do not survive it, and neither
+            // the gesture nor the search can find that out on its own. The
+            // search is released rather than reset because it cannot be
+            // rebound: `rebind` below makes a new one over the new terminal and
+            // gives it the query the old one had, so a find bar open across an
+            // attach keeps looking for the same thing.
             selectionGesture.reset(terminal: terminal)
+            search.free()
             ghostty_terminal_free(terminal)
         }
         terminal = newTerminal
+        search.rebind(to: newTerminal)
         self.cols = cols
         self.rows = rows
         // A new terminal has whatever history READY brought with it and no
@@ -258,10 +292,13 @@ final class TerminalEngine: @unchecked Sendable {
 
     /// Force the next frame to rebuild every row, and ask for one.
     ///
-    /// The same flag a viewport move sets, for the same reason: a selection
-    /// changes no cell, so libghostty's per-row dirty flags — which describe
-    /// content, not what is on screen — do not describe it either.
-    func markSelectionDirty() {
+    /// The same flag a viewport move sets, for the same reason: neither a
+    /// selection nor a search match changes a cell, so libghostty's per-row
+    /// dirty flags — which describe content, not what is on screen — do not
+    /// describe them either. It also has to *wake* the render loop, which
+    /// pauses after a second of quiet: a terminal sitting idle while its find
+    /// bar is typed into would otherwise not draw the highlights at all.
+    func markHighlightsDirty() {
         lock.lock()
         forceFullRebuild = true
         lock.unlock()
@@ -491,8 +528,27 @@ final class TerminalEngine: @unchecked Sendable {
             lock.unlock()
             return false
         }
+        // Under the same lock as `begin_update`, and it has to be: a match is
+        // an *untracked* grid reference, valid only until the next byte of
+        // output, so reading the list and turning it into viewport cells is
+        // one operation or it is a use-after-free. Bounded — this is the
+        // matches on one screen, not in the scrollback.
+        search.viewportSpans(
+            terminal: terminal, columns: cols, rows: rows, into: &searchSpans)
         let beginResult = ghostty_render_state_begin_update(renderState, terminal)
-        let mustRebuild = forceFullRebuild
+        // Highlights change no cell, so a match arriving, moving or being
+        // stepped onto is invisible to libghostty's per-row dirty flags. This
+        // is what makes it visible.
+        let searchMoved = searchSpans != lastSearchSpans
+        if searchMoved {
+            // Element-wise rather than `lastSearchSpans = searchSpans`, which
+            // would leave the two sharing one buffer and make the *next*
+            // frame's `removeAll` copy it. Both stay uniquely referenced, so a
+            // steady state costs one comparison and no allocation.
+            lastSearchSpans.removeAll(keepingCapacity: true)
+            lastSearchSpans.append(contentsOf: searchSpans)
+        }
+        let mustRebuild = forceFullRebuild || searchMoved
         forceFullRebuild = false
         lock.unlock()
 
@@ -604,6 +660,14 @@ final class TerminalEngine: @unchecked Sendable {
             iterator, GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION, &selection) == GHOSTTY_SUCCESS
         {
             snapshot.rowData[y].selection = (selection.start_x, selection.end_x)
+        }
+
+        // Search matches, from the list taken under the lock above. Ours to
+        // map rather than libghostty's: the C API stops at "a match is a
+        // selection" and never exposes Ghostty's own per-row highlights.
+        for span in searchSpans where span.row == y {
+            snapshot.rowData[y].search.append(
+                SearchHighlight(start: span.start, end: span.end, isSelected: span.isSelected))
         }
 
         var cellsHandle: GhosttyRenderStateRowCells? = cells

@@ -41,9 +41,48 @@ struct TerminalPane: View {
                             retry: { controller.retryNow() })
                     }
                 }
+                // The find bar, over the same surface and for the same reason
+                // the banner is: a bar that pushed the grid down would resize
+                // the PTY and reflow the screen being searched every time ⌘F
+                // was pressed.
+                .overlay {
+                    if let controller = store.existingController(for: pane.terminal) {
+                        FindOverlay(session: controller.search)
+                    }
+                }
         }
         .background(Palette.background)
         .traceFrame("pane-\(pane.terminal.terminal)")
+    }
+}
+
+/// The find bar and the space it floats in.
+///
+/// A `GeometryReader` rather than an alignment, because the bar's position is
+/// not a constant: it starts at the top right and moves down past whatever the
+/// search found underneath it, and working that out needs the surface's own
+/// size in the same coordinates the matches are measured in.
+struct FindOverlay: View {
+    let session: SearchSession
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        GeometryReader { geometry in
+            // The container is unconditional so the *removal* transition has
+            // something to run inside — the same shape `ConnectionBanner` uses.
+            ZStack(alignment: .topLeading) {
+                if session.isOpen {
+                    SearchBar(session: session, surface: geometry.size)
+                        .transition(Motion.search.transition(reduceMotion: reduceMotion))
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .animation(
+                Motion.search.animation(reduceMotion: reduceMotion), value: session.isOpen)
+        }
+        // Only the bar takes the mouse. Without this the reader would swallow
+        // every click meant for the terminal underneath it.
+        .allowsHitTesting(session.isOpen)
     }
 }
 
@@ -133,6 +172,13 @@ struct TerminalSurface: NSViewRepresentable {
 
     func updateNSView(_ view: TerminalSurfaceView, context: Context) {
         context.coordinator.store = store
+        // Not while this pane's find bar is up. The field holds first responder
+        // for as long as it is open, and this runs on *every* update — so
+        // anything that touches the store while you are typing a query would
+        // take the keyboard back mid-word and put the rest of it into the
+        // shell. Read rather than observed on purpose: this is a question about
+        // right now, not an input the view needs rebuilding for.
+        guard store.existingController(for: pane.terminal)?.search.isOpen != true else { return }
         // The tab may have moved focus without a click — a keyboard move, or
         // the pane the tree collapsed onto. AppKit is the authority on first
         // responder, so tell it rather than tracking focus separately.
@@ -175,6 +221,11 @@ struct TerminalSurface: NSViewRepresentable {
             }
             self.controller = controller
             view.engine = controller.engine
+            // The find bar measures its dodge in this surface's coordinates,
+            // and rebinds here rather than holding one for the terminal's life:
+            // a split, a close or a zoom builds a new surface over the same
+            // engine, and the matches have to be measured in the one on screen.
+            controller.search.bind(surface: view)
             view.statusText = nil
             view.needsDisplay = true
             Trace.log(

@@ -120,8 +120,9 @@ engine's lock; the reasoning is in [CLIENT.md](CLIENT.md#the-attach-path-and-the
 
 **Ends at:** the Mac app is a terminal you would actually use. See
 [CLIENT.md](CLIENT.md). Its gate is met and measured below; the open items it
-spawned — IME, search, links, Kitty graphics — are tracked as issues rather
-than as an unfinished milestone.
+spawned — IME, links, Kitty graphics — are tracked as issues rather than as an
+unfinished milestone. Search was one of them and has since landed (#16, #36);
+see [OPTIMIZATIONS.md §D3](OPTIMIZATIONS.md).
 
 Landed so far: the Metal renderer described in [CLIENT.md](CLIENT.md), ported
 from libghostty's own; the Superlogical-style chrome (session button,
@@ -387,7 +388,6 @@ about it.
 
 - Session sharing — multiple people, one session. Needs identity and permissions,
   neither of which the protocol addresses yet.
-- **D3** — incremental search over scrollback.
 - Rename, reorder, per-terminal cwd in the UI.
 - Config file.
 - Daemon restart survival for live children (fd handoff).
