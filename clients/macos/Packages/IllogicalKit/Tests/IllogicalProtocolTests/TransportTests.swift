@@ -78,8 +78,9 @@ struct SSHCommandTests {
     /// `home + 18`, and the guard allows `count - 2 + 40 <= 100`, so 44 bytes
     /// of home is the last that fits. Only a pair either side of that pins the
     /// constant; a single far-over case leaves it free to be anything from 84
-    /// to 116, and above 104 it accepts paths `bind` cannot hold, which is the
-    /// warning the guard exists to prevent.
+    /// to 116, and at 104 it already accepts paths `bind` cannot hold —
+    /// `sun_path` is 104 bytes *including* the terminator, so 103 is the
+    /// longest bindable — which is the warning the guard exists to prevent.
     @Test("the budget is measured from the home directory too")
     func controlPathBudgetFromHome() {
         func path(homeLength: Int) -> String? {
@@ -157,7 +158,7 @@ struct SSHCommandTests {
         let options = SSHCommand.Options(destination: "h")
         let live = try #require(
             SSHCommand.controlPath(options, environment: ProcessInfo.processInfo.environment),
-            "this machine's home is too long for a control path; the checks below cannot run")
+            "no control path for this machine's HOME: unset, or over 44 bytes")
         #expect(SSHCommand.controlPath(options) == live)
     }
 
@@ -168,14 +169,59 @@ struct SSHCommandTests {
     /// `controlPath` with the suite still green, losing `ControlMaster` on
     /// every connection.
     @Test("with no control directory, argv still multiplexes off the home")
-    func multiplexingWithoutAnExplicitDirectory() throws {
+    func multiplexingWithoutAnExplicitDirectory() {
         let options = SSHCommand.Options(destination: "build-box", controlDirectory: nil)
-        let expected = try #require(
-            SSHCommand.controlPath(options),
-            "this machine's home is too long for a control path")
         let args = SSHCommand.argv(options)
-        #expect(args.contains("ControlPath=" + expected))
-        #expect(args.contains("ControlMaster=auto"))
+        // The *relationship*, not the value: a machine whose home leaves no
+        // room renders no path, and then argv must not ask for multiplexing
+        // either. Requiring a path instead would report a defect on such a
+        // machine that does not exist.
+        if let expected = SSHCommand.controlPath(options) {
+            #expect(args.contains("ControlPath=" + expected))
+            #expect(args.contains("ControlMaster=auto"))
+        } else {
+            #expect(!args.contains("ControlMaster=auto"))
+        }
+    }
+
+    /// The other caller, in the same shape. It creates a directory, so it is
+    /// pointed at a home of the test's choosing rather than the real one.
+    @Test("with no control directory, the socket's directory is still prepared")
+    func controlDirectoryPreparedFromTheEnvironment() throws {
+        // Under `/tmp`, not `NSTemporaryDirectory()`: the latter is a ~50-byte
+        // per-user path on macOS, which with a name appended is past the
+        // control-path budget, so `prepareControlDirectory` would correctly do
+        // nothing and the test would pass for the wrong reason.
+        let home = URL(fileURLWithPath: "/tmp")
+            .appending(path: "il-\(getpid())-\(UInt32.random(in: 0..<100_000))")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        // ...and prove that premise rather than assume it.
+        #expect(
+            SSHCommand.controlPath(
+                SSHCommand.Options(destination: "h"), environment: ["HOME": home.path]) != nil)
+
+        SSHCommand.prepareControlDirectory(
+            SSHCommand.Options(destination: "h", controlDirectory: nil),
+            environment: ["HOME": home.path])
+
+        var isDirectory: ObjCBool = false
+        #expect(
+            FileManager.default.fileExists(
+                atPath: home.appending(path: ".ssh").path, isDirectory: &isDirectory))
+        #expect(isDirectory.boolValue)
+    }
+
+    /// The premise both of those rest on: production never sets a control
+    /// directory, so the environment branch is the only one it takes. Adding
+    /// one to `sshOptions` — a plausible "keep sockets out of the home" change
+    /// — would make every comment here false and split the app's control
+    /// socket from the one `src/core/conn.zig` derives, which is two ssh
+    /// masters per host and the bug this whole mechanism exists to prevent.
+    @Test("ssh options never pin a control directory of their own")
+    func sshOptionsLeaveTheControlDirectoryToTheEnvironment() throws {
+        let options = try #require(ServerHost.ssh(destination: "build-box").sshOptions)
+        #expect(options.controlDirectory == nil)
     }
 
     @Test("a remote binary somewhere else is respected")

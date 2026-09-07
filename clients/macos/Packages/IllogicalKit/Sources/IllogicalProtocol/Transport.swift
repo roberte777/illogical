@@ -732,9 +732,8 @@ public enum SSHCommand {
     /// it, without failing a test.
     ///
     /// It does not secure the default argument below, and nothing in this
-    /// process can — `= ["HOME": FileManager.default
-    /// .homeDirectoryForCurrentUser.path]` type-checks and is invisible to
-    /// every assertion, because the two agree here. That is one line of
+    /// process can. A default of `["HOME": <the passwd entry>]` type-checks
+    /// and is invisible to every assertion, because the two agree here. That is one line of
     /// wiring; the test pins it against the process environment, which catches
     /// an empty, filtered or differing default and not the passwd dictionary.
     /// Distinguishing that would need a helper spawned with a different
@@ -763,8 +762,12 @@ public enum SSHCommand {
     /// `ssh` creates the socket but not the directory above it, so on a machine
     /// whose owner has never run ssh, multiplexing would fail on every
     /// connection with nothing to show for it.
-    static func prepareControlDirectory(_ options: Options) {
-        guard options.multiplex, let path = controlPath(options) else { return }
+    static func prepareControlDirectory(
+        _ options: Options,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
+        guard options.multiplex, let path = controlPath(options, environment: environment)
+        else { return }
         let directory = (path as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(
             atPath: directory,
