@@ -133,20 +133,24 @@ final class RenderHarness {
     /// Build a harness sized to hold exactly `columns` x `rows` cells with no
     /// padding, so grid coordinates map straight onto pixels.
     convenience init(
-        columns: Int, rows: Int, pointSize: Double = 13,
+        columns: Int, rows: Int, pointSize: Double = 13, family: String? = "Menlo",
         configure: ((inout RendererConfig) -> Void)? = nil
     ) throws {
         try self.init(
-            columns: columns, rows: rows, pointSize: pointSize,
+            columns: columns, rows: rows, pointSize: pointSize, family: family,
             source: FakeSource(columns: columns, rows: rows), configure: configure)
     }
 
+    /// `family` defaults to Menlo rather than to the app's own default so
+    /// that a pixel assertion written against one face keeps measuring that
+    /// face. Pass nil to render with the font we ship.
     init(
-        columns: Int, rows: Int, pointSize: Double = 13, source: TerminalRenderSource,
+        columns: Int, rows: Int, pointSize: Double = 13, family: String? = "Menlo",
+        source: TerminalRenderSource,
         configure: ((inout RendererConfig) -> Void)? = nil
     ) throws {
         context = try MetalContext.acquire()
-        grid = FontGridSet.grid(family: "Menlo", pointSize: pointSize, scale: 2)
+        grid = FontGridSet.grid(family: family, pointSize: pointSize, scale: 2)
 
         cellWidth = Int(grid.metrics.cellWidth)
         cellHeight = Int(grid.metrics.cellHeight)
