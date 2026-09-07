@@ -25,6 +25,9 @@ clients/macos/Frameworks/
 # illogicald + illogical, staged into the app bundle by `just stage-daemon`
 clients/macos/Illogical/Supporting/bin/
 
+# Release tarballs, from `just dist`
+dist/
+
 # macOS
 .DS_Store
 .zig-bench/

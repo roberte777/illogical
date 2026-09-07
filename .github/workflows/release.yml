@@ -1,0 +1,171 @@
+name: Release
+
+# The server ships on its own. A tag builds `illogicald` and the `illogical`
+# CLI for macOS (universal), Linux x86_64 and Linux aarch64, smoke-runs every
+# artifact on the machine that built it, and publishes the tarballs plus
+# SHA256SUMS to the release.
+#
+# The macOS artifact is *not yet* what the Mac app embeds. `just stage-daemon`
+# copies the Debug host-arch binary from `just build`, which is the dev loop;
+# this job produces ReleaseFast, stripped and lipo'd. Same source, same ghostty
+# pin, different bytes — so the app's version marker calls a release daemon
+# under a dev app skew, which it is. They become one build when #47's app job
+# stages the `macos-universal` artifact from here instead of `zig-out`, which is
+# what "one server, embedded for local use and shippable standalone" needs to
+# actually mean the same binary.
+#
+# Linux is built *natively* rather than cross-compiled from the macOS job.
+# Cross-compiling to musl works at the current ghostty pin (and `just dist`
+# does exactly that locally), but a native build gets the smoke run for free,
+# the Linux runners and their warm zig cache already exist in ci.yml, and the
+# aarch64 leg is the only place the epoll poller is ever exercised on ARM.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Never cancelled: a half-published release is worse than a slow one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  daemon:
+    name: illogicald (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    # A cold `zig build` of three targets is minutes, not tens of them. The
+    # bound is here so a hung build fails the release rather than holding a
+    # runner for six hours.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: linux-x86_64
+            target: x86_64-linux-musl
+          - os: ubuntu-24.04-arm
+            label: linux-aarch64
+            target: aarch64-linux-musl
+          - os: macos-26
+            label: macos-universal
+            target: universal
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # build.zig resolves ghostty-vt out of the submodule and returns null
+          # without it, which builds an illogicald missing its terminal rather
+          # than failing.
+          submodules: recursive
+          # Unlike ci.yml: `git describe --tags` is what names the tarball, and
+          # a shallow clone has no tags to describe against.
+          fetch-depth: 0
+
+      - name: Resolve the ghostty pin
+        id: pin
+        run: echo "sha=$(git rev-parse HEAD:vendor/ghostty)" >> "$GITHUB_OUTPUT"
+
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: accept-flake-config = true
+
+      # Same key shape as ci.yml, and deliberately shared with it: the packages
+      # a release fetches are the packages a test run fetched an hour ago.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/global
+          key: zig-global-${{ matrix.os }}-${{ steps.pin.outputs.sha }}-${{ hashFiles('build.zig.zon', 'flake.lock') }}
+          restore-keys: |
+            zig-global-${{ matrix.os }}-${{ steps.pin.outputs.sha }}-
+            zig-global-${{ matrix.os }}-
+
+      - name: Build
+        run: nix develop -c just dist-daemon ${{ matrix.target }}
+
+      # The artifact that was just built, run on the machine that built it. A
+      # release whose binaries have never been executed is a release nobody has
+      # tested, and every step below is one line of the actual install story.
+      - name: Smoke-run the artifact
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/smoke"
+          mkdir -p "$out"
+          tar -xzf dist/*-${{ matrix.label }}.tar.gz -C "$out"
+
+          "$out/illogicald" --version
+          "$out/illogical" --version
+
+          # The whole of "nothing to start": --ensure leaves a daemon behind,
+          # detached, and exits.
+          sock="$RUNNER_TEMP/server.sock"
+          "$out/illogicald" --ensure --socket "$sock" | tee "$RUNNER_TEMP/first"
+          grep -q "started, listening on" "$RUNNER_TEMP/first"
+
+          # ...and it is really there, answering the protocol.
+          "$out/illogical" --socket "$sock" list
+
+          # A second --ensure must find it rather than start a second daemon:
+          # whatever owns that socket owns every terminal behind it.
+          "$out/illogicald" --ensure --socket "$sock" | tee "$RUNNER_TEMP/second"
+          grep -q "already running" "$RUNNER_TEMP/second"
+
+          pkill -f -- "--socket $sock" || true
+
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: illogicald-${{ matrix.label }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # Only this job can write, and it is the only one that needs to.
+  release:
+    name: publish
+    needs: daemon
+    runs-on: ubuntu-24.04
+    # A manual run builds and smoke-runs everything and publishes nothing;
+    # there is no release to publish to.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          path: dist
+          pattern: illogicald-*
+          merge-multiple: true
+
+      # Rebuilt here rather than taken from any one job's dist/, so the file
+      # covers all three tarballs and its hashes are over the bytes actually
+      # being published.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -la
+          # Bare names, not `./name`: `sha256sum -c SHA256SUMS` compares the
+          # path as written, and `./illogicald-linux-x86_64.tar.gz` does not
+          # match the file somebody downloaded under its own name.
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # Created only if it is not there. `|| true` on the create swallowed
+          # an auth or permission failure too, and the upload below then failed
+          # with "release not found" — which sends whoever is reading the log
+          # to entirely the wrong place.
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --title "$tag" --generate-notes --verify-tag
+          # `--clobber` so re-running a failed publish replaces the assets it
+          # already uploaded rather than refusing.
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
+            dist/*.tar.gz dist/SHA256SUMS

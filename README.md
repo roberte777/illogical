@@ -17,10 +17,11 @@ until they speak again.
 > and posts, and from libghostty's source. The evidence is written down with
 > citations in [docs/RESEARCH.md](docs/RESEARCH.md).
 
-**Status: M5.** The daemon runs sessions, parks idle terminals to disk, and the
+**Status: M6.** The daemon runs sessions, parks idle terminals to disk, and the
 Mac client attaches to them — on this machine or on another one over SSH,
-several at a time in one window. What is measured and what is not is in
-[docs/ROADMAP.md](docs/ROADMAP.md).
+several at a time in one window. The app carries the server and starts one when
+there is none, and the same server ships on its own for any other box. What is
+measured and what is not is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Remote hosts
 
@@ -43,6 +44,39 @@ The Mac app holds as many hosts at once as you add, and gets them back on its
 own when a network goes away. That recovery is the desync path with a new socket
 in front of it: the same `attach`, because the terminal on the far side never
 stopped.
+
+## Install
+
+**The Mac app.** Download it, open it, get a terminal. It carries the server
+inside it and starts one when there is none — nothing to install first and
+nothing to start. Signing, notarization and updates are
+[#47](https://github.com/roberte777/illogical/issues/47); until that lands,
+build it from source below.
+
+**The server, on any other box.** One tarball, two static binaries, no runtime
+dependencies:
+
+```bash
+curl -fsSL https://github.com/roberte777/illogical/releases/latest/download/illogicald-linux-x86_64.tar.gz \
+  | tar xz -C ~/.local/bin illogicald illogical
+```
+
+The two binaries by name, because the tarball also carries `LICENSE` and
+`THIRD_PARTY_NOTICES` and those do not belong on a `PATH`.
+
+Nothing needs starting after that. `illogical --host <box>` runs
+`ssh <box> illogicald --stdio`, which starts a daemon there if there is none —
+it only has to be on the `PATH` of a login shell on that machine, or named with
+`--remote-bin`. To start one by hand, `illogicald --ensure`.
+
+Releases carry `macos-universal`, `linux-x86_64` and `linux-aarch64` tarballs
+plus `SHA256SUMS`; the Linux binaries are statically linked against musl, so
+they impose no glibc floor. Locally, `just dist` builds all three.
+
+**The CLI, from the app.** It is not inside the bundle — `Contents/MacOS/`
+already holds the app's own `Illogical` executable and the default macOS volume
+is case-insensitive, so a file called `illogical` in there *is* that file. Take
+it from the tarball, or from `zig-out/bin` in a build tree.
 
 ## Getting started
 
@@ -171,3 +205,9 @@ are ones tmux currently wins — see
 
 Superlogical is Mitchell Hashimoto's. This is not that, so it is the other
 thing.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). The binaries are statically linked, so
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) carries the terms of everything
+compiled into them; both files ship inside the release tarball.

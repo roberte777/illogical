@@ -1,0 +1,345 @@
+Third-party notices
+===================
+
+`illogicald` and the `illogical` CLI are statically linked. The code below is
+compiled into those binaries and is not ours; it is redistributed here under
+the terms reproduced in full. `Illogical.app` embeds the same binaries and links
+the same terminal core, so the same notices apply to it.
+
+The licence for illogical itself is in LICENSE, beside this file.
+
+Every notice below was copied out of the source tree or package cache the
+binaries are built from, not transcribed. Where a dependency offers a choice of
+licences, the one reproduced is the one this redistribution relies on.
+
+Contents
+
+  * ghostty (libghostty-vt)  -- MIT
+  * simdutf                  -- see the note under its heading
+  * highway                  -- Apache-2.0, with a BSD-3-Clause option
+  * uucode                   -- MIT
+  * wuffs                    -- MIT, or Apache-2.0 at your option
+  * Zig standard library     -- MIT (Expat)
+  * musl libc                -- MIT (Linux builds only)
+
+----------------------------------------------------------------------------
+ghostty
+https://github.com/ghostty-org/ghostty -- vendor/ghostty/LICENSE
+----------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----------------------------------------------------------------------------
+simdutf
+https://github.com/simdutf/simdutf -- vendored into ghostty as
+pkg/simdutf/vendor/simdutf.{h,cpp}
+----------------------------------------------------------------------------
+
+The amalgamated source ghostty vendors carries no top-level licence file,
+so simdutf's own terms are not reproducible from this tree; they are in
+the upstream repository above. The notice the amalgamation does carry, for
+the ISA-detection code it adapted from PyTorch, is reproduced in full:
+
+From
+https://github.com/endorno/pytorch/blob/master/torch/lib/TH/generic/simd/simd.h
+Highly modified.
+
+Copyright (c) 2016-     Facebook, Inc            (Adam Paszke)
+Copyright (c) 2014-     Facebook, Inc            (Soumith Chintala)
+Copyright (c) 2011-2014 Idiap Research Institute (Ronan Collobert)
+Copyright (c) 2012-2014 Deepmind Technologies    (Koray Kavukcuoglu)
+Copyright (c) 2011-2012 NEC Laboratories America (Koray Kavukcuoglu)
+Copyright (c) 2011-2013 NYU                      (Clement Farabet)
+Copyright (c) 2006-2010 NEC Laboratories America (Ronan Collobert, Leon Bottou,
+Iain Melvin, Jason Weston) Copyright (c) 2006      Idiap Research Institute
+(Samy Bengio) Copyright (c) 2001-2004 Idiap Research Institute (Ronan Collobert,
+Samy Bengio, Johnny Mariethoz)
+
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+3. Neither the names of Facebook, Deepmind Technologies, NYU, NEC Laboratories
+America and IDIAP Research Institute nor the names of its contributors may be
+   used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+----------------------------------------------------------------------------
+highway
+https://github.com/google/highway -- LICENSE-BSD3 from the package cache.
+Highway is offered under Apache-2.0 (its LICENSE) or BSD-3-Clause
+(reproduced here); the full Apache-2.0 text is at
+https://www.apache.org/licenses/LICENSE-2.0
+----------------------------------------------------------------------------
+
+Copyright (c) The Highway Project Authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+1.  Redistributions of source code must retain the above copyright notice, this
+    list of conditions and the following disclaimer.
+
+2.  Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+3.  Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+----------------------------------------------------------------------------
+uucode
+https://github.com/jacobsandlund/uucode -- LICENSE.md from the package cache
+----------------------------------------------------------------------------
+
+# uucode license
+
+MIT License
+
+Copyright (c) 2026 Jacob Sandlund
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Other licenses
+
+See [./licenses](./licenses) for licenses of code being used in the repo:
+
+* [LICENSE_Bjoern_Hoehrmann](./licenses/LICENSE_Bjoern_Hoehrmann)
+* [LICENSE_unicode](./licenses/LICENSE_unicode)
+
+-- and that `licenses/` directory is not in the package the build fetches.
+`build.zig.zon` pulls the source tarball, and what it unpacks is `LICENSE.md`,
+`README.md`, `build.zig`, `build.zig.zon`, `src/` and `ucd/` -- no `licenses/`.
+So uucode's own copies of the two texts it points at above are not reproducible
+from this tree; they are in the upstream repository. Same situation as simdutf,
+above. What follows is what can be established here.
+
+The Unicode data uucode compiles its tables from *is* in the package, under
+`ucd/`, and each file carries its own header. Reproduced verbatim from
+`ucd/DerivedCoreProperties.txt`, which is representative of all of them:
+
+# DerivedCoreProperties-17.0.0.txt
+# Date: 2025-07-30, 23:55:08 GMT
+# © 2025 Unicode®, Inc.
+# Unicode and the Unicode Logo are registered trademarks of Unicode, Inc. in the U.S. and other countries.
+# For terms of use and license, see https://www.unicode.org/terms_of_use.html
+
+Those terms are the Unicode, Inc. licence agreement for data files and
+software, whose copyright-and-permission notice wants to travel with copies of
+the data. It is reproduced below, but note its provenance: this copy was taken
+from the Zig toolchain this repository builds with
+(`lib/libcxx/include/__format/width_estimation_table.h`, where it appears
+identically in four generated headers), *not* from uucode and not from
+unicode.org, and it therefore bears that copy's `1991-2022` range rather than
+the `2025` the `ucd/` files above claim. The permission grant is the operative
+part and is unchanged between the two, but the exact text uucode ships in
+`licenses/LICENSE_unicode` has not been seen, and this entry should be replaced
+with it -- or with the current text from unicode.org -- before the first tag.
+
+UNICODE, INC. LICENSE AGREEMENT - DATA FILES AND SOFTWARE
+
+See Terms of Use <https://www.unicode.org/copyright.html>
+for definitions of Unicode Inc.'s Data Files and Software.
+
+NOTICE TO USER: Carefully read the following legal agreement.
+BY DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING UNICODE INC.'S
+DATA FILES ("DATA FILES"), AND/OR SOFTWARE ("SOFTWARE"),
+YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT.
+IF YOU DO NOT AGREE, DO NOT DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE
+THE DATA FILES OR SOFTWARE.
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright (c) 1991-2022 Unicode, Inc. All rights reserved.
+Distributed under the Terms of Use in https://www.unicode.org/copyright.html.
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of the Unicode data files and any associated documentation
+(the "Data Files") or Unicode software and any associated documentation
+(the "Software") to deal in the Data Files or Software
+without restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, and/or sell copies of
+the Data Files or Software, and to permit persons to whom the Data Files
+or Software are furnished to do so, provided that either
+(a) this copyright and permission notice appear with all copies
+of the Data Files or Software, or
+(b) this copyright and permission notice appear in associated
+Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT OF THIRD PARTY RIGHTS.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS
+NOTICE BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL
+DAMAGES, OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THE DATA FILES OR SOFTWARE.
+
+The other file uucode points at, `licenses/LICENSE_Bjoern_Hoehrmann`, covers
+the DFA-based UTF-8 decoder at http://bjoern.hoehrmann.de/utf-8/decoder/dfa.
+Its text is **not reproduced here and is not available anywhere in this tree**:
+the only mention of it in the checkout outside this file is a source comment in
+`vendor/ghostty/src/terminal/UTF8Decoder.zig`, which names the author and says
+"MIT licensed" but reproduces no notice. Fetching it is the second half of the
+same job as the paragraph above, and both are a gate on tagging, not on
+merging: `release.yml` fires on tags only.
+
+----------------------------------------------------------------------------
+wuffs
+https://github.com/google/wuffs -- LICENSE-MIT from the package cache.
+Wuffs is distributed under the MIT licence (reproduced here) and the
+Apache License 2.0; either may be chosen.
+----------------------------------------------------------------------------
+
+Copyright 2023 The Wuffs Authors
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+----------------------------------------------------------------------------
+Zig standard library, compiler builtins and translate-c support
+https://github.com/ziglang/zig -- LICENSE from the translate_c package
+----------------------------------------------------------------------------
+
+The MIT License (Expat)
+
+Copyright (c) Zig contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+----------------------------------------------------------------------------
+musl libc
+https://musl.libc.org -- lib/libc/musl/COPYRIGHT from the Zig toolchain.
+Statically linked into the Linux builds only. The rest of musl's COPYRIGHT
+is per-file attribution for third-party code inside musl, and is at the
+URL above.
+----------------------------------------------------------------------------
+
+Copyright © 2005-2020 Rich Felker, et al.
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

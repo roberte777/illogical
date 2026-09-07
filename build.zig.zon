@@ -8,6 +8,20 @@
         // the macOS client's XCFramework are always built from the exact same
         // libghostty-vt source revision.
         .ghostty = .{ .path = "vendor/ghostty" },
+        // ghostty's own Apple SDK helper, from inside the same submodule, and
+        // named `apple_sdk` because `addPaths` resolves itself by that name
+        // through *our* build graph (`b.dependency("apple_sdk", ...)`).
+        //
+        // It exists for one target: `-Dtarget=x86_64-macos` from an arm64 Mac,
+        // which is half of the universal daemon the app bundle ships. Without
+        // it, zig resolves the macOS SDK headers only for the *native* Darwin
+        // target and falls back to its own bundled Darwin libc headers for any
+        // other Apple arch -- which do not carry `util.h`, so `src/core/pty.zig`
+        // fails at its `@cImport` of `openpty`. `--sysroot "$SDKROOT"` is not
+        // the fix (zig double-appends the nix SDK path and highway then fails
+        // to link); this is what ghostty itself uses to build its universal
+        // XCFramework.
+        .apple_sdk = .{ .path = "vendor/ghostty/pkg/apple-sdk" },
     },
     .paths = .{
         "build.zig",
