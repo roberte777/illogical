@@ -194,6 +194,22 @@ final class HostConnection: Identifiable {
 
     private var startedThisOutage = false
 
+    /// Why the server this app tried to start did not start, or nil if it has
+    /// not tried and failed during this outage.
+    ///
+    /// Kept because the sentence is *perishable*. `--ensure` fails, its reason
+    /// goes to the status, and 250 ms later the backoff's own retry finds the
+    /// socket still refusing and overwrites it with `describe`'s generic "No
+    /// server at <path>". From attempt 2 to the end of the outage the person
+    /// would read the sentence that says nothing, and the one sentence that
+    /// says which directory is unwritable -- the whole point of the daemon
+    /// writing it -- would have been on screen for a quarter of a second.
+    ///
+    /// Lives exactly as long as `startedThisOutage`: both are set when this
+    /// app spends its one spawn, and both are cleared by the `session_list`
+    /// that ends the outage and by Try Again.
+    private var lastStartFailure: String?
+
     /// When the server this app started came up, or nil if it did not start
     /// one that is still notionally alive.
     ///
@@ -243,6 +259,7 @@ final class HostConnection: Identifiable {
         // control connection on top of the one below.
         cancelStart()
         startedThisOutage = false
+        lastStartFailure = nil
         // Try Again is a person saying "once more", which is the one thing
         // that gets past the lifetime rule below.
         serverCameUpAt = nil
@@ -424,6 +441,10 @@ final class HostConnection: Identifiable {
                 self.starting = nil
                 let detail = self.describeStartFailure(error, socketPath: path)
                 Trace.log("could not start a server at \(path): \(detail)")
+                // Before either branch below, because the reconnecting one
+                // comes back through `describe` on every later tick and this
+                // is what it reads.
+                self.lastStartFailure = detail
                 // The same split as a transport failure, and for the same
                 // reason: a bundle with no daemon in it will not grow one, and
                 // rescanning for it every thirty seconds tells nobody anything.
@@ -459,7 +480,22 @@ final class HostConnection: Identifiable {
         case .notBundled, .spawn, .none:
             return "\(error)"
         case .failed, .timedOut:
-            return "\(error). Its log is \(Self.daemonLogPath(forSocket: socketPath))."
+            let said = "\(error)"
+            // The daemon's own last line is self-contained -- it names the
+            // socket, the reason, *and* the log -- so appending to it either
+            // says "daemon.log" twice or, worse, contradicts it: the sentence
+            // for an unwritable state directory is "cannot write to <dir>,
+            // where the socket and daemon.log live", and suffixing the path of
+            // a log in that same unwritable directory sends somebody to a file
+            // that cannot exist. Which is the thing this function's other
+            // branch exists to avoid.
+            //
+            // Matched on the filename rather than the full path because the
+            // daemon writes the directory it was given and the app derives the
+            // same one from the socket; a mismatch between the two is a bug
+            // worth showing rather than papering over with a second path.
+            guard !said.contains("daemon.log") else { return said }
+            return "\(said). Its log is \(Self.daemonLogPath(forSocket: socketPath))."
         }
     }
 
@@ -519,6 +555,13 @@ final class HostConnection: Identifiable {
         // start one sends them round in a circle -- so those keep the error's
         // own wording, which says what actually happened.
         if case .local(let path) = host, case .connectFailed = error as? TransportError {
+            // If this app already tried to start one during this outage and was
+            // told why it could not, that is the answer -- it is a reason, and
+            // this function's own sentence is only a restatement of the
+            // symptom. Without this the reason survives one 250 ms backoff tick
+            // and is then overwritten by the line below for the rest of the
+            // outage, which is most of the outage.
+            if let reason = lastStartFailure { return reason }
             // This used to tell the user to run `illogicald` themselves, which
             // was the gap: the app does that now. Reaching this line means it
             // already tried once this outage and the socket is *still* refusing
@@ -609,6 +652,7 @@ final class HostConnection: Identifiable {
             // same reason the backoff is: a daemon that accepts and drops would
             // otherwise re-arm the spawn on every attempt.
             startedThisOutage = false
+            lastStartFailure = nil
             setStatus(.connected)
             onListChanged?()
 
