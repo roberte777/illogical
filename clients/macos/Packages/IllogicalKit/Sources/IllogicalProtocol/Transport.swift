@@ -317,15 +317,21 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     /// `ENOTCONN`, `ECONNRESET`, `ENETRESET`, `ECONNABORTED`, `ESHUTDOWN`,
     /// `EPIPE`. The server itself unreachable: `EHOSTDOWN`, `EHOSTUNREACH`.
     /// The network gone: `ENETDOWN`, `ENETUNREACH`. Removable media:
-    /// `ENODEV`, and Darwin's own `EPWROFF`/`EDEVERR` for a disk unpowered or
-    /// failed. `EIO` for a disk that is merely failing.
+    /// `ENODEV`, `ENXIO` for a device that is no longer configured, and
+    /// Darwin's own `EPWROFF`/`EDEVERR` for a disk unpowered or failed. `EIO`
+    /// for a disk that is merely failing.
+    ///
+    /// `ECONNREFUSED` belongs with the two host errnos rather than apart from
+    /// them: a NAS that has rebooted is up and not yet listening on 445, and
+    /// the RST arrives here. Left out, that is a share which comes back while
+    /// the host keeps its red triangle.
     ///
     /// It has to be right, because the default beside it is *permanent*: an
     /// errno missing from here is a host that never comes back on its own,
     /// which is the bug this whole mechanism exists for.
     static let recoverable: Set<Int32> = [
         EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET, ECONNABORTED,
-        ESHUTDOWN, EPIPE, EHOSTDOWN, EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV,
+        ESHUTDOWN, EPIPE, EHOSTDOWN, EHOSTUNREACH, ECONNREFUSED, ENETDOWN, ENETUNREACH, ENODEV,
         EPWROFF, EDEVERR,
     ]
 
@@ -434,16 +440,24 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         switch code {
         case ENOENT: return ("is not there", false)
         case EACCES: return ("is in a directory that cannot be searched", false)
-        // rather than at the network.
+        // What macOS reports for a TCC prompt nobody has granted -- a binary
+        // on an external or network volume, or in Desktop, Documents or
+        // Downloads. The remedy is Privacy & Security, so the sentence has to
+        // point there rather than at the network.
         case EPERM:
             return (
                 "is somewhere this app has not been granted access to"
                     + " (Privacy & Security ▸ Files and Folders)", false
             )
+        // Not the same fault as EACCES, and not the same advice: there is no
+        // unsearchable directory to go and look at, because a component of the
+        // path is not a directory at all -- `/usr/local/bin/ssh` where
         // `/usr/local/bin` is a leftover regular file.
         case ENOTDIR: return ("is under something that is not a directory", false)
         case ELOOP: return ("is a loop of symlinks", false)
         case ENAMETOOLONG: return ("is too long a path to open", false)
+        // Anything not established says so. Naming a cause we have not
+        // determined is how a file somebody was looking at came to be
         // described as absent.
         default: return ("could not be checked", false)
         }

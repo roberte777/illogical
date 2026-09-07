@@ -679,6 +679,10 @@ struct TransportTests {
         #expect(busy.hasPrefix("could not run ssh: "))
         #expect(!busy.contains("Domain="), "\(busy)")
         #expect(!busy.contains("UserInfo="), "\(busy)")
+        // ...and is not empty. Swapping `localizedDescription` for
+        // `localizedFailureReason ?? ""` renders "could not run ssh: " with
+        // nothing after the colon, and the three checks above all pass.
+        #expect(busy.count > "could not run ssh: ".count, "\(busy)")
 
         // The two halves of the permanence guard, each of which survived a
         // one-token mutation: without the domain check, any error whose code
@@ -699,28 +703,23 @@ struct TransportTests {
         #expect(String(describing: classify(NSPOSIXErrorDomain, EISDIR)) == "ssh cannot be run")
     }
 
-    /// The wording *and* the retry verdict for a path that could not be
-    /// walked, checked directly because most of these need a filesystem no
-    /// test can build — a TCC-gated volume, a dying disk, a mount that
-    /// vanished. Five of the `pathReason` sentences are also pinned through
-    /// real spawns above; these are the ones that cannot be.
-    ///
-    /// The defaults are the point. An errno this does not recognise says so
-    /// rather than guessing: naming a cause that was never established is how
-    /// a file somebody was looking at came to be described as absent.
     /// Membership by name, not by iterating the set the code uses.
     ///
-    /// The loops below walk `CommandTransport.recoverable`, which keeps the
-    /// two switches consistent with each other but cannot notice a member
-    /// being deleted — removing one removes it from the check as well.
+    /// The loops in the next test walk `CommandTransport.recoverable`, which
+    /// keeps the two switches consistent with each other but cannot notice a
+    /// member being deleted — removing one removes it from the check as well.
     /// Verified: dropping `ESHUTDOWN` passed everything. So the errnos are
-    /// also written out once, here, where deleting one is visible.
+    /// also written out once, here, where a deletion is visible.
+    ///
+    /// Double entry, and the weakness of it is worth naming: an edit that
+    /// touches both this list and the set is invisible. What it does catch is
+    /// the one-sided edit, which is what actually happened.
     @Test("the recoverable errnos are the ones the mounts actually report")
     func recoverableMembership() {
         let expected: Set<Int32> = [
             EIO, ESTALE, ETIMEDOUT, ENXIO, ENOTCONN, ECONNRESET, ENETRESET, ECONNABORTED,
-            ESHUTDOWN, EPIPE, EHOSTDOWN, EHOSTUNREACH, ENETDOWN, ENETUNREACH, ENODEV,
-            EPWROFF, EDEVERR,
+            ESHUTDOWN, EPIPE, EHOSTDOWN, EHOSTUNREACH, ECONNREFUSED, ENETDOWN, ENETUNREACH,
+            ENODEV, EPWROFF, EDEVERR,
         ]
         #expect(CommandTransport.recoverable == expected)
         // And nothing that will not fix itself has crept in.
@@ -729,6 +728,14 @@ struct TransportTests {
         }
     }
 
+    /// The wording *and* the retry verdict for a path that could not be
+    /// walked, checked directly because most of these need a filesystem no
+    /// test can build — a TCC-gated volume, a dying disk, a mount that
+    /// vanished.
+    ///
+    /// The defaults are the point. An errno this does not recognise says so
+    /// rather than guessing: naming a cause that was never established is how
+    /// a file somebody was looking at came to be described as absent.
     @Test("an unrecognised reason says so, and an unreachable one is retried")
     func pathFailuresAreNamedOrAdmitted() {
         #expect(CommandTransport.pathReason(ENOENT) == ("is not there", false))
@@ -821,11 +828,14 @@ struct TransportTests {
     @Test("a predicate never lands in the clause template")
     func reasonsMatchTheirTemplate() {
         let predicate = ["is ", "points ", "could not be ", "cannot be ", "needs "]
-        for code in [
-            ENOENT, EACCES, EPERM, ENOTDIR, ELOOP, ENAMETOOLONG, EIO, ESTALE, ETIMEDOUT,
-            ENXIO, ENOTCONN, ECONNRESET, ENETRESET, EHOSTDOWN, EHOSTUNREACH, ENETDOWN,
-            ENETUNREACH, ENODEV, EPWROFF, EDEVERR, EBUSY, EINVAL, ENOSPC,
-        ] {
+        // The recoverable set plus the permanent ones and a few strangers, so
+        // the rule covers every arm either helper can take. Taken from the set
+        // rather than copied: this loop was the copy that still listed the
+        // pre-consolidation fourteen and so applied the rule to none of the
+        // errnos added with it.
+        for code in CommandTransport.recoverable.union([
+            ENOENT, EACCES, EPERM, ENOTDIR, ELOOP, ENAMETOOLONG, EBUSY, EINVAL, ENOSPC,
+        ]) {
             for (reason, retryable) in [
                 CommandTransport.pathReason(code), CommandTransport.targetReason(code),
             ] {
