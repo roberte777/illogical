@@ -171,17 +171,20 @@ struct SSHCommandTests {
     @Test("with no control directory, argv still multiplexes off the home")
     func multiplexingWithoutAnExplicitDirectory() {
         let options = SSHCommand.Options(destination: "build-box", controlDirectory: nil)
-        let args = SSHCommand.argv(options)
-        // The *relationship*, not the value: a machine whose home leaves no
-        // room renders no path, and then argv must not ask for multiplexing
-        // either. Requiring a path instead would report a defect on such a
-        // machine that does not exist.
-        if let expected = SSHCommand.controlPath(options) {
-            #expect(args.contains("ControlPath=" + expected))
-            #expect(args.contains("ControlMaster=auto"))
-        } else {
-            #expect(!args.contains("ControlMaster=auto"))
-        }
+        // A home of the test's choosing, so this does not depend on the
+        // machine's. Driving it from the real `$HOME` meant one branch on a
+        // short home and another on a long one, and the long-home branch
+        // asserted so little that deleting the whole multiplexing block would
+        // have passed.
+        let args = SSHCommand.argv(options, environment: ["HOME": "/tmp/illogical-home"])
+        #expect(args.contains("ControlPath=/tmp/illogical-home/.ssh/illogical-%C"))
+        #expect(args.contains("ControlMaster=auto"))
+
+        // No home, no path, and then no multiplexing options at all — not a
+        // half-emitted pair.
+        let none = SSHCommand.argv(options, environment: [:])
+        #expect(!none.contains("ControlMaster=auto"))
+        #expect(!none.contains { $0.hasPrefix("ControlPath=") })
     }
 
     /// The other caller, in the same shape. It creates a directory, so it is
@@ -191,9 +194,10 @@ struct SSHCommandTests {
         // Under `/tmp`, not `NSTemporaryDirectory()`: the latter is a ~50-byte
         // per-user path on macOS, which with a name appended is past the
         // control-path budget, so `prepareControlDirectory` would correctly do
-        // nothing and the test would pass for the wrong reason.
+        // nothing — which the assertion below would then catch, loudly and
+        // for a reason that has nothing to do with what is under test.
         let home = URL(fileURLWithPath: "/tmp")
-            .appending(path: "il-\(getpid())-\(UInt32.random(in: 0..<100_000))")
+            .appending(path: "il-\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: home) }
         // ...and prove that premise rather than assume it.
@@ -210,6 +214,17 @@ struct SSHCommandTests {
             FileManager.default.fileExists(
                 atPath: home.appending(path: ".ssh").path, isDirectory: &isDirectory))
         #expect(isDirectory.boolValue)
+
+        // And the other branch of the same guard: asked not to multiplex,
+        // it creates nothing. `argv` has `noMultiplexing` for this; this side
+        // had nothing.
+        let quiet = URL(fileURLWithPath: "/tmp").appending(path: "il-q-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: quiet, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: quiet) }
+        SSHCommand.prepareControlDirectory(
+            SSHCommand.Options(destination: "h", controlDirectory: nil, multiplex: false),
+            environment: ["HOME": quiet.path])
+        #expect(!FileManager.default.fileExists(atPath: quiet.appending(path: ".ssh").path))
     }
 
     /// The premise both of those rest on: production never sets a control
@@ -222,6 +237,17 @@ struct SSHCommandTests {
     func sshOptionsLeaveTheControlDirectoryToTheEnvironment() throws {
         let options = try #require(ServerHost.ssh(destination: "build-box").sshOptions)
         #expect(options.controlDirectory == nil)
+        // Both callers short-circuit on `multiplex` *before* consulting the
+        // environment, so the premise is two facts, not one. Set this false
+        // here and every connection drops `ControlMaster` while the assertion
+        // above still holds.
+        #expect(options.multiplex)
+        // And this is the only test that reaches `sshOptions` at all, so it is
+        // also the only place the `ILLOGICAL_SSH` read can be pinned. It
+        // cannot tell "reads the variable" from "returns the literal" — the
+        // same in-process limit as the `HOME` default — but it does catch the
+        // field being dropped or hardcoded to something else.
+        #expect(options.ssh == ProcessInfo.processInfo.environment["ILLOGICAL_SSH"] ?? "ssh")
     }
 
     @Test("a remote binary somewhere else is respected")
@@ -232,9 +258,10 @@ struct SSHCommandTests {
 
     @Test("the ssh binary can be overridden")
     func sshOverride() {
-        // ILLOGICAL_SSH rides through `ServerHost.sshOptions`; without this the
-        // override could be dropped from the argv with nothing failing, and a
-        // user with a second OpenSSH would silently get the first on PATH.
+        // That the argv carries whatever `ssh` it was given. Where that value
+        // comes from is `ServerHost.sshOptions`, which this does not reach —
+        // it is pinned in `sshOptionsLeaveTheControlDirectoryToTheEnvironment`
+        // instead, the one test that does.
         #expect(argv(ssh: "/usr/bin/ssh").first == "/usr/bin/ssh")
     }
 }

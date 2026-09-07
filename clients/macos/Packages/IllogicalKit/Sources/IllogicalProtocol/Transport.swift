@@ -698,7 +698,17 @@ public enum SSHCommand {
         }
     }
 
-    public static func argv(_ options: Options) -> [String] {
+    /// `environment` for the same reason `prepareControlDirectory` takes one,
+    /// and it must be the same one: this renders the `ControlPath` and that
+    /// creates the directory it sits in. Handed different homes, the socket
+    /// would be named under one and its directory made under the other, and
+    /// multiplexing would fail on every connection with ssh's complaint going
+    /// nowhere -- which is the failure `prepareControlDirectory` exists to
+    /// prevent, reached through its own seam. Production passes neither.
+    public static func argv(
+        _ options: Options,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String] {
         var argv = [
             options.ssh,
             // No pty. A pty would put a line discipline in the middle of a
@@ -708,7 +718,7 @@ public enum SSHCommand {
             "-o", "ServerAliveCountMax=\(aliveCountMax)",
         ]
 
-        if options.multiplex, let path = controlPath(options) {
+        if options.multiplex, let path = controlPath(options, environment: environment) {
             argv += ["-o", "ControlMaster=auto"]
             argv += ["-o", "ControlPath=\(path)"]
             argv += ["-o", "ControlPersist=\(controlPersist)"]
