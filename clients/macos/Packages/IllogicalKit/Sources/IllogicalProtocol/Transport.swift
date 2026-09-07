@@ -640,11 +640,10 @@ public enum SSHCommand {
     /// and `illogical --host` bind different control sockets and hold two ssh
     /// masters, which is precisely what this exists to avoid. Nil when `$HOME`
     /// is unset, which is what the Zig side does too.
-    /// `home` is a parameter so the no-home branch can be tested without
-    /// removing `HOME` from the process. Adding a name back to `environ` may
-    /// reallocate it, and this package spawns children from
-    /// concurrently-running tests -- `posix_spawn` walks that same array.
-    /// Production never passes it.
+    /// `home` is a parameter so a caller can render a path for a home that is
+    /// not this process's. Production never passes it; the test does, to
+    /// separate "the default reads the environment" from "the body
+    /// concatenates what it is handed".
     static func controlPath(
         _ options: Options,
         home: String? = ProcessInfo.processInfo.environment["HOME"]

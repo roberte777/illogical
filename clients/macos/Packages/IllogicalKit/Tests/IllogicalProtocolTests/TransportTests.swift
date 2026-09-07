@@ -89,42 +89,6 @@ struct SSHCommandTests {
         #expect(args.suffix(4) == ["--", "me@host", "/opt/illogical/bin/illogicald", "--stdio"])
     }
 
-    /// The Zig CLI renders the same path, so `illogical --host` and the app
-    /// share one multiplexing master. Drifting apart silently doubles the SSH
-    /// connections a machine holds.
-    ///
-    /// `HOME` is *set* here rather than read. Three earlier versions computed
-    /// the expectation the same way the code computes the value — inline, then
-    /// through a parameter whose default was the same expression — and each
-    /// time substituting `homeDirectoryForCurrentUser` left the suite green,
-    /// because the two agree on every machine anyone runs this on. Only an
-    /// input the test controls can tell them apart.
-    ///
-    /// Overwriting only: no `unsetenv`. Overwriting a name that is already
-    /// there cannot move the `environ` array — measured, the pointer is
-    /// unchanged even when the new value is far longer — whereas *adding* one
-    /// may reallocate it, which is what removing and re-adding amounts to.
-    /// The transport suite runs concurrently with this one and hands the live
-    /// `environ` to `posix_spawn`, so this closes a possibility rather than an
-    /// observed fault: a remove-and-re-add did not move the array here either,
-    /// because there was spare capacity. Cheap to not depend on. The no-home
-    /// branch goes through the parameter instead, which is what it is for.
-    @Test("the default control path is the one src/core/conn.zig renders")
-    func defaultControlPath() throws {
-        // Required rather than optional-handled: restoring a `HOME` that was
-        // never there would need the `unsetenv` this test exists to avoid.
-        let original = try #require(getenv("HOME").map { String(cString: $0) })
-        defer { setenv("HOME", original, 1) }
-
-        setenv("HOME", "/tmp/illogical-not-your-home", 1)
-        #expect(
-            SSHCommand.controlPath(SSHCommand.Options(destination: "h"))
-                == "/tmp/illogical-not-your-home/.ssh/illogical-%C")
-
-        // No home is not a path, rather than one rooted at nothing.
-        #expect(SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: nil) == nil)
-    }
-
     @Test("the ssh binary can be overridden")
     func sshOverride() {
         // ILLOGICAL_SSH rides through `ServerHost.sshOptions`; without this the
@@ -143,6 +107,50 @@ struct SSHCommandTests {
 /// with the teardown.
 @Suite("Transports", .serialized)
 struct TransportTests {
+    /// The Zig CLI renders the same path, so `illogical --host` and the app
+    /// share one multiplexing master. Drifting apart silently doubles the SSH
+    /// connections a machine holds.
+    ///
+    /// **In this suite rather than "The ssh command", and that is the point.**
+    /// It is the only test that writes to the process environment, and the
+    /// only spawning tests are here — `.serialized` therefore keeps it from
+    /// overlapping them. That matters more than it sounds: `posix_spawn` reads
+    /// the live `environ`, and `setenv` mutates the very strings it points at
+    /// even when it does not move the array. Overwriting an existing name can
+    /// publish a freshly-malloc'd pointer before filling it, `strcpy` over a
+    /// live value in place, or `realloc` a value and free the old buffer. An
+    /// earlier version of this reasoned only about the array and concluded
+    /// overwriting was safe; it is not, and serializing is what makes it so.
+    ///
+    /// `HOME` is *set* here rather than read. Two earlier versions computed
+    /// the expectation the same way the code computes the value — inline, then
+    /// through a parameter whose default was the same expression — so
+    /// substituting `homeDirectoryForCurrentUser` left them green. Only an
+    /// input the test controls can tell the two apart.
+    @Test("the default control path is the one src/core/conn.zig renders")
+    func defaultControlPath() throws {
+        let original = try #require(getenv("HOME").map { String(cString: $0) })
+        defer { setenv("HOME", original, 1) }
+
+        setenv("HOME", "/tmp/illogical-not-your-home", 1)
+        #expect(
+            SSHCommand.controlPath(SSHCommand.Options(destination: "h"))
+                == "/tmp/illogical-not-your-home/.ssh/illogical-%C")
+
+        // Through the *default*, not the parameter: `src/core/conn.zig:291`
+        // returns null when `HOME` is unset, and nothing else pins that the
+        // default agrees. Safe to remove the name here only because this suite
+        // is serialized against everything that spawns.
+        unsetenv("HOME")
+        #expect(SSHCommand.controlPath(SSHCommand.Options(destination: "h")) == nil)
+
+        // ...and an explicit home still wins, which is what the parameter is
+        // for: production never passes it.
+        #expect(
+            SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: "/tmp/elsewhere")
+                == "/tmp/elsewhere/.ssh/illogical-%C")
+    }
+
     /// `cat` is the smallest thing that behaves like the far end of an SSH
     /// pipe: what goes in comes back, framed exactly as it was sent. The
     /// transport is what is under test, not the server.
