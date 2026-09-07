@@ -653,6 +653,64 @@ final class HostConnection: Identifiable {
         closeController(id)
     }
 
+    /// Rename a session on this machine.
+    ///
+    /// Nothing is queued and nothing is waited for: `rename_session` has no
+    /// positional reply. Success arrives as the `sessions_changed` broadcast
+    /// that every client — this one included — answers with a `list`, so the
+    /// new name reaches the tab strip, the session button and the dropdown at
+    /// the same moment it reaches every other window. A refusal is an `err` on
+    /// the control channel, and the old name simply survives the next list.
+    ///
+    /// The session id is in the body, not the header: the header's u64
+    /// addresses a *terminal*, and this frame goes out on the control channel.
+    ///
+    /// Returns whether the frame actually left. Everything else on this class
+    /// sends through a bare `try?` because losing one is survivable — a `kill`
+    /// that never went leaves a terminal running, and the next list says so.
+    /// These two are not like that: the caller acts on them locally, and
+    /// acting on a frame that was never sent is how a confirmed delete wiped a
+    /// window's tabs while the terminals ran on.
+    func renameSession(_ id: UInt64, to name: String) -> Bool {
+        send(.renameSession, RenameSessionBody(session: id, name: name))
+    }
+
+    /// Delete a session: every terminal in it, and then the session itself.
+    ///
+    /// Always cascading. `only_if_empty` exists for scripts that want to be
+    /// careful; the app asks the person instead, which is a better place for
+    /// that question than a flag.
+    ///
+    /// Like `renameSession`, there is nothing to wait for. The terminals go
+    /// the way any killed terminal does — SIGHUP, child exit, retirement on
+    /// the maintenance tick — and the `sessions_changed` that follows is what
+    /// takes the session out of the dropdown.
+    func deleteSession(_ id: UInt64) -> Bool {
+        send(.deleteSession, DeleteSessionBody(session: id))
+    }
+
+    private func send<T: Encodable>(_ type: FrameType, _ body: T) -> Bool {
+        guard let control else { return false }
+        do {
+            try control.send(type, json: body)
+            return true
+        } catch {
+            Trace.log("\(host.displayName): \(type) not sent: \(error)")
+            return false
+        }
+    }
+
+    /// Whether there is a control connection to send on *now*.
+    ///
+    /// Not the same question as `status.isConnected`, which turns true at the
+    /// first `session_list` and means "this machine has answered". The case
+    /// this exists for is the other one: `controlClosed` deliberately keeps
+    /// `sessions` and `terminals` — they are the last thing the machine said
+    /// it had, and it is still running them — so during a reconnect every row
+    /// in the dropdown looks exactly as live as it did a second ago, while
+    /// nothing sent can leave the process.
+    var canSend: Bool { control != nil }
+
     /// Why a connection could not be *opened*, phrased for a person.
     ///
     /// This is the throw out of `Connection(host:)` -- ssh not on PATH, a

@@ -515,9 +515,12 @@ checked by hand.
 
 ## Session and terminal switching
 
-The dropdown lists sessions; a session expands to its terminals. Each row shows
-residency — live, parked, rehydrating, exited — because parked is normal and
-should look normal, not like an error.
+The dropdown lists sessions, one row each, and switching to one brings its tabs
+to the front. It does **not** expand a session to its terminals: the tab strip
+is where a session's terminals live, and a dropdown that listed them again
+would be a second, worse tab strip. Residency — live, parked, rehydrating,
+exited — is shown on the tab itself (`Chrome.swift`, `TerminalTab`), because
+parked is normal and should look normal, not like an error.
 
 With more than one machine connected it grows a header per host and the sessions
 under it are that machine's. One host is the common case, so the headers only
@@ -547,6 +550,106 @@ against it, which also means the button still fires on the mouse-up that ends a
 drag — a dragged tab comes to the front, the way it does in every tabbed app.
 `TabStrip.dropIndex` turns the translation into a slot and is the one part of
 this that is unit-tested; the gesture plumbing around it cannot be simulated.
+
+### Renaming and deleting a session
+
+Right-click a session row: **Rename** turns the row into a text field in place
+— Enter commits, Escape cancels — and **Delete…** asks first. Both are also in
+the File menu, disabled when no session is selected; Rename Session… there
+opens the dropdown with that row already a field, because the field *is* the
+row and there is no second place to read the name.
+
+Delete is additionally disabled — in the File menu and in the row's own context
+menu — while that machine is being reconnected to. The rows stay listed through
+an outage on purpose (`controlClosed` keeps `sessions`: the machine is still
+running them), so they look exactly as live as they did a second before while
+nothing sent can leave the process. Offering an irreversible action there asked
+somebody to confirm something that could not happen.
+
+Neither is optimistic. `rename_session` and `delete_session` have no positional
+reply: the server answers a success with the `sessions_changed` broadcast every
+client re-lists on, and a failure with an `err` on the control channel. So the
+name changes everywhere at once, when the server says it has, and a refused
+rename simply is not there on the next list. Nothing holds a session by name —
+`TabLayout.session` is a `SessionRef`, which keys on the id — so a rename moves
+no tab and no selection.
+
+Delete cascades, always: the app has already asked. (`only_if_empty` is on the
+frame for scripts that want to be careful; the app never sets it.) Confirming
+takes the session's tabs immediately and closes their connections, because the
+server is a SIGHUP, a child exit and a maintenance tick away, and the lists it
+sends in between still name every one of those terminals — the same `closing`
+mechanism that stops a closed pane being resurrected covers it. The server's
+own cascade is what ends the terminals, so the client sends no `kill` beside
+the delete.
+
+**The request goes first; the window is torn down only if it left.** Both
+halves of that matter. `HostConnection` sends on a control connection that is
+nil for the whole of a reconnect, so tearing down first destroyed a window's
+state on the strength of a `try?` — the tabs went, `closing` pinned those
+terminals invisible for the life of the process (it is only ever intersected
+with what is *live*, and they stayed live), and the next click on that session
+made a third terminal, all under a dialog that had just said "This cannot be
+undone." And the session is re-checked at confirm time rather than trusted from
+when the dialog was built: its last terminal can exit while the question is on
+screen, and `delete_session` for a session the server has already retired is
+answered `no_such_session`, which is an `err` — see the create-voiding
+paragraph below.
+
+**Session names somebody typed are checked client-side, with the server as the
+authority.** The rule is 1–64 bytes of `[A-Za-z0-9._-]`, mirrored in
+`SessionName.isValid`. That is load-bearing rather than polite: a `create` the
+server refuses produces no `created` frame at all, and the `err` it sends
+instead voids *every* create outstanding on that host — the frame does not say
+which one failed — so an unchecked typo in the filter field turns a ⌘D split
+that was already in flight into a tab. A rename has the same consequence and
+one more reason to check, since you rename *towards* names you already use.
+
+There is one rule and one place it lives, because the two halves have to agree
+and did not: `SessionStore.filterOffer` decides both whether the Create row
+appears and what is shown instead, and `SessionStore.renameRefusal` decides
+both whether the rename field is amber and whether Enter sends. A refused name
+puts the reason where the Create row would be (`SessionNameRefusal`) rather
+than leaving Enter to do nothing. Two things that rule covers beyond
+`isValid`:
+
+- **Trimming.** Leading and trailing whitespace is a typing artefact, so it is
+  removed before anything is checked or sent — `work ` renames to `work`. Only
+  the ends: an inner space is a real character in a name the server will not
+  take, and deleting it would make a session under a name nobody asked for.
+- **Names already in use.** Refused before sending, per machine (names are
+  unique per daemon, so a name used on a remote box does not block a local
+  rename) and by exact comparison, mirroring `Server.renameSession`'s
+  `mem.eql`. A session keeping its own name is not a collision.
+
+**Names that came from the server are not checked.** Only typed ones are. ⌘T,
+the `+` button, the empty-state button and ⌘D all derive their session name
+from what the daemon listed, and this app supports talking to daemons it did
+not ship — one older than the naming rule may be holding a session called
+`my project`. Refusing that here would make all four do nothing, with nothing
+on screen saying why: the silent no-op the check exists to prevent, turned on
+the user. `SessionStore.createName` is the single place that decides, and every
+create in the app goes through it.
+
+### A session is addressed by name on the way in (residual, #37)
+
+`create` carries a `session_name`, not a session id — issue #37 notes this
+under "the session ID has to stay stable across a rename". Everything the
+client *holds* is keyed by id (`SessionRef`), and rename and delete are
+id-scoped frames, so the audit passes for those. `create` is the exception, and
+it cannot be fixed from this side: `SessionStore.createName` has to resolve the
+tab's `SessionRef` back to a name at send time, out of the last list.
+
+The window where that is wrong is between a rename being sent and the
+`session_list` that follows it — one round trip locally, up to a few hundred
+milliseconds over SSH. Rename `work` to `done` and press ⌘T inside it and the
+create carries `work`, which `Server.sessionByNameLocked` **creates** rather
+than failing on: a second session appears under the old name. With ⌘D the new
+pane is spliced into a tab whose `SessionRef` still points at the renamed one.
+
+Closing it means a session id on `create` (and `sessionByNameLocked` refusing
+to invent a session for a `create` that named one), which is server work and a
+protocol change. Until then this is a known residual, not a fixed bug.
 
 ## Motion
 

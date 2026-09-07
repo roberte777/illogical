@@ -41,6 +41,16 @@ final class SessionStore {
     var sessionMenuOpen =
         ProcessInfo.processInfo.environment["ILLOGICAL_OPEN_SESSION_MENU"] != nil
 
+    /// A session the menu bar has asked the dropdown to rename in place.
+    ///
+    /// The rename field lives in `SessionMenu`, which only exists while the
+    /// menu is open, so File ▸ Rename Session… has nothing to reach directly.
+    /// It leaves the session here and opens the menu; the menu consumes it on
+    /// appear. Nil the rest of the time, including immediately after the menu
+    /// has taken it — a value left behind would re-arm the field the next time
+    /// the menu opened for some quite different reason.
+    var pendingRename: SessionRef?
+
     /// ILLOGICAL_SPLIT=columns|rows splits the first tab once, as soon as
     /// there is one. Same purpose as ILLOGICAL_OPEN_SESSION_MENU: the layout
     /// can be inspected — or screenshotted — without driving the mouse.
@@ -326,8 +336,16 @@ final class SessionStore {
     }
 
     var selectedSessionSummary: SessionSummary? {
-        guard let ref = selectedSession else { return nil }
-        return host(ref.host)?.sessions.first { $0.id == ref.session }
+        selectedSession.flatMap { session($0) }
+    }
+
+    /// What a host says about one of its sessions, by id.
+    ///
+    /// By id, never by name, which is the whole of what makes rename safe: a
+    /// `SessionRef` survives a rename because the id does, and everywhere a
+    /// name is *drawn* goes through here. See issue #37.
+    func session(_ ref: SessionRef) -> SessionSummary? {
+        host(ref.host)?.sessions.first { $0.id == ref.session }
     }
 
     /// Tabs in the session that is currently in front. A session lives on one
@@ -367,9 +385,69 @@ final class SessionStore {
     /// in the session it is in.
     func createTerminal(sessionName: String? = nil, on host: ServerHost? = nil) {
         let target = host.flatMap { self.host($0) } ?? selectedHost
-        guard let target else { return }
-        let name = sessionName ?? frontSessionName(on: target) ?? "default"
+        guard let target, let name = createName(typed: sessionName, joining: nil, on: target)
+        else { return }
         target.createTerminal(sessionName: name)
+    }
+
+    /// The session name a `create` should carry, or nil when it must not be
+    /// sent at all. The one place that decides, so no path can bypass it.
+    ///
+    /// Two kinds of name reach `create`, and only one of them is this app's to
+    /// refuse.
+    ///
+    /// A **typed** name is checked, and that is not a nicety: the server
+    /// refuses a session name outside `[A-Za-z0-9._-]` with
+    /// `err(invalid_name)`, and an `err` on the control channel voids *every*
+    /// create outstanding on that host — the frame does not say which one
+    /// failed, so `HostConnection.voidPendingCreates` cannot know. Without
+    /// this, typing "My Project" into the dropdown's free-text field while a
+    /// ⌘D split is in flight makes that split open as a tab instead of a pane.
+    ///
+    /// A name that came **from the server** is not checked. This app talks to
+    /// daemons it did not ship — that is what the version-skew marker is for —
+    /// and one older than the naming rule may well be holding a session called
+    /// `my project`. Refusing it here would make ⌘T, the `+` button and the
+    /// empty-state button all do nothing, with nothing on screen saying why:
+    /// the silent no-op the check exists to prevent, turned on the user.
+    ///
+    /// `joining` is a *session*, and resolving it back to a name here is the
+    /// residual issue #37 names ("`create` takes a name rather than an ID").
+    /// See docs/CLIENT.md, "A session is addressed by name on the way in".
+    private func createName(
+        typed: String?, joining: SessionRef?, on host: HostConnection
+    ) -> String? {
+        if let typed {
+            let name = SessionName.normalized(typed)
+            return SessionName.isValid(name) ? name : nil
+        }
+        if let joining, let match = host.sessions.first(where: { $0.id == joining.session }) {
+            return match.name
+        }
+        return frontSessionName(on: host) ?? "default"
+    }
+
+    /// What the dropdown offers for what has been typed into its filter field.
+    ///
+    /// In the store because it is two decisions that have to agree — whether
+    /// Enter creates, and what is shown when it does not — and a view cannot
+    /// be asked either question. Both used to live in `SessionMenu`, where a
+    /// regression in either was invisible: a Create row whose Enter does
+    /// nothing is exactly the silent no-op the notice was added to kill.
+    func filterOffer(_ typed: String) -> FilterOffer {
+        let name = SessionName.normalized(typed)
+        guard !name.isEmpty else { return .nothing }
+        if let refusal = SessionNameRefusal.of(name) { return .refused(refusal) }
+        guard selectedHost != nil else { return .nothing }
+        // Checked against *every* host's sessions, not just the one in front.
+        // The rows below list them all, so a name that matches a session on
+        // another machine is one you can switch to — offering "Create" for it
+        // as well meant Enter silently made a second, local session with the
+        // same name instead of going where the visible row pointed.
+        let exists = hosts.contains { host in
+            host.sessions.contains { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+        }
+        return exists ? .nothing : .create(name)
     }
 
     /// The session a new terminal on `host` should join: the one in front if
@@ -390,6 +468,150 @@ final class SessionStore {
         host(ref.host)?.kill(ref.terminal)
     }
 
+    /// Stop drawing a terminal without asking the server to end it.
+    ///
+    /// The client half of `kill`, and the whole of what a session delete needs
+    /// locally: the connection goes, and the reconcile is told not to open a
+    /// tab for this terminal again while the server is still listing it. The
+    /// *ending* is the server's, because `delete_session` cascades — sending a
+    /// `kill` per terminal on top of it would be a second SIGHUP for every one
+    /// of them and, on the way, a set of killed terminals inside a session the
+    /// server might still have refused to delete.
+    private func forget(_ ref: TerminalRef) {
+        closing.insert(ref)
+        closeController(ref)
+    }
+
+    // MARK: - Renaming and deleting sessions
+    //
+    // Both are session-scoped and neither has a positional reply: the server
+    // answers a success with the `sessions_changed` broadcast every client
+    // re-lists on, and a failure with an `err` on the control channel. So
+    // nothing here is optimistic about the *name*. What is not optional is the
+    // client-side name check: an `err` voids every create in flight on that
+    // host, so a name the server would refuse is worth never sending.
+
+    /// Why renaming `ref` to what has been typed would not go out, or nil when
+    /// it would.
+    ///
+    /// The whole rule, in one place, so the field's colour and Enter's
+    /// behaviour cannot disagree — they did: the field validated the raw text
+    /// and the commit sent a trimmed one, so `work ` painted amber, showed the
+    /// "use these characters" tooltip, and then renamed successfully.
+    func renameRefusal(_ ref: SessionRef, to typed: String) -> SessionNameRefusal? {
+        let name = SessionName.normalized(typed)
+        if let refusal = SessionNameRefusal.of(name) { return refusal }
+        // The duplicate check the create path has always had, and rename needs
+        // more: you rename *towards* names you already use. Without it the
+        // server answers `name_in_use`, and that `err` on the control channel
+        // voids every create in flight on the host — so a rename that quietly
+        // did nothing also turned somebody's in-flight ⌘D into a whole new tab
+        // that stole the selection.
+        //
+        // Scoped to `ref.host`: names are unique per daemon, and refusing a
+        // local rename because a remote machine uses that name would be
+        // inventing a rule the server does not have. Exact, not
+        // case-insensitive, because `Server.renameSession` compares with
+        // `mem.eql` — being stricter here would refuse a rename the server
+        // accepts. (`filterOffer` is case-insensitive on purpose: it is
+        // choosing between "switch to the row you can see" and "make a second
+        // one", which is a different question.)
+        let taken =
+            host(ref.host)?.sessions.contains { $0.id != ref.session && $0.name == name } ?? false
+        return taken ? .inUse : nil
+    }
+
+    /// Rename a session. The server is the authority; this refuses first.
+    ///
+    /// Deliberately changes nothing locally. Every place a session name is
+    /// drawn — the tab strip, the session button, the dropdown — reads
+    /// `host.sessions` by id, so the `list` behind `sessions_changed` moves
+    /// all of them at once, and a rename the server refused simply is not
+    /// there on the next one. `SessionRef` keys on the id, so no tab moves:
+    /// that is the stability property issue #37 asks to audit, and
+    /// `SessionLifecycleTests` pins it.
+    ///
+    /// Returns whether the request left this process, so the field that sent
+    /// it knows whether to close.
+    @discardableResult
+    func renameSession(_ ref: SessionRef, to typed: String) -> Bool {
+        guard renameRefusal(ref, to: typed) == nil else { return false }
+        guard let host = host(ref.host) else { return false }
+        return host.renameSession(ref.session, to: SessionName.normalized(typed))
+    }
+
+    /// File ▸ Rename Session…: open the dropdown with that row already a field.
+    ///
+    /// The field *is* the row, so there is no second place to put it and no
+    /// sheet to raise. Nothing is armed for a session that is not there —
+    /// `SessionMenu` would find no row matching it, focus nothing, and leave a
+    /// dropdown with a dead keyboard.
+    func requestRenameSession(_ ref: SessionRef) {
+        guard session(ref) != nil else { return }
+        pendingRename = ref
+        sessionMenuOpen = true
+    }
+
+    /// Whether deleting `ref` is something this window can actually carry out.
+    ///
+    /// The connection matters as much as the session existing. `controlClosed`
+    /// keeps `sessions` through a reconnect — deliberately, they are the last
+    /// thing the machine said it had — so every row in the dropdown still
+    /// looks live while nothing can be sent. Offering Delete there asked a
+    /// person to confirm something irreversible that could not happen.
+    func canDeleteSession(_ ref: SessionRef) -> Bool {
+        session(ref) != nil && host(ref.host)?.canSend == true
+    }
+
+    /// Ask for a session to be deleted. Fills in the dialog; destroys nothing.
+    ///
+    /// Nothing pends for a session that is not there or cannot be reached:
+    /// there would be no name and no count to put in the sentence, and the
+    /// dialog would be promising something it cannot do.
+    func requestDeleteSession(_ ref: SessionRef) {
+        guard canDeleteSession(ref), let summary = session(ref) else { return }
+        pendingDestruction = .deleteSession(
+            ref, name: summary.name, terminalCount: summary.terminals.count)
+    }
+
+    /// Ask the server to delete a session, and take its tabs if it was asked.
+    ///
+    /// **The request goes first, and the window is only torn down if it left.**
+    /// The other order destroyed a window's worth of state on the strength of
+    /// a `try?`: `HostConnection` sends on a control connection that is nil
+    /// through every reconnect, the dropdown still lists the session because
+    /// `controlClosed` keeps `sessions` on purpose, and so a confirmed delete
+    /// dropped the tabs, pinned the terminals invisible for the life of the
+    /// process (`closing` is only ever intersected with what is *live*, and
+    /// they stayed live), and left the next click on that session making a
+    /// third terminal — under a dialog that had just said "This cannot be
+    /// undone."
+    ///
+    /// Re-checked here rather than trusting the value the dialog was built
+    /// from: the session's last terminal can exit between the right-click and
+    /// the confirm, and `delete_session` for a session the server has already
+    /// retired is answered `no_such_session` — an `err` on the control
+    /// channel, which voids every create in flight on that host.
+    ///
+    /// The tabs go immediately once it *has* been sent, rather than on the
+    /// server's word, because deleting is SIGHUP → child exit → retirement on
+    /// the maintenance tick: a quarter of a second at best, and longer for a
+    /// child that is slow to go. Leaving the panes up for that would draw live
+    /// surfaces attached to terminals we have just asked to end. `forget` is
+    /// what stops the reconcile putting the tabs straight back while the
+    /// server is still listing them.
+    private func deleteSession(_ ref: SessionRef) {
+        guard let host = host(ref.host), session(ref) != nil else { return }
+        guard host.deleteSession(ref.session) else { return }
+
+        let wasInFront = selectedTab?.session
+        for tab in tabs where tab.session == ref {
+            for pane in tab.panes { forget(pane.terminal) }
+        }
+        tabs.removeAll { $0.session == ref }
+        repairSelection(preferring: wasInFront)
+    }
+
     // MARK: - Splits
     //
     // A split is a new terminal on the server and a new connection to it.
@@ -404,11 +626,13 @@ final class SessionStore {
 
     func split(pane paneID: UUID, in tabID: TabLayout.ID, direction: SplitNode.Direction) {
         guard let tab = tabs.first(where: { $0.id == tabID }),
-            let host = host(tab.session.host)
+            let host = host(tab.session.host),
+            // Through `createName` like every other create, rather than
+            // resolving the name here: this was the one path that reached
+            // `HostConnection.createTerminal` directly, so it had no gate at
+            // all and no way to grow one.
+            let name = createName(typed: nil, joining: tab.session, on: host)
         else { return }
-        let name =
-            host.sessions.first { $0.id == tab.session.session }?.name
-            ?? host.sessions.first?.name ?? "default"
         // The pane appears when the server answers with a terminal id. Over a
         // unix socket that is one round trip; a placeholder pane would be more
         // machinery than the wait is worth. Over SSH it is a round trip on an
@@ -659,6 +883,7 @@ final class SessionStore {
         pendingDestruction = nil
         switch pending {
         case .closeTab(let tabID, _): closeTab(tabID)
+        case .deleteSession(let ref, _, _): deleteSession(ref)
         }
     }
 
@@ -863,6 +1088,13 @@ final class SessionStore {
         switch pendingDestruction {
         case .closeTab(let tabID, _):
             if !tabs.contains(where: { $0.id == tabID }) { pendingDestruction = nil }
+        // A session whose last terminal exits on its own while the dialog is
+        // up is a session the server has already retired. Asking about it is
+        // asking about nothing, and confirming would send a `delete_session`
+        // the daemon answers `no_such_session` -- an `err` on the control
+        // channel, which voids every create in flight on that host.
+        case .deleteSession(let ref, _, _):
+            if session(ref) == nil { pendingDestruction = nil }
         case nil:
             break
         }
@@ -907,21 +1139,45 @@ final class SessionStore {
 /// The wording lives here rather than in the view so it is one thing to read
 /// and one thing to test: what the dialog says is part of the policy, not a
 /// detail of how it is drawn.
+///
+/// A value, not a closure, for a second reason too: what a session *held* has
+/// to be captured when the question is asked. A `sessions_changed` arriving
+/// while the dialog is up would otherwise change the sentence underneath the
+/// person reading it, or empty it.
 enum PendingDestruction: Equatable {
     /// A tab with more than one pane. `paneCount` is what the message counts.
     case closeTab(TabLayout.ID, paneCount: Int)
+    /// A session, and what it held when the question was asked.
+    case deleteSession(SessionRef, name: String, terminalCount: Int)
 
     var title: String {
         switch self {
         case .closeTab: "Close this tab?"
+        // Names the session. The dropdown row that was right-clicked is gone
+        // by the time this is read, and a destructive dialog that does not say
+        // what it is about is one a person has to guess at.
+        case .deleteSession(_, let name, _): "Delete session \u{201C}\(name)\u{201D}?"
         }
     }
 
     var message: String {
         switch self {
         case .closeTab(_, let paneCount):
-            "Its \(paneCount) terminals will be closed. This cannot be undone."
+            "Its \(Self.terminals(paneCount)) will be closed. This cannot be undone."
+        // An empty session is the case issue #37 opens with -- every terminal
+        // killed, and no way to be rid of what is left -- so it has to read as
+        // a sentence rather than as "Its 0 terminals will be closed."
+        case .deleteSession(_, _, 0):
+            "It has no terminals left. This cannot be undone."
+        case .deleteSession(_, _, let count):
+            "Its \(Self.terminals(count)) will be closed. This cannot be undone."
         }
+    }
+
+    /// "1 terminal", "3 terminals". A dialog that says "1 terminals" is one a
+    /// person stops trusting the rest of.
+    private static func terminals(_ count: Int) -> String {
+        count == 1 ? "1 terminal" : "\(count) terminals"
     }
 
     /// The destructive button's title. Named after what it does, not "OK":
@@ -929,7 +1185,87 @@ enum PendingDestruction: Equatable {
     var confirmTitle: String {
         switch self {
         case .closeTab: "Close Tab"
+        case .deleteSession: "Delete Session"
         }
+    }
+}
+
+/// Why the server would refuse a session name, phrased for the person typing
+/// it.
+///
+/// Here rather than in `SessionMenu` because it is policy, not decoration: the
+/// dropdown's "Filter or create\u{2026}" field is the one place free text reaches
+/// `create`, and the daemon answers `err(invalid_name)` for anything outside
+/// `[A-Za-z0-9._-]`. Before this, a space in that field made Enter do nothing
+/// at all -- no Create row, no match to fall through to, and no reason on
+/// screen.
+///
+/// Derived from ``SessionName/isValid(_:)`` rather than re-deciding: `of` is
+/// nil for exactly the names that one accepts, so the two cannot drift into
+/// disagreeing about which names are creatable.
+enum SessionNameRefusal: Equatable {
+    case empty
+    case tooLong
+    case badCharacters
+    /// Another session on that machine already has this name. Not something
+    /// ``of(_:)`` can see — it is about one name — so only `renameRefusal` and
+    /// `filterOffer`, which know which sessions exist, produce it.
+    case inUse
+
+    static func of(_ name: String) -> SessionNameRefusal? {
+        guard !SessionName.isValid(name) else { return nil }
+        if name.isEmpty { return .empty }
+        if name.utf8.count > SessionName.maxLength { return .tooLong }
+        return .badCharacters
+    }
+
+    /// Short, because it is drawn in a dropdown row in place of the Create
+    /// row and SwiftUI truncates rather than wraps: `MenuMetrics.titleWidth`
+    /// is the budget, and `SessionLifecycleTests` measures every sentence here
+    /// against it. Two of these did not fit, and the one people reach by
+    /// typing a space lost the half that carried the meaning. It says what is
+    /// allowed rather than what was wrong -- the field is right there with the
+    /// offending text still in it.
+    ///
+    /// "bytes" and "A-Z a-z" are literal on purpose. The limit really is 64
+    /// *bytes*, so a name of thirty emoji is refused by this message and
+    /// telling that person to "shorten" it would be advice that cannot work;
+    /// and the character class really is ASCII, so "letters" would promise an
+    /// accented one that the server refuses.
+    var message: String {
+        switch self {
+        case .empty: "Type a name"
+        case .tooLong: "Up to \(SessionName.maxLength) bytes"
+        case .badCharacters: "Use A-Za-z0-9 . _ -"
+        case .inUse: "That name is taken"
+        }
+    }
+}
+
+/// What the dropdown's "Filter or create…" field can offer for what is in it.
+enum FilterOffer: Equatable {
+    /// Offer to create this — already normalized, so it is exactly what will
+    /// be sent.
+    case create(String)
+    /// Say why it cannot be, where the Create row would have gone.
+    case refused(SessionNameRefusal)
+    /// Neither: nothing has been typed, or it names a session already on
+    /// screen that you can simply switch to.
+    case nothing
+}
+
+extension SessionName {
+    /// What a typed name actually becomes.
+    ///
+    /// The ends only. Surrounding whitespace is a typing artefact rather than
+    /// something somebody means, and the server refuses it — so trimming is
+    /// what keeps "the field says why" and "Enter works" agreeing about
+    /// `work `, which they did not: one validated the raw text and the other
+    /// sent a trimmed one. An *inner* space is a real character in a name the
+    /// server will not take, and quietly deleting it would make a session
+    /// under a name nobody asked for.
+    static func normalized(_ typed: String) -> String {
+        typed.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
