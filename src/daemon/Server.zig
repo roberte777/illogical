@@ -250,6 +250,21 @@ pub fn stop(self: *Server) void {
     // one of them is unregistering.
     self.pty_poller.stop();
     if (self.listener >= 0) {
+        // `shutdown` first, and it is the line that actually ends `run`.
+        // Closing the descriptor does not wake a thread already blocked in
+        // `accept` on Linux: the sleeping call holds its own reference to the
+        // socket, so it keeps waiting for a connection that is never coming
+        // while the descriptor number goes away underneath it. `stop` returned
+        // anyway and every `join` behind it hung forever -- the two tests that
+        // run a server on a thread of its own never finished, and `zig build
+        // test` sat there with nothing printed until CI killed it at six
+        // hours. Darwin happens to end the `accept` on `close`, which is why
+        // only the Linux leg ever showed it.
+        //
+        // Same reasoning as `Client.destroy`, and the same tool; see
+        // `sys.shutdownFd`. The woken `accept` fails, `run` breaks out of its
+        // loop, and the close below is then just a close.
+        sys.shutdownFd(self.listener);
         sys.closeFd(self.listener);
         self.listener = -1;
     }
