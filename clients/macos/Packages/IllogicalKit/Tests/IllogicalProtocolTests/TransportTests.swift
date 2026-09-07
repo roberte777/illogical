@@ -413,14 +413,35 @@ struct TransportTests {
         let loop = root.appending(path: "loop").path
         try FileManager.default.createSymbolicLink(
             atPath: loop, withDestinationPath: loop)
-        let looped = try #require(reasonFor(loop))
-        #expect(!looped.contains("is not there"), "\(looped)")
+        #expect(reasonFor(loop) == "\(loop) is a loop of symlinks")
 
         // And a link to something that really is gone stays honest about it.
         let dangling = root.appending(path: "dangling").path
         try FileManager.default.createSymbolicLink(
             atPath: dangling, withDestinationPath: root.appending(path: "nope").path)
         #expect(reasonFor(dangling) == "\(dangling) is a broken symlink")
+
+        // And a binary that is present and runnable behind a directory nobody
+        // may search: `ls -l` shows it, every `stat` says no. Skipped as root,
+        // for whom the permission does not apply.
+        if geteuid() != 0 {
+            let locked = root.appending(path: "locked")
+            let hidden = locked.appending(path: "ssh").path
+            try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+            #expect(
+                FileManager.default.createFile(
+                    atPath: hidden, contents: Data(),
+                    attributes: [.posixPermissions: 0o755]))
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o000], ofItemAtPath: locked.path)
+            // Restored before the enclosing cleanup, which cannot recurse into
+            // a directory it may not search.
+            defer {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o755], ofItemAtPath: locked.path)
+            }
+            #expect(reasonFor(hidden) == "\(hidden) is in a directory that cannot be searched")
+        }
 
         // And none of it is an NSError dump.
         for path in [notExecutable, absent, root.path, notAProgram] {

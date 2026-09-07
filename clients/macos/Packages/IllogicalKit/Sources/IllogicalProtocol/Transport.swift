@@ -270,11 +270,17 @@ public final class CommandTransport: Transport, @unchecked Sendable {
     ///
     /// The app is not sandboxed, so these calls see what the spawn saw.
     private static func whyNotRunnable(_ path: String, _ ns: NSError) -> String {
-        let manager = FileManager.default
-        var isDirectory: ObjCBool = false
-        if manager.fileExists(atPath: path, isDirectory: &isDirectory) {
-            if isDirectory.boolValue { return "is a directory" }
-            if !manager.isExecutableFile(atPath: path) { return "is not executable" }
+        // `stat` directly rather than `FileManager.fileExists`, which answers
+        // false for *any* failure and keeps the reason to itself. Reporting
+        // "is not there" for all of them would tell somebody whose `ls` shows
+        // the binary that it is absent -- the whole complaint this function
+        // exists to end, reached by a rarer door.
+        var followed = stat()
+        if stat(path, &followed) == 0 {
+            if (followed.st_mode & S_IFMT) == S_IFDIR { return "is a directory" }
+            if !FileManager.default.isExecutableFile(atPath: path) {
+                return "is not executable"
+            }
             // Present, and the execute bit is on, so the objection is to the
             // image: not a program, or built for another architecture.
             if ns.domain == NSPOSIXErrorDomain, ns.code == Int(ENOEXEC) {
@@ -282,15 +288,17 @@ public final class CommandTransport: Transport, @unchecked Sendable {
             }
             return "cannot be run"
         }
+        let followError = errno
 
-        // `fileExists` is false for *any* `stat` failure, not only for a
-        // missing file -- so reporting "is not there" here would tell somebody
-        // whose `ls` shows the binary that it is absent, which is the whole
-        // complaint this function was written to end, reached by a rarer door.
-        // `lstat` separates the cases: if the entry itself is there, following
-        // it is what failed.
+        // Following the path failed. `lstat` says whether the entry itself is
+        // there, which separates "the link is unresolvable" from "the path to
+        // it is". Measured, because the two are easy to get backwards: a
+        // self-referential symlink is `stat` ELOOP and `lstat` OK, while a
+        // loop in a *parent* component fails both.
         var entry = stat()
-        if lstat(path, &entry) == 0 { return "is a broken symlink" }
+        if lstat(path, &entry) == 0 {
+            return followError == ELOOP ? "is a loop of symlinks" : "is a broken symlink"
+        }
         switch errno {
         case EACCES, ENOTDIR: return "is in a directory that cannot be searched"
         case ELOOP: return "is a loop of symlinks"
