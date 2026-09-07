@@ -127,6 +127,7 @@ src/cli/                   illogical
 clients/macos/
   project.yml              XcodeGen source of truth (.xcodeproj is generated)
   Illogical/               the app
+  Illogical/Supporting/Fonts/  JetBrains Mono, shipped as the default face
   Packages/IllogicalKit/   pure-Swift protocol core
 
 scripts/                   build-xcframework.sh

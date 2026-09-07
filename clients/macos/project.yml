@@ -28,12 +28,15 @@ targets:
     # `xcodebuild -downloadComponent MetalToolchain`.
     sources:
       - path: Illogical
-        # The staged server is a copy-files phase of its own, below. Without
-        # this it would also be swept up by the recursive scan above and land
-        # in Resources, where an executable is signed as data and notarization
-        # rejects the bundle.
         excludes:
+          # The staged server is a copy-files phase of its own, below. Without
+          # this it would also be swept up by the recursive scan above and land
+          # in Resources, where an executable is signed as data and
+          # notarization rejects the bundle.
           - "Supporting/bin/**"
+          # Supporting/Fonts/ is a resource directory, so everything in it is
+          # copied into the bundle. OFL.txt has to be; its manifest does not.
+          - Supporting/Fonts/README.md
       # illogicald, put here by `just stage-daemon` from zig-out/bin and
       # gitignored, exactly as `just xcframework` stages the XCFramework.
       # Copied into Contents/MacOS/ and re-signed on the way in, so
@@ -118,6 +121,12 @@ targets:
       - path: Illogical/Sessions/HostConnection.swift
       - path: Illogical/Sessions/Reconnect.swift
       - path: Illogical/Terminal/TerminalController.swift
+      # The font the app ships. Without it in the test bundle the renderer
+      # tests would resolve the default family to the system's fixed-pitch
+      # face and measure a grid the app never draws.
+      - path: Illogical/Supporting/Fonts
+        excludes:
+          - README.md
       # The renderer and the controller both emit launch signposts.
       - path: Illogical/App/Signposts.swift
       - path: Illogical/App/Palette.swift
