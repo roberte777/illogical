@@ -328,55 +328,70 @@ struct TransportTests {
     /// A spawn failure is two different events wearing one name, and the whole
     /// retry decision hangs on telling them apart. `EMFILE` clears when a pane
     /// closes — a remote connection costs three descriptors, so a window with
-    /// enough of them reaches it — while a broken image never will. Before
-    /// this the errno was stringified away at the throw, so the client had to
-    /// treat both alike, and treating both as permanent killed a perfectly
-    /// reachable machine for the life of the process.
-    @Test("a spawn failure is classified by its errno, not by its wording")
-    func spawnFailuresAreClassified() {
-        func classify(_ domain: String, _ code: Int32) -> TransportError {
-            CommandTransport.spawnError(
-                NSError(domain: domain, code: Int(code)), command: "ssh")
+    /// enough of them reaches it — while a broken image never will.
+    ///
+    /// Driven through a real `Process.run()` rather than a hand-built
+    /// `NSError`, because the interesting behaviour is Foundation's: it
+    /// pre-checks `isExecutableFile` and collapses missing, present-but-not-
+    /// executable and several others into one `NSCocoaErrorDomain` 4 saying
+    /// "The file … doesn't exist.". A synthetic error cannot show that, which
+    /// is exactly how a version of this that mapped code 4 to "is not there"
+    /// passed while telling users a file they were looking at was absent.
+    @Test("a spawn failure says which kind it is, from the filesystem")
+    func spawnFailuresAreClassified() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "illogical-spawn-\(getpid())-\(UInt32.random(in: 0..<1_000_000))")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        func reasonFor(_ path: String) -> String? {
+            do {
+                let transport = try CommandTransport(argv: [path])
+                transport.shutdown()
+                transport.close()
+                return nil
+            } catch let error as TransportError {
+                return String(describing: error)
+            } catch {
+                return "unexpected \(error)"
+            }
         }
 
-        for code in [EMFILE, ENFILE, EAGAIN, ENOMEM] {
-            #expect(
-                classify(NSPOSIXErrorDomain, code).isTransient,
-                "errno \(code) is worth a retry")
-        }
-        for code in [ENOENT, EACCES, ENOEXEC, EISDIR] {
-            #expect(
-                !classify(NSPOSIXErrorDomain, code).isTransient,
-                "errno \(code) will not fix itself")
-        }
-        // What Foundation actually raises for a missing or unreadable image.
-        #expect(!classify(NSCocoaErrorDomain, 4).isTransient)
-        #expect(!classify(NSCocoaErrorDomain, 257).isTransient)
-
-        // Unknown means retry: one attempt every thirty seconds is cheaper
-        // than giving up on a machine that was briefly out of something.
-        #expect(classify(NSPOSIXErrorDomain, EINTR).isTransient)
-
-        // And whichever it is, it reads like a sentence rather than a dump.
-        //
-        // The permanent case does not relay Foundation's wording at all: for
-        // the file it is actually about -- present, not executable -- that
-        // wording is "The file ... doesn't exist.", which sends somebody
-        // looking for an `ssh` that is sitting where they left it.
-        // Distinct wording per errno, because "is not an executable program"
-        // is wrong for a file that is simply missing and Foundation's own
-        // "The file ... doesn't exist." is wrong for one that is present and
-        // not runnable. Both send somebody to fix the wrong thing.
-        #expect(String(describing: classify(NSCocoaErrorDomain, 4)) == "ssh is not there")
+        // Present, readable, and not executable. Foundation calls this one
+        // "doesn't exist"; it is sitting right there.
+        let notExecutable = root.appending(path: "ssh").path
         #expect(
-            String(describing: classify(NSPOSIXErrorDomain, EACCES))
-                == "ssh is not executable")
+            FileManager.default.createFile(
+                atPath: notExecutable, contents: Data("#!/bin/sh\nexit 0\n".utf8),
+                attributes: [.posixPermissions: 0o644]))
+        #expect(reasonFor(notExecutable) == "\(notExecutable) is not executable")
+
+        // Genuinely absent.
+        let absent = root.appending(path: "gone").path
+        #expect(reasonFor(absent) == "\(absent) is not there")
+
+        // A directory, which macOS reports as EACCES rather than EISDIR --
+        // the search bit is on, so it gets past the pre-check.
+        #expect(reasonFor(root.path) == "\(root.path) is a directory")
+
+        // Executable, but not a program: a shebang naming something absent.
+        let notAProgram = root.appending(path: "broken").path
         #expect(
-            String(describing: classify(NSPOSIXErrorDomain, ENOEXEC)) == "ssh is not a program")
-        let transient = String(describing: classify(NSPOSIXErrorDomain, EMFILE))
-        #expect(transient.hasPrefix("could not run ssh: "))
-        #expect(!transient.contains("UserInfo="))
+            FileManager.default.createFile(
+                atPath: notAProgram, contents: Data("\u{7f}ELF not really\n".utf8),
+                attributes: [.posixPermissions: 0o755]))
+        let broken = try #require(reasonFor(notAProgram))
+        #expect(broken.hasPrefix(notAProgram), "\(broken)")
+        #expect(!broken.contains("is not there"), "\(broken)")
+
+        // And none of it is an NSError dump.
+        for path in [notExecutable, absent, root.path, notAProgram] {
+            let text = try #require(reasonFor(path))
+            #expect(!text.contains("UserInfo="), "\(text)")
+            #expect(!text.contains("NSCocoaErrorDomain"), "\(text)")
+        }
     }
+
 
     /// `close()` is called from the main actor, once per pane. Blocking there
     /// while a wedged child fails to die froze the window for seconds when

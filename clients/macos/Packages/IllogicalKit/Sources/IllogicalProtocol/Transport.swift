@@ -229,48 +229,58 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         signal(SIGPIPE, SIG_IGN)
     }()
 
-    /// Which kind of spawn failure this is, from the errno Foundation carries.
+    /// Which kind of spawn failure this is, and how to say so.
     ///
     /// Worth the unwrapping: `"\(error)"` on what `Process.run()` throws is an
     /// `NSError` dump — `Error Domain=NSCocoaErrorDomain Code=4 "…"
     /// UserInfo={NSFilePath=…}` — and this string is a tooltip in the session
     /// dropdown and, when it is the only host, the full-window message. It is
-    /// also what decides whether the host is retried at all, and that decision
-    /// is only makeable because the errno survives to here.
+    /// also what decides whether the host is retried at all.
     ///
-    /// Unrecognised failures are treated as transient. Retrying something
-    /// permanent costs one connection attempt every thirty seconds; giving up
-    /// on something temporary costs the machine for the life of the process.
-    static func spawnError(_ error: Error, command: String) -> TransportError {
+    /// Unrecognised failures are transient. Retrying something permanent costs
+    /// one connection attempt every thirty seconds; giving up on something
+    /// temporary costs the machine for the life of the process.
+    static func spawnError(_ error: Error, command: String, path: String) -> TransportError {
         let ns = error as NSError
+        let permanent: Set<Int32> = [ENOENT, EACCES, ENOEXEC, EISDIR, ENAMETOOLONG, ELOOP]
+        let isPermanent =
+            (ns.domain == NSCocoaErrorDomain && (ns.code == 4 || ns.code == 257))
+            || (ns.domain == NSPOSIXErrorDomain && permanent.contains(Int32(ns.code)))
+        guard isPermanent else {
+            return .spawnFailed(command: command, reason: ns.localizedDescription)
+        }
+        return .notExecutable(command: command, reason: whyNotRunnable(path, ns))
+    }
 
-        // Our wording, from the errno, rather than Foundation's sentence.
-        // Foundation says "The file ... doesn't exist." for a file that is
-        // present and merely not executable, and a flat "is not an executable
-        // program" is wrong the other way for one that really is missing --
-        // both send somebody to fix the wrong thing. These six are also the
-        // whole permanent set: anything else is retried.
-        let permanent: [Int32: String] = [
-            ENOENT: "is not there",
-            EACCES: "is not executable",
-            ENOEXEC: "is not a program",
-            EISDIR: "is a directory",
-            ENAMETOOLONG: "is too long a path to open",
-            ELOOP: "is a loop of symlinks",
-        ]
-        if ns.domain == NSPOSIXErrorDomain, let reason = permanent[Int32(ns.code)] {
-            return .notExecutable(command: command, reason: reason)
+    /// Why a file that exists in somebody's config cannot be run, asked of the
+    /// filesystem rather than of the error.
+    ///
+    /// The error cannot answer it. Foundation pre-checks `isExecutableFile`
+    /// and collapses missing, present-but-not-executable, unreadable,
+    /// unsearchable-parent, too-long and symlink-loop into a single
+    /// `NSCocoaErrorDomain` 4 whose sentence is "The file … doesn't exist." —
+    /// true for one of those and false for the rest. Only what survives that
+    /// pre-check reaches `posix_spawn` and arrives with a real errno, and even
+    /// then a directory comes back `EACCES` rather than `EISDIR`. Deriving the
+    /// wording from the code therefore tells a user with a `chmod +x` problem
+    /// to go looking for a missing file, or the reverse — which is the whole
+    /// complaint this function exists to answer, so it asks `stat` instead.
+    ///
+    /// The app is not sandboxed, so these calls see what the spawn saw.
+    private static func whyNotRunnable(_ path: String, _ ns: NSError) -> String {
+        let manager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard manager.fileExists(atPath: path, isDirectory: &isDirectory) else {
+            return "is not there"
         }
-        // `NSFileNoSuchFileError` (4) and `NSFileReadNoPermissionError` (257)
-        // are two of the same answers wearing Cocoa's numbering, which is what
-        // Foundation actually raises for a missing or unreadable image.
-        if ns.domain == NSCocoaErrorDomain {
-            if ns.code == 4 { return .notExecutable(command: command, reason: "is not there") }
-            if ns.code == 257 {
-                return .notExecutable(command: command, reason: "cannot be read")
-            }
+        if isDirectory.boolValue { return "is a directory" }
+        if !manager.isExecutableFile(atPath: path) { return "is not executable" }
+        // Present, and the execute bit is on, so the objection is to the image
+        // itself: a shebang that is not a program, or the wrong architecture.
+        if ns.domain == NSPOSIXErrorDomain, ns.code == Int(ENOEXEC) {
+            return "is not a program"
         }
-        return .spawnFailed(command: command, reason: ns.localizedDescription)
+        return "cannot be run"
     }
 
     public init(argv: [String]) throws {
@@ -284,7 +294,8 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         let stderrPipe = Pipe()
 
         let process = Process()
-        process.executableURL = try Self.resolve(executable)
+        let resolved = try Self.resolve(executable)
+        process.executableURL = resolved
         process.arguments = Array(argv.dropFirst())
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
@@ -293,7 +304,7 @@ public final class CommandTransport: Transport, @unchecked Sendable {
         do {
             try process.run()
         } catch {
-            throw Self.spawnError(error, command: executable)
+            throw Self.spawnError(error, command: executable, path: resolved.path)
         }
 
         self.process = process

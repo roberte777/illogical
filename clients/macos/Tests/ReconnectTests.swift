@@ -438,6 +438,14 @@ final class ReconnectTests: XCTestCase {
         XCTAssertFalse(
             message.contains("NSCocoaErrorDomain") || message.contains("UserInfo="),
             "an NSError dump was put in front of a person: \(message)")
+        // And it says the *right* thing. This file is present and mode 0644,
+        // so "is not there" would be the same wrong advice pointing the other
+        // way -- which is what Foundation's own sentence says here, and what a
+        // classification driven by its error code produced. Asserting only
+        // "not a dump" let that through.
+        XCTAssertTrue(
+            message.contains("is not executable"),
+            "a file that is present and unrunnable was described as something else: \(message)")
     }
 
 }
