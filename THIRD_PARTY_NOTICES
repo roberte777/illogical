@@ -175,6 +175,86 @@ See [./licenses](./licenses) for licenses of code being used in the repo:
 * [LICENSE_Bjoern_Hoehrmann](./licenses/LICENSE_Bjoern_Hoehrmann)
 * [LICENSE_unicode](./licenses/LICENSE_unicode)
 
+-- and that `licenses/` directory is not in the package the build fetches.
+`build.zig.zon` pulls the source tarball, and what it unpacks is `LICENSE.md`,
+`README.md`, `build.zig`, `build.zig.zon`, `src/` and `ucd/` -- no `licenses/`.
+So uucode's own copies of the two texts it points at above are not reproducible
+from this tree; they are in the upstream repository. Same situation as simdutf,
+above. What follows is what can be established here.
+
+The Unicode data uucode compiles its tables from *is* in the package, under
+`ucd/`, and each file carries its own header. Reproduced verbatim from
+`ucd/DerivedCoreProperties.txt`, which is representative of all of them:
+
+# DerivedCoreProperties-17.0.0.txt
+# Date: 2025-07-30, 23:55:08 GMT
+# © 2025 Unicode®, Inc.
+# Unicode and the Unicode Logo are registered trademarks of Unicode, Inc. in the U.S. and other countries.
+# For terms of use and license, see https://www.unicode.org/terms_of_use.html
+
+Those terms are the Unicode, Inc. licence agreement for data files and
+software, whose copyright-and-permission notice wants to travel with copies of
+the data. It is reproduced below, but note its provenance: this copy was taken
+from the Zig toolchain this repository builds with
+(`lib/libcxx/include/__format/width_estimation_table.h`, where it appears
+identically in four generated headers), *not* from uucode and not from
+unicode.org, and it therefore bears that copy's `1991-2022` range rather than
+the `2025` the `ucd/` files above claim. The permission grant is the operative
+part and is unchanged between the two, but the exact text uucode ships in
+`licenses/LICENSE_unicode` has not been seen, and this entry should be replaced
+with it -- or with the current text from unicode.org -- before the first tag.
+
+UNICODE, INC. LICENSE AGREEMENT - DATA FILES AND SOFTWARE
+
+See Terms of Use <https://www.unicode.org/copyright.html>
+for definitions of Unicode Inc.'s Data Files and Software.
+
+NOTICE TO USER: Carefully read the following legal agreement.
+BY DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING UNICODE INC.'S
+DATA FILES ("DATA FILES"), AND/OR SOFTWARE ("SOFTWARE"),
+YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT.
+IF YOU DO NOT AGREE, DO NOT DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE
+THE DATA FILES OR SOFTWARE.
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright (c) 1991-2022 Unicode, Inc. All rights reserved.
+Distributed under the Terms of Use in https://www.unicode.org/copyright.html.
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of the Unicode data files and any associated documentation
+(the "Data Files") or Unicode software and any associated documentation
+(the "Software") to deal in the Data Files or Software
+without restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, and/or sell copies of
+the Data Files or Software, and to permit persons to whom the Data Files
+or Software are furnished to do so, provided that either
+(a) this copyright and permission notice appear with all copies
+of the Data Files or Software, or
+(b) this copyright and permission notice appear in associated
+Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT OF THIRD PARTY RIGHTS.
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS
+NOTICE BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL
+DAMAGES, OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THE DATA FILES OR SOFTWARE.
+
+The other file uucode points at, `licenses/LICENSE_Bjoern_Hoehrmann`, covers
+the DFA-based UTF-8 decoder at http://bjoern.hoehrmann.de/utf-8/decoder/dfa.
+Its text is **not reproduced here and is not available anywhere in this tree**:
+the only mention of it in the checkout outside this file is a source comment in
+`vendor/ghostty/src/terminal/UTF8Decoder.zig`, which names the author and says
+"MIT licensed" but reproduces no notice. Fetching it is the second half of the
+same job as the paragraph above, and both are a gate on tagging, not on
+merging: `release.yml` fires on tags only.
+
 ----------------------------------------------------------------------------
 wuffs
 https://github.com/google/wuffs -- LICENSE-MIT from the package cache.
