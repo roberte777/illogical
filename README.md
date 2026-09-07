@@ -93,6 +93,52 @@ already holds the app's own `Illogical` executable and the default macOS volume
 is case-insensitive, so a file called `illogical` in there *is* that file. Take
 it from the tarball, or from `zig-out/bin` in a build tree.
 
+## Configuration
+
+Ghostty's format, and Ghostty's option names. The app reads two files, both
+optional, and applies them in this order:
+
+```
+~/.config/illogical/config                              # or $XDG_CONFIG_HOME
+~/Library/Application Support/dev.illogical.Illogical/config
+```
+
+If neither exists, the app writes a commented template to the second one on
+first launch, so there is a file to open rather than a path to guess.
+
+```ini
+# Key and value. Spacing around the = does not matter, and a line starting
+# with # is a comment — but a # after a value is part of the value.
+font-family = Berkeley Mono
+
+# Repeat it to add fallbacks. The first family with the character wins; the
+# system's own cascade is asked only after every one of them has missed.
+font-family = Noto Sans CJK
+
+# Because repeating appends, clearing the list needs an empty value first.
+font-family = ""
+font-family = Iosevka
+
+# Styles are looked for inside the family above unless you name one, and a
+# family with no italic gets a synthesized one rather than another family's.
+font-family-bold = Iosevka Bold
+font-family-italic = Iosevka Oblique
+font-family-bold-italic = Iosevka Bold Oblique
+
+# Points. Fractional sizes are real — the cell is measured in pixels, so 13.5
+# at 2x is a 27px cell. Default 13.
+font-size = 13
+```
+
+The font is all there is so far;
+[#39](https://github.com/roberte777/illogical/issues/39) tracks the rest.
+Unknown keys and unparseable values are warnings — they go to the unified log
+(`log stream --predicate 'subsystem == "dev.illogical.Illogical"'`) and the
+rest of the file still applies. Nothing here reloads while the app runs yet.
+
+`ILLOGICAL_CONFIG` names one file to read instead of both, and reads nothing
+when set to empty.
+
 ## Releases
 
 Every merge to `main` rebuilds everything and moves the

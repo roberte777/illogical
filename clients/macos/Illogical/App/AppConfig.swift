@@ -34,6 +34,22 @@ enum AppConfig {
     /// `load()`.
     static var current: Config { storage.withLock { $0 } }
 
+    /// The font half of it, in the renderer's own vocabulary.
+    ///
+    /// The one place the two line up, and the reason `Renderer/` does not
+    /// import the config package at all: a grid is built from a `FontConfig`,
+    /// so a test builds one directly instead of writing a config file to get
+    /// at the renderer.
+    static var font: FontConfig {
+        let config = current
+        return FontConfig(
+            regular: config.fontFamily,
+            bold: config.fontFamilyBold,
+            italic: config.fontFamilyItalic,
+            boldItalic: config.fontFamilyBoldItalic,
+            pointSize: config.fontSize)
+    }
+
     /// Read the config files, create one if this machine has none, and say
     /// what happened.
     ///

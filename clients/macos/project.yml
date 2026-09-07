@@ -153,6 +153,11 @@ targets:
       - path: Illogical/Supporting/Fonts
         excludes:
           - README.md
+      # The surface reads the font it draws with from here. No test calls
+      # `AppConfig.load()`, so every one of them gets the defaults -- which is
+      # exactly why loading is explicit rather than lazy: a lazy read would
+      # have every render test parsing the developer's own config file.
+      - path: Illogical/App/AppConfig.swift
       # The renderer and the controller both emit launch signposts.
       - path: Illogical/App/Signposts.swift
       - path: Illogical/App/Palette.swift
@@ -168,6 +173,8 @@ targets:
         embed: false
       - package: IllogicalKit
         product: IllogicalProtocol
+      - package: IllogicalKit
+        product: IllogicalConfig
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.illogical.RendererTests
