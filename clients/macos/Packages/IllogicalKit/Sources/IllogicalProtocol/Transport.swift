@@ -638,31 +638,31 @@ public enum SSHCommand {
     /// and `illogical --host` bind different control sockets and hold two ssh
     /// masters, which is precisely what this exists to avoid. Nil when `$HOME`
     /// is unset, which is what the Zig side does too.
-    /// Where the home directory comes from, taking the environment as an
-    /// argument so it can be checked without touching the process's own.
+    /// Takes the *environment*, not a home directory, and that is the point.
     ///
-    /// This is the whole of the bug worth pinning: `src/core/conn.zig:291`
-    /// renders the same path from `getenv("HOME")`, and a client that read the
-    /// passwd entry instead would bind a second control socket and hold a
-    /// second ssh master for every host. The two agree on every machine anyone
-    /// tests on, so only an input the test chooses can tell them apart -- and
-    /// choosing it here rather than by `setenv` keeps it away from the
-    /// concurrently-running tests that walk `environ`.
-    static func home(from environment: [String: String]) -> String? {
-        environment["HOME"]
-    }
-
-    /// `home` is a parameter so a caller can render a path for a home that is
-    /// not this process's. Production never passes it.
+    /// `src/core/conn.zig:291` renders this same path from `getenv("HOME")`,
+    /// and a client that read the passwd entry instead -- via
+    /// `homeDirectoryForCurrentUser`, the obvious-looking alternative -- would
+    /// bind a second control socket and hold a second ssh master for every
+    /// host. The two agree on every machine anyone tests on, so no assertion
+    /// can tell them apart without an input the test chooses.
+    ///
+    /// Four earlier versions tried to *detect* that substitution and each was
+    /// a tautology in a new place: the expectation was computed the same way
+    /// the code computed the value, and when a parameter was added the
+    /// tautology moved into its default. Setting `HOME` for real would work
+    /// and puts a write to `environ` beside suites that walk it. Taking the
+    /// dictionary makes the mistake unrepresentable rather than detectable --
+    /// there is nowhere to put `homeDirectoryForCurrentUser` that type-checks.
     static func controlPath(
         _ options: Options,
-        home: String? = SSHCommand.home(from: ProcessInfo.processInfo.environment)
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String? {
         let directory: String
         if let explicit = options.controlDirectory {
             directory = explicit
         } else {
-            guard let home else { return nil }
+            guard let home = environment["HOME"] else { return nil }
             directory = home + "/.ssh"
         }
         let path = directory + "/illogical-%C"

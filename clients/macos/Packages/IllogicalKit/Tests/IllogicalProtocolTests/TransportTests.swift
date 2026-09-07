@@ -111,40 +111,41 @@ struct TransportTests {
     /// share one multiplexing master. Drifting apart silently doubles the SSH
     /// connections a machine holds.
     ///
-    /// The environment is *passed in*, not mutated. Earlier versions computed
-    /// the expectation the same way the code computes the value, so
-    /// substituting `homeDirectoryForCurrentUser` left them green; the version
-    /// after that set `HOME` for real, which works but puts a write to
-    /// `environ` next to suites that walk it — `.serialized` is scoped to one
-    /// suite and does not hold across them, and every `SSHCommand.argv` call
-    /// reads the whole environment through this same default. Handing the
-    /// dictionary in tells the two sources apart with nothing shared.
-    @Test("the home directory comes from the environment, not the passwd entry")
-    func homeComesFromTheEnvironment() {
+    /// The environment is handed in. Four earlier versions tried to *catch*
+    /// `homeDirectoryForCurrentUser` being substituted for the environment
+    /// read, and each computed its expectation the same way the code computed
+    /// the value — so each passed with the substitution in place, the last
+    /// because the tautology had moved into a default argument. Setting `HOME`
+    /// for real does work, and puts a write to `environ` beside suites that
+    /// walk it. Passing the dictionary removes the question instead: the
+    /// passwd entry is not a `[String: String]`, so there is nowhere to put it.
+    @Test("the control path comes from the environment, not the passwd entry")
+    func controlPathComesFromTheEnvironment() {
         #expect(
-            SSHCommand.home(from: ["HOME": "/tmp/illogical-not-your-home"])
-                == "/tmp/illogical-not-your-home")
+            SSHCommand.controlPath(
+                SSHCommand.Options(destination: "h"),
+                environment: ["HOME": "/tmp/illogical-not-your-home"])
+                == "/tmp/illogical-not-your-home/.ssh/illogical-%C")
+
         // Nil rather than a path rooted at nothing, matching
         // `src/core/conn.zig:291`'s `orelse return null`.
-        #expect(SSHCommand.home(from: [:]) == nil)
-        #expect(SSHCommand.home(from: ["HOMEBREW_PREFIX": "/opt/homebrew"]) == nil)
+        #expect(
+            SSHCommand.controlPath(SSHCommand.Options(destination: "h"), environment: [:]) == nil)
+        #expect(
+            SSHCommand.controlPath(
+                SSHCommand.Options(destination: "h"),
+                environment: ["HOMEBREW_PREFIX": "/opt/homebrew"]) == nil)
+
+        // An explicit directory wins, asserted while the environment says
+        // something different so it pins precedence rather than merely that
+        // the option is read.
+        #expect(
+            SSHCommand.controlPath(
+                SSHCommand.Options(destination: "h", controlDirectory: "/tmp/elsewhere"),
+                environment: ["HOME": "/tmp/illogical-not-your-home"])
+                == "/tmp/elsewhere/illogical-%C")
     }
 
-    @Test("the default control path is the one src/core/conn.zig renders")
-    func defaultControlPath() throws {
-        let home = try #require(SSHCommand.home(from: ProcessInfo.processInfo.environment))
-        #expect(
-            SSHCommand.controlPath(SSHCommand.Options(destination: "h"))
-                == home + "/.ssh/illogical-%C")
-
-        // An explicit home wins over the environment, which is what the
-        // parameter is for. Asserted while `HOME` is set and different, so it
-        // pins precedence rather than merely "the parameter is read".
-        #expect(
-            SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: "/tmp/elsewhere")
-                == "/tmp/elsewhere/.ssh/illogical-%C")
-        #expect(SSHCommand.controlPath(SSHCommand.Options(destination: "h"), home: nil) == nil)
-    }
     /// `cat` is the smallest thing that behaves like the far end of an SSH
     /// pipe: what goes in comes back, framed exactly as it was sent. The
     /// transport is what is under test, not the server.
