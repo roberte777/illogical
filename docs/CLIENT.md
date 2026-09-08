@@ -831,6 +831,17 @@ keyed on view identity for that reason, and `reportSizeIfNeeded` checks the same
 thing so a displaced surface cannot resize the PTY out from under its
 replacement.
 
+The replacement has to *say* what size it is, and that is the other half. A
+surface's first layout is exempt from `reportSizeIfNeeded` because the size
+travels in the attach — true for a controller the attach just made, and false
+for every one of these: the surviving pane's controller is already connected, at
+the geometry of the pane it used to fill. So the size was recorded as reported
+and never sent, and a ⌘D left a half-width pane drawing a full-width grid with
+the right-hand half past its own edge. `Coordinator.attach` resizes the
+controller it was handed, which the controller drops when it is already at that
+size — so a fresh attach still says it once, and a rehomed surface says it at
+all.
+
 ## Remote hosts
 
 `ssh <dest> illogicald --stdio`, with the frame stream on the pipe. The user's

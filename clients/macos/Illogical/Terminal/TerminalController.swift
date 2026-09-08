@@ -212,6 +212,12 @@ final class TerminalController {
 
     func resize(cols: UInt16, rows: UInt16) {
         guard cols > 0, rows > 0 else { return }
+        // Nothing to tell anyone. The server drops a resize to the size it is
+        // already at, and reflowing the mirror for one would be work for no
+        // change — so a caller that cannot know whether this is news (the
+        // attach path, which resizes a controller it may have just connected at
+        // this very size) may say it unconditionally.
+        guard cols != self.cols || rows != self.rows else { return }
         // Remembered even while disconnected, so a window resized during an
         // outage reattaches at the size it is now rather than the size it was.
         self.cols = cols

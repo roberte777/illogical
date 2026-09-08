@@ -66,11 +66,17 @@ dependencies:
 
 ```bash
 curl -fsSL https://github.com/roberte777/illogical/releases/download/latest/illogicald-linux-x86_64.tar.gz \
-  | tar xz -C ~/.local/bin illogicald illogical
+  | tar xz -C ~/.local/bin illogicald illogical terminfo
 ```
 
-The two binaries by name, because the tarball also carries `LICENSE` and
+Those three by name, because the tarball also carries `LICENSE` and
 `THIRD_PARTY_NOTICES` and those do not belong on a `PATH`.
+
+`terminfo/` is the compiled database for `xterm-ghostty`, and it travels beside
+the daemon rather than into a `share/` because `illogicald` looks for it in its
+own directory. Leaving it out is not fatal — the daemon notices, says so in its
+log, and tells the shells it starts `TERM=xterm-256color` — but the terminals on
+that box are then a smaller terminal than the ones at home.
 
 `releases/download/latest/…`, naming the tag, rather than the
 `releases/latest/download/…` redirect that looks equivalent and is not: that

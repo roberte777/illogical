@@ -24,6 +24,8 @@ clients/macos/Frameworks/
 
 # illogicald + illogical, staged into the app bundle by `just stage-daemon`
 clients/macos/Illogical/Supporting/bin/
+# The compiled terminfo database, staged the same way
+clients/macos/Illogical/Supporting/terminfo/
 
 # Release tarballs, from `just dist`
 dist/

@@ -263,6 +263,21 @@ pub fn isWritableDir(path: []const u8) bool {
     return access(@ptrCast(&buf), W_OK | X_OK) == 0;
 }
 
+/// `access(path, F_OK)`: whether anything is there at all.
+///
+/// A file-existence check and nothing more -- it says nothing about whether
+/// this process could open it. The terminfo lookup wants exactly that: a
+/// database entry that exists but cannot be read is a database entry the
+/// child's ncurses cannot read either, and the answer is the same.
+pub fn pathExists(path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len == 0 or path.len >= buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return access(@ptrCast(&buf), F_OK) == 0;
+}
+
+const F_OK: c_int = 0;
 const W_OK: c_int = 2;
 const X_OK: c_int = 1;
 

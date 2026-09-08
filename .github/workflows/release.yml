@@ -292,18 +292,27 @@ jobs:
             *arm64*x86_64* | *x86_64*arm64*) ;;
             *) echo "error: expected a universal illogicald, got '$archs'" >&2; exit 1 ;;
           esac
+          # The terminfo database rides in the same tarball, and the bundle
+          # carries it for the same reason the daemon does: without it every
+          # shell in every terminal runs against a TERM nothing can look up.
+          [ -d "$out/terminfo" ] || {
+            echo "error: the daemon tarball has no terminfo database" >&2; exit 1
+          }
           echo "bin=$out/illogicald" >> "$GITHUB_OUTPUT"
+          echo "terminfo=$out/terminfo" >> "$GITHUB_OUTPUT"
 
       # xcodegen names the staged directory as a source and refuses to generate
       # against a path that is not there, so the daemon is staged first.
       - name: Generate the project
         env:
           ILLOGICAL_DAEMON_BIN: ${{ steps.daemon.outputs.bin }}
+          ILLOGICAL_TERMINFO_DIR: ${{ steps.daemon.outputs.terminfo }}
         run: nix develop -c just xcodeproj
 
       - name: Build, sign, notarize and package
         env:
           ILLOGICAL_DAEMON_BIN: ${{ steps.daemon.outputs.bin }}
+          ILLOGICAL_TERMINFO_DIR: ${{ steps.daemon.outputs.terminfo }}
           # Absent on a fork or before the certificate exists. dist-app.sh
           # builds an ad-hoc signed DMG in that case and says so loudly.
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}

@@ -100,6 +100,12 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(cli);
 
     // ---------------------------------------------------------------
+    // The terminfo database that makes `TERM=xterm-ghostty` a name a child
+    // can look up. See `src/core/pty.zig`.
+    // ---------------------------------------------------------------
+    terminfoDatabase(b, target, optimize);
+
+    // ---------------------------------------------------------------
     // Steps
     // ---------------------------------------------------------------
     const run_step = b.step("run", "Run illogicald in the foreground");
@@ -140,6 +146,69 @@ fn appleSdkPaths(b: *std.Build, exe: *std.Build.Step.Compile) void {
     @import("apple_sdk").addPaths(b, exe) catch |err| {
         std.debug.panic("could not resolve the macOS SDK: {t}", .{err});
     };
+}
+
+/// Compile ghostty's terminfo entry and install it as `share/terminfo`.
+///
+/// The daemon tells every child `TERM=xterm-ghostty` and points its `TERMINFO`
+/// here, which is the only way that name means anything: the entry is not part
+/// of ncurses, so a machine that has never had ghostty on it cannot look it up,
+/// and a child with no terminfo at all cannot so much as move its own cursor.
+/// This is ghostty's own build step (`src/build/GhosttyResources.zig`) over
+/// ghostty's own source, so what we ship describes the pin we build against.
+///
+/// `cp -R` rather than `addInstallDirectory`, because what `tic` writes is
+/// `tic`'s business and not ours: here it is a plain file per name, but ncurses
+/// built with `--enable-symlinks` writes the aliases as links, and Zig's own
+/// step does not preserve those. Copying keeps whatever shape the host's `tic`
+/// produced. A no-op when the submodule is not checked out, like everything
+/// else here.
+fn terminfoDatabase(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const dep = b.lazyDependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+    }) orelse return;
+
+    // Built for the host: it runs here, at build time, whatever we are
+    // cross-compiling the daemon for.
+    const generator = b.addExecutable(.{
+        .name = "terminfo-gen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/terminfo.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    generator.root_module.addAnonymousImport("ghostty-terminfo", .{
+        .root_source_file = dep.path("src/terminfo/ghostty.zig"),
+    });
+
+    const emit = b.addRunArtifact(generator);
+    const source = emit.captureStdOut(.{});
+
+    const tic = std.Build.Step.Run.create(b, "tic");
+    tic.addArgs(&.{ "tic", "-x", "-o" });
+    const database = tic.addOutputDirectoryArg("terminfo");
+    tic.addFileArg(source);
+    // tic reports what it compiled on stderr, which is not news.
+    _ = tic.captureStdErr(.{});
+
+    // So that the copy below lands *in* `share/terminfo` rather than creating
+    // a file by that name.
+    const mkdir = std.Build.Step.Run.create(b, "make share/terminfo");
+    mkdir.addArgs(&.{ "mkdir", "-p", b.fmt("{s}/share/terminfo", .{b.install_path}) });
+
+    const copy = std.Build.Step.Run.create(b, "install terminfo");
+    copy.addArgs(&.{ "cp", "-R" });
+    copy.addFileArg(database);
+    copy.addArg(b.fmt("{s}/share/", .{b.install_path}));
+    copy.step.dependOn(&mkdir.step);
+
+    b.getInstallStep().dependOn(&copy.step);
 }
 
 /// Resolve the `ghostty-vt` module from the vendored ghostty checkout.

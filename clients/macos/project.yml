@@ -34,6 +34,10 @@ targets:
           # in Resources, where an executable is signed as data and
           # notarization rejects the bundle.
           - "Supporting/bin/**"
+          # Likewise the terminfo database: a folder reference below, so that
+          # `78/xterm-ghostty` keeps its directory. Swept up here it would land
+          # as a flat file in Resources, where no ncurses would look for it.
+          - "Supporting/terminfo/**"
           # Supporting/Fonts/ is a resource directory, so everything in it is
           # copied into the bundle. OFL.txt has to be; its manifest does not.
           - Supporting/Fonts/README.md
@@ -63,6 +67,16 @@ targets:
             destination: executables
             subpath: ""
         attributes: [CodeSignOnCopy]
+      # The terminfo database, put here by `just stage-daemon` from
+      # zig-out/share and gitignored like everything else staged. A folder
+      # reference (`type: folder`) rather than a scanned group: ncurses looks
+      # for `<db>/78/xterm-ghostty`, so the directory *is* the artifact.
+      #
+      # It lands in `Contents/Resources/terminfo`, which is where the daemon
+      # in `Contents/MacOS` looks for it -- the same layout ghostty's own
+      # bundle uses, for the same reason. See `src/core/pty.zig`.
+      - path: Illogical/Supporting/terminfo
+        type: folder
     dependencies:
       - package: IllogicalKit
         product: IllogicalProtocol
