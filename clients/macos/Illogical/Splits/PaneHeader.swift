@@ -85,8 +85,8 @@ struct PaneHeader: View {
                 // the window and this left an empty one behind.
                 //
                 // Dimmed in an unsplit tab, like zoom: this ✕ closes *a pane*,
-                // and the only pane there is is the tab, so a click would take
-                // the whole tab from a control that never said so. The strip's
+                // and in a tab with one pane that is the whole tab, so a click
+                // would take it from a control that never said so. The strip's
                 // own ✕ is the one that closes a tab, and it asks first when
                 // that means more than one terminal. ⌘W still works — the
                 // chord is allowed to mean both; a button is not.

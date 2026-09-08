@@ -137,10 +137,10 @@ it, so "does ⌘W close the window" is a question a test can ask without a windo
 **⇧⌘W closes the whole tab** — as does the ✕ in the tab strip, and a pane's own
 ✕ is ⌘W for that pane, in the splits where it is live. All four routes answer
 to the same two store calls — the chord keeps the cases the button drops, since
-⌘W is allowed to mean both and a button is not — and
-the window half of each goes through `WindowClose`, because they used to
-disagree: ⌘W on the last terminal closed the window and left the shell running,
-while ⇧⌘W on the same terminal hung it up and left an empty window behind.
+⌘W is allowed to mean both and a button is not — and the window half of each
+goes through `WindowClose`, because they used to disagree: ⌘W on the last
+terminal closed the window and left the shell running, while ⇧⌘W on the same
+terminal hung it up and left an empty window behind.
 
 The rules, in the order they are applied:
 
