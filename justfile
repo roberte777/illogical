@@ -101,7 +101,7 @@ fmt:
 fmt-check:
     zig fmt --check build.zig src
     alejandra --check .
-    swift-format lint --strict --recursive clients/macos/Illogical clients/macos/Tests clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests
+    swift-format lint --strict --recursive clients/macos/Illogical clients/macos/Tests clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests scripts
 
 # Measure memory per terminal, live vs parked. Reads phys_footprint, not RSS —
 # with RSS the parking win is invisible on macOS.
@@ -119,6 +119,19 @@ bench-pty lines="100000" count="32" repeats="3": build
 # Pass `universal` for a shippable multi-arch build.
 xcframework MODE="native":
     ./scripts/build-xcframework.sh {{MODE}}
+
+# Regenerate the app icon set from the master artwork in images/.
+#
+# Only when the artwork changes. The ten PNGs this writes are committed rather
+# than built, because `actool` is the only consumer and it runs inside
+# xcodebuild -- a generated asset catalog would make every clean build depend
+# on a Swift script that draws squircles, to produce bytes that change roughly
+# never. scripts/make-appicon.swift carries the grid it puts them on.
+#
+# Through `xcenv` because the devshell points SDKROOT at nix's macOS 14.4 SDK,
+# and the script is compiled by Xcode's Swift, which must not see it.
+appicon master="images/illogical.png":
+    {{xcenv}} ./scripts/make-appicon.swift {{master}} clients/macos/Illogical/Supporting/Assets.xcassets/AppIcon.appiconset
 
 # Regenerate Illogical.xcodeproj from project.yml.
 #
@@ -251,7 +264,7 @@ demo: run-app
     ./zig-out/bin/illogical new -s Demo -n logs
 
 fmt-swift:
-    swift-format format --in-place --recursive clients/macos/Illogical clients/macos/Tests clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests
+    swift-format format --in-place --recursive clients/macos/Illogical clients/macos/Tests clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests scripts
 
 # --- housekeeping -----------------------------------------------------------
 
