@@ -146,7 +146,62 @@ background-opacity = 0.9
 background-blur = true
 ```
 
-The font and the window are all there is so far;
+### Colours
+
+Ghostty's colour vocabulary, which is XParseColor's plus a couple of
+conveniences: hex with or without the `#`, an X11 name, `rgb:` or `rgbi:`.
+`background = red`, `background = f00` and `background = rgb:ff/00/00` are the
+same red.
+
+```ini
+# The terminal's own two, for cells that carry no colour of their own.
+background = #1e1e2e
+foreground = #cdd6f4
+
+# The 16 ANSI colours, and any of the other 240. Repeat the key; the index may
+# be decimal, or 0x, 0o or 0b prefixed.
+palette = 0=#45475a
+palette = 1=#f38ba8
+palette = 0xF=#a6adc8
+
+# Derive 16–255 from the 16 above instead of using xterm's cube, so a palette
+# of your own stays in keeping with itself. Off by default: plenty of software
+# assumes it knows what xterm's indices are. `palette-harmonious` runs the
+# generated cube the other way round under a light theme.
+palette-generate = true
+
+# The cursor's block, and the character under it. Unset, the cursor is the
+# foreground colour and the character under it is the background.
+cursor-color = #f5e0dc
+cursor-text = #1e1e2e
+
+# The selection. Unset, it inverts the terminal's two colours.
+selection-background = #f5e0dc
+selection-foreground = #1e1e2e
+
+# Any of those four can be `cell-foreground` or `cell-background` instead —
+# the colour the cell already has rather than a fixed one. A selection that
+# keeps each token's colour instead of flattening them; a cursor that inverts
+# whatever it is standing on. (`cursor-invert-fg-bg` and
+# `selection-invert-fg-bg` are the older spellings, and still read.)
+cursor-color = cell-foreground
+cursor-text = cell-background
+
+# Force a WCAG contrast ratio between text and its own background, 1 to 21.
+# 1 is off, and off is the default — this overrides the colour a program
+# asked for. 1.1 avoids invisible text; 3 or more pushes towards black
+# and white.
+minimum-contrast = 1.1
+```
+
+Every one of these is parsed by a port of libghostty's own
+`terminal/color.zig`, checked against `ghostty_color_parse` itself over every
+X11 name and every 3- and 6-digit hex value in
+[`ColorParityTests`](clients/macos/Tests/ColorParityTests.swift) — because a
+theme is a config file somebody else wrote against that parser, and agreeing
+with it in the cases we thought of is not the same as agreeing with it.
+
+The font, the window and the colours are what there is so far;
 [#39](https://github.com/roberte777/illogical/issues/39) tracks the rest.
 Unknown keys and unparseable values are warnings — they go to the unified log
 (`log stream --predicate 'subsystem == "dev.illogical.Illogical"'`) and the

@@ -9,6 +9,37 @@
 
 import Foundation
 
+/// A colour that may instead be one the cell already has.
+///
+/// The renderer's half of `ConfigTerminalColor`: `cursor-color` and the two
+/// selection colours can each be a fixed colour, or `cell-foreground` /
+/// `cell-background`, which are resolved per cell against the character being
+/// covered. That is the only way a cursor or a selection can invert what it
+/// lands on rather than be one colour everywhere, and it is why these cannot
+/// simply be resolved once and stored as RGB.
+enum RenderColor: Equatable {
+    case color(r: UInt8, g: UInt8, b: UInt8)
+    case cellForeground
+    case cellBackground
+
+    /// Resolve against one cell.
+    ///
+    /// `foreground` and `background` are the cell's own colours, already
+    /// fallen back to the terminal's defaults. `inverse` swaps which is which,
+    /// exactly as libghostty's renderer does: on a cell drawn in reverse
+    /// video, the colour you can see as its foreground is the one it stores as
+    /// its background.
+    func resolve(
+        foreground: PackedRGB, background: PackedRGB, inverse: Bool
+    ) -> PackedRGB {
+        switch self {
+        case .color(let r, let g, let b): return PackedRGB(r: r, g: g, b: b)
+        case .cellForeground: return inverse ? background : foreground
+        case .cellBackground: return inverse ? foreground : background
+        }
+    }
+}
+
 struct RendererConfig {
     /// WCAG 2.0 minimum contrast ratio to enforce between text and its
     /// background. 1 disables the correction, which is Ghostty's default:
@@ -80,11 +111,27 @@ struct RendererConfig {
     }
     var paddingColor: PaddingColor = .background
 
-    /// Explicit selection colours. Nil inverts: selection background becomes
-    /// the foreground colour and vice versa, which reads correctly against
-    /// any theme.
-    var selectionBackground: (r: UInt8, g: UInt8, b: UInt8)? = nil
-    var selectionForeground: (r: UInt8, g: UInt8, b: UInt8)? = nil
+    /// Explicit selection colours. Nil inverts against the *terminal*:
+    /// selection background becomes the default foreground colour and vice
+    /// versa, which reads correctly against any theme.
+    ///
+    /// `cell-foreground` and `cell-background` invert against the *cell*
+    /// instead, which is a different picture — a selection over syntax
+    /// highlighting keeps each token's own colour rather than flattening the
+    /// lot to two. Themes set this pair often; most set fixed colours.
+    var selectionBackground: RenderColor? = nil
+    var selectionForeground: RenderColor? = nil
+
+    /// The cursor, and the character under it.
+    ///
+    /// Only the `cell-` cases ever reach here as a cursor colour: a fixed
+    /// `cursor-color` is set on the terminal instead, so that a program's
+    /// OSC 12 can override it and `OSC 112` can put it back. Nil for the
+    /// cursor means the terminal's foreground; nil for the text under it
+    /// means the terminal's background, which is what makes a block cursor
+    /// read as a knockout.
+    var cursorColor: RenderColor? = nil
+    var cursorText: RenderColor? = nil
 
     /// Search match colours, and the match the find bar is on.
     ///

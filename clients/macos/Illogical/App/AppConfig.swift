@@ -58,8 +58,25 @@ enum AppConfig {
     /// rebuilt to take effect — the same rule the font follows, and for the
     /// same reason (#39).
     static var renderer: RendererConfig {
+        let config = current
         var renderer = RendererConfig()
-        renderer.backgroundOpacity = current.backgroundOpacity
+        renderer.backgroundOpacity = config.backgroundOpacity
+        renderer.minimumContrast = Float(config.minimumContrast)
+        renderer.selectionBackground = config.selectionBackground?.render
+        renderer.selectionForeground = config.selectionForeground?.render
+        renderer.cursorText = config.cursorText?.render
+
+        // Only the two cell-relative spellings of `cursor-color` reach the
+        // renderer. A fixed one is set on the terminal instead — see
+        // `TerminalColors` — and passing it here as well would put it ahead of
+        // the program's own OSC 12, which is the one thing that must outrank
+        // it.
+        switch config.cursorColor {
+        case .cellForeground, .cellBackground:
+            renderer.cursorColor = config.cursorColor?.render
+        case .color, nil:
+            break
+        }
         return renderer
     }
 
@@ -101,5 +118,21 @@ enum AppConfig {
         }
 
         return result
+    }
+}
+
+extension ConfigTerminalColor {
+    /// The same value in the renderer's vocabulary.
+    ///
+    /// Two enums with the same three cases, and they stay two on purpose:
+    /// `Renderer/` does not import the config package, so that a font grid or
+    /// a selection colour can be built in a test without a config file
+    /// anywhere near it.
+    var render: RenderColor {
+        switch self {
+        case .color(let c): return .color(r: c.r, g: c.g, b: c.b)
+        case .cellForeground: return .cellForeground
+        case .cellBackground: return .cellBackground
+        }
     }
 }

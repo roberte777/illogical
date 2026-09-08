@@ -96,6 +96,56 @@ public enum ConfigTemplate {
         # background-blur = true
         # background-blur = 30
 
+        # Colours
+        # =======
+        # # A colour is hex with or without the #, an X11 name, or
+        # # XParseColor's rgb: and rgbi: forms. These are all the same red:
+        # background = #ff0000
+        # background = ff0000
+        # background = f00
+        # background = red
+        # background = rgb:ff/00/00
+        # background = rgbi:1/0/0
+        #
+        # # The terminal's own two, for cells that carry no colour.
+        # background = #1e1e2e
+        # foreground = #cdd6f4
+        #
+        # # The 16 ANSI colours, and any of the other 240. Repeat the key; the
+        # # index may be decimal, or 0x, 0o or 0b prefixed.
+        # palette = 0=#45475a
+        # palette = 1=#f38ba8
+        # palette = 0xF=#a6adc8
+        #
+        # # Derive 16-255 from the 16 above rather than using xterm's cube, so
+        # # that a palette of your own stays in keeping with itself. Off by
+        # # default: a lot of software assumes it knows what xterm's indices
+        # # are, and moving them makes that software unreadable.
+        # palette-generate = true
+        #
+        # # The cursor's block, and the character underneath it. Unset, the
+        # # cursor is the foreground colour and the character under it is the
+        # # background, which reads as a knockout.
+        # cursor-color = #f5e0dc
+        # cursor-text = #1e1e2e
+        #
+        # # The selection. Unset, it inverts the terminal's two colours.
+        # selection-background = #f5e0dc
+        # selection-foreground = #1e1e2e
+        #
+        # # Any of those four can be cell-foreground or cell-background
+        # # instead, which is the cell's own colour rather than a fixed one --
+        # # a selection that keeps each token's colour instead of flattening
+        # # them, or a cursor that inverts whatever it is standing on.
+        # cursor-color = cell-foreground
+        # cursor-text = cell-background
+        #
+        # # Force a WCAG contrast ratio between text and its own background,
+        # # 1 through 21. 1 is off, and off is the default: this overrides the
+        # # colour a program asked for. 1.1 avoids invisible text; 3 or more
+        # # pushes text towards black and white.
+        # minimum-contrast = 1.1
+
         """
     }
 

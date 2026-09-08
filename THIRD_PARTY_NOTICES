@@ -21,6 +21,7 @@ Contents
   * wuffs                    -- MIT, or Apache-2.0 at your option
   * Zig standard library     -- MIT (Expat)
   * musl libc                -- MIT (Linux builds only)
+  * X11 rgb.txt              -- MIT/X11 (the Mac app only)
 
 ----------------------------------------------------------------------------
 ghostty
@@ -343,3 +344,30 @@ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+----------------------------------------------------------------------------
+X11 rgb.txt
+https://gitlab.freedesktop.org/xorg/app/rgb -- copied from
+vendor/ghostty/src/terminal/res/rgb.txt into
+clients/macos/Packages/IllogicalKit/Sources/IllogicalConfig/Resources/rgb.txt
+----------------------------------------------------------------------------
+
+The X11 colour-name table, so that `background = cornflower blue` in a config
+file means what it means everywhere else. Data, not code, and it is compiled
+into `Illogical.app` alone -- neither `illogicald` nor the CLI reads a config
+file, so neither carries it.
+
+The file is byte for byte the copy libghostty embeds. It carries no header of
+its own -- every line is a colour -- so its terms are not reproducible from
+this tree; ghostty states them beside its copy, in
+`src/terminal/x11_color.zig`:
+
+    This is the rgb.txt file from the X11 project. This was last sourced
+    from this location: https://gitlab.freedesktop.org/xorg/app/rgb
+    This data is licensed under the MIT/X11 license while this Zig file is
+    licensed under the same license as Ghostty.
+
+The MIT/X11 text is the one reproduced under `ghostty` at the top of this
+file, with the X.Org Foundation and its contributors in place of the copyright
+holders named there. The upstream repository above carries the authoritative
+copy.

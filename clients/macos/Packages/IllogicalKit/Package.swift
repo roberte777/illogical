@@ -18,7 +18,18 @@ let package = Package(
             name: "IllogicalProtocolTests",
             dependencies: ["IllogicalProtocol"]
         ),
-        .target(name: "IllogicalConfig"),
+        .target(
+            name: "IllogicalConfig",
+            resources: [
+                // X11's rgb.txt, embedded as bytes rather than copied into a
+                // resource bundle: `Bundle.module` would have to resolve from
+                // the app, from the package's own test bundle and from the
+                // app's test host, and a colour name that silently stopped
+                // resolving in one of the three is not a failure mode worth
+                // owning for a 20 KB file.
+                .embedInCode("Resources/rgb.txt")
+            ]
+        ),
         .testTarget(
             name: "IllogicalConfigTests",
             dependencies: ["IllogicalConfig"]

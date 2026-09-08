@@ -101,6 +101,21 @@ public enum ConfigSyntax {
         return entries
     }
 
+    /// A flag's value, in libghostty's spelling. Nil when it is neither.
+    ///
+    /// Its set exactly (`cli/args.zig`), which is smaller than it looks:
+    /// `true` and `false` written out, `1` and `0`, and a bare `t` or `f` in
+    /// either case — but not `T`rue, and not `yes`, `on` or `enabled`. A
+    /// config file that says one of those was written for something else, and
+    /// a warning is more use to whoever wrote it than a guess would be.
+    public static func bool(_ value: String) -> Bool? {
+        switch value {
+        case "1", "t", "T", "true": return true
+        case "0", "f", "F", "false": return false
+        default: return nil
+        }
+    }
+
     /// `background-blur`'s value as a radius in pixels, which libghostty
     /// spells as a bool *or* a number. Nil when it is neither.
     ///

@@ -170,25 +170,43 @@ final class TerminalEngine: @unchecked Sendable {
         applyThemeLocked()
     }
 
-    /// Default foreground/background for cells that carry no explicit colour.
+    /// The default colours a cell with none of its own is drawn in, and the
+    /// palette an SGR index is looked up in.
     ///
-    /// libghostty defaults to white on black. Superlogical's terminal sits on
-    /// the same dark blue ground as its chrome, so the window reads as one
-    /// surface rather than a black rectangle in a blue frame.
-    enum Theme {
-        static let background = GhosttyColorRgb(r: 0x0C, g: 0x1F, b: 0x2F)
-        static let foreground = GhosttyColorRgb(r: 0xC8, g: 0xD6, b: 0xE0)
-        static let cursor = GhosttyColorRgb(r: 0xC8, g: 0xD6, b: 0xE0)
-    }
-
+    /// Read from the config once per terminal, which includes the one built by
+    /// `adopt` — a snapshot decodes with libghostty's own white-on-black
+    /// defaults, so a terminal that arrived over the wire has to be told the
+    /// theme just as a fresh one does.
+    ///
+    /// The cursor is set only when the config named a fixed colour for it.
+    /// Left unset otherwise, and deliberately: the render state reports the
+    /// *effective* cursor colour, so a default written here would be
+    /// indistinguishable from a program's OSC 12 and would take precedence
+    /// over `cursor-color = cell-foreground` in the renderer. Unset is what
+    /// makes `snapshot.cursorColor` mean "the program asked for this one".
     private func applyThemeLocked() {
         guard let terminal else { return }
-        var background = Theme.background
-        var foreground = Theme.foreground
-        var cursor = Theme.cursor
+        let colors = TerminalColors.from(AppConfig.current)
+
+        var background = colors.background
+        var foreground = colors.foreground
         _ = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &background)
         _ = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &foreground)
-        _ = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &cursor)
+
+        if var cursor = colors.cursor {
+            _ = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &cursor)
+        } else {
+            _ = ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, nil)
+        }
+
+        // Setting the palette keeps whatever OSC 4 has already changed, which
+        // is what makes this safe to call on `adopt`: a program that recoloured
+        // index 1 before we attached keeps its colour.
+        var palette = colors.palette
+        palette.withUnsafeMutableBufferPointer {
+            _ = ghostty_terminal_set(
+                terminal, GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, $0.baseAddress)
+        }
     }
 
     deinit {
