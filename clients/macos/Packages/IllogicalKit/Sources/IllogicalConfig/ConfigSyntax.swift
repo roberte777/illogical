@@ -101,6 +101,71 @@ public enum ConfigSyntax {
         return entries
     }
 
+    /// Every `--key=value` in `arguments`, in the order they were given.
+    ///
+    /// The same `ConfigEntry` a config file line produces, because they are
+    /// the same thing: libghostty turns each config line back into a
+    /// `--key=value` argument and hands it to the parser its CLI already
+    /// uses. We came at it from the other end and parse arguments into the
+    /// line format instead, but the seam is in the same place and the
+    /// vocabulary is identical.
+    ///
+    /// Only `--key=value` and a bare `--key`. Not `--key value`: a Mac app is
+    /// handed arguments by whoever launched it, and a two-token form cannot
+    /// tell `--font-family Berkeley` from `--font-family` followed by a file
+    /// the Finder appended. The bare form yields a nil value, which `Config`
+    /// reports as "value required" exactly as it does for a config line with
+    /// no `=`.
+    ///
+    /// Anything not starting with `--` is skipped rather than reported, and
+    /// that is load-bearing rather than lax: the first argument is the
+    /// executable's own path, and AppKit adds its own single-dash pairs
+    /// (`-NSDocumentRevisionsDebugMode YES`, `-ApplePersistenceIgnoreState`)
+    /// to any app launched from Xcode. Reporting those would mean a warning
+    /// per launch about a flag nobody typed.
+    ///
+    /// A bare `--` ends the options, in the usual way.
+    ///
+    /// `line` is the argument's position, counted from 1 over everything
+    /// passed in including what was skipped, so it points at the argument a
+    /// person actually typed. `ConfigDiagnostic` does not print it — it shows
+    /// a position only alongside a file — so today it is carried rather than
+    /// shown, and a command-line warning names the key and not the argument.
+    public static func entries(ofArguments arguments: [String]) -> [ConfigEntry] {
+        var entries: [ConfigEntry] = []
+
+        for (offset, argument) in arguments.enumerated() {
+            if argument == "--" { break }
+            guard argument.hasPrefix("--") else { continue }
+
+            let body = argument.dropFirst(2)
+
+            guard let equals = body.firstIndex(of: "=") else {
+                entries.append(
+                    ConfigEntry(key: String(body.trimmed), value: nil, line: offset + 1))
+                continue
+            }
+
+            let key = body[..<equals].trimmed
+            // `--=value` names nothing. Skipped rather than reported, like
+            // any other argument that is not ours: a warning whose key is
+            // the empty string tells whoever typed it precisely nothing.
+            if key.isEmpty { continue }
+            var value = body[body.index(after: equals)...].trimmed
+            // The same quote-stripping a config line gets. A shell usually
+            // eats the quotes first, but `--font-family=""` typed into a
+            // launcher that does not is the documented way to say "empty".
+            if value.count >= 2, value.first == "\"", value.last == "\"" {
+                value = value.dropFirst().dropLast()
+            }
+
+            entries.append(
+                ConfigEntry(key: String(key), value: String(value), line: offset + 1))
+        }
+
+        return entries
+    }
+
     /// A flag's value, in libghostty's spelling. Nil when it is neither.
     ///
     /// Its set exactly (`cli/args.zig`), which is smaller than it looks:

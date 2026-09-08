@@ -222,16 +222,14 @@ public struct Config: Equatable, Sendable {
                 ConfigDiagnostic(file: path, line: entry.line, key: entry.key, message: message))
         }
 
-        switch entry.key {
-        case "font-family":
-            apply(entry, to: \.fontFamily, report: report)
-        case "font-family-bold":
-            apply(entry, to: \.fontFamilyBold, report: report)
-        case "font-family-italic":
-            apply(entry, to: \.fontFamilyItalic, report: report)
-        case "font-family-bold-italic":
-            apply(entry, to: \.fontFamilyBoldItalic, report: report)
+        // The list-valued keys, from the one table that also decides what
+        // the command line resets. See `listValuedKeys`.
+        if let keyPath = Self.listValuedKeys[entry.key] {
+            apply(entry, to: keyPath, report: report)
+            return
+        }
 
+        switch entry.key {
         case "font-size":
             guard let value = entry.value else {
                 report("value required")
@@ -507,6 +505,67 @@ public struct Config: Equatable, Sendable {
         if fontFamilyBold.isEmpty { fontFamilyBold = fontFamily }
         if fontFamilyItalic.isEmpty { fontFamilyItalic = fontFamily }
         if fontFamilyBoldItalic.isEmpty { fontFamilyBoldItalic = fontFamily }
+    }
+
+    /// The keys whose entries append to a list rather than setting a value,
+    /// and where each one's values go.
+    ///
+    /// A table rather than a set, and `apply` routes through it rather than
+    /// listing the same four keys in its switch. That is deliberate: as two
+    /// lists they could drift, and the direction that drifts silently is a
+    /// new list-valued key added to the switch and forgotten here — the
+    /// command line would then append to it instead of replacing, which is
+    /// the whole bug this exists to prevent, and no test could see it. Routed
+    /// through one table, there is nothing to keep in sync.
+    /// Computed rather than stored: a key path is not `Sendable`, so the
+    /// same table as a `static let` is a mutable global the compiler is
+    /// right to complain about. Four entries built on demand, on a path
+    /// that runs once per config line.
+    public static var listValuedKeys: [String: WritableKeyPath<Config, [String]>] {
+        [
+            "font-family": \.fontFamily,
+            "font-family-bold": \.fontFamilyBold,
+            "font-family-italic": \.fontFamilyItalic,
+            "font-family-bold-italic": \.fontFamilyBoldItalic,
+        ]
+    }
+
+    /// `entries` with a reset in front of the first appearance of each
+    /// list-valued key.
+    ///
+    /// This is what makes a command line *replace* what the config files set
+    /// rather than adding to it, which is libghostty's rule and the one thing
+    /// about `font-family` that a person cannot work around: every entry
+    /// appends, so without this `--font-family=X` would mean "and also X" and
+    /// there would be no way to say "X instead" at all.
+    ///
+    /// Spelled as a synthetic `key = ""` entry rather than as a flag on the
+    /// apply path, because `""` already means reset and an entry is a thing
+    /// the rest of the loader already knows how to carry: it replays under a
+    /// theme, it reports diagnostics with a line number, and it needed no new
+    /// argument anywhere. Only the *first* appearance gets one, so two
+    /// `--font-family` arguments still build a list between themselves.
+    ///
+    /// An entry with no value at all gets none. A bare `--font-family` is a
+    /// mistake — it is reported as "value required" and sets nothing — and
+    /// resetting for it would answer that mistake by silently emptying the
+    /// list the config file spent three lines building, leaving a warning
+    /// whose text says the argument was *ignored*. libghostty checks for the
+    /// value before it touches its own overwrite flag, for the same reason.
+    /// The flag stays unarmed, so a later `--font-family=Menlo` is still the
+    /// first one seen and still replaces.
+    public static func resettingLists(_ entries: [ConfigEntry]) -> [ConfigEntry] {
+        var seen: Set<String> = []
+        var result: [ConfigEntry] = []
+        for entry in entries {
+            if entry.value != nil, listValuedKeys[entry.key] != nil,
+                seen.insert(entry.key).inserted
+            {
+                result.append(ConfigEntry(key: entry.key, value: "", line: entry.line))
+            }
+            result.append(entry)
+        }
+        return result
     }
 }
 
