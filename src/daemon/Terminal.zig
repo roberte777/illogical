@@ -868,8 +868,13 @@ fn pixels(cells: u16, cell_px: u32) u16 {
 fn flushPtyWrites(self: *Terminal) void {
     while (true) {
         if (!self.pty_write_mutex.tryLock()) return;
-        self.drainPtyWrites();
+        const drained = self.drainPtyWrites();
         self.pty_write_mutex.unlock();
+        // Stopped short because the master would block: what is left is
+        // waiting on the child, not on us, and going round again would spin
+        // on the same full queue until it reads. The next flush -- the next
+        // read, the next resize -- picks it up.
+        if (!drained) return;
         // A producer that queued after the last look and found the lock held
         // has left it to us. If there is anything, go round again.
         self.mutex.lock();
@@ -887,14 +892,17 @@ fn flushPtyWrites(self: *Terminal) void {
 /// back to the front of the queue for the next flush rather than on the
 /// floor: half a `CSI 48 ... t` is not a report, it is garbage in front of the
 /// child's next keystroke.
-fn drainPtyWrites(self: *Terminal) void {
+///
+/// True when the queue was emptied; false when the master would have blocked
+/// and the rest was put back, so the caller knows not to try again now.
+fn drainPtyWrites(self: *Terminal) bool {
     while (true) {
         self.mutex.lock();
         var out = self.pty_out;
         self.pty_out = .empty;
         self.mutex.unlock();
         defer out.deinit(self.gpa);
-        if (out.items.len == 0) return;
+        if (out.items.len == 0) return true;
 
         var off: usize = 0;
         while (off < out.items.len) {
@@ -905,11 +913,11 @@ fn drainPtyWrites(self: *Terminal) void {
                     self.pty_out.insertSlice(self.gpa, 0, out.items[off..]) catch |e| {
                         log.warn("terminal {d}: could not requeue a pty write: {t}", .{ self.id, e });
                     };
-                    return;
+                    return false;
                 },
                 else => {
                     log.warn("terminal {d}: failed writing to the pty: {t}", .{ self.id, err });
-                    return;
+                    return true;
                 },
             };
         }
