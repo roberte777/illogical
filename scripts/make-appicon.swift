@@ -133,7 +133,6 @@ func icon(pixels: Int) -> CGImage {
     ctx.restoreGState()
 
     guard let supersampled = ctx.makeImage() else { fatalError("render failed at \(pixels)px") }
-    guard pixels != side else { return supersampled }
 
     let down = context(side: pixels)
     down.draw(supersampled, in: CGRect(x: 0, y: 0, width: pixels, height: pixels))
@@ -150,14 +149,30 @@ func writePNG(_ image: CGImage, to url: URL) {
     guard CGImageDestinationFinalize(dest) else { fatalError("cannot write \(url.path)") }
 }
 
-try? FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
+do {
+    try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
+} catch {
+    FileHandle.standardError.write(
+        "cannot create \(outputURL.path): \(error.localizedDescription)\n".data(using: .utf8)!)
+    exit(1)
+}
 
 var entries: [String] = []
+// What this run wrote, against which the directory is pruned below.
+var written: Set<String> = ["Contents.json"]
+// Ten slots, seven distinct pixel sizes: 16@2x and 32 are both 32px, 128@2x
+// and 256 are both 256px, 256@2x and 512 are both 512px. Rendering each size
+// once and writing it under both names drops three supersampled renders, the
+// largest of them 2048 square.
+var rendered: [Int: CGImage] = [:]
 for slot in slots {
     let suffix = slot.scale == 1 ? "" : "@\(slot.scale)x"
     let filename = "icon_\(slot.points)x\(slot.points)\(suffix).png"
     let pixels = slot.points * slot.scale
-    writePNG(icon(pixels: pixels), to: outputURL.appendingPathComponent(filename))
+    let image = rendered[pixels] ?? icon(pixels: pixels)
+    rendered[pixels] = image
+    writePNG(image, to: outputURL.appendingPathComponent(filename))
+    written.insert(filename)
     entries.append(
         """
             {
@@ -184,3 +199,18 @@ let contents = """
     """
 try contents.write(
     to: outputURL.appendingPathComponent("Contents.json"), atomically: true, encoding: .utf8)
+
+// `slots` is the only thing that decides what belongs in the set, so a size
+// dropped from it has to leave the directory too. actool reports a PNG no
+// Contents.json entry references as an unassigned child, and nothing else
+// would catch the orphan before someone committed it.
+//
+// Only files this script could itself have written are candidates. The output
+// directory is argv[2], and a delete loop over a path someone typed is worth
+// bounding: mistype it and the worst case is that nothing matches, rather than
+// that the directory is emptied.
+for stale in try FileManager.default.contentsOfDirectory(atPath: outputURL.path)
+where stale.hasPrefix("icon_") && stale.hasSuffix(".png") && !written.contains(stale) {
+    try FileManager.default.removeItem(at: outputURL.appendingPathComponent(stale))
+    print("  removed \(stale)")
+}

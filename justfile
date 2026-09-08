@@ -101,7 +101,7 @@ fmt:
 fmt-check:
     zig fmt --check build.zig src
     alejandra --check .
-    swift-format lint --strict --recursive clients/macos/Illogical clients/macos/Tests clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests
+    swift-format lint --strict --recursive clients/macos/Illogical clients/macos/Tests clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests scripts
 
 # Measure memory per terminal, live vs parked. Reads phys_footprint, not RSS —
 # with RSS the parking win is invisible on macOS.
@@ -264,7 +264,7 @@ demo: run-app
     ./zig-out/bin/illogical new -s Demo -n logs
 
 fmt-swift:
-    swift-format format --in-place --recursive clients/macos/Illogical clients/macos/Tests clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests
+    swift-format format --in-place --recursive clients/macos/Illogical clients/macos/Tests clients/macos/Packages/IllogicalKit/Sources clients/macos/Packages/IllogicalKit/Tests scripts
 
 # --- housekeeping -----------------------------------------------------------
 
