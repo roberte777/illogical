@@ -112,8 +112,10 @@ terminal on the server and a connection to it, and adds a pane — never a tab.
 The split controls live in **each terminal's own header**, not the window
 toolbar: in a tab with four panes, "split right" has to mean "split this one",
 and a button in the title bar cannot say which one it means. Split right, split
-down, zoom, close — with zoom disabled in a tab with one pane, because there is
-nothing to zoom out of.
+down, zoom, close — with zoom and close both disabled in a tab with one pane.
+There is nothing to zoom out of, and the ✕ closes *a pane*: in an unsplit tab
+the only pane is the tab, so a live one would take the whole tab from a control
+that never said it could. Closing a tab is the strip's ✕, which says so.
 
 Focus is AppKit's. The pane the layout calls focused is whichever surface is
 first responder, reported back by the surface, rather than a SwiftUI tap
@@ -133,7 +135,9 @@ The policy is `SessionStore.closeSurfacePane` and not the delegate method over
 it, so "does ⌘W close the window" is a question a test can ask without a window.
 
 **⇧⌘W closes the whole tab** — as does the ✕ in the tab strip, and a pane's own
-✕ is ⌘W for that pane. All four routes answer to the same two store calls, and
+✕ is ⌘W for that pane, in the splits where it is live. All four routes answer
+to the same two store calls — the chord keeps the cases the button drops, since
+⌘W is allowed to mean both and a button is not — and
 the window half of each goes through `WindowClose`, because they used to
 disagree: ⌘W on the last terminal closed the window and left the shell running,
 while ⇧⌘W on the same terminal hung it up and left an empty window behind.
