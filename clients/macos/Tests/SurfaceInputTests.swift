@@ -17,7 +17,7 @@ final class SurfaceInputTests: XCTestCase {
     /// `input` frame.
     private final class Recorder: TerminalSurfaceDelegate {
         var sent: [[UInt8]] = []
-        var resizes: [(cols: UInt16, rows: UInt16)] = []
+        var resizes: [SurfaceSize] = []
         var readied = false
         var focusedCount = 0
         /// What `performClose` should report: true means a pane was closed,
@@ -31,8 +31,8 @@ final class SurfaceInputTests: XCTestCase {
 
         func surfaceIsReady(_ surface: TerminalSurfaceView) { readied = true }
         func surface(_ surface: TerminalSurfaceView, send bytes: [UInt8]) { sent.append(bytes) }
-        func surface(_ surface: TerminalSurfaceView, resizeTo cols: UInt16, rows: UInt16) {
-            resizes.append((cols, rows))
+        func surface(_ surface: TerminalSurfaceView, resizeTo size: SurfaceSize) {
+            resizes.append(size)
         }
         func surfaceDidBecomeFocused(_ surface: TerminalSurfaceView) { focusedCount += 1 }
         func surface(_ surface: TerminalSurfaceView, didPresentFirstFrameAt moment: Date) {

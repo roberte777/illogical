@@ -218,8 +218,78 @@ needs that split because its client is a passthrough TTY. Ours is a real termina
 emulator that is not in the byte path back to the PTY, so letting clients answer
 would race them against each other and produce duplicate replies.
 
+**A resize is a reply too.** Not every program learns its size from the kernel.
+DEC mode 2048 asks the terminal to *push* one — `CSI 48 ; rows ; cols ; height ;
+width t` on every change — and Neovim, which asks for it, stops handling
+`SIGWINCH` once it is on. So a terminal that resizes the PTY and says nothing in
+band leaves Neovim painting the grid it started with: shrink the window and the
+screen is chopped, grow it again and the chop stays. `Terminal.resize` therefore
+goes through the stream handler rather than resizing the VT directly, which is
+what puts the report on the PTY beside the signal.
+
+**Resizes are coalesced, not queued.** Ghostty's rule, and ghostty's 25ms
+(`termio/Thread.zig`): the first resize arms a window, later ones replace the
+size inside it without pushing the deadline back, and when it expires the
+newest wins. A drag then costs one resize per window rather than one per frame.
+
+The window is arithmetic, not politeness. The VT reflow is cheap — 5ms with a
+child that ignores it — but a full-screen program answers *every* size with a
+full repaint, and the daemon parses that repaint under the same lock the next
+resize needs. Measured against Neovim: 27ms a step, so a one-second drag ran
+half a second behind and walked visibly through sizes the window had already
+left. Coalescing took the same drag to settling 14ms after the last frame.
+
+Anything that is not a resize flushes the pending one first, so a keystroke is
+never handled at a size that was asked for after it.
+
+That report quotes a text area in *pixels*, and the server has no font. So the
+cell travels on the wire — `resize` and `attach` both carry `cell_width` and
+`cell_height` in device pixels — and the daemon quotes back whatever the client
+that last sized the terminal said. Zero until one does, which is the value the
+spec reserves for "unknown" and the honest answer for a client with no metrics
+of its own (the CLI).
+
 Open: which size to report when attached clients disagree. Provisionally the
-session's configured size, not any client's.
+session's configured size, not any client's. The same open question decides
+whose cell is quoted; today it is simply the last one to speak.
+
+## Data flow: resize
+
+1. The window changes. The client sends `resize{cols, rows, cell px}` and
+   **does not touch its own terminal.**
+2. The server coalesces (25ms, ghostty's rule), then under the terminal lock:
+   reflows its VT, writes the mode 2048 report to the PTY, sets the `winsize`
+   (which raises SIGWINCH), and queues `resized{cols, rows}` to every attached
+   client — through the same queue as `output`, so it lands at exactly the
+   byte where the size changed.
+3. The client reflows its terminal when it dequeues `resized`, in stream order
+   with the output around it.
+4. The program repaints for the new size; those bytes are parsed by a client
+   terminal that is already that size.
+
+Two details that are easy to get wrong. The report in step 2 is written to the
+PTY *after* the terminal lock is released, never under it: the master is a
+blocking descriptor, a child that has stopped reading fills the kernel's input
+queue in about a kilobyte, and a write blocked there with the lock held would
+park the reader thread — and with it every client of that terminal — behind a
+program that is not listening. And a *parked* terminal has no VT: a resize
+moves the PTY and tells the clients, and that is all it can do. The report is
+not written (there is no VT to ask whether the child wants one), and once the
+terminal unparks its VT keeps the park width. Waking it for the resize is the
+obvious fix and the wrong one — the history restore is at the park width and
+every page is discarded once the VT is reflowed under it, so a drag across an
+idle pane emptied its scrollback. The design that keeps both parking and the
+streaming attach is
+[#82](https://github.com/roberte777/illogical/issues/82).
+
+Step 1 is the one that matters. Ghostty has no step 3 because it has no second
+terminal: the resize sits at one point in one byte stream by construction. A
+client that reflowed on its own cue would be a size ahead of what it is parsing
+for a coalesce window plus a round trip — and during a drag that is every
+repaint, which is what garbled lines and colour flashes on a fast resize were.
+The cost is that the grid lags the window by that same interval, drawn into
+the new frame with background around it: ~30ms on this machine, the SSH round
+trip elsewhere.
 
 ## Data flow: attach
 

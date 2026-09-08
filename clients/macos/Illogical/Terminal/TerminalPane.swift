@@ -290,11 +290,8 @@ struct TerminalSurface: NSViewRepresentable {
 
         private func attach(into view: TerminalSurfaceView) {
             guard controller == nil else { return }
-            let size = view.gridSize
-            guard
-                let controller = store.controller(
-                    for: terminal, cols: size.cols, rows: size.rows)
-            else {
+            let size = view.surfaceSize
+            guard let controller = store.controller(for: terminal, size: size) else {
                 view.statusText = "could not attach"
                 return
             }
@@ -316,7 +313,7 @@ struct TerminalSurface: NSViewRepresentable {
             // without this nothing ever tells the terminal, and the pane draws
             // a grid twice its width with the right-hand half past the edge.
             // A no-op when the attach above already carried this size.
-            controller.resize(cols: size.cols, rows: size.rows)
+            controller.resize(size)
             Trace.log(
                 "attached to \(terminal.host.displayName) terminal \(terminal.terminal) "
                     + "at \(size.cols)x\(size.rows)")
@@ -326,8 +323,8 @@ struct TerminalSurface: NSViewRepresentable {
             controller?.send(bytes)
         }
 
-        func surface(_ surface: TerminalSurfaceView, resizeTo cols: UInt16, rows: UInt16) {
-            controller?.resize(cols: cols, rows: rows)
+        func surface(_ surface: TerminalSurfaceView, resizeTo size: SurfaceSize) {
+            controller?.resize(size)
         }
 
         /// AppKit is the authority on which pane has focus; the tab follows it

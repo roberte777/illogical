@@ -28,7 +28,11 @@ const std = @import("std");
 
 /// Bumped on any incompatible change. The server refuses connections whose
 /// `hello` advertises a different major version.
-pub const version: u16 = 1;
+/// 2: `resize` and `attach` carry the cell in pixels, the server sends
+/// `resized`, and a body with a key the server does not know is read rather
+/// than refused. A client from before any of that is turned away at `hello`
+/// with `version_mismatch`, which the app already knows how to say.
+pub const version: u16 = 2;
 
 /// Reserved terminal id for connection-level control frames. Named for the
 /// header field it goes in; see `Header.session`.
@@ -97,6 +101,13 @@ pub const FrameType = enum(u8) {
     pong = 0x8c,
     /// Plain-text rendering of the terminal, in reply to `peek`.
     screen = 0x8d,
+    /// The server's terminal changed size, and this is where in the output
+    /// stream it did. Everything before this frame was parsed at the old size
+    /// and everything after it at the new one, so a client that resizes its
+    /// own terminal *here* -- and nowhere else -- stays a replica.
+    ///
+    /// Sent to every attached client.
+    resized = 0x8e,
 
     pub fn isClientToServer(self: FrameType) bool {
         return @intFromEnum(self) < 0x80;
@@ -224,9 +235,31 @@ pub const body = struct {
     pub const Attach = struct {
         cols: u16 = 80,
         rows: u16 = 24,
+        /// One cell, in device pixels. See `Resize`.
+        cell_width: u32 = 0,
+        cell_height: u32 = 0,
     };
 
     pub const Resize = struct {
+        cols: u16,
+        rows: u16,
+        /// One cell, in device pixels.
+        ///
+        /// Carried because a grid is not the whole size: a mode 2048 in-band
+        /// size report quotes the text area in pixels as well as in cells, and
+        /// so does a `winsize`. Only the client knows how big a cell is -- the
+        /// server has no font and no display.
+        ///
+        /// Defaulted, so a client with no metrics of its own still resizes:
+        /// the CLI attaching from a real terminal, or a build older than this
+        /// field. Zero is what those two reported before it existed, and it is
+        /// the value the spec reserves for "unknown".
+        cell_width: u32 = 0,
+        cell_height: u32 = 0,
+    };
+
+    /// Body of `resized`: the size the server's terminal now is.
+    pub const Resized = struct {
         cols: u16,
         rows: u16,
     };
@@ -275,10 +308,71 @@ pub const body = struct {
         return std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     }
 
+    /// A key this build does not know is skipped, not refused. That is what
+    /// lets a field be added to a body without a version bump: the peer that
+    /// sends it is ahead, and "ahead" is not a protocol error. The bump to 2
+    /// was needed precisely because 1 did not do this, so the first client to
+    /// send `cell_width` was turned away as malformed.
     pub fn decode(comptime T: type, alloc: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(T) {
-        return std.json.parseFromSlice(T, alloc, bytes, .{ .allocate = .alloc_always });
+        return std.json.parseFromSlice(T, alloc, bytes, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
     }
 };
+
+test "resized is a server frame at 0x8e, and a key from the future is read past" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    try testing.expectEqual(@as(u8, 0x8e), @intFromEnum(FrameType.resized));
+    try testing.expect(!FrameType.resized.isClientToServer());
+
+    const want: body.Resized = .{ .cols = 132, .rows = 43 };
+    const bytes = try body.encode(alloc, want);
+    defer alloc.free(bytes);
+    const got = try body.decode(body.Resized, alloc, bytes);
+    defer got.deinit();
+    try testing.expectEqual(want, got.value);
+
+    // The other half of being version 2: a body from a client that knows a
+    // field this build does not still decodes. Under version 1 this was
+    // `error.UnknownField`, and the first client to send `cell_width` found
+    // out the hard way.
+    const ahead = try body.decode(body.Resized, alloc, "{\"cols\":1,\"rows\":2,\"later\":true}");
+    defer ahead.deinit();
+    try testing.expectEqual(@as(u16, 1), ahead.value.cols);
+}
+
+test "a resize carries cell metrics, and an older client's omission reads as zero" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const want: body.Resize = .{
+        .cols = 100,
+        .rows = 30,
+        .cell_width = 8,
+        .cell_height = 16,
+    };
+    const bytes = try body.encode(alloc, want);
+    defer alloc.free(bytes);
+    const got = try body.decode(body.Resize, alloc, bytes);
+    defer got.deinit();
+    try testing.expectEqual(want, got.value);
+
+    // The compatibility half, and the reason the fields are defaulted: a build
+    // from before they existed sends a body with two keys in it, and that has
+    // to keep resizing rather than fail to parse. Zero is "unknown", which is
+    // what such a client is.
+    const old = try body.decode(body.Resize, alloc, "{\"cols\":100,\"rows\":30}");
+    defer old.deinit();
+    try testing.expectEqual(@as(u32, 0), old.value.cell_width);
+    try testing.expectEqual(@as(u32, 0), old.value.cell_height);
+
+    const old_attach = try body.decode(body.Attach, alloc, "{\"cols\":80,\"rows\":24}");
+    defer old_attach.deinit();
+    try testing.expectEqual(@as(u32, 0), old_attach.value.cell_width);
+}
 
 test "control bodies round trip through json" {
     const testing = std.testing;

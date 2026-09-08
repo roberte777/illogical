@@ -892,8 +892,8 @@ final class SessionLifecycleTests: XCTestCase {
         defer { host.disconnect() }
         list(store, host: host.host, [(7, "work", [1, 2]), (8, "spare", [3])])
 
-        XCTAssertNotNil(host.controller(for: 1, cols: 80, rows: 24))
-        XCTAssertNotNil(host.controller(for: 3, cols: 80, rows: 24))
+        XCTAssertNotNil(host.controller(for: 1, size: .test(cols: 80, rows: 24)))
+        XCTAssertNotNil(host.controller(for: 3, size: .test(cols: 80, rows: 24)))
 
         store.requestDeleteSession(ref(7, on: host.host))
         store.confirmPendingDestruction()

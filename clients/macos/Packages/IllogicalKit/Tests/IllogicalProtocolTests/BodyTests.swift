@@ -41,6 +41,31 @@ struct BodyTests {
         #expect(careful["only_if_empty"] as? Bool == true)
     }
 
+    @Test("the geometry bodies spell the cell the way the server reads it")
+    func geometryKeys() throws {
+        // Snake case, and the same four keys on both: the Zig `Resize` and
+        // `Attach` structs' field names are the keys. A `cellWidth` would not
+        // be refused -- version 2 reads past a key it does not know -- it
+        // would be read as no cell at all, which is quieter and worse.
+        for json in [
+            try keyedJSON(ResizeBody(cols: 100, rows: 30, cellWidth: 8, cellHeight: 16)),
+            try keyedJSON(AttachBody(cols: 100, rows: 30, cellWidth: 8, cellHeight: 16)),
+        ] {
+            #expect(Set(json.keys) == ["cols", "rows", "cell_width", "cell_height"])
+            #expect(json["cell_width"] as? UInt32 == 8)
+            #expect(json["cell_height"] as? UInt32 == 16)
+        }
+        // Absent on this side means zero on the wire, which is "unknown".
+        let bare = try keyedJSON(ResizeBody(cols: 100, rows: 30))
+        #expect(bare["cell_width"] as? UInt32 == 0)
+
+        let resized = try JSONDecoder().decode(
+            ResizedBody.self,
+            from: JSONEncoder().encode(ResizedBody(cols: 132, rows: 43)))
+        #expect(resized.cols == 132)
+        #expect(resized.rows == 43)
+    }
+
     @Test("both bodies round trip")
     func roundTrip() throws {
         let encoder = JSONEncoder()

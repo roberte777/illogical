@@ -84,6 +84,18 @@ pub const Pty = struct {
         if (c.ioctl(self.master, c.TIOCSWINSZ, &ws) < 0) return error.IoctlFailed;
     }
 
+    /// What the kernel has: the answer a child's own `TIOCGWINSZ` gets.
+    pub fn getSize(self: Pty) ?WinSize {
+        var ws: c.struct_winsize = undefined;
+        if (c.ioctl(self.master, c.TIOCGWINSZ, &ws) < 0) return null;
+        return .{
+            .cols = ws.ws_col,
+            .rows = ws.ws_row,
+            .width_px = ws.ws_xpixel,
+            .height_px = ws.ws_ypixel,
+        };
+    }
+
     pub const EnvPair = struct { name: [*:0]const u8, value: [*:0]const u8 };
 
     /// Fork and exec `argv` with the slave as the child's controlling terminal.

@@ -137,13 +137,6 @@ final class TerminalRenderer: @unchecked Sendable {
         updateScreenSizeUniformsLocked()
     }
 
-    /// Grid dimensions for the current surface size.
-    var gridSize: GridDimensions {
-        mutex.lock()
-        defer { mutex.unlock() }
-        return size.grid
-    }
-
     /// Screen, cell and padding for the current surface, in device pixels.
     ///
     /// Input needs it: a mouse report is a cell coordinate, and turning a

@@ -127,9 +127,40 @@ pub fn writeFd(fd: fd_t, buf: []const u8) Error!usize {
     }
 }
 
+/// One `write`, with EAGAIN as `error.WouldBlock` rather than folded into
+/// `WriteFailed`. For a caller that can keep the unwritten tail for later --
+/// a descriptor in non-blocking mode is not a failure, it is a queue that is
+/// full right now.
+pub fn writeSome(fd: fd_t, buf: []const u8) Error!usize {
+    while (true) {
+        const n = write(fd, buf.ptr, buf.len);
+        if (n >= 0) return @intCast(n);
+        return switch (errno()) {
+            EINTR => continue,
+            EAGAIN => error.WouldBlock,
+            else => error.WriteFailed,
+        };
+    }
+}
+
 pub fn writeAll(fd: fd_t, bytes: []const u8) Error!void {
     var off: usize = 0;
     while (off < bytes.len) off += try writeFd(fd, bytes[off..]);
+}
+
+/// Wait up to `timeout_ms` for `fd` to become readable. True if it did.
+///
+/// A blocking reader's version of a timer: `Client` uses the timeout as the
+/// deadline of a coalesced resize, so the read it was going to make anyway is
+/// also what wakes it to apply one. See `flushPendingResize`.
+pub fn waitReadable(fd: fd_t, timeout_ms: i32) bool {
+    var fds: [1]std.c.pollfd = .{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+    if (std.c.poll(&fds, 1, timeout_ms) <= 0) return false;
+    // HUP and ERR also mean "the next read will not block", and a caller that
+    // read them as "nothing came" would be right for the wrong reason. Say
+    // readable either way and let the read itself report the end.
+    const ready = std.c.POLL.IN | std.c.POLL.HUP | std.c.POLL.ERR;
+    return (fds[0].revents & ready) != 0;
 }
 
 /// Fill `buf` completely or fail. Returns error.ReadFailed at end of stream.

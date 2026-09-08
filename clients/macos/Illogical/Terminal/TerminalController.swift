@@ -73,10 +73,19 @@ final class TerminalController {
     private var historyTask: Task<Void, Never>?
     private var historyToken: HistoryToken?
 
-    /// The grid the surface last asked for, so a reconnect attaches at the
+    /// The geometry the surface last asked for, so a reconnect attaches at the
     /// size the window is now rather than the size it was when it opened.
-    private var cols: UInt16
-    private var rows: UInt16
+    private var size: SurfaceSize
+    /// What every attach says, from the one place the window's size is kept.
+    /// The desync path used to build its own from the engine, which is sized
+    /// by the server and so lags the window by a round trip — an attach at
+    /// that size moved the server *back*, and nothing ever moved it forward
+    /// again.
+    private var attachBody: AttachBody {
+        AttachBody(
+            cols: size.cols, rows: size.rows,
+            cellWidth: size.cell.width, cellHeight: size.cell.height)
+    }
     /// The retry in flight, and how far into the backoff we are.
     private var retry: Task<Void, Never>?
     private var backoff = Backoff()
@@ -102,12 +111,11 @@ final class TerminalController {
     private var attachInterval: OSSignpostIntervalState?
     private var snapshotBytes = 0
 
-    init(terminalID: UInt64, host: ServerHost, cols: UInt16, rows: UInt16) throws {
+    init(terminalID: UInt64, host: ServerHost, size: SurfaceSize) throws {
         self.terminalID = terminalID
         self.host = host
-        self.cols = cols
-        self.rows = rows
-        let engine = try TerminalEngine(cols: cols, rows: rows)
+        self.size = size
+        let engine = try TerminalEngine(cols: size.cols, rows: size.rows)
         self.engine = engine
         self.search = SearchSession(engine: engine)
     }
@@ -120,9 +128,8 @@ final class TerminalController {
     ///
     /// Which machine that is does not appear below this line: a remote host is
     /// `ssh <dest> illogicald --stdio` and the frames on it are the same ones.
-    func connect(cols: UInt16, rows: UInt16) {
-        self.cols = cols
-        self.rows = rows
+    func connect(_ size: SurfaceSize) {
+        self.size = size
         openConnection()
     }
 
@@ -153,8 +160,7 @@ final class TerminalController {
             connection.start()
 
             try connection.send(.hello, json: HelloBody(client: "Illogical.app"))
-            try connection.send(
-                .attach, terminal: terminalID, json: AttachBody(cols: cols, rows: rows))
+            try connection.send(.attach, terminal: terminalID, json: attachBody)
             state = .attaching
             attachSentAt = Date()
             attachInterval = Signposts.attach.beginInterval("attach")
@@ -197,9 +203,7 @@ final class TerminalController {
             "reattach-sent", seconds: Signposts.sinceLaunch(),
             detail: "terminal=\(terminalID) reason=desync")
         do {
-            try connection.send(
-                .attach, terminal: terminalID,
-                json: AttachBody(cols: engine.cols, rows: engine.rows))
+            try connection.send(.attach, terminal: terminalID, json: attachBody)
         } catch {
             state = .failed("\(error)")
         }
@@ -210,22 +214,30 @@ final class TerminalController {
         try? connection.send(.input, terminal: terminalID, payload: Data(bytes))
     }
 
-    func resize(cols: UInt16, rows: UInt16) {
-        guard cols > 0, rows > 0 else { return }
+    func resize(_ size: SurfaceSize) {
+        guard size.cols > 0, size.rows > 0 else { return }
         // Nothing to tell anyone. The server drops a resize to the size it is
         // already at, and reflowing the mirror for one would be work for no
         // change — so a caller that cannot know whether this is news (the
         // attach path, which resizes a controller it may have just connected at
         // this very size) may say it unconditionally.
-        guard cols != self.cols || rows != self.rows else { return }
+        guard size != self.size else { return }
         // Remembered even while disconnected, so a window resized during an
         // outage reattaches at the size it is now rather than the size it was.
-        self.cols = cols
-        self.rows = rows
-        engine.resize(cols: cols, rows: rows, cellWidth: 0, cellHeight: 0)
+        self.size = size
+        // Not the engine. The mirror is a replica of the server's terminal,
+        // and its size is part of that state — so the server says when the
+        // mirror reflows, and it says so *in the output stream*, at the byte
+        // where its own terminal changed (`.resized`, below). Reflowing here
+        // would put the mirror a size ahead of the bytes it is parsing for
+        // the length of a round trip: a full-screen program's repaint for 200
+        // columns, wrapped into 180. During a drag that is every repaint.
         guard let connection else { return }
         try? connection.send(
-            .resize, terminal: terminalID, json: ResizeBody(cols: cols, rows: rows))
+            .resize, terminal: terminalID,
+            json: ResizeBody(
+                cols: size.cols, rows: size.rows,
+                cellWidth: size.cell.width, cellHeight: size.cell.height))
     }
 
     func disconnect() {
@@ -295,6 +307,14 @@ final class TerminalController {
     /// is a race a test cannot reliably win -- the pump and `openConnection`
     /// are on the same actor, so which of them runs first is up to the
     /// scheduler.
+    /// The frame, on whatever connection is live — the shape
+    /// `HostConnection.handleForTesting(_:)` has, for tests that are about
+    /// what a frame *does* rather than which socket it came in on.
+    func handleForTesting(_ frame: Frame) {
+        guard let connection else { return }
+        handle(frame, from: connection)
+    }
+
     func handleForTesting(_ frame: Frame, from source: Connection) {
         handle(frame, from: source)
     }
@@ -341,6 +361,18 @@ final class TerminalController {
         case .output:
             // Straight into our VT engine, unmodified. This is the whole point.
             frame.payload.withUnsafeBytes { engine.write($0) }
+
+        case .resized:
+            // In stream order with `output`, which is what makes this the one
+            // right moment: every byte before this frame was written for the
+            // old size and every byte after it for the new. The cell is ours
+            // to add — the server has no font, and the mirror's own size
+            // reports go nowhere anyway.
+            guard let body = try? JSONDecoder().decode(ResizedBody.self, from: frame.payload)
+            else { return }
+            engine.resize(
+                cols: body.cols, rows: body.rows,
+                cellWidth: size.cell.width, cellHeight: size.cell.height)
 
         case .exited:
             let code = (try? JSONDecoder().decode(ExitedBody.self, from: frame.payload))?.code ?? 0
@@ -412,7 +444,7 @@ final class TerminalController {
         }
         do {
             let terminal = try restore.ready()
-            engine.adopt(terminal: terminal, cols: engine.cols, rows: engine.rows)
+            engine.adopt(terminal: terminal)
             // The snapshot knows how much history it is about to send, and
             // says so at READY — before a byte of it has arrived. Declaring it
             // now is what lets the scrollbar be the right size on the first

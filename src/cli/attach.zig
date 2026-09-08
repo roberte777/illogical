@@ -29,10 +29,7 @@ pub fn run(conn: *Conn, gpa: Allocator, io: std.Io, args: []const []const u8) !v
     const id = try std.fmt.parseInt(u64, args[0], 10);
 
     const size = terminalSize();
-    try conn.sendJson(.attach, id, protocol.body.Attach{
-        .cols = size.cols,
-        .rows = size.rows,
-    });
+    try conn.sendJson(.attach, id, size);
 
     // A pipe has no termios to put in raw mode, and that is not a reason to
     // refuse. `illogical attach 3 </dev/null >log` is a legitimate thing to
@@ -74,7 +71,7 @@ pub fn run(conn: *Conn, gpa: Allocator, io: std.Io, args: []const []const u8) !v
 
 /// Decode the snapshot into a real terminal, then emit it as VT so the
 /// surrounding terminal shows the same screen.
-fn repaint(gpa: Allocator, io: std.Io, bytes: []const u8, size: Size) !void {
+fn repaint(gpa: Allocator, io: std.Io, bytes: []const u8, size: protocol.body.Attach) !void {
     if (bytes.len == 0) return;
 
     var reader: std.Io.Reader = .fixed(bytes);
@@ -118,12 +115,20 @@ fn feedInput(conn: *Conn, id: u64) void {
     }
 }
 
-const Size = struct { cols: u16, rows: u16 };
-
-fn terminalSize() Size {
+/// The terminal this is running in, in the shape the daemon is told.
+fn terminalSize() protocol.body.Attach {
     var ws: c.struct_winsize = undefined;
     if (c.ioctl(sys.STDOUT, c.TIOCGWINSZ, &ws) == 0 and ws.ws_col > 0) {
-        return .{ .cols = ws.ws_col, .rows = ws.ws_row };
+        return .{
+            .cols = ws.ws_col,
+            .rows = ws.ws_row,
+            // Divided out rather than asked for: a `winsize` carries the text
+            // area, not the cell. Most terminals leave the pixel fields at
+            // zero -- and zero divided by a column count is zero, which is
+            // exactly the "unknown" the server wants for them.
+            .cell_width = @as(u32, ws.ws_xpixel) / ws.ws_col,
+            .cell_height = if (ws.ws_row > 0) @as(u32, ws.ws_ypixel) / ws.ws_row else 0,
+        };
     }
     return .{ .cols = 80, .rows = 24 };
 }

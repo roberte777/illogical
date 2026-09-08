@@ -1,6 +1,8 @@
 # Wire protocol
 
-Version 1. Implemented by [`src/core/protocol.zig`](../src/core/protocol.zig) and
+Version 2 — `resize` and `attach` carry the cell in pixels, the server sends
+`resized`, and a body key a peer does not know is read past rather than
+refused; a version-1 client is turned away at `hello`. Implemented by [`src/core/protocol.zig`](../src/core/protocol.zig) and
 [`IllogicalProtocol/Frame.swift`](../clients/macos/Packages/IllogicalKit/Sources/IllogicalProtocol/Frame.swift).
 Those two must stay byte-for-byte in step; both carry the same tests.
 
@@ -49,10 +51,10 @@ no parser.
 
 | Type | Name | Payload |
 | --- | --- | --- |
-| `0x01` | `hello` | protocol version, client name, capabilities |
+| `0x01` | `hello` | protocol version, client name |
 | `0x02` | `list` | — |
 | `0x03` | `create` | session name (validated — see [Names](#names)), terminal name, argv, env, cwd, initial size |
-| `0x04` | `attach` | size, scrollback budget |
+| `0x04` | `attach` | size (cols, rows, cell px), scrollback budget |
 | `0x05` | `detach` | — |
 | `0x06` | `kill` | signal |
 | `0x07` | `input` | raw bytes for the PTY |
@@ -79,6 +81,7 @@ no parser.
 | `0x8b` | `err` | code, message. Code 7, `desync`, means "re-attach" — see below |
 | `0x8c` | `pong` | echoed token |
 | `0x8d` | `screen` | plain-text rendering, in reply to `peek` |
+| `0x8e` | `resized` | cols, rows — the server's terminal changed size *here* in the stream |
 
 `peek` is the automation primitive: it returns what the server's own terminal
 currently shows, as plain text, without attaching. Scripts and agents can read a
@@ -87,6 +90,26 @@ terminal without pretending to be a client — the same idea as
 
 `input` and `output` payloads are opaque. The server never inspects `input`
 beyond forwarding it, and never rewrites `output`.
+
+`resize` and `attach` both carry the client's **cell size in device pixels**,
+and both default it to zero. The server has no font, so those are the only
+numbers it can give a program that asks for its size in pixels — DEC mode 2048's
+in-band report, or the pixel fields of a `winsize`. Zero means "unknown", which
+is what a client with no metrics of its own sends: the CLI. See [ARCHITECTURE.md](ARCHITECTURE.md#terminal-queries) for why
+the report matters — without it Neovim never learns that the window changed.
+
+`resized` is the size half of rule 2. A client's terminal is a replica of the
+server's, and its *size* is part of that state, so the client does not reflow
+its copy when its window changes — it asks (`resize`) and reflows when told.
+The marker is queued through the same path as `output`, under the same lock,
+so it sits at exactly the byte where the server's own terminal changed: every
+byte before it was written for the old size and every byte after for the new.
+A client that reflowed on its own cue would be a size ahead of the bytes it is
+parsing for the length of a round trip, and during a drag that is every
+repaint. Every attached client is sent it; that is the frame that made this
+version 2, since a client that predates it cannot decode the header, and the
+version check at `hello` is what keeps such a client from ever seeing one. See
+[ARCHITECTURE.md](ARCHITECTURE.md#data-flow-resize).
 
 ### `err` codes
 

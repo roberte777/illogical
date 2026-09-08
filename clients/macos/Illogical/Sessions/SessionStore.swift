@@ -1145,8 +1145,8 @@ final class SessionStore {
     // MARK: - Per-terminal connections
 
     /// The controller for a terminal, creating and attaching one if needed.
-    func controller(for ref: TerminalRef, cols: UInt16, rows: UInt16) -> TerminalController? {
-        host(ref.host)?.controller(for: ref.terminal, cols: cols, rows: rows)
+    func controller(for ref: TerminalRef, size: SurfaceSize) -> TerminalController? {
+        host(ref.host)?.controller(for: ref.terminal, size: size)
     }
 
     /// The controller for a terminal, if one is open. For views, which must

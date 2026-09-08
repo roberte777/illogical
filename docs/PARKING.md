@@ -39,6 +39,16 @@ So a terminal that is attached, focused, and being typed into is **still parked*
 if the child is producing no output. Our `park.shouldPark` must key on
 `last_pty_read_ns`, never on a general "activity" timestamp.
 
+A resize does not wake it — deliberately, for now. Waking it reflows the VT
+under a history restore that is still at the park width, and every page after
+that is discarded: a drag across an idle pane emptied its scrollback. So a
+resize while parked moves the PTY winsize and tells every attached client, and
+the VT keeps the park width once it unparks; a program that asked for mode 2048
+size reports gets none until something else makes it speak. What it should do
+instead — write the report from the mode bit the park file already carries,
+reflow once the restore is done, send the marker after the park-file snapshot
+on attach — is [#82](https://github.com/roberte777/illogical/issues/82).
+
 ### Lifecycle
 
 ```

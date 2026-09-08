@@ -66,7 +66,7 @@ final class PendingHistoryTests: XCTestCase {
         let restore = try SnapshotRestore(snapshot: bytes)
         let terminal = try restore.ready()
         let engine = try TerminalEngine(cols: 80, rows: 24)
-        engine.adopt(terminal: terminal, cols: 80, rows: 24)
+        engine.adopt(terminal: terminal)
 
         let resident = engine.scrollbar.total - engine.scrollbar.length
         let declared = restore.declaredHistoryRows
@@ -126,7 +126,7 @@ final class PendingHistoryTests: XCTestCase {
         let restore = try SnapshotRestore(snapshot: bytes)
         let terminal = try restore.ready()
         let engine = try TerminalEngine(cols: 80, rows: 24)
-        engine.adopt(terminal: terminal, cols: 80, rows: 24)
+        engine.adopt(terminal: terminal)
         engine.declarePendingHistory(rows: restore.declaredHistoryRows)
         XCTAssertGreaterThan(engine.scrollbar.pending, 0, "there is history to wait for")
 
@@ -172,7 +172,7 @@ final class PendingHistoryTests: XCTestCase {
 
         let restore = try SnapshotRestore(snapshot: bytes)
         let engine = try TerminalEngine(cols: 80, rows: 24)
-        engine.adopt(terminal: try restore.ready(), cols: 80, rows: 24)
+        engine.adopt(terminal: try restore.ready())
         engine.declarePendingHistory(rows: restore.declaredHistoryRows)
 
         engine.scroll(.top)
@@ -231,7 +231,7 @@ final class PendingHistoryTests: XCTestCase {
         XCTAssertEqual(engine.scrollbar.pending, 100)
 
         let restore = try SnapshotRestore(snapshot: bytes)
-        engine.adopt(terminal: try restore.ready(), cols: 80, rows: 24)
+        engine.adopt(terminal: try restore.ready())
         XCTAssertEqual(
             engine.scrollbar.pending, 0, "the new terminal owes nothing until it says so")
     }
@@ -275,7 +275,7 @@ final class PendingHistoryTests: XCTestCase {
 
         let restore = try SnapshotRestore(snapshot: bytes)
         let engine = try TerminalEngine(cols: 80, rows: 24)
-        engine.adopt(terminal: try restore.ready(), cols: 80, rows: 24)
+        engine.adopt(terminal: try restore.ready())
 
         // Deliver some history so there is somewhere to scroll to that is not
         // the top, then declare the rest still owed.

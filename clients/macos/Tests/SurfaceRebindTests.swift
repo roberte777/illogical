@@ -21,11 +21,11 @@ import XCTest
 @MainActor
 final class SurfaceRebindTests: XCTestCase {
     private final class Recorder: TerminalSurfaceDelegate {
-        var resizes: [(cols: UInt16, rows: UInt16)] = []
+        var resizes: [SurfaceSize] = []
         func surfaceIsReady(_ surface: TerminalSurfaceView) {}
         func surface(_ surface: TerminalSurfaceView, send bytes: [UInt8]) {}
-        func surface(_ surface: TerminalSurfaceView, resizeTo cols: UInt16, rows: UInt16) {
-            resizes.append((cols, rows))
+        func surface(_ surface: TerminalSurfaceView, resizeTo size: SurfaceSize) {
+            resizes.append(size)
         }
         func surfaceDidBecomeFocused(_ surface: TerminalSurfaceView) {}
         func surface(_ surface: TerminalSurfaceView, didPresentFirstFrameAt moment: Date) {}
@@ -128,6 +128,27 @@ final class SurfaceRebindTests: XCTestCase {
         XCTAssertEqual(
             recorder.resizes.count, 0,
             "a displaced surface resized the PTY out from under the live one")
+    }
+
+    /// A surface reports the cell it drew with, not a zero.
+    ///
+    /// The server has no font and no display. Every answer it gives about
+    /// pixels — a mode 2048 in-band size report, the pixel fields of a
+    /// `winsize` — is a quote of this number, so a surface that reported only
+    /// its grid would leave all of them at zero for a client that plainly
+    /// knows better.
+    func testASurfaceReportsTheCellItMeasuredWith() throws {
+        let (window, view, recorder, _) = try windowed()
+        defer { close(window) }
+
+        resize(view, to: NSRect(x: 0, y: 0, width: 400, height: 400))
+
+        let reported = try XCTUnwrap(recorder.resizes.last)
+        XCTAssertGreaterThan(reported.cell.width, 0, "reported a zero-width cell")
+        XCTAssertGreaterThan(reported.cell.height, 0, "reported a zero-height cell")
+        XCTAssertEqual(
+            reported.cell, view.rendererSizeForTesting?.cell,
+            "reported a cell the renderer did not draw with")
     }
 
     // MARK: - Helpers

@@ -24,6 +24,20 @@ import Carbon.HIToolbox
 import GhosttyVt
 import QuartzCore
 
+/// A surface's geometry as the server needs to hear it: a grid, and the cell
+/// it is measured in.
+///
+/// One value rather than two arguments because the pair has to travel
+/// together. A grid on its own cannot answer "how many pixels wide is the text
+/// area", and that is a question programs genuinely ask — through DEC mode
+/// 2048 and through `ws_xpixel`. The server cannot answer it either; it has no
+/// font. Only this side can.
+struct SurfaceSize: Equatable {
+    var cols: UInt16
+    var rows: UInt16
+    var cell: CellSize
+}
+
 /// Views are main-actor bound, and so is everything that answers them.
 @MainActor
 protocol TerminalSurfaceDelegate: AnyObject {
@@ -31,7 +45,7 @@ protocol TerminalSurfaceDelegate: AnyObject {
     /// known. Attaching before this point would guess at cols/rows.
     func surfaceIsReady(_ surface: TerminalSurfaceView)
     func surface(_ surface: TerminalSurfaceView, send bytes: [UInt8])
-    func surface(_ surface: TerminalSurfaceView, resizeTo cols: UInt16, rows: UInt16)
+    func surface(_ surface: TerminalSurfaceView, resizeTo size: SurfaceSize)
     /// This surface took keyboard focus. Focus lives in AppKit's responder
     /// chain and the layout follows it, not the other way round.
     func surfaceDidBecomeFocused(_ surface: TerminalSurfaceView)
@@ -65,7 +79,8 @@ final class TerminalSurfaceView: NSView {
     /// every sequence it produces depends on that terminal's modes.
     private var inputEncoder: InputEncoder?
 
-    private var lastReportedSize: (cols: UInt16, rows: UInt16) = (0, 0)
+    /// Nil until the first layout, which is what makes that one always news.
+    private var lastReportedSize: SurfaceSize?
     private var didSignalReady = false
     private var currentScale: CGFloat = 0
 
@@ -102,7 +117,7 @@ final class TerminalSurfaceView: NSView {
     /// The fonts this surface draws with, read once when it is built.
     ///
     /// Once, and not per grid lookup, because the three places below have to
-    /// agree: `gridSize` measures a cell with it before the renderer exists,
+    /// agree: `surfaceSize` measures a cell with it before the renderer exists,
     /// and a surface that measured against one font and drew with another
     /// would report a size the server then allocated. Reloading the config
     /// while the app runs is a separate problem (#39) and needs the surface
@@ -172,7 +187,7 @@ final class TerminalSurfaceView: NSView {
 
         if !didSignalReady {
             didSignalReady = true
-            lastReportedSize = gridSize
+            lastReportedSize = surfaceSize
             delegate?.surfaceIsReady(self)
             return
         }
@@ -194,7 +209,7 @@ final class TerminalSurfaceView: NSView {
         do {
             let context = try MetalContext.acquire()
             guard let engine else {
-                // No engine yet: we still want the grid so `gridSize` can
+                // No engine yet: we still want the grid so `surfaceSize` can
                 // answer, but there is nothing to render.
                 return
             }
@@ -350,8 +365,15 @@ final class TerminalSurfaceView: NSView {
         }
     }
 
-    /// The grid size this view can show, in cells.
-    var gridSize: (cols: UInt16, rows: UInt16) {
+    /// What this view would tell the server it is: the grid it can show, and
+    /// the cell that grid is measured in.
+    ///
+    /// The cell travels with the grid because the server has no font. It is
+    /// what the daemon quotes back to any program that asked for its size in
+    /// pixels — DEC mode 2048, or a `winsize` — and those numbers are wrong,
+    /// not merely absent, if they come from anywhere but the surface actually
+    /// drawing the text.
+    var surfaceSize: SurfaceSize {
         guard let renderer else {
             // Before the renderer exists, fall back to the shared grid's
             // metrics so an attach can still pick a sensible size.
@@ -361,10 +383,14 @@ final class TerminalSurfaceView: NSView {
             let cellH = max(1, Double(grid.metrics.cellHeight))
             let cols = max(1, Int(bounds.width * scale / cellW))
             let rows = max(1, Int(bounds.height * scale / cellH))
-            return (UInt16(min(cols, Int(UInt16.max))), UInt16(min(rows, Int(UInt16.max))))
+            return SurfaceSize(
+                cols: UInt16(min(cols, Int(UInt16.max))),
+                rows: UInt16(min(rows, Int(UInt16.max))),
+                cell: CellSize(width: grid.metrics.cellWidth, height: grid.metrics.cellHeight))
         }
-        let g = renderer.gridSize
-        return (g.columns, g.rows)
+        let size = renderer.currentSize
+        return SurfaceSize(
+            cols: size.grid.columns, rows: size.grid.rows, cell: size.cell)
     }
 
     private func reportSizeIfNeeded() {
@@ -375,10 +401,10 @@ final class TerminalSurfaceView: NSView {
         // right one, leaving the PTY's winsize larger than the pane and a
         // full-screen program drawing off its edge.
         if let engine, !engine.isBound(self) { return }
-        let size = gridSize
+        let size = surfaceSize
         guard size != lastReportedSize else { return }
         lastReportedSize = size
-        delegate?.surface(self, resizeTo: size.cols, rows: size.rows)
+        delegate?.surface(self, resizeTo: size)
     }
 
     // MARK: - Status overlay

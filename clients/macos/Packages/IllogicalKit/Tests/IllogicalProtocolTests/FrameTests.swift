@@ -51,6 +51,7 @@ struct FrameHeaderTests {
         #expect(!FrameType.output.isClientToServer)
         #expect(FrameType.renameSession.isClientToServer)
         #expect(FrameType.deleteSession.isClientToServer)
+        #expect(!FrameType.resized.isClientToServer)
     }
 
     // The numbers, not just the names. This file and src/core/protocol.zig are
@@ -61,6 +62,7 @@ struct FrameHeaderTests {
     func sessionScopedFrameValues() {
         #expect(FrameType.renameSession.rawValue == 0x0B)
         #expect(FrameType.deleteSession.rawValue == 0x0C)
+        #expect(FrameType.resized.rawValue == 0x8E)
     }
 
     @Test("the naming error codes carry the values the server sends")

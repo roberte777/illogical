@@ -224,7 +224,16 @@ final class TerminalEngine: @unchecked Sendable {
     ///
     /// This is the attach path: the snapshot carries the screen the server
     /// already has, so we adopt it wholesale instead of replaying history.
-    func adopt(terminal newTerminal: GhosttyTerminal, cols: UInt16, rows: UInt16) {
+    func adopt(terminal newTerminal: GhosttyTerminal) {
+        // Its own size, not ours. The terminal in a snapshot is whatever size
+        // the server's was, and ours may be a resize behind it -- a window
+        // dragged while the connection was down attaches at the new size and
+        // gets a snapshot to match, while `cols`/`rows` here still say what
+        // they said before the outage.
+        var cols: UInt16 = 0
+        var rows: UInt16 = 0
+        _ = ghostty_terminal_get(newTerminal, GHOSTTY_TERMINAL_DATA_COLS, &cols)
+        _ = ghostty_terminal_get(newTerminal, GHOSTTY_TERMINAL_DATA_ROWS, &rows)
         lock.lock()
         if let terminal {
             // Tracked references into a terminal do not survive it, and neither

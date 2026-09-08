@@ -72,9 +72,9 @@ final class ReconnectTests: XCTestCase {
         defer { server.stop() }
 
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: server.path), cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
         defer { controller.disconnect() }
-        controller.connect(cols: 80, rows: 24)
+        controller.connect(.test(cols: 80, rows: 24))
 
         try await waitFor("the first reconnect") { controller.state.isReconnecting }
 
@@ -94,8 +94,8 @@ final class ReconnectTests: XCTestCase {
         defer { server.stop() }
 
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: server.path), cols: 80, rows: 24)
-        controller.connect(cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
+        controller.connect(.test(cols: 80, rows: 24))
         try await waitFor("the first reconnect") { controller.state.isReconnecting }
 
         controller.disconnect()
@@ -110,9 +110,9 @@ final class ReconnectTests: XCTestCase {
         let path = "/tmp/illogical-absent-\(getpid()).sock"
         unlink(path)
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: path), cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: path), size: .test(cols: 80, rows: 24))
         defer { controller.disconnect() }
-        controller.connect(cols: 80, rows: 24)
+        controller.connect(.test(cols: 80, rows: 24))
 
         try await waitFor("a reconnect rather than a failure") {
             controller.state.isReconnecting
@@ -126,14 +126,38 @@ final class ReconnectTests: XCTestCase {
         defer { server.stop() }
 
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: server.path), cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
         defer { controller.disconnect() }
-        controller.connect(cols: 80, rows: 24)
+        controller.connect(.test(cols: 80, rows: 24))
         try await waitFor("the first reconnect") { controller.state.isReconnecting }
 
-        controller.resize(cols: 120, rows: 40)
+        controller.resize(.test(cols: 120, rows: 40))
         try await waitFor("an attach at the new size") {
-            server.lastAttach == AttachSize(cols: 120, rows: 40)
+            server.lastAttach
+                == AttachSize(cols: 120, rows: 40, cellWidth: 16, cellHeight: 38)
+        }
+    }
+
+    /// The cell travels with the grid, and a reattach carries it too.
+    ///
+    /// Not a detail: the server has no font, so what it tells a program that
+    /// asked for its size in pixels — DEC mode 2048, or `ws_xpixel` — is
+    /// whatever the last client said a cell was. Send zeros and Neovim is told
+    /// the terminal is zero pixels wide.
+    func testAnAttachCarriesTheCellItMeasuredWith() async throws {
+        let server = try HangUpServer()
+        defer { server.stop() }
+
+        let controller = try TerminalController(
+            terminalID: 1, host: .local(socketPath: server.path),
+            size: SurfaceSize(cols: 80, rows: 24, cell: CellSize(width: 9, height: 19)))
+        defer { controller.disconnect() }
+        controller.connect(
+            SurfaceSize(cols: 80, rows: 24, cell: CellSize(width: 9, height: 19)))
+
+        try await waitFor("an attach carrying the cell") {
+            server.lastAttach
+                == AttachSize(cols: 80, rows: 24, cellWidth: 9, cellHeight: 19)
         }
     }
 
@@ -189,9 +213,9 @@ final class ReconnectTests: XCTestCase {
         defer { server.stop() }
 
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: server.path), cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
         defer { controller.disconnect() }
-        controller.connect(cols: 80, rows: 24)
+        controller.connect(.test(cols: 80, rows: 24))
         try await waitFor("the pane to fail with its socket still up") {
             if case .failed = controller.state { return true }
             return false
@@ -359,9 +383,9 @@ final class ReconnectTests: XCTestCase {
         defer { server.stop() }
 
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: server.path), cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
         defer { controller.disconnect() }
-        controller.connect(cols: 80, rows: 24)
+        controller.connect(.test(cols: 80, rows: 24))
         try await waitFor("the pane to attach") { server.accepted == 1 }
 
         // A second, unstarted connection stands in for the superseded one: what
@@ -761,6 +785,62 @@ final class ReconnectTests: XCTestCase {
         XCTAssertEqual(launcher.callCount, 0, "a refusal was mistaken for nothing listening")
     }
 
+    /// The mirror is a replica, and its size is part of the state it
+    /// replicates — so the window never sizes it and the stream always does.
+    ///
+    /// The point of the ordering is what a fast drag looked like without it:
+    /// the mirror a size ahead of the bytes it was parsing, so a full-screen
+    /// program's repaint for 200 columns wrapped into 180.
+    func testTheStreamSizesTheMirrorAndTheWindowDoesNot() async throws {
+        let server = try HangUpServer(mode: .errorThenHold)
+        defer { server.stop() }
+
+        let controller = try TerminalController(
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
+        defer { controller.disconnect() }
+        controller.connect(.test(cols: 80, rows: 24))
+        try await waitFor("the pane to attach") { server.accepted == 1 }
+
+        controller.resize(.test(cols: 120, rows: 40))
+        XCTAssertEqual(controller.engine.cols, 80, "the window sized the mirror")
+
+        controller.handleForTesting(
+            Frame(type: .resized, terminal: 1, payload: Data(#"{"cols":120,"rows":40}"#.utf8)))
+        XCTAssertEqual(controller.engine.cols, 120)
+        XCTAssertEqual(controller.engine.rows, 40)
+    }
+
+    /// A desync reattaches at the size the *window* is, not the size the
+    /// mirror is. They differ by a round trip on purpose (above), and a
+    /// resize is exactly what provokes the repaint burst that desyncs a
+    /// client — so this is the ordinary case, not a corner. Attaching at the
+    /// mirror's size moved the server back to it, and the size guard in
+    /// `resize` then kept the window's size from ever being sent again.
+    func testADesyncReattachesAtTheWindowsSize() async throws {
+        let server = try HangUpServer(mode: .errorThenHold)
+        defer { server.stop() }
+
+        let controller = try TerminalController(
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
+        defer { controller.disconnect() }
+        controller.connect(.test(cols: 80, rows: 24))
+        try await waitFor("the first attach") {
+            server.lastAttach == AttachSize(cols: 80, rows: 24, cellWidth: 16, cellHeight: 38)
+        }
+
+        // Sent, not yet answered: the mirror is still 80x24.
+        controller.resize(.test(cols: 120, rows: 40))
+        XCTAssertEqual(controller.engine.cols, 80)
+
+        controller.handleForTesting(
+            Frame(
+                type: .error, terminal: 1,
+                payload: Data(#"{"code":7,"message":"desync"}"#.utf8)))
+        try await waitFor("a reattach at the window's size") {
+            server.lastAttach == AttachSize(cols: 120, rows: 40, cellWidth: 16, cellHeight: 38)
+        }
+    }
+
 }
 
 /// A `DaemonLauncher` that starts nothing, and remembers being asked.
@@ -847,6 +927,12 @@ final class RecordingLauncher: DaemonLauncher, @unchecked Sendable {
 struct AttachSize: Equatable, Sendable {
     var cols: UInt16
     var rows: UInt16
+    /// The cell the client measured that grid with. Zero from a client that
+    /// has no font of its own; the server quotes it back to any program that
+    /// asked for a size in pixels, so a test that ignored it would not notice
+    /// the whole thing going out at zero.
+    var cellWidth: UInt32 = 0
+    var cellHeight: UInt32 = 0
 }
 
 /// A unix socket that accepts a connection, reads whatever the client sends,
@@ -892,21 +978,41 @@ final class HangUpServer: @unchecked Sendable {
         /// Keep a client fd open for the life of the server. Closed by `stop`,
         /// which is what keeps the test from leaking descriptors into the rest
         /// of the suite.
-        func hold(_ fd: Int32) {
+        /// True if the socket is now held and a reader may be started on it.
+        /// The reader is counted *under the lock*, so `releaseHeld` cannot
+        /// find the group empty between a hold and its reader starting; and
+        /// a hold after `stop` closes the socket and returns false, so no
+        /// reader is ever started on a number that is already free.
+        func hold(_ fd: Int32) -> Bool {
             lock.lock()
             defer { lock.unlock() }
             if _stopped {
                 Darwin.close(fd)
-                return
+                return false
             }
             _held.append(fd)
+            readers.enter()
+            return true
         }
+
+        /// The threads reading held sockets. `releaseHeld` waits for them
+        /// between shutting a socket down and closing it: a close while a
+        /// reader has yet to enter `read` frees the descriptor number for the
+        /// next test's socket, and the stray reader then eats that socket's
+        /// hello.
+        let readers = DispatchGroup()
 
         func releaseHeld() {
             lock.lock()
             let fds = _held
             _held = []
             lock.unlock()
+            // Shut down first: that is what wakes a reader blocked on the
+            // socket, or makes one that has not started yet return at once.
+            // Close only once every reader has left, so the number cannot be
+            // reused under one.
+            for fd in fds { Darwin.shutdown(fd, SHUT_RDWR) }
+            readers.wait()
             for fd in fds { Darwin.close(fd) }
         }
 
@@ -1003,7 +1109,16 @@ final class HangUpServer: @unchecked Sendable {
                 // these tests does deliberately -- must not be written to.
                 if spoke {
                     sendError(client, code: ProtocolErrorCode.noSuchSession, session: 1)
-                    state.hold(client)
+                    // Keep reading the held socket. A test that provokes a
+                    // reattach on it wants the attach it sends recorded, and
+                    // the accept loop must not be the thread that waits for
+                    // it: the same tests open a second connection meanwhile.
+                    if state.hold(client) {
+                        Thread.detachNewThread {
+                            defer { state.readers.leave() }
+                            _ = Self.readFrames(client, state, count: .max)
+                        }
+                    }
                 } else {
                     Darwin.close(client)
                 }
@@ -1057,11 +1172,14 @@ final class HangUpServer: @unchecked Sendable {
     /// has no `SO_NOSIGPIPE` unless we set one -- which would take the whole
     /// test bundle down with a crash report rather than a failure.
     @discardableResult
-    private static func readFrames(_ fd: Int32, _ state: State) -> Bool {
+    private static func readFrames(_ fd: Int32, _ state: State, count: Int = 2) -> Bool {
         var buffer = [UInt8](repeating: 0, count: 4096)
         var pending: [UInt8] = []
         // Two frames is all a client sends before it waits: hello, attach.
-        for _ in 0..<2 {
+        // `.max` reads until the far end hangs up.
+        var read = 0
+        while read < count {
+            read += 1
             while pending.count < Protocol.headerLength {
                 let n = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, 4096) }
                 if n <= 0 { return false }
@@ -1079,7 +1197,10 @@ final class HangUpServer: @unchecked Sendable {
             if header.type == .attach,
                 let body = try? JSONDecoder().decode(AttachBody.self, from: payload)
             {
-                state.record(attach: AttachSize(cols: body.cols, rows: body.rows))
+                state.record(
+                    attach: AttachSize(
+                        cols: body.cols, rows: body.rows,
+                        cellWidth: body.cellWidth, cellHeight: body.cellHeight))
             }
         }
         return true

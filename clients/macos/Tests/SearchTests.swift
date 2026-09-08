@@ -192,7 +192,7 @@ final class SearchTests: XCTestCase {
         bytes.withUnsafeMutableBufferPointer {
             ghostty_terminal_vt_write(terminal, $0.baseAddress, $0.count)
         }
-        engine.adopt(terminal: terminal, cols: 80, rows: 10)
+        engine.adopt(terminal: terminal)
 
         XCTAssertEqual(settle(engine).total, 1)
         XCTAssertEqual(engine.searchViewportSpans().first?.row, 0)
