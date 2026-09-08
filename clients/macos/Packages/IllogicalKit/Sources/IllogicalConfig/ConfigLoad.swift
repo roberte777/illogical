@@ -55,10 +55,14 @@ extension Config {
     /// place they are not looking.
     public static func loadDefaults(
         bundleID: String?,
+        resources: URL? = Bundle.main.resourceURL,
+        appearance: ConfigAppearance = .dark,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> ConfigLoad {
         let files = ConfigPath.defaults(bundleID: bundleID, environment: environment)
-        var result = load(files: files)
+        var result = load(
+            files: files, bundleID: bundleID, resources: resources, appearance: appearance,
+            environment: environment)
         guard result.sources.isEmpty, environment[ConfigPath.overrideVariable] == nil else {
             return result
         }
@@ -82,19 +86,122 @@ extension Config {
     /// One config, not one per file: a later file's `font-family` appends to
     /// the earlier file's list rather than replacing it, exactly as a second
     /// line in one file would. See `ConfigPath.defaults`.
-    public static func load(files: [URL]) -> ConfigLoad {
+    ///
+    /// Then, if any of them named a `theme`, the whole lot is applied a second
+    /// time on top of it. See `applying(theme:)`.
+    public static func load(
+        files: [URL],
+        bundleID: String? = nil,
+        resources: URL? = nil,
+        appearance: ConfigAppearance = .dark,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> ConfigLoad {
         var config = Config()
         var diagnostics: [ConfigDiagnostic] = []
         var sources: [URL] = []
+        // What was applied, in order, so a theme can be slid underneath it.
+        // Kept here rather than on `Config` deliberately: two configs holding
+        // the same colours have to compare equal however they were arrived
+        // at, and a record of the lines that produced them would break that.
+        var replay: [(entry: ConfigEntry, path: String)] = []
 
         for file in files {
             guard let text = read(file, diagnostics: &diagnostics) else { continue }
             sources.append(file)
-            config.apply(text: text, path: file.path, diagnostics: &diagnostics)
+            for entry in ConfigSyntax.entries(of: text) {
+                config.apply(entry, path: file.path, diagnostics: &diagnostics)
+                replay.append((entry, file.path))
+            }
+        }
+
+        if let theme = config.theme {
+            let reloaded = applying(
+                theme: theme, replay: replay, bundleID: bundleID, resources: resources,
+                appearance: appearance, environment: environment)
+            config = reloaded.config
+            // The replay produced this run's diagnostics a second time, so
+            // the first pass's are dropped rather than doubled. Only the
+            // file-level ones -- a config file that could not be read at all
+            // -- survive from it, and those are what `diagnostics` holds
+            // before any entry is applied.
+            diagnostics = read(files: files) + reloaded.diagnostics
         }
 
         config.finalize()
         return ConfigLoad(config: config, diagnostics: diagnostics, sources: sources)
+    }
+
+    /// Load `theme` and put the config that named it back on top.
+    ///
+    /// libghostty's `loadTheme`, and the same dance for the same two reasons.
+    /// A theme is an ordinary config file, so the only way for `background =
+    /// #ff0000` in your own config to beat the theme's background is for the
+    /// theme to be applied *first* -- and the option that named it can appear
+    /// anywhere in the file, including after the colours it is supposed to
+    /// lose to. Applying entries one at a time cannot do that. So the config
+    /// is thrown away and rebuilt: defaults, then the theme, then every line
+    /// the files held, in order.
+    ///
+    /// Which means every diagnostic is produced twice over a run, and the
+    /// second set is the one that gets reported. They are identical -- the
+    /// same entries against the same defaults -- so which set is dropped is
+    /// arbitrary; that it is exactly one of them is not.
+    private static func applying(
+        theme: ConfigTheme,
+        replay: [(entry: ConfigEntry, path: String)],
+        bundleID: String?,
+        resources: URL?,
+        appearance: ConfigAppearance,
+        environment: [String: String]
+    ) -> (config: Config, diagnostics: [ConfigDiagnostic]) {
+        var config = Config()
+        var diagnostics: [ConfigDiagnostic] = []
+
+        let name = theme.expandingHome(home(environment)).name(for: appearance)
+        switch ThemePath.resolve(
+            name, bundleID: bundleID, resources: resources, environment: environment)
+        {
+        case .missing(let reasons):
+            diagnostics.append(contentsOf: reasons)
+        case .file(let file):
+            var fileDiagnostics: [ConfigDiagnostic] = []
+            if let text = read(file, diagnostics: &fileDiagnostics) {
+                for entry in ConfigSyntax.entries(of: text) {
+                    // A theme cannot name a theme. libghostty ignores this
+                    // silently rather than warning, and silence is right:
+                    // the file is not the user's, so a warning would be about
+                    // somebody else's mistake in a file they cannot edit.
+                    guard entry.key != "theme", entry.key != "config-file" else { continue }
+                    config.apply(entry, path: file.path, diagnostics: &diagnostics)
+                }
+            }
+            diagnostics.append(contentsOf: fileDiagnostics)
+        }
+
+        for step in replay {
+            config.apply(step.entry, path: step.path, diagnostics: &diagnostics)
+        }
+        return (config, diagnostics)
+    }
+
+    /// The diagnostics reading `files` produces on its own, without applying
+    /// anything in them -- a file that is a directory, or that cannot be
+    /// opened. Cheap: the successful case is a read of a file already in the
+    /// page cache, and this only runs when a theme was named.
+    private static func read(files: [URL]) -> [ConfigDiagnostic] {
+        var diagnostics: [ConfigDiagnostic] = []
+        for file in files { _ = read(file, diagnostics: &diagnostics) }
+        return diagnostics
+    }
+
+    /// `$HOME`, for expanding a `~` in a theme path. The same rule
+    /// `ConfigPath` follows, and duplicated rather than shared because
+    /// `ConfigPath.home` is private to the question of where a config lives.
+    private static func home(_ environment: [String: String]) -> URL {
+        if let home = environment["HOME"], !home.isEmpty {
+            return URL(fileURLWithPath: home)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
     }
 
     /// The contents of `file`, or nil when there is nothing to read.

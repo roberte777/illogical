@@ -22,6 +22,22 @@
         // to link); this is what ghostty itself uses to build its universal
         // XCFramework.
         .apple_sdk = .{ .path = "vendor/ghostty/pkg/apple-sdk" },
+        // The theme collection the Mac app ships, so that `theme = Nord`
+        // resolves without anybody downloading a file. Ghostty's own
+        // dependency at Ghostty's own pinned URL and hash, rather than a set
+        // of our own: a theme is a config file written against Ghostty's
+        // parser, and taking the same tarball is what keeps the name someone
+        // reads in Ghostty's docs meaning the same thing here.
+        //
+        // Lazy, like it is there. `zig build` alone does not fetch it -- only
+        // `-Demit-themes`, which is what `just stage-daemon` passes and what
+        // the app bundle needs. The daemon does not read themes and neither
+        // does the CLI.
+        .iterm2_themes = .{
+            .url = "https://deps.files.ghostty.org/ghostty-themes-release-20260824-153547-75c93ee.tgz",
+            .hash = "N-V-__8AAGZkBACH0haGC9R-hfNPYWxu16hr-ydEsolad9GV",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

@@ -37,6 +37,8 @@ Packages/IllogicalKit/
     ├── Config.swift            the keys, and what setting one does
     ├── ConfigColor.swift       colours, palette entries, cell-relative ones
     ├── X11Colors.swift         rgb.txt, embedded and read on first use
+    ├── ConfigTheme.swift       one theme, or a light/dark pair
+    ├── ThemePath.swift         where a theme is looked for, and in what order
     ├── ConfigPath.swift        XDG and Application Support
     ├── ConfigLoad.swift        reading the files, and the diagnostics
     └── ConfigTemplate.swift    the file written when a machine has none

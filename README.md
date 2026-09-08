@@ -146,6 +146,40 @@ background-opacity = 0.9
 background-blur = true
 ```
 
+### Themes
+
+A theme is a file of colours, and the app ships the same ~600 of them Ghostty
+does — the [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes)
+collection, from Ghostty's own pinned tarball, under the same names.
+
+```ini
+# Applied underneath everything else in the file, so anything you set
+# yourself still wins — wherever in the file you set it.
+theme = Catppuccin Mocha
+
+# Two of them, picked by whether the system is in light or dark mode. Both
+# halves are required; the order does not matter.
+theme = light:Rose Pine Dawn,dark:Rose Pine
+```
+
+`theme = <name>` looks in three places, first hit winning, so a file of your own
+beats one we shipped by having the same name:
+
+```
+~/.config/illogical/themes/<name>                                # or $XDG_CONFIG_HOME
+~/Library/Application Support/dev.illogical.Illogical/themes/<name>
+Illogical.app/Contents/Resources/themes/<name>
+```
+
+An absolute path skips the search (`theme = ~/dotfiles/mine`); a relative one
+may not contain a `/` at all. A theme that is not found names every path it
+tried. A theme file is an ordinary config file — the same syntax, the same
+seven colour keys below — and the only thing it may not set is another
+`theme`.
+
+The light/dark pair is resolved at launch, so switching the system between
+light and dark needs the app restarted for now.
+
 ### Colours
 
 Ghostty's colour vocabulary, which is XParseColor's plus a couple of

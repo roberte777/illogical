@@ -201,6 +201,24 @@ stage-daemon:
     fi
     rm -rf clients/macos/Illogical/Supporting/terminfo
     cp -R "$terminfo" clients/macos/Illogical/Supporting/terminfo
+    # The theme collection, into Contents/Resources/themes -- the second and
+    # last place `theme = <name>` looks. Its own `zig build` invocation rather
+    # than a flag on the one above, because the release path does not run that
+    # one at all: it stages a prebuilt daemon. `themes` compiles nothing, so
+    # this costs an unpack of a cached tarball and a directory copy.
+    #
+    # ILLOGICAL_THEMES_DIR names a prebuilt collection for the same reason the
+    # two variables above name a prebuilt daemon and terminfo.
+    themes="${ILLOGICAL_THEMES_DIR:-zig-out/share/illogical/themes}"
+    if [ ! -d "$themes" ]; then
+        zig build -Demit-themes themes
+    fi
+    if [ ! -d "$themes" ]; then
+        echo "no theme collection at $themes -- set ILLOGICAL_THEMES_DIR" >&2
+        exit 1
+    fi
+    rm -rf clients/macos/Illogical/Supporting/themes
+    cp -R "$themes" clients/macos/Illogical/Supporting/themes
 
 # Test the pure-Swift client core. Needs no XCFramework.
 test-swift:

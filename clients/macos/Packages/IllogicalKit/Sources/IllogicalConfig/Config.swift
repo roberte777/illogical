@@ -94,6 +94,20 @@ public struct Config: Equatable, Sendable {
     /// private call Ghostty uses.
     public var backgroundBlurRadius: Int = 0
 
+    // MARK: - Theme
+
+    /// The theme file to read colours from, under the terminal's own two.
+    ///
+    /// Nil for no theme, which is the default and what leaves the app looking
+    /// like itself. One name, or a light/dark pair — see `ConfigTheme`.
+    ///
+    /// Loading it is `ConfigLoad`'s job rather than this type's, and it has to
+    /// be: a theme is a *file*, and the whole point of the option is that
+    /// anything the config says explicitly outranks it however the two are
+    /// ordered in the file. That is not something applying one entry at a time
+    /// can do — see `Config.load(files:)`.
+    public var theme: ConfigTheme?
+
     // MARK: - Colours
 
     /// The terminal's default background and foreground: what a cell that
@@ -256,6 +270,22 @@ public struct Config: Equatable, Sendable {
                 return
             }
             backgroundBlurRadius = radius
+
+        case "theme":
+            guard let value = entry.value, !value.isEmpty else {
+                // Empty is an error rather than a reset, which is
+                // libghostty's call and worth keeping: every other key resets
+                // to a default, and this one has no default to reset *to* —
+                // `theme =` would have to mean "the colours a theme already
+                // set", which is not a thing a config file can express.
+                report("value required")
+                return
+            }
+            guard let parsed = ConfigTheme.parse(value) else {
+                report("invalid value \"\(value)\"")
+                return
+            }
+            theme = parsed
 
         case "background":
             apply(entry, to: \.background, report: report)

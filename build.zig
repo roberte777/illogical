@@ -38,6 +38,15 @@ pub fn build(b: *std.Build) void {
     // than run afterwards because a release is cross-compiled from a Mac and
     // the host's `strip` cannot touch an ELF.
     const strip = b.option(bool, "strip", "Leave out debug information (default: no)");
+    // Off by default, and lazily fetched, so a plain `zig build` neither
+    // downloads 2.4 MB nor installs 600 files nobody asked for. The Mac app
+    // is the only thing that reads a theme -- `just stage-daemon` passes this
+    // and copies the result into the bundle.
+    const emit_themes = b.option(
+        bool,
+        "emit-themes",
+        "Install the bundled Ghostty theme collection (default: no)",
+    ) orelse false;
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
@@ -104,6 +113,11 @@ pub fn build(b: *std.Build) void {
     // can look up. See `src/core/pty.zig`.
     // ---------------------------------------------------------------
     terminfoDatabase(b, target, optimize);
+
+    // ---------------------------------------------------------------
+    // The theme collection, for `theme = <name>` in the Mac app's config.
+    // ---------------------------------------------------------------
+    if (emit_themes) themes(b);
 
     // ---------------------------------------------------------------
     // Steps
@@ -209,6 +223,36 @@ fn terminfoDatabase(
     copy.step.dependOn(&mkdir.step);
 
     b.getInstallStep().dependOn(&copy.step);
+}
+
+/// Install the iTerm2-Color-Schemes themes as `share/illogical/themes`.
+///
+/// Ghostty's own step (`src/build/GhosttyResources.zig`) over Ghostty's own
+/// dependency, so the collection is name-for-name the one its documentation
+/// describes. The Mac app copies this directory into
+/// `Illogical.app/Contents/Resources/themes`, which is the second and last
+/// place `theme = <name>` looks -- the first being the user's own themes
+/// directory, so a file of your own always wins over one we shipped.
+///
+/// `.md` is excluded because the tarball carries a README that is not a theme
+/// and would otherwise be offered as one.
+fn themes(b: *std.Build) void {
+    // A step of its own as well as part of `install`, so that staging the app
+    // bundle can copy 600 files without also compiling a daemon it already
+    // has: `zig build -Demit-themes themes`. The option still gates the
+    // `lazyDependency` call, because that is evaluated while the graph is
+    // built rather than when a step runs -- which is why the step cannot be
+    // the only gate.
+    const step = b.step("themes", "Install the theme collection into share/illogical/themes");
+    const upstream = b.lazyDependency("iterm2_themes", .{}) orelse return;
+    const install = b.addInstallDirectory(.{
+        .source_dir = upstream.path(""),
+        .install_dir = .{ .custom = "share" },
+        .install_subdir = b.pathJoin(&.{ "illogical", "themes" }),
+        .exclude_extensions = &.{".md"},
+    });
+    step.dependOn(&install.step);
+    b.getInstallStep().dependOn(&install.step);
 }
 
 /// Resolve the `ghostty-vt` module from the vendored ghostty checkout.

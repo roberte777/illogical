@@ -96,6 +96,28 @@ public enum ConfigTemplate {
         # background-blur = true
         # background-blur = 30
 
+        # Themes
+        # ======
+        # # A theme is a file of colours, and the app ships about 600 of them
+        # # -- the same collection Ghostty does, under the same names. Name one
+        # # and it is applied underneath everything else in this file, so
+        # # anything you set yourself still wins.
+        # theme = Catppuccin Mocha
+        # theme = Nord
+        #
+        # # Two of them, chosen by whether the system is in light or dark
+        # # mode. Both halves are required, and the order does not matter.
+        # theme = light:Rose Pine Dawn,dark:Rose Pine
+        #
+        # # A theme of your own goes in one of these, and a file there wins
+        # # over one we shipped by having the same name:
+        # #
+        # #   ~/.config/illogical/themes/<name>
+        # #   ~/Library/Application Support/dev.illogical.Illogical/themes/<name>
+        # #
+        # # Or name a path outright, which must be absolute:
+        # theme = ~/dotfiles/my-theme
+
         # Colours
         # =======
         # # A colour is hex with or without the #, an X11 name, or

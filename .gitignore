@@ -26,6 +26,8 @@ clients/macos/Frameworks/
 clients/macos/Illogical/Supporting/bin/
 # The compiled terminfo database, staged the same way
 clients/macos/Illogical/Supporting/terminfo/
+# The theme collection, likewise -- 600 files from a fetched tarball
+clients/macos/Illogical/Supporting/themes/
 
 # Release tarballs, from `just dist`
 dist/
