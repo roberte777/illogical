@@ -32,7 +32,8 @@ struct ScreenSize: Equatable {
     /// whenever the view isn't an exact multiple of the cell size, which is
     /// almost always.
     ///
-    /// `self` should be the unpadded screen.
+    /// `self` is the whole screen, padding included — `padding` is subtracted
+    /// here, so handing it the terminal size would take it off twice.
     func blankPadding(
         _ padding: EdgePadding, grid: GridDimensions, cell: CellSize
     )
