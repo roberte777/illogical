@@ -81,11 +81,11 @@ final class RendererSizeTests: XCTestCase {
 
     /// The same claim in pixels, through the renderer that draws them.
     ///
-    /// Grow the surface by less than a row — every intermediate size a drag
-    /// passes through — and the frame above the new slack has to come back
-    /// byte for byte. The geometry tests above say the origin holds; this says
-    /// the projection and the shader agree with them.
-    func testTextDoesNotMoveWhenTheSurfaceGrowsWithinARow() throws {
+    /// Resize the surface by less than a row, in both directions — every
+    /// intermediate size a drag passes through — and the frame above the slack
+    /// has to come back byte for byte. The geometry tests above say the origin
+    /// holds; this says the projection and the shader agree with them.
+    func testTextDoesNotMoveAsTheSurfaceResizesWithinARow() throws {
         let harness = try RenderHarness(columns: 40, rows: 12) { config in
             config.windowPaddingX = 8
             config.windowPaddingY = 8
@@ -102,7 +102,10 @@ final class RendererSizeTests: XCTestCase {
         harness.renderer.setScreenSize(width: width, height: height, scale: 2)
         let before = try harness.render()
 
-        for extra in [1, 3, harness.cellHeight - 1] {
+        // Up through a row's worth of slack and back down to where it started:
+        // a drag does both, and a shrink hands the renderer a target smaller
+        // than the one that frame slot last held.
+        for extra in [1, 3, harness.cellHeight - 1, 3, 1, 0] {
             harness.renderer.setScreenSize(width: width, height: height + extra, scale: 2)
             let after = try harness.render()
 
@@ -110,9 +113,9 @@ final class RendererSizeTests: XCTestCase {
             let row = (0..<height).first { y in
                 let start = y * width * 4
                 let end = start + width * 4
-                return Array(before.pixels[start..<end]) != Array(after.pixels[start..<end])
+                return !before.pixels[start..<end].elementsEqual(after.pixels[start..<end])
             }
-            XCTAssertNil(row, "row \(row ?? -1) moved when the surface grew by \(extra)px")
+            XCTAssertNil(row, "row \(row ?? -1) moved at \(extra)px of slack")
         }
     }
 

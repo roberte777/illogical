@@ -1177,6 +1177,19 @@ painted in the terminal's own background. In a split each pane carries its own
 card, so the gutter between two of them is two bezels with the divider line
 down the middle.
 
+**The 8pt is the top and the left; the leftover goes to the bottom and the
+right.** A surface is almost never a whole number of cells, and libghostty
+either leaves that remainder past the last row and column or splits it between
+opposite edges — `window-padding-balance`, which defaults to off. We leave it,
+because balancing makes the grid's origin a function of the surface size: the
+top padding ramps up by half a cell as a window is dragged and drops back the
+moment another row fits, so every glyph on screen — the scrollback being read
+included — slides and snaps once per row for as long as the drag lasts. The
+price is that the gap under the last row is 8pt plus up to a cell where the gap
+above the first is 8pt exactly. Both are the terminal's own background, so it
+reads as a slightly deeper gutter at the bottom of the card rather than as an
+edge in the wrong place.
+
 **`background-blur` is a radius**, spelled as a bool or a number the way
 libghostty spells it, and honoured either way — `true` is 20, which is the
 radius it picks for the same word. That it can be honoured at all is why the
