@@ -76,6 +76,11 @@ final class TerminalController {
     /// The geometry the surface last asked for, so a reconnect attaches at the
     /// size the window is now rather than the size it was when it opened.
     private var size: SurfaceSize
+    /// The server on this connection sends `resized`, so the mirror is sized
+    /// from those and not from the window. False until its `welcome` says so,
+    /// and false again on every reconnect: the daemon answering the socket
+    /// may not be the one that answered it last time.
+    private var serverResizes = false
     /// The retry in flight, and how far into the backoff we are.
     private var retry: Task<Void, Never>?
     private var backoff = Backoff()
@@ -149,7 +154,8 @@ final class TerminalController {
             self.connection = connection
             connection.start()
 
-            try connection.send(.hello, json: HelloBody(client: "Illogical.app"))
+            serverResizes = false
+            try connection.send(.hello, json: HelloBody(client: "Illogical.app", resized: true))
             try connection.send(
                 .attach, terminal: terminalID,
                 json: AttachBody(
@@ -223,9 +229,21 @@ final class TerminalController {
         // Remembered even while disconnected, so a window resized during an
         // outage reattaches at the size it is now rather than the size it was.
         self.size = size
-        engine.resize(
-            cols: size.cols, rows: size.rows,
-            cellWidth: size.cell.width, cellHeight: size.cell.height)
+        // The mirror is a replica of the server's terminal, and its size is
+        // part of that state — so a server that sends `resized` gets to say
+        // when the mirror reflows, and it says so *in the output stream*, at
+        // the byte where its own terminal changed. Reflowing here instead
+        // would put the mirror a size ahead of the bytes it is parsing for
+        // the length of a round trip: a full-screen program's repaint for 200
+        // columns, wrapped into 180. During a drag that is every repaint.
+        //
+        // An older server never sends the frame, so against one the mirror
+        // is sized here, as it always was.
+        if !serverResizes {
+            engine.resize(
+                cols: size.cols, rows: size.rows,
+                cellWidth: size.cell.width, cellHeight: size.cell.height)
+        }
         guard let connection else { return }
         try? connection.send(
             .resize, terminal: terminalID,
@@ -301,6 +319,14 @@ final class TerminalController {
     /// is a race a test cannot reliably win -- the pump and `openConnection`
     /// are on the same actor, so which of them runs first is up to the
     /// scheduler.
+    /// The frame, on whatever connection is live — the shape
+    /// `HostConnection.handleForTesting(_:)` has, for tests that are about
+    /// what a frame *does* rather than which socket it came in on.
+    func handleForTesting(_ frame: Frame) {
+        guard let connection else { return }
+        handle(frame, from: connection)
+    }
+
     func handleForTesting(_ frame: Frame, from source: Connection) {
         handle(frame, from: source)
     }
@@ -318,7 +344,8 @@ final class TerminalController {
         guard connection === source else { return }
         switch frame.type {
         case .welcome:
-            break
+            let welcome = try? JSONDecoder().decode(WelcomeBody.self, from: frame.payload)
+            serverResizes = welcome?.resized ?? false
 
         case .snapshotBegin:
             beginSnapshot()
@@ -347,6 +374,18 @@ final class TerminalController {
         case .output:
             // Straight into our VT engine, unmodified. This is the whole point.
             frame.payload.withUnsafeBytes { engine.write($0) }
+
+        case .resized:
+            // In stream order with `output`, which is what makes this the one
+            // right moment: every byte before this frame was written for the
+            // old size and every byte after it for the new. The cell is ours
+            // to add — the server has no font, and the mirror's own size
+            // reports go nowhere anyway.
+            guard let body = try? JSONDecoder().decode(ResizedBody.self, from: frame.payload)
+            else { return }
+            engine.resize(
+                cols: body.cols, rows: body.rows,
+                cellWidth: size.cell.width, cellHeight: size.cell.height)
 
         case .exited:
             let code = (try? JSONDecoder().decode(ExitedBody.self, from: frame.payload))?.code ?? 0

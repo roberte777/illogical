@@ -49,7 +49,7 @@ no parser.
 
 | Type | Name | Payload |
 | --- | --- | --- |
-| `0x01` | `hello` | protocol version, client name, capabilities |
+| `0x01` | `hello` | protocol version, client name, capabilities (`resized`) |
 | `0x02` | `list` | — |
 | `0x03` | `create` | session name (validated — see [Names](#names)), terminal name, argv, env, cwd, initial size |
 | `0x04` | `attach` | size (cols, rows, cell px), scrollback budget |
@@ -66,7 +66,7 @@ no parser.
 
 | Type | Name | Payload |
 | --- | --- | --- |
-| `0x81` | `welcome` | protocol version, and the server's own build |
+| `0x81` | `welcome` | protocol version, the server's own build, capabilities (`resized`) |
 | `0x82` | `session_list` | sessions and their terminals |
 | `0x83` | `created` | new terminal id |
 | `0x84` | `snapshot_begin` | snapshot format version |
@@ -79,6 +79,7 @@ no parser.
 | `0x8b` | `err` | code, message. Code 7, `desync`, means "re-attach" — see below |
 | `0x8c` | `pong` | echoed token |
 | `0x8d` | `screen` | plain-text rendering, in reply to `peek` |
+| `0x8e` | `resized` | cols, rows — the server's terminal changed size *here* in the stream |
 
 `peek` is the automation primitive: it returns what the server's own terminal
 currently shows, as plain text, without attaching. Scripts and agents can read a
@@ -95,6 +96,19 @@ in-band report, or the pixel fields of a `winsize`. Zero means "unknown", which
 is what a client with no metrics of its own sends: the CLI, or a build older
 than the fields. See [ARCHITECTURE.md](ARCHITECTURE.md#terminal-queries) for why
 the report matters — without it Neovim never learns that the window changed.
+
+`resized` is the size half of rule 2. A client's terminal is a replica of the
+server's, and its *size* is part of that state, so the client does not reflow
+its copy when its window changes — it asks (`resize`) and reflows when told.
+The marker is queued through the same path as `output`, under the same lock,
+so it sits at exactly the byte where the server's own terminal changed: every
+byte before it was written for the old size and every byte after for the new.
+A client that reflowed on its own cue would be a size ahead of the bytes it is
+parsing for the length of a round trip, and during a drag that is every
+repaint. Capability-gated both ways: a client says `resized` in `hello` (an
+older one cannot decode the frame type), and a server says it in `welcome` (a
+client talking to an older one keeps sizing itself). See
+[ARCHITECTURE.md](ARCHITECTURE.md#data-flow-resize).
 
 ### `err` codes
 

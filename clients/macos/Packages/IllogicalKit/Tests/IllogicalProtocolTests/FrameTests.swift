@@ -51,6 +51,7 @@ struct FrameHeaderTests {
         #expect(!FrameType.output.isClientToServer)
         #expect(FrameType.renameSession.isClientToServer)
         #expect(FrameType.deleteSession.isClientToServer)
+        #expect(!FrameType.resized.isClientToServer)
     }
 
     // The numbers, not just the names. This file and src/core/protocol.zig are

@@ -97,6 +97,13 @@ pub const FrameType = enum(u8) {
     pong = 0x8c,
     /// Plain-text rendering of the terminal, in reply to `peek`.
     screen = 0x8d,
+    /// The server's terminal changed size, and this is where in the output
+    /// stream it did. Everything before this frame was parsed at the old size
+    /// and everything after it at the new one, so a client that resizes its
+    /// own terminal *here* -- and nowhere else -- stays a replica.
+    ///
+    /// Only sent to a client whose `hello` said `resized`; see `body.Hello`.
+    resized = 0x8e,
 
     pub fn isClientToServer(self: FrameType) bool {
         return @intFromEnum(self) < 0x80;
@@ -170,11 +177,22 @@ pub const body = struct {
     pub const Hello = struct {
         version: u16 = version,
         client: []const u8 = "unknown",
+        /// This client understands `resized` frames and will size its own
+        /// terminal from them rather than from its window. A capability, and
+        /// defaulted off, because a client that does not know the frame type
+        /// fails to decode the header -- so the server must not send one to
+        /// a client that did not ask.
+        resized: bool = false,
     };
 
     pub const Welcome = struct {
         version: u16 = version,
         server: []const u8,
+        /// The server sends `resized` frames to a client that asked for them.
+        /// Defaulted off for the same reason as `Hello.resized`, from the
+        /// other side: a client talking to an older server gets no frames and
+        /// has to keep sizing its own terminal.
+        resized: bool = false,
     };
 
     pub const Create = struct {
@@ -247,6 +265,12 @@ pub const body = struct {
         cell_height: u32 = 0,
     };
 
+    /// Body of `resized`: the size the server's terminal now is.
+    pub const Resized = struct {
+        cols: u16,
+        rows: u16,
+    };
+
     pub const Kill = struct {
         /// Zero means hang up (SIGHUP to the process group), which is what
         /// closing a tab means. SIGTERM would be ignored by an interactive
@@ -295,6 +319,31 @@ pub const body = struct {
         return std.json.parseFromSlice(T, alloc, bytes, .{ .allocate = .alloc_always });
     }
 };
+
+test "resized is a server frame, and both ends of the capability default off" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    try testing.expectEqual(@as(u8, 0x8e), @intFromEnum(FrameType.resized));
+    try testing.expect(!FrameType.resized.isClientToServer());
+
+    // The bodies both peers send when they predate the frame. An old client
+    // must not be sent one, and an old server will not send one -- so both
+    // sides read the missing key as "no".
+    const hello = try body.decode(body.Hello, alloc, "{\"version\":1,\"client\":\"old\"}");
+    defer hello.deinit();
+    try testing.expect(!hello.value.resized);
+    const welcome = try body.decode(body.Welcome, alloc, "{\"version\":1,\"server\":\"old\"}");
+    defer welcome.deinit();
+    try testing.expect(!welcome.value.resized);
+
+    const want: body.Resized = .{ .cols = 132, .rows = 43 };
+    const bytes = try body.encode(alloc, want);
+    defer alloc.free(bytes);
+    const got = try body.decode(body.Resized, alloc, bytes);
+    defer got.deinit();
+    try testing.expectEqual(want, got.value);
+}
 
 test "a resize carries cell metrics, and an older client's omission reads as zero" {
     const testing = std.testing;

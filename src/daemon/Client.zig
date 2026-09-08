@@ -84,6 +84,12 @@ read_mutex: illogical.thread.Mutex = .{},
 /// ever sent and then keeps that memory forever.
 read_payload: std.ArrayList(u8) = .empty,
 
+/// This client's `hello` asked for `resized` frames. Reader-thread only at
+/// the point it is written; read from the terminal's reader thread inside
+/// `onResized`, after the attach that made that possible, which is enough of
+/// a happens-before for a flag that only ever goes from false to true.
+wants_resized: bool = false,
+
 /// The last size this client asked for and we have not applied yet.
 ///
 /// Reader-thread only, so it needs no lock. See `flushPendingResize`.
@@ -338,8 +344,10 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
                 // instead of as the sentence this refusal exists to produce.
                 return error.ProtocolRefused;
             }
+            self.wants_resized = req.value.resized;
             const bytes = try protocol.body.encode(arena, protocol.body.Welcome{
                 .server = illogical.version,
+                .resized = true,
             });
             try self.send(.welcome, protocol.control_session, bytes);
         },
@@ -682,6 +690,7 @@ fn attach(self: *Client, id: session.TerminalId, req: protocol.body.Attach) !voi
         .ctx = self,
         .writeFn = onOutput,
         .exitFn = onExit,
+        .resizeFn = onResized,
     }, &chunker.interface);
     errdefer t.unsubscribe(self);
 
@@ -727,6 +736,21 @@ fn onOutput(ctx: *anyopaque, terminal: session.TerminalId, bytes: []const u8) bo
         else => {},
     };
     return true;
+}
+
+/// The terminal changed size: put the marker in this client's stream, at the
+/// point in it where that happened. Queued through the same path as output,
+/// so it cannot overtake or fall behind a byte of it.
+///
+/// Not sent to a client that did not ask. An older client fails to decode a
+/// frame type it has never heard of, and a resize would take its connection
+/// down -- which is what the capability in `hello` is for.
+fn onResized(ctx: *anyopaque, terminal: session.TerminalId, cols: u16, rows: u16) void {
+    const self: *Client = @ptrCast(@alignCast(ctx));
+    if (!self.wants_resized) return;
+    var buf: [64]u8 = undefined;
+    const body = std.fmt.bufPrint(&buf, "{{\"cols\":{d},\"rows\":{d}}}", .{ cols, rows }) catch return;
+    self.enqueue(.resized, terminal, body, .drop) catch {};
 }
 
 fn onExit(ctx: *anyopaque, terminal: session.TerminalId, code: i32) void {
@@ -1471,6 +1495,59 @@ fn firstErrorCode(gpa: Allocator, bytes: []const u8) !u16 {
     const parsed = try protocol.body.decode(protocol.body.Err, gpa, payload);
     defer parsed.deinit();
     return parsed.value.code;
+}
+
+test "a resized marker reaches only the client that asked for it" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var pair = try SocketPair.open("resized-marker");
+    defer pair.close();
+
+    const server = try Server.init(
+        gpa,
+        threaded.io(),
+        "/tmp/illogical-unused.sock",
+        "/tmp/illogical-unused",
+    );
+    defer server.deinit();
+
+    const client = try Client.create(server, pair.server_end);
+    defer client.destroy();
+
+    // Before any hello, or after one that did not ask: nothing. This is the
+    // client that would fall over on a frame type it cannot decode.
+    onResized(client, 7, 100, 30);
+    try testing.expectEqual(@as(usize, 0), client.queue.items.len);
+
+    const hello = try protocol.body.encode(gpa, protocol.body.Hello{ .resized = true });
+    defer gpa.free(hello);
+    try client.dispatch(.{
+        .type = .hello,
+        .session = protocol.control_session,
+        .len = @intCast(hello.len),
+    }, hello);
+    // The welcome it was answered with says the server will do this.
+    {
+        const header, const payload = try firstFrame(client.queue.items);
+        try testing.expectEqual(protocol.FrameType.welcome, header.type);
+        const welcome = try protocol.body.decode(protocol.body.Welcome, gpa, payload);
+        defer welcome.deinit();
+        try testing.expect(welcome.value.resized);
+    }
+    client.queue.clearRetainingCapacity();
+
+    onResized(client, 7, 100, 30);
+    const header, const payload = try firstFrame(client.queue.items);
+    try testing.expectEqual(protocol.FrameType.resized, header.type);
+    try testing.expectEqual(@as(session.TerminalId, 7), header.session);
+    const body = try protocol.body.decode(protocol.body.Resized, gpa, payload);
+    defer body.deinit();
+    try testing.expectEqual(@as(u16, 100), body.value.cols);
+    try testing.expectEqual(@as(u16, 30), body.value.rows);
 }
 
 test "a run of resizes collapses to the newest, on the first one's deadline" {

@@ -253,6 +253,29 @@ Open: which size to report when attached clients disagree. Provisionally the
 session's configured size, not any client's. The same open question decides
 whose cell is quoted; today it is simply the last one to speak.
 
+## Data flow: resize
+
+1. The window changes. The client sends `resize{cols, rows, cell px}` and
+   **does not touch its own terminal.**
+2. The server coalesces (25ms, ghostty's rule), then under the terminal lock:
+   reflows its VT, writes the mode 2048 report to the PTY, sets the `winsize`
+   (which raises SIGWINCH), and queues `resized{cols, rows}` to every attached
+   client — through the same queue as `output`, so it lands at exactly the
+   byte where the size changed.
+3. The client reflows its terminal when it dequeues `resized`, in stream order
+   with the output around it.
+4. The program repaints for the new size; those bytes are parsed by a client
+   terminal that is already that size.
+
+Step 1 is the one that matters. Ghostty has no step 3 because it has no second
+terminal: the resize sits at one point in one byte stream by construction. A
+client that reflowed on its own cue would be a size ahead of what it is parsing
+for a coalesce window plus a round trip — and during a drag that is every
+repaint, which is what garbled lines and colour flashes on a fast resize were.
+The cost is that the grid lags the window by that same interval, drawn into
+the new frame with background around it: ~30ms on this machine, the SSH round
+trip elsewhere.
+
 ## Data flow: attach
 
 1. Client sends `attach{terminal, cols, rows}`.

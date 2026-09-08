@@ -90,6 +90,14 @@ pub const Subscriber = struct {
     writeFn: *const fn (ctx: *anyopaque, terminal: session.TerminalId, bytes: []const u8) bool,
     /// The child exited.
     exitFn: *const fn (ctx: *anyopaque, terminal: session.TerminalId, code: i32) void,
+    /// The terminal changed size. Called under `mutex` from `resize`, between
+    /// the last fan-out at the old size and the first at the new one -- which
+    /// is the whole reason it exists. A subscriber that resized its own copy
+    /// on any other cue would parse bytes at a size they were not written
+    /// for: a full-screen program's repaint for 200 columns, wrapped into
+    /// 180. Optional, because only a client with a terminal of its own has
+    /// anything to do with it.
+    resizeFn: ?*const fn (ctx: *anyopaque, terminal: session.TerminalId, cols: u16, rows: u16) void = null,
 
     fn write(self: Subscriber, terminal: session.TerminalId, bytes: []const u8) bool {
         return self.writeFn(self.ctx, terminal, bytes);
@@ -754,6 +762,14 @@ pub fn resize(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
     });
     self.cols = cols;
     self.rows = rows;
+    // Under the lock, so it lands in every client's stream exactly where the
+    // size changed: after the last output parsed at the old size, before the
+    // first at the new. The reader thread cannot be fanning out right now --
+    // it needs this same lock to -- and that is what makes the position exact
+    // rather than approximate.
+    for (self.subscribers.items) |s| {
+        if (s.resizeFn) |f| f(s.ctx, self.id, cols, rows);
+    }
 }
 
 /// A grid dimension in pixels, for a `winsize`.
@@ -2295,6 +2311,62 @@ fn waitForScreen(
     }
     return on_timeout;
 }
+
+test "a resize tells every subscriber the new size, and a repeat tells nobody" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    const t = try Terminal.create(gpa, .{
+        .io = threaded.io(),
+        .store = .{ .root = "/tmp/illogical-unused" },
+        .id = 1,
+        .session_id = 1,
+        .name = "resized",
+        .argv = &.{ "/bin/sh", "-c", "sleep 10" },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    defer t.hangup();
+    try t.start();
+
+    var seen = Resizes{};
+    try t.subscribe(seen.subscriber());
+
+    try t.resize(100, 30, .{});
+    try testing.expectEqual(@as(usize, 1), seen.n);
+    try testing.expectEqual(@as(u16, 100), seen.cols);
+    try testing.expectEqual(@as(u16, 30), seen.rows);
+
+    // The same size again is not a change, and a client told about one would
+    // reflow its terminal for nothing.
+    try t.resize(100, 30, .{});
+    try testing.expectEqual(@as(usize, 1), seen.n);
+}
+
+/// A subscriber that remembers the last size it was told and how often.
+const Resizes = struct {
+    n: usize = 0,
+    cols: u16 = 0,
+    rows: u16 = 0,
+
+    fn subscriber(self: *Resizes) Subscriber {
+        return .{ .ctx = self, .writeFn = write, .exitFn = exited, .resizeFn = resized };
+    }
+    fn write(_: *anyopaque, _: session.TerminalId, _: []const u8) bool {
+        return true;
+    }
+    fn exited(_: *anyopaque, _: session.TerminalId, _: i32) void {}
+    fn resized(ctx: *anyopaque, _: session.TerminalId, cols: u16, rows: u16) void {
+        const self: *Resizes = @ptrCast(@alignCast(ctx));
+        self.n += 1;
+        self.cols = cols;
+        self.rows = rows;
+    }
+};
 
 test "xtversion reports illogical, not the library underneath" {
     try std.testing.expectEqualStrings(

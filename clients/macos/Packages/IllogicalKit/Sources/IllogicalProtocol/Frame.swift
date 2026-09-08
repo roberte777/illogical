@@ -53,6 +53,12 @@ public enum FrameType: UInt8, Sendable {
     case error = 0x8B
     case pong = 0x8C
     case screen = 0x8D
+    /// The server's terminal changed size, and this is where in the output
+    /// stream it did: everything before was parsed at the old size, everything
+    /// after at the new. A client that resizes its own terminal here — and
+    /// nowhere else — stays a replica. Only sent to a client whose `hello`
+    /// asked; see ``HelloBody/resized``.
+    case resized = 0x8E
 
     public var isClientToServer: Bool { rawValue < 0x80 }
 }

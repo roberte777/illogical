@@ -266,12 +266,32 @@ final class ManagedAtomicFlag: @unchecked Sendable {
 public struct HelloBody: Codable, Sendable {
     public var version: UInt16 = Protocol.version
     public var client: String
-    public init(client: String) { self.client = client }
+    /// This client understands ``FrameType/resized`` and will size its
+    /// terminal from those frames rather than from its window. A capability
+    /// rather than an assumption, because a client that has never heard of
+    /// the frame type fails to decode its header — so the server must not
+    /// send one to a client that did not ask.
+    public var resized: Bool
+    public init(client: String, resized: Bool = false) {
+        self.client = client
+        self.resized = resized
+    }
 }
 
 public struct WelcomeBody: Codable, Sendable {
     public var version: UInt16
     public var server: String
+    /// The server will send ``FrameType/resized`` to a client that asked.
+    /// Optional on the wire: a server from before the frame existed sends no
+    /// such key, and a client talking to one has to keep sizing its own
+    /// terminal from its window, as it always did.
+    public var resized: Bool?
+}
+
+/// Body of ``FrameType/resized``: the size the server's terminal now is.
+public struct ResizedBody: Codable, Sendable {
+    public var cols: UInt16
+    public var rows: UInt16
 }
 
 public struct CreateBody: Codable, Sendable {

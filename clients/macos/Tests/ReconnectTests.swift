@@ -785,6 +785,44 @@ final class ReconnectTests: XCTestCase {
         XCTAssertEqual(launcher.callCount, 0, "a refusal was mistaken for nothing listening")
     }
 
+    /// The mirror is a replica, and its size is part of the state it
+    /// replicates — so once the server says it sends `resized`, the window
+    /// stops sizing the mirror and the stream does. Before that (an older
+    /// server, or a welcome not yet in) the window does, as it always did.
+    ///
+    /// The point of the ordering is what a fast drag looked like without it:
+    /// the mirror a size ahead of the bytes it was parsing, so a full-screen
+    /// program's repaint for 200 columns wrapped into 180.
+    func testTheServerSizesTheMirrorOnceItSaysItWill() async throws {
+        let server = try HangUpServer(mode: .errorThenHold)
+        defer { server.stop() }
+
+        let controller = try TerminalController(
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
+        defer { controller.disconnect() }
+        controller.connect(.test(cols: 80, rows: 24))
+        try await waitFor("the pane to attach") { server.accepted == 1 }
+
+        // No welcome yet: an older server, for all the client knows.
+        controller.resize(.test(cols: 100, rows: 30))
+        XCTAssertEqual(
+            controller.engine.cols, 100, "without the capability the window sizes the mirror")
+
+        controller.handleForTesting(
+            Frame(
+                type: .welcome, terminal: Protocol.controlSession,
+                payload: Data(#"{"version":1,"server":"x","resized":true}"#.utf8)))
+        controller.resize(.test(cols: 120, rows: 40))
+        XCTAssertEqual(
+            controller.engine.cols, 100,
+            "the window sized the mirror on a server that said it would")
+
+        controller.handleForTesting(
+            Frame(type: .resized, terminal: 1, payload: Data(#"{"cols":120,"rows":40}"#.utf8)))
+        XCTAssertEqual(controller.engine.cols, 120)
+        XCTAssertEqual(controller.engine.rows, 40)
+    }
+
 }
 
 /// A `DaemonLauncher` that starts nothing, and remembers being asked.

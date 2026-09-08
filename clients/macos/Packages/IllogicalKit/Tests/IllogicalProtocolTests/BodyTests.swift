@@ -41,6 +41,31 @@ struct BodyTests {
         #expect(careful["only_if_empty"] as? Bool == true)
     }
 
+    @Test("hello asks for resized by name, and an old server's welcome says nothing")
+    func resizedCapability() throws {
+        // The key the daemon reads; a client that sends it is one that can
+        // decode the frame, which is the only client the daemon may send it to.
+        let hello = try keyedJSON(HelloBody(client: "test", resized: true))
+        #expect(hello["resized"] as? Bool == true)
+        let quiet = try keyedJSON(HelloBody(client: "test"))
+        #expect(quiet["resized"] as? Bool == false)
+
+        // A welcome from before the frame existed. It must decode, and it
+        // must read as "no": against that server the client sizes its own
+        // terminal, as it always did.
+        let old = try JSONDecoder().decode(
+            WelcomeBody.self, from: Data(#"{"version":1,"server":"old"}"#.utf8))
+        #expect(old.resized == nil)
+        let new = try JSONDecoder().decode(
+            WelcomeBody.self, from: Data(#"{"version":1,"server":"new","resized":true}"#.utf8))
+        #expect(new.resized == true)
+
+        let resized = try JSONDecoder().decode(
+            ResizedBody.self, from: Data(#"{"cols":132,"rows":43}"#.utf8))
+        #expect(resized.cols == 132)
+        #expect(resized.rows == 43)
+    }
+
     @Test("both bodies round trip")
     func roundTrip() throws {
         let encoder = JSONEncoder()
