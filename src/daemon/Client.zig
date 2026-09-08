@@ -321,7 +321,10 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
             defer req.deinit();
             const t = self.server.terminal(header.session) orelse
                 return self.sendError(header.session, .no_such_session, "no such terminal");
-            try t.resize(req.value.cols, req.value.rows);
+            try t.resize(req.value.cols, req.value.rows, .{
+                .width = req.value.cell_width,
+                .height = req.value.cell_height,
+            });
         },
 
         .kill => {
@@ -559,7 +562,10 @@ fn attach(self: *Client, id: session.TerminalId, req: protocol.body.Attach) !voi
     const t = self.server.terminal(id) orelse
         return self.sendError(id, .no_such_session, "no such terminal");
 
-    if (req.cols > 0 and req.rows > 0) try t.resize(req.cols, req.rows);
+    if (req.cols > 0 and req.rows > 0) try t.resize(req.cols, req.rows, .{
+        .width = req.cell_width,
+        .height = req.cell_height,
+    });
 
     const begin = try protocol.body.encode(self.gpa, protocol.body.SnapshotBegin{});
     defer self.gpa.free(begin);

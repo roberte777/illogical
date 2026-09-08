@@ -32,6 +32,8 @@ pub fn run(conn: *Conn, gpa: Allocator, io: std.Io, args: []const []const u8) !v
     try conn.sendJson(.attach, id, protocol.body.Attach{
         .cols = size.cols,
         .rows = size.rows,
+        .cell_width = size.cell_width,
+        .cell_height = size.cell_height,
     });
 
     // A pipe has no termios to put in raw mode, and that is not a reason to
@@ -118,12 +120,27 @@ fn feedInput(conn: *Conn, id: u64) void {
     }
 }
 
-const Size = struct { cols: u16, rows: u16 };
+const Size = struct {
+    cols: u16,
+    rows: u16,
+    /// One cell in pixels, or zero where the terminal above us did not say.
+    cell_width: u32 = 0,
+    cell_height: u32 = 0,
+};
 
 fn terminalSize() Size {
     var ws: c.struct_winsize = undefined;
     if (c.ioctl(sys.STDOUT, c.TIOCGWINSZ, &ws) == 0 and ws.ws_col > 0) {
-        return .{ .cols = ws.ws_col, .rows = ws.ws_row };
+        return .{
+            .cols = ws.ws_col,
+            .rows = ws.ws_row,
+            // Divided out rather than asked for: a `winsize` carries the text
+            // area, not the cell. Most terminals leave the pixel fields at
+            // zero -- and zero divided by a column count is zero, which is
+            // exactly the "unknown" the server wants for them.
+            .cell_width = @as(u32, ws.ws_xpixel) / ws.ws_col,
+            .cell_height = if (ws.ws_row > 0) @as(u32, ws.ws_ypixel) / ws.ws_row else 0,
+        };
     }
     return .{ .cols = 80, .rows = 24 };
 }

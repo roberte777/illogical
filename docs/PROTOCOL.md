@@ -52,7 +52,7 @@ no parser.
 | `0x01` | `hello` | protocol version, client name, capabilities |
 | `0x02` | `list` | — |
 | `0x03` | `create` | session name (validated — see [Names](#names)), terminal name, argv, env, cwd, initial size |
-| `0x04` | `attach` | size, scrollback budget |
+| `0x04` | `attach` | size (cols, rows, cell px), scrollback budget |
 | `0x05` | `detach` | — |
 | `0x06` | `kill` | signal |
 | `0x07` | `input` | raw bytes for the PTY |
@@ -87,6 +87,14 @@ terminal without pretending to be a client — the same idea as
 
 `input` and `output` payloads are opaque. The server never inspects `input`
 beyond forwarding it, and never rewrites `output`.
+
+`resize` and `attach` both carry the client's **cell size in device pixels**,
+and both default it to zero. The server has no font, so those are the only
+numbers it can give a program that asks for its size in pixels — DEC mode 2048's
+in-band report, or the pixel fields of a `winsize`. Zero means "unknown", which
+is what a client with no metrics of its own sends: the CLI, or a build older
+than the fields. See [ARCHITECTURE.md](ARCHITECTURE.md#terminal-queries) for why
+the report matters — without it Neovim never learns that the window changed.
 
 ### `err` codes
 

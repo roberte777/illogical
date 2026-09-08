@@ -343,18 +343,52 @@ public struct SessionListBody: Codable, Sendable {
 public struct AttachBody: Codable, Sendable {
     public var cols: UInt16
     public var rows: UInt16
-    public init(cols: UInt16, rows: UInt16) {
+    /// One cell, in device pixels. See ``ResizeBody``.
+    public var cellWidth: UInt32
+    public var cellHeight: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case cols
+        case rows
+        case cellWidth = "cell_width"
+        case cellHeight = "cell_height"
+    }
+
+    public init(cols: UInt16, rows: UInt16, cellWidth: UInt32 = 0, cellHeight: UInt32 = 0) {
         self.cols = cols
         self.rows = rows
+        self.cellWidth = cellWidth
+        self.cellHeight = cellHeight
     }
 }
 
 public struct ResizeBody: Codable, Sendable {
     public var cols: UInt16
     public var rows: UInt16
-    public init(cols: UInt16, rows: UInt16) {
+    /// One cell, in device pixels.
+    ///
+    /// The grid is not the whole size. A program that asked for DEC mode 2048
+    /// is told the text area in pixels as well as in cells, and so is the
+    /// `winsize` — and the server has neither a font nor a display to measure
+    /// one with. Only this side knows.
+    ///
+    /// Defaulted to zero, which is what the spec reserves for "unknown" and
+    /// what an older client sends by sending nothing.
+    public var cellWidth: UInt32
+    public var cellHeight: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case cols
+        case rows
+        case cellWidth = "cell_width"
+        case cellHeight = "cell_height"
+    }
+
+    public init(cols: UInt16, rows: UInt16, cellWidth: UInt32 = 0, cellHeight: UInt32 = 0) {
         self.cols = cols
         self.rows = rows
+        self.cellWidth = cellWidth
+        self.cellHeight = cellHeight
     }
 }
 

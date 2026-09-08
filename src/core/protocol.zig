@@ -224,11 +224,27 @@ pub const body = struct {
     pub const Attach = struct {
         cols: u16 = 80,
         rows: u16 = 24,
+        /// One cell, in device pixels. See `Resize`.
+        cell_width: u32 = 0,
+        cell_height: u32 = 0,
     };
 
     pub const Resize = struct {
         cols: u16,
         rows: u16,
+        /// One cell, in device pixels.
+        ///
+        /// Carried because a grid is not the whole size: a mode 2048 in-band
+        /// size report quotes the text area in pixels as well as in cells, and
+        /// so does a `winsize`. Only the client knows how big a cell is -- the
+        /// server has no font and no display.
+        ///
+        /// Defaulted, so a client with no metrics of its own still resizes:
+        /// the CLI attaching from a real terminal, or a build older than this
+        /// field. Zero is what those two reported before it existed, and it is
+        /// the value the spec reserves for "unknown".
+        cell_width: u32 = 0,
+        cell_height: u32 = 0,
     };
 
     pub const Kill = struct {
@@ -279,6 +295,36 @@ pub const body = struct {
         return std.json.parseFromSlice(T, alloc, bytes, .{ .allocate = .alloc_always });
     }
 };
+
+test "a resize carries cell metrics, and an older client's omission reads as zero" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const want: body.Resize = .{
+        .cols = 100,
+        .rows = 30,
+        .cell_width = 8,
+        .cell_height = 16,
+    };
+    const bytes = try body.encode(alloc, want);
+    defer alloc.free(bytes);
+    const got = try body.decode(body.Resize, alloc, bytes);
+    defer got.deinit();
+    try testing.expectEqual(want, got.value);
+
+    // The compatibility half, and the reason the fields are defaulted: a build
+    // from before they existed sends a body with two keys in it, and that has
+    // to keep resizing rather than fail to parse. Zero is "unknown", which is
+    // what such a client is.
+    const old = try body.decode(body.Resize, alloc, "{\"cols\":100,\"rows\":30}");
+    defer old.deinit();
+    try testing.expectEqual(@as(u32, 0), old.value.cell_width);
+    try testing.expectEqual(@as(u32, 0), old.value.cell_height);
+
+    const old_attach = try body.decode(body.Attach, alloc, "{\"cols\":80,\"rows\":24}");
+    defer old_attach.deinit();
+    try testing.expectEqual(@as(u32, 0), old_attach.value.cell_width);
+}
 
 test "control bodies round trip through json" {
     const testing = std.testing;

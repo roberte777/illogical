@@ -906,13 +906,13 @@ final class HostConnection: Identifiable {
 
     /// The controller for a terminal on this host, creating and attaching one
     /// if needed.
-    func controller(for id: UInt64, cols: UInt16, rows: UInt16) -> TerminalController? {
+    func controller(for id: UInt64, size: SurfaceSize) -> TerminalController? {
         if let existing = controllers[id] { return existing }
         guard
             let controller = try? TerminalController(
-                terminalID: id, host: host, cols: cols, rows: rows)
+                terminalID: id, host: host, size: size)
         else { return nil }
-        controller.connect(cols: cols, rows: rows)
+        controller.connect(size)
         controllers[id] = controller
         return controller
     }
@@ -923,7 +923,7 @@ final class HostConnection: Identifiable {
     }
 
     /// The controller for a terminal, if one is open. Read-only, for views:
-    /// `controller(for:cols:rows:)` would attach one as a side effect of being
+    /// `controller(for:size:)` would attach one as a side effect of being
     /// looked at.
     func existingController(_ id: UInt64) -> TerminalController? {
         controllers[id]

@@ -218,8 +218,25 @@ needs that split because its client is a passthrough TTY. Ours is a real termina
 emulator that is not in the byte path back to the PTY, so letting clients answer
 would race them against each other and produce duplicate replies.
 
+**A resize is a reply too.** Not every program learns its size from the kernel.
+DEC mode 2048 asks the terminal to *push* one — `CSI 48 ; rows ; cols ; height ;
+width t` on every change — and Neovim, which asks for it, stops handling
+`SIGWINCH` once it is on. So a terminal that resizes the PTY and says nothing in
+band leaves Neovim painting the grid it started with: shrink the window and the
+screen is chopped, grow it again and the chop stays. `Terminal.resize` therefore
+goes through the stream handler rather than resizing the VT directly, which is
+what puts the report on the PTY beside the signal.
+
+That report quotes a text area in *pixels*, and the server has no font. So the
+cell travels on the wire — `resize` and `attach` both carry `cell_width` and
+`cell_height` in device pixels — and the daemon quotes back whatever the client
+that last sized the terminal said. Zero until one does, which is the value the
+spec reserves for "unknown" and the honest answer for a client with no metrics
+of its own (the CLI, or a build older than the field).
+
 Open: which size to report when attached clients disagree. Provisionally the
-session's configured size, not any client's.
+session's configured size, not any client's. The same open question decides
+whose cell is quoted; today it is simply the last one to speak.
 
 ## Data flow: attach
 

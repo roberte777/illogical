@@ -73,10 +73,9 @@ final class TerminalController {
     private var historyTask: Task<Void, Never>?
     private var historyToken: HistoryToken?
 
-    /// The grid the surface last asked for, so a reconnect attaches at the
+    /// The geometry the surface last asked for, so a reconnect attaches at the
     /// size the window is now rather than the size it was when it opened.
-    private var cols: UInt16
-    private var rows: UInt16
+    private var size: SurfaceSize
     /// The retry in flight, and how far into the backoff we are.
     private var retry: Task<Void, Never>?
     private var backoff = Backoff()
@@ -102,12 +101,11 @@ final class TerminalController {
     private var attachInterval: OSSignpostIntervalState?
     private var snapshotBytes = 0
 
-    init(terminalID: UInt64, host: ServerHost, cols: UInt16, rows: UInt16) throws {
+    init(terminalID: UInt64, host: ServerHost, size: SurfaceSize) throws {
         self.terminalID = terminalID
         self.host = host
-        self.cols = cols
-        self.rows = rows
-        let engine = try TerminalEngine(cols: cols, rows: rows)
+        self.size = size
+        let engine = try TerminalEngine(cols: size.cols, rows: size.rows)
         self.engine = engine
         self.search = SearchSession(engine: engine)
     }
@@ -120,9 +118,8 @@ final class TerminalController {
     ///
     /// Which machine that is does not appear below this line: a remote host is
     /// `ssh <dest> illogicald --stdio` and the frames on it are the same ones.
-    func connect(cols: UInt16, rows: UInt16) {
-        self.cols = cols
-        self.rows = rows
+    func connect(_ size: SurfaceSize) {
+        self.size = size
         openConnection()
     }
 
@@ -154,7 +151,10 @@ final class TerminalController {
 
             try connection.send(.hello, json: HelloBody(client: "Illogical.app"))
             try connection.send(
-                .attach, terminal: terminalID, json: AttachBody(cols: cols, rows: rows))
+                .attach, terminal: terminalID,
+                json: AttachBody(
+                    cols: size.cols, rows: size.rows,
+                    cellWidth: size.cell.width, cellHeight: size.cell.height))
             state = .attaching
             attachSentAt = Date()
             attachInterval = Signposts.attach.beginInterval("attach")
@@ -199,7 +199,9 @@ final class TerminalController {
         do {
             try connection.send(
                 .attach, terminal: terminalID,
-                json: AttachBody(cols: engine.cols, rows: engine.rows))
+                json: AttachBody(
+                    cols: engine.cols, rows: engine.rows,
+                    cellWidth: size.cell.width, cellHeight: size.cell.height))
         } catch {
             state = .failed("\(error)")
         }
@@ -210,22 +212,26 @@ final class TerminalController {
         try? connection.send(.input, terminal: terminalID, payload: Data(bytes))
     }
 
-    func resize(cols: UInt16, rows: UInt16) {
-        guard cols > 0, rows > 0 else { return }
+    func resize(_ size: SurfaceSize) {
+        guard size.cols > 0, size.rows > 0 else { return }
         // Nothing to tell anyone. The server drops a resize to the size it is
         // already at, and reflowing the mirror for one would be work for no
         // change — so a caller that cannot know whether this is news (the
         // attach path, which resizes a controller it may have just connected at
         // this very size) may say it unconditionally.
-        guard cols != self.cols || rows != self.rows else { return }
+        guard size != self.size else { return }
         // Remembered even while disconnected, so a window resized during an
         // outage reattaches at the size it is now rather than the size it was.
-        self.cols = cols
-        self.rows = rows
-        engine.resize(cols: cols, rows: rows, cellWidth: 0, cellHeight: 0)
+        self.size = size
+        engine.resize(
+            cols: size.cols, rows: size.rows,
+            cellWidth: size.cell.width, cellHeight: size.cell.height)
         guard let connection else { return }
         try? connection.send(
-            .resize, terminal: terminalID, json: ResizeBody(cols: cols, rows: rows))
+            .resize, terminal: terminalID,
+            json: ResizeBody(
+                cols: size.cols, rows: size.rows,
+                cellWidth: size.cell.width, cellHeight: size.cell.height))
     }
 
     func disconnect() {

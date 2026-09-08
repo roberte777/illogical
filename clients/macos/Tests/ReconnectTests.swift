@@ -72,9 +72,9 @@ final class ReconnectTests: XCTestCase {
         defer { server.stop() }
 
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: server.path), cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
         defer { controller.disconnect() }
-        controller.connect(cols: 80, rows: 24)
+        controller.connect(.test(cols: 80, rows: 24))
 
         try await waitFor("the first reconnect") { controller.state.isReconnecting }
 
@@ -94,8 +94,8 @@ final class ReconnectTests: XCTestCase {
         defer { server.stop() }
 
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: server.path), cols: 80, rows: 24)
-        controller.connect(cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
+        controller.connect(.test(cols: 80, rows: 24))
         try await waitFor("the first reconnect") { controller.state.isReconnecting }
 
         controller.disconnect()
@@ -110,9 +110,9 @@ final class ReconnectTests: XCTestCase {
         let path = "/tmp/illogical-absent-\(getpid()).sock"
         unlink(path)
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: path), cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: path), size: .test(cols: 80, rows: 24))
         defer { controller.disconnect() }
-        controller.connect(cols: 80, rows: 24)
+        controller.connect(.test(cols: 80, rows: 24))
 
         try await waitFor("a reconnect rather than a failure") {
             controller.state.isReconnecting
@@ -126,14 +126,38 @@ final class ReconnectTests: XCTestCase {
         defer { server.stop() }
 
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: server.path), cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
         defer { controller.disconnect() }
-        controller.connect(cols: 80, rows: 24)
+        controller.connect(.test(cols: 80, rows: 24))
         try await waitFor("the first reconnect") { controller.state.isReconnecting }
 
-        controller.resize(cols: 120, rows: 40)
+        controller.resize(.test(cols: 120, rows: 40))
         try await waitFor("an attach at the new size") {
-            server.lastAttach == AttachSize(cols: 120, rows: 40)
+            server.lastAttach
+                == AttachSize(cols: 120, rows: 40, cellWidth: 16, cellHeight: 38)
+        }
+    }
+
+    /// The cell travels with the grid, and a reattach carries it too.
+    ///
+    /// Not a detail: the server has no font, so what it tells a program that
+    /// asked for its size in pixels — DEC mode 2048, or `ws_xpixel` — is
+    /// whatever the last client said a cell was. Send zeros and Neovim is told
+    /// the terminal is zero pixels wide.
+    func testAnAttachCarriesTheCellItMeasuredWith() async throws {
+        let server = try HangUpServer()
+        defer { server.stop() }
+
+        let controller = try TerminalController(
+            terminalID: 1, host: .local(socketPath: server.path),
+            size: SurfaceSize(cols: 80, rows: 24, cell: CellSize(width: 9, height: 19)))
+        defer { controller.disconnect() }
+        controller.connect(
+            SurfaceSize(cols: 80, rows: 24, cell: CellSize(width: 9, height: 19)))
+
+        try await waitFor("an attach carrying the cell") {
+            server.lastAttach
+                == AttachSize(cols: 80, rows: 24, cellWidth: 9, cellHeight: 19)
         }
     }
 
@@ -189,9 +213,9 @@ final class ReconnectTests: XCTestCase {
         defer { server.stop() }
 
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: server.path), cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
         defer { controller.disconnect() }
-        controller.connect(cols: 80, rows: 24)
+        controller.connect(.test(cols: 80, rows: 24))
         try await waitFor("the pane to fail with its socket still up") {
             if case .failed = controller.state { return true }
             return false
@@ -359,9 +383,9 @@ final class ReconnectTests: XCTestCase {
         defer { server.stop() }
 
         let controller = try TerminalController(
-            terminalID: 1, host: .local(socketPath: server.path), cols: 80, rows: 24)
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
         defer { controller.disconnect() }
-        controller.connect(cols: 80, rows: 24)
+        controller.connect(.test(cols: 80, rows: 24))
         try await waitFor("the pane to attach") { server.accepted == 1 }
 
         // A second, unstarted connection stands in for the superseded one: what
@@ -847,6 +871,12 @@ final class RecordingLauncher: DaemonLauncher, @unchecked Sendable {
 struct AttachSize: Equatable, Sendable {
     var cols: UInt16
     var rows: UInt16
+    /// The cell the client measured that grid with. Zero from a client that
+    /// has no font of its own; the server quotes it back to any program that
+    /// asked for a size in pixels, so a test that ignored it would not notice
+    /// the whole thing going out at zero.
+    var cellWidth: UInt32 = 0
+    var cellHeight: UInt32 = 0
 }
 
 /// A unix socket that accepts a connection, reads whatever the client sends,
@@ -1079,7 +1109,10 @@ final class HangUpServer: @unchecked Sendable {
             if header.type == .attach,
                 let body = try? JSONDecoder().decode(AttachBody.self, from: payload)
             {
-                state.record(attach: AttachSize(cols: body.cols, rows: body.rows))
+                state.record(
+                    attach: AttachSize(
+                        cols: body.cols, rows: body.rows,
+                        cellWidth: body.cellWidth, cellHeight: body.cellHeight))
             }
         }
         return true

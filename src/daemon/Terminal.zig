@@ -143,6 +143,11 @@ compression_activity: u64 = 0,
 compression_idle_since_ns: u64 = 0,
 cols: u16,
 rows: u16,
+/// One cell in device pixels, as the client that last sized this terminal
+/// measures it. Zero when nobody has said -- the CLI has no font, and neither
+/// does a build older than the field on the wire.
+cell_width: u32 = 0,
+cell_height: u32 = 0,
 residency: session.Residency = .live,
 exit_code: ?i32 = null,
 /// Monotonic timestamp of the last PTY *read*. This — not general activity —
@@ -702,14 +707,65 @@ pub fn writeInput(self: *Terminal, bytes: []const u8) !void {
     try sys.writeAll(self.pty_pair.master, bytes);
 }
 
-pub fn resize(self: *Terminal, cols: u16, rows: u16) !void {
+/// One cell in device pixels, as a client measures it.
+pub const CellSize = struct {
+    width: u32 = 0,
+    height: u32 = 0,
+};
+
+/// Resize the terminal, the PTY, and every program that asked to be told.
+///
+/// Three notifications, not one, and a terminal that sends only the first two
+/// is the bug this signature exists to fix. `TIOCSWINSZ` makes the kernel
+/// raise SIGWINCH on the foreground process group -- which is how a shell
+/// learns -- but Neovim (0.10 and later) asks for DEC mode 2048, in-band size
+/// reports, and *stops handling SIGWINCH once it is on*. It then waits for a
+/// `CSI 48 ; rows ; cols ; height ; width t` that only the terminal can send.
+///
+/// So the VT resize goes through the stream handler rather than through
+/// `Terminal.resize` directly: same reflow, plus the mode 2048 report when the
+/// child has enabled it. Without it Neovim never learns of a resize at all --
+/// it keeps painting the grid it started with, which a shrinking window chops
+/// and a growing one never restores. libghostty-vt documents the difference on
+/// `Handler.resize`; the raw call has no way to reach `write_pty`.
+pub fn resize(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
     self.mutex.lock();
     defer self.mutex.unlock();
+    // Remembered whichever way the early return below goes: these are the
+    // numbers `sizeEffect` quotes, and a client whose cell changed while its
+    // grid did not -- a window dragged onto a display of another scale -- has
+    // still told us something we did not know.
+    self.cell_width = cell.width;
+    self.cell_height = cell.height;
     if (cols == self.cols and rows == self.rows) return;
-    if (self.vt) |*vt| try vt.resize(self.gpa, .{ .cols = cols, .rows = rows });
-    try self.pty_pair.setSize(.{ .cols = cols, .rows = rows });
+    if (self.stream) |*stream| try stream.handler.resize(.{
+        .cols = cols,
+        .rows = rows,
+        // Non-null or the handler returns before writing anything: a report
+        // needs complete pixel geometry, and "we do not know" is spelled zero
+        // rather than absent. See `sizeEffect`.
+        .cell_size_px = .{ .width = cell.width, .height = cell.height },
+    });
+    try self.pty_pair.setSize(.{
+        .cols = cols,
+        .rows = rows,
+        .width_px = pixels(cols, cell.width),
+        .height_px = pixels(rows, cell.height),
+    });
     self.cols = cols;
     self.rows = rows;
+}
+
+/// A grid dimension in pixels, for a `winsize`.
+///
+/// Saturating, because the field is a `u16` and the product of two client-
+/// supplied numbers is not: a client claiming a 200-pixel cell across 400
+/// columns would otherwise wrap to a small number, which is worse than the
+/// clamp. Zero cells give zero, which is what the field meant before any
+/// client sent metrics.
+fn pixels(cells: u16, cell_px: u32) u16 {
+    const total = @as(u32, cells) * cell_px;
+    return @intCast(@min(total, std.math.maxInt(u16)));
 }
 
 /// Encode a complete snapshot of this terminal to `writer`.
@@ -1167,7 +1223,9 @@ fn fromHandler(h: *ghostty.TerminalStream.Handler) *Terminal {
 
 fn writePtyEffect(h: *ghostty.TerminalStream.Handler, data: []const u8) void {
     const self = fromHandler(h);
-    // We already hold `mutex` here: this runs inside `stream.nextSlice`.
+    // We already hold `mutex` here: every caller does. This runs inside
+    // `stream.nextSlice` for a query the child asked, and inside `resize` for
+    // the mode 2048 report it did not.
     sys.writeAll(self.pty_pair.master, data) catch |err| {
         log.warn("failed writing query response to pty: {t}", .{err});
     };
@@ -1223,10 +1281,14 @@ fn sizeEffect(h: *ghostty.TerminalStream.Handler) ?ghostty.size_report.Size {
     return .{
         .rows = self.rows,
         .columns = self.cols,
-        // We do not know the client's font metrics, and clients may disagree.
-        // Reporting zero is the honest answer for a headless server.
-        .cell_width = 0,
-        .cell_height = 0,
+        // Whatever the client that last sized this terminal said a cell was.
+        // The server has no font of its own, and two clients on one terminal
+        // may well disagree -- so this is a quote, not a measurement, and it
+        // is zero until somebody has made one. Zero is also what the spec
+        // reserves for "unknown", which is the honest answer for a headless
+        // server nobody has told yet.
+        .cell_width = self.cell_width,
+        .cell_height = self.cell_height,
     };
 }
 
@@ -2147,6 +2209,91 @@ test "a device attributes query is answered back through the pty" {
         if (std.mem.indexOf(u8, text, "DA1<033[?62;22c>") != null) break;
         sys.sleepNs(10 * std.time.ns_per_ms);
     } else return error.DeviceAttributesNeverAnswered;
+}
+
+test "a resize under mode 2048 is reported in band as well as by signal" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    // The regression, at the layer it lives in. A shell learns about a resize
+    // from SIGWINCH, so `TIOCSWINSZ` alone looked like it worked -- but Neovim
+    // asks for DEC mode 2048 and then stops handling SIGWINCH, so a terminal
+    // that resizes the pty and says nothing in band freezes it at the size it
+    // started with. Everything below is the child's side of that contract.
+    //
+    // `ARMED` is a handshake, not decoration: the test may only resize once
+    // mode 2048 is actually on, or the resize writes nothing and the `dd`
+    // below waits for bytes that never come.
+    //
+    // 35 bytes is both reports, and their exact lengths are the assertion.
+    // Enabling the mode answers with one at the size the terminal already is
+    // (80x24, and a cell of zero because no client has said otherwise); the
+    // resize answers with the second.
+    const script =
+        \\stty raw -echo
+        \\printf '\033[?2048h'
+        \\printf 'ARMED'
+        \\R=$(dd bs=1 count=35 2>/dev/null | od -An -c | tr -d ' \n')
+        \\printf 'SIZE<%s>' "$R"
+        \\sleep 10
+    ;
+    const t = try Terminal.create(gpa, .{
+        .io = threaded.io(),
+        .store = .{ .root = "/tmp/illogical-unused" },
+        .id = 1,
+        .session_id = 1,
+        .name = "inband",
+        .argv = &.{ "/bin/sh", "-c", script },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    // For the reason the device attributes test gives: this child blocks in
+    // `dd` forever when the terminal says nothing, and SIGHUP is what turns
+    // that hang into a five-second failure.
+    defer t.hangup();
+    try t.start();
+
+    try waitForScreen(gpa, t, "ARMED", error.ModeNeverEnabled);
+    try t.resize(100, 30, .{ .width = 8, .height = 16 });
+
+    // `\x1b[48;{rows};{cols};{height_px};{width_px}t`, twice, as `od -An -c`
+    // spells it. The pixels are the cell multiplied out: 30 rows of 16 is 480,
+    // 100 columns of 8 is 800 -- which is the whole reason the cell size
+    // travels on the wire at all.
+    try waitForScreen(
+        gpa,
+        t,
+        "SIZE<033[48;24;80;0;0t033[48;30;100;480;800t>",
+        error.ResizeNeverReportedInBand,
+    );
+}
+
+/// Poll the terminal's own screen until `needle` is on it.
+///
+/// The child writes its answers where `plainText` can see them rather than
+/// back to the test, because there is no back channel: the daemon owns the pty
+/// and a test holds a terminal, not a client.
+fn waitForScreen(
+    gpa: std.mem.Allocator,
+    t: *Terminal,
+    needle: []const u8,
+    on_timeout: anyerror,
+) !void {
+    var waited: usize = 0;
+    while (waited < 5000) : (waited += 10) {
+        const text = t.plainText(gpa) catch {
+            sys.sleepNs(10 * std.time.ns_per_ms);
+            continue;
+        };
+        defer gpa.free(text);
+        if (std.mem.indexOf(u8, text, needle) != null) return;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    }
+    return on_timeout;
 }
 
 test "xtversion reports illogical, not the library underneath" {
