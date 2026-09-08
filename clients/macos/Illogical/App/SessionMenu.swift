@@ -2,7 +2,7 @@
 //  The session dropdown, matched to Superlogical's.
 //
 //      ┌────────────────────────────────┐
-//      │ ⊜  Filter or create...         │  capsule field, 17pt
+//      │ ⊜  Filter or create...         │  capsule field, 22pt
 //      │                                │
 //      │ ✓   Demo                       │  22pt row, ✓ in the icon column
 //      │ ─────────────────────────────  │
@@ -43,7 +43,11 @@ enum MenuMetrics {
     static let iconToTitle: CGFloat = 9
     static let cornerRadius: CGFloat = 10
     static let rowCornerRadius: CGFloat = 7
-    static let fieldHeight: CGFloat = 17
+    /// The same height as a row, rather than the 17pt the reference measured.
+    /// At 17 a 13pt field had two points of air above and below the text and
+    /// read as squished; matching `rowHeight` gives the field and the rows
+    /// under it one vertical rhythm.
+    static let fieldHeight: CGFloat = rowHeight
     static let fieldToRows: CGFloat = 8
     static let separatorInset: CGFloat = 7
     static let separatorPadding: CGFloat = 6
