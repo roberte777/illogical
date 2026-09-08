@@ -34,15 +34,62 @@ extension View {
     }
 }
 
-/// Which way ⌃⇥ goes, as a pure function of the event.
+/// Which way ⌃⇥ goes, and what the monitor does with one event.
 enum TabCycle {
-    enum Direction {
+    enum Direction: Sendable {
         case next
         case previous
     }
 
-    static func direction(for event: NSEvent) -> Direction? {
-        direction(keyCode: event.keyCode, modifiers: event.modifierFlags)
+    /// What the monitor should do with an event.
+    enum Claim: Equatable, Sendable {
+        /// Not ours. Hand it on.
+        case pass
+        /// Ours, and it moves the selection.
+        case cycle(Direction)
+        /// Ours only in that it must not be delivered: the release half of a
+        /// chord whose press was dropped.
+        case drop
+    }
+
+    /// The chord's whole state machine — the matching *and* the key-up
+    /// bookkeeping — as a value, so both are testable. A `ViewModifier`'s
+    /// monitor closure is not something a unit test can build; this is.
+    struct Matcher {
+        /// A ⌃⇥ `keyDown` that was dropped, owed a dropped `keyUp`.
+        private(set) var owesKeyUp = false
+
+        mutating func claim(
+            isKeyUp: Bool, keyCode: UInt16, modifiers: NSEvent.ModifierFlags
+        ) -> Claim {
+            guard isKeyUp else {
+                if let direction = TabCycle.direction(keyCode: keyCode, modifiers: modifiers) {
+                    // A held chord repeats: many downs, one up. So this is a
+                    // flag rather than a count.
+                    owesKeyUp = true
+                    return .cycle(direction)
+                }
+                // A ⇥ that is *not* the chord settles the debt on its way past.
+                // Without this a flag stranded by a release delivered elsewhere
+                // — ⌘⇥ to another app mid-chord, and the key-up lands there —
+                // would go on to eat the release of a later, ordinary ⇥.
+                if keyCode == tabKeyCode { owesKeyUp = false }
+                return .pass
+            }
+            // Matched on the keycode taken on the way *down*, never on the
+            // release event's own modifiers — the rule the surface's viewport
+            // chords follow, and for the same bug. Letting go of ⌃ before ⇥ is
+            // the ordinary way anyone releases this chord, and it produces a
+            // key-up with no ⌃ in it; under the Kitty protocol that release
+            // would go down the wire for a press the program never saw.
+            //
+            // Nothing else in the app needs this, because everything else is
+            // ⌘-bearing: AppKit delivers no `keyUp` at all while ⌘ is held, so
+            // ⇧⌘] has no release to swallow.
+            guard keyCode == tabKeyCode, owesKeyUp else { return .pass }
+            owesKeyUp = false
+            return .drop
+        }
     }
 
     /// ⌃ **and nothing else**, plus ⇧ for the way back.
@@ -71,61 +118,44 @@ enum TabCycle {
 private struct TabCycleKey: ViewModifier {
     let action: (TabCycle.Direction) -> Void
 
-    /// A class, so the handler that outlives each `body` pass writes to one
-    /// `owesKeyUp` rather than to a copy of it. It also holds what
+    /// A class, so the handler that outlives each `body` pass carries one
+    /// `Matcher` rather than a copy of it. It also holds what
     /// `NSEvent.removeMonitor` wants back — exactly what
     /// `addLocalMonitorForEvents` returned, and that is an `Any`.
-    @State private var state = MonitorState()
+    @State private var box = Box()
 
     func body(content: Content) -> some View {
         content
             .onAppear {
                 // Guarded: SwiftUI may run `onAppear` again without an
                 // intervening `onDisappear`, and two monitors would both fire.
-                guard state.monitor == nil else { return }
-                state.monitor = NSEvent.addLocalMonitorForEvents(
+                guard box.monitor == nil else { return }
+                box.monitor = NSEvent.addLocalMonitorForEvents(
                     matching: [.keyDown, .keyUp]
                 ) { event in
-                    MainActor.assumeIsolated { claims(event) } ? nil : event
+                    let claim = MainActor.assumeIsolated {
+                        box.matcher.claim(
+                            isKeyUp: event.type == .keyUp, keyCode: event.keyCode,
+                            modifiers: event.modifierFlags)
+                    }
+                    switch claim {
+                    case .pass: return event
+                    case .drop: return nil
+                    case .cycle(let direction):
+                        MainActor.assumeIsolated { action(direction) }
+                        return nil
+                    }
                 }
             }
             .onDisappear {
-                if let monitor = state.monitor { NSEvent.removeMonitor(monitor) }
-                state.monitor = nil
-                state.owesKeyUp = false
+                if let monitor = box.monitor { NSEvent.removeMonitor(monitor) }
+                box.monitor = nil
+                box.matcher = TabCycle.Matcher()
             }
     }
 
-    /// Whether this event belongs to the chord — and, on the way down, act on
-    /// it. `true` means drop it.
-    @MainActor
-    private func claims(_ event: NSEvent) -> Bool {
-        if event.type == .keyUp {
-            // Matched on the keycode this took on the way *down*, never on the
-            // release event's modifiers — the rule the surface's viewport
-            // chords follow, and for the same bug. Letting go of ⌃ before ⇥ is
-            // the ordinary way anyone releases this chord, and it produces a
-            // key-up with no ⌃ in it; under the Kitty protocol that release
-            // would go down the wire for a press the program never saw.
-            //
-            // Nothing else in the app needs this, because everything else is
-            // ⌘-bearing: AppKit delivers no `keyUp` at all while ⌘ is held, so
-            // ⇧⌘] has no release to swallow.
-            guard event.keyCode == TabCycle.tabKeyCode, state.owesKeyUp else { return false }
-            state.owesKeyUp = false
-            return true
-        }
-        guard let direction = TabCycle.direction(for: event) else { return false }
-        // A held chord repeats: many downs, one up. So this is a flag rather
-        // than a count.
-        state.owesKeyUp = true
-        action(direction)
-        return true
-    }
-
-    private final class MonitorState {
+    private final class Box {
         var monitor: Any?
-        /// A ⌃⇥ `keyDown` this dropped, owed a dropped `keyUp`.
-        var owesKeyUp = false
+        var matcher = TabCycle.Matcher()
     }
 }
