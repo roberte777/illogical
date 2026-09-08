@@ -57,6 +57,11 @@ struct SplitPair: View {
     /// from where it began, so without this the divider would jump to the
     /// pointer on the first pixel of movement.
     @State private var dragOrigin: Double?
+    /// Whether the pointer is over the grab area. Kept because the cursor is a
+    /// stack that has to be popped exactly as often as it is pushed.
+    @State private var hovering = false
+    /// Whether this divider currently owns a pushed cursor.
+    @State private var pushedCursor = false
 
     static let dividerThickness: CGFloat = 1
     /// Grab area. One pixel of divider is impossible to hit; every split view
@@ -88,6 +93,11 @@ struct SplitPair: View {
                 }
             }
         }
+        // The frame a drag is measured against, named per split so nested ones
+        // do not answer for each other. It has to be this view and not the
+        // divider: this one holds still for the whole drag, and the divider is
+        // the thing the drag moves. See `divider(total:)`.
+        .coordinateSpace(.named(split.id))
     }
 
     private func divider(total: CGFloat) -> some View {
@@ -107,20 +117,31 @@ struct SplitPair: View {
                     )
                     .contentShape(Rectangle())
                     .onHover { inside in
-                        if inside {
-                            split.direction == .columns
-                                ? NSCursor.resizeLeftRight.push() : NSCursor.resizeUpDown.push()
-                        } else {
-                            NSCursor.pop()
-                        }
+                        hovering = inside
+                        syncCursor()
                     }
+                    // A divider that leaves the screen while the pointer is on
+                    // it — the other pane closed, the tab changed — still owes
+                    // the stack a pop, or the whole app keeps wearing a resize
+                    // arrow.
+                    .onDisappear { popCursor() }
                     // Deliberately not animated. A pane appearing or closing is
                     // motion; a divider under the pointer is not. `setRatio` is
                     // never wrapped in a `withAnimation` — an animated divider
                     // lags the mouse by its own duration, which reads as the
                     // window being slow rather than as polish.
+                    //
+                    // Measured against the enclosing `SplitPair`, never the
+                    // default `.local`. Local space is this view's own, and
+                    // this view is dragged by the ratio the drag is writing:
+                    // the divider moves under the pointer, so the next event's
+                    // local translation comes back short by exactly the
+                    // distance already travelled. The two feed each other and
+                    // the reported translation oscillates instead of settling,
+                    // which is felt as a divider that shakes and trails the
+                    // mouse. A space that holds still breaks the loop.
                     .gesture(
-                        DragGesture(minimumDistance: 0)
+                        DragGesture(minimumDistance: 0, coordinateSpace: .named(split.id))
                             .onChanged { value in
                                 let origin = dragOrigin ?? split.ratio
                                 dragOrigin = origin
@@ -130,8 +151,40 @@ struct SplitPair: View {
                                 let usable = max(1, total - Self.dividerThickness)
                                 store.setRatio(
                                     origin + moved / usable, forSplit: split.id, in: tab)
+                                syncCursor()
                             }
-                            .onEnded { _ in dragOrigin = nil })
+                            .onEnded { _ in
+                                dragOrigin = nil
+                                syncCursor()
+                            })
             }
+    }
+
+    // MARK: - Cursor
+    //
+    // `NSCursor` is a stack, so every push needs its pop. Hover alone cannot
+    // run it: a drag held past the clamp puts the pointer outside the grab
+    // area with the drag still live, and popping there would flip the pointer
+    // back to the terminal's I-beam in the middle of a resize.
+
+    private func syncCursor() {
+        if hovering || dragOrigin != nil {
+            pushCursor()
+        } else {
+            popCursor()
+        }
+    }
+
+    private func pushCursor() {
+        guard !pushedCursor else { return }
+        pushedCursor = true
+        split.direction == .columns
+            ? NSCursor.resizeLeftRight.push() : NSCursor.resizeUpDown.push()
+    }
+
+    private func popCursor() {
+        guard pushedCursor else { return }
+        pushedCursor = false
+        NSCursor.pop()
     }
 }
