@@ -761,9 +761,9 @@ pub fn resize(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
 }
 
 fn resizeLocked(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
-    // Before anything is touched, and before a parked terminal is woken for
-    // it: libghostty refuses the same value, and a client that sent it must
-    // not get a zero-column winsize out of the refusal.
+    // Before anything is touched: libghostty refuses the same value, and a
+    // client that sent it must not get a zero-column winsize out of the
+    // refusal.
     if (cols == 0 or rows == 0) return error.InvalidValue;
     const grid_changed = cols != self.cols or rows != self.rows;
     const cell_changed = cell.width != self.cell.width or cell.height != self.cell.height;
