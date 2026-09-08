@@ -786,14 +786,12 @@ final class ReconnectTests: XCTestCase {
     }
 
     /// The mirror is a replica, and its size is part of the state it
-    /// replicates — so once the server says it sends `resized`, the window
-    /// stops sizing the mirror and the stream does. Before that (an older
-    /// server, or a welcome not yet in) the window does, as it always did.
+    /// replicates — so the window never sizes it and the stream always does.
     ///
     /// The point of the ordering is what a fast drag looked like without it:
     /// the mirror a size ahead of the bytes it was parsing, so a full-screen
     /// program's repaint for 200 columns wrapped into 180.
-    func testTheServerSizesTheMirrorOnceItSaysItWill() async throws {
+    func testTheStreamSizesTheMirrorAndTheWindowDoesNot() async throws {
         let server = try HangUpServer(mode: .errorThenHold)
         defer { server.stop() }
 
@@ -803,24 +801,44 @@ final class ReconnectTests: XCTestCase {
         controller.connect(.test(cols: 80, rows: 24))
         try await waitFor("the pane to attach") { server.accepted == 1 }
 
-        // No welcome yet: an older server, for all the client knows.
-        controller.resize(.test(cols: 100, rows: 30))
-        XCTAssertEqual(
-            controller.engine.cols, 100, "without the capability the window sizes the mirror")
-
-        controller.handleForTesting(
-            Frame(
-                type: .welcome, terminal: Protocol.controlSession,
-                payload: Data(#"{"version":1,"server":"x","resized":true}"#.utf8)))
         controller.resize(.test(cols: 120, rows: 40))
-        XCTAssertEqual(
-            controller.engine.cols, 100,
-            "the window sized the mirror on a server that said it would")
+        XCTAssertEqual(controller.engine.cols, 80, "the window sized the mirror")
 
         controller.handleForTesting(
             Frame(type: .resized, terminal: 1, payload: Data(#"{"cols":120,"rows":40}"#.utf8)))
         XCTAssertEqual(controller.engine.cols, 120)
         XCTAssertEqual(controller.engine.rows, 40)
+    }
+
+    /// A desync reattaches at the size the *window* is, not the size the
+    /// mirror is. They differ by a round trip on purpose (above), and a
+    /// resize is exactly what provokes the repaint burst that desyncs a
+    /// client — so this is the ordinary case, not a corner. Attaching at the
+    /// mirror's size moved the server back to it, and the size guard in
+    /// `resize` then kept the window's size from ever being sent again.
+    func testADesyncReattachesAtTheWindowsSize() async throws {
+        let server = try HangUpServer(mode: .errorThenHold)
+        defer { server.stop() }
+
+        let controller = try TerminalController(
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
+        defer { controller.disconnect() }
+        controller.connect(.test(cols: 80, rows: 24))
+        try await waitFor("the first attach") {
+            server.lastAttach == AttachSize(cols: 80, rows: 24, cellWidth: 16, cellHeight: 38)
+        }
+
+        // Sent, not yet answered: the mirror is still 80x24.
+        controller.resize(.test(cols: 120, rows: 40))
+        XCTAssertEqual(controller.engine.cols, 80)
+
+        controller.handleForTesting(
+            Frame(
+                type: .error, terminal: 1,
+                payload: Data(#"{"code":7,"message":"desync"}"#.utf8)))
+        try await waitFor("a reattach at the window's size") {
+            server.lastAttach == AttachSize(cols: 120, rows: 40, cellWidth: 16, cellHeight: 38)
+        }
     }
 
 }
@@ -975,7 +993,13 @@ final class HangUpServer: @unchecked Sendable {
             let fds = _held
             _held = []
             lock.unlock()
-            for fd in fds { Darwin.close(fd) }
+            for fd in fds {
+                // A reader may be blocked on it (`errorThenHold` keeps one);
+                // `close` alone does not reliably wake that thread, `shutdown`
+                // does.
+                Darwin.shutdown(fd, SHUT_RDWR)
+                Darwin.close(fd)
+            }
         }
 
         var accepted: Int {
@@ -1072,6 +1096,11 @@ final class HangUpServer: @unchecked Sendable {
                 if spoke {
                     sendError(client, code: ProtocolErrorCode.noSuchSession, session: 1)
                     state.hold(client)
+                    // Keep reading the held socket. A test that provokes a
+                    // reattach on it wants the attach it sends recorded, and
+                    // the accept loop must not be the thread that waits for
+                    // it: the same tests open a second connection meanwhile.
+                    Thread.detachNewThread { _ = Self.readFrames(client, state, count: .max) }
                 } else {
                     Darwin.close(client)
                 }
@@ -1125,11 +1154,14 @@ final class HangUpServer: @unchecked Sendable {
     /// has no `SO_NOSIGPIPE` unless we set one -- which would take the whole
     /// test bundle down with a crash report rather than a failure.
     @discardableResult
-    private static func readFrames(_ fd: Int32, _ state: State) -> Bool {
+    private static func readFrames(_ fd: Int32, _ state: State, count: Int = 2) -> Bool {
         var buffer = [UInt8](repeating: 0, count: 4096)
         var pending: [UInt8] = []
         // Two frames is all a client sends before it waits: hello, attach.
-        for _ in 0..<2 {
+        // `.max` reads until the far end hangs up.
+        var read = 0
+        while read < count {
+            read += 1
             while pending.count < Protocol.headerLength {
                 let n = buffer.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, 4096) }
                 if n <= 0 { return false }

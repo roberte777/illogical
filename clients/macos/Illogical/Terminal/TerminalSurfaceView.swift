@@ -36,10 +36,6 @@ struct SurfaceSize: Equatable {
     var cols: UInt16
     var rows: UInt16
     var cell: CellSize
-
-    /// Nothing reported yet. Not a valid grid — `reportSizeIfNeeded` compares
-    /// against it so the first real layout is always news.
-    static let zero = SurfaceSize(cols: 0, rows: 0, cell: CellSize(width: 0, height: 0))
 }
 
 /// Views are main-actor bound, and so is everything that answers them.
@@ -83,7 +79,8 @@ final class TerminalSurfaceView: NSView {
     /// every sequence it produces depends on that terminal's modes.
     private var inputEncoder: InputEncoder?
 
-    private var lastReportedSize: SurfaceSize = .zero
+    /// Nil until the first layout, which is what makes that one always news.
+    private var lastReportedSize: SurfaceSize?
     private var didSignalReady = false
     private var currentScale: CGFloat = 0
 

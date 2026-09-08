@@ -76,11 +76,16 @@ final class TerminalController {
     /// The geometry the surface last asked for, so a reconnect attaches at the
     /// size the window is now rather than the size it was when it opened.
     private var size: SurfaceSize
-    /// The server on this connection sends `resized`, so the mirror is sized
-    /// from those and not from the window. False until its `welcome` says so,
-    /// and false again on every reconnect: the daemon answering the socket
-    /// may not be the one that answered it last time.
-    private var serverResizes = false
+    /// What every attach says, from the one place the window's size is kept.
+    /// The desync path used to build its own from the engine, which is sized
+    /// by the server and so lags the window by a round trip — an attach at
+    /// that size moved the server *back*, and nothing ever moved it forward
+    /// again.
+    private var attachBody: AttachBody {
+        AttachBody(
+            cols: size.cols, rows: size.rows,
+            cellWidth: size.cell.width, cellHeight: size.cell.height)
+    }
     /// The retry in flight, and how far into the backoff we are.
     private var retry: Task<Void, Never>?
     private var backoff = Backoff()
@@ -154,13 +159,8 @@ final class TerminalController {
             self.connection = connection
             connection.start()
 
-            serverResizes = false
-            try connection.send(.hello, json: HelloBody(client: "Illogical.app", resized: true))
-            try connection.send(
-                .attach, terminal: terminalID,
-                json: AttachBody(
-                    cols: size.cols, rows: size.rows,
-                    cellWidth: size.cell.width, cellHeight: size.cell.height))
+            try connection.send(.hello, json: HelloBody(client: "Illogical.app"))
+            try connection.send(.attach, terminal: terminalID, json: attachBody)
             state = .attaching
             attachSentAt = Date()
             attachInterval = Signposts.attach.beginInterval("attach")
@@ -203,11 +203,7 @@ final class TerminalController {
             "reattach-sent", seconds: Signposts.sinceLaunch(),
             detail: "terminal=\(terminalID) reason=desync")
         do {
-            try connection.send(
-                .attach, terminal: terminalID,
-                json: AttachBody(
-                    cols: engine.cols, rows: engine.rows,
-                    cellWidth: size.cell.width, cellHeight: size.cell.height))
+            try connection.send(.attach, terminal: terminalID, json: attachBody)
         } catch {
             state = .failed("\(error)")
         }
@@ -229,21 +225,13 @@ final class TerminalController {
         // Remembered even while disconnected, so a window resized during an
         // outage reattaches at the size it is now rather than the size it was.
         self.size = size
-        // The mirror is a replica of the server's terminal, and its size is
-        // part of that state — so a server that sends `resized` gets to say
-        // when the mirror reflows, and it says so *in the output stream*, at
-        // the byte where its own terminal changed. Reflowing here instead
+        // Not the engine. The mirror is a replica of the server's terminal,
+        // and its size is part of that state — so the server says when the
+        // mirror reflows, and it says so *in the output stream*, at the byte
+        // where its own terminal changed (`.resized`, below). Reflowing here
         // would put the mirror a size ahead of the bytes it is parsing for
         // the length of a round trip: a full-screen program's repaint for 200
         // columns, wrapped into 180. During a drag that is every repaint.
-        //
-        // An older server never sends the frame, so against one the mirror
-        // is sized here, as it always was.
-        if !serverResizes {
-            engine.resize(
-                cols: size.cols, rows: size.rows,
-                cellWidth: size.cell.width, cellHeight: size.cell.height)
-        }
         guard let connection else { return }
         try? connection.send(
             .resize, terminal: terminalID,
@@ -344,8 +332,7 @@ final class TerminalController {
         guard connection === source else { return }
         switch frame.type {
         case .welcome:
-            let welcome = try? JSONDecoder().decode(WelcomeBody.self, from: frame.payload)
-            serverResizes = welcome?.resized ?? false
+            break
 
         case .snapshotBegin:
             beginSnapshot()
@@ -457,7 +444,7 @@ final class TerminalController {
         }
         do {
             let terminal = try restore.ready()
-            engine.adopt(terminal: terminal, cols: engine.cols, rows: engine.rows)
+            engine.adopt(terminal: terminal)
             // The snapshot knows how much history it is about to send, and
             // says so at READY — before a byte of it has arrived. Declaring it
             // now is what lets the scrollbar be the right size on the first

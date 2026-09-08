@@ -53,7 +53,7 @@ final class LaunchBudgetTests: XCTestCase {
         let engine = try TerminalEngine(cols: 20, rows: 5)
         XCTAssertFalse(engine.consumeSnapshotAdopted())
 
-        engine.adopt(terminal: try newTerminal(cols: 20, rows: 5), cols: 20, rows: 5)
+        engine.adopt(terminal: try newTerminal(cols: 20, rows: 5))
         XCTAssertTrue(engine.consumeSnapshotAdopted())
         XCTAssertFalse(engine.consumeSnapshotAdopted())
     }
@@ -71,7 +71,7 @@ final class LaunchBudgetTests: XCTestCase {
         _ = try harness.render()
         XCTAssertEqual(counter.count, 0, "a frame before any snapshot is not the first frame")
 
-        engine.adopt(terminal: try newTerminal(cols: 20, rows: 5), cols: 20, rows: 5)
+        engine.adopt(terminal: try newTerminal(cols: 20, rows: 5))
         _ = try harness.render()
         XCTAssertEqual(counter.count, 1)
 
@@ -79,7 +79,7 @@ final class LaunchBudgetTests: XCTestCase {
         XCTAssertEqual(counter.count, 1, "reported once per snapshot, not once per frame")
 
         // A re-attach adopts again, and is worth measuring again.
-        engine.adopt(terminal: try newTerminal(cols: 20, rows: 5), cols: 20, rows: 5)
+        engine.adopt(terminal: try newTerminal(cols: 20, rows: 5))
         _ = try harness.render()
         XCTAssertEqual(counter.count, 2)
     }

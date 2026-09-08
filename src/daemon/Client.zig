@@ -84,12 +84,6 @@ read_mutex: illogical.thread.Mutex = .{},
 /// ever sent and then keeps that memory forever.
 read_payload: std.ArrayList(u8) = .empty,
 
-/// This client's `hello` asked for `resized` frames. Reader-thread only at
-/// the point it is written; read from the terminal's reader thread inside
-/// `onResized`, after the attach that made that possible, which is enough of
-/// a happens-before for a flag that only ever goes from false to true.
-wants_resized: bool = false,
-
 /// The last size this client asked for and we have not applied yet.
 ///
 /// Reader-thread only, so it needs no lock. See `flushPendingResize`.
@@ -178,9 +172,7 @@ fn stopWriter(self: *Client) void {
 
 const PendingResize = struct {
     id: session.TerminalId,
-    cols: u16,
-    rows: u16,
-    cell: Terminal.CellSize,
+    size: protocol.body.Resize,
     /// When this batch must be applied. Set by the *first* resize of a batch
     /// and never pushed back, so a client that keeps sending cannot keep
     /// deferring; see `coalesce_ns`.
@@ -223,13 +215,23 @@ const coalesce_ns: u64 = 25 * std.time.ns_per_ms;
 fn flushPendingResize(self: *Client) !void {
     const p = self.pending_resize orelse return;
     self.pending_resize = null;
-    const t = self.server.terminal(p.id) orelse
-        return self.sendError(p.id, .no_such_session, "no such terminal");
-    try t.resize(p.cols, p.rows, p.cell);
+    // A terminal that went away while its resize waited is not news to the
+    // client: it has the `exited` that took it. And an `err` here would be
+    // the one send a desynced client cannot make -- `enqueue` refuses it --
+    // which is how a stale resize used to stop an `attach` from ever being
+    // handled.
+    const t = self.server.terminal(p.id) orelse return;
+    try t.resize(p.size.cols, p.size.rows, .{
+        .width = p.size.cell_width,
+        .height = p.size.cell_height,
+    });
 }
 
 fn run(self: *Client) void {
     defer {
+        // The size it last asked for, if the socket went before the window
+        // did: a pane closed mid-drag still means the size it closed at.
+        self.flushPendingResize() catch {};
         // Unsubscribe before anything else: from here on no terminal holds a
         // pointer to this client, so the retirement below cannot race a
         // fan-out.
@@ -250,12 +252,10 @@ fn run(self: *Client) void {
         // still dragging gets its newer size folded in, and one that stopped
         // gets served when the window closes.
         if (self.pending_resize) |p| {
-            const now = sys.monotonicNs();
-            const remaining_ns = p.deadline_ns -| now;
-            const remaining_ms: i32 = @intCast(@min(
-                remaining_ns / std.time.ns_per_ms,
-                @as(u64, coalesce_ns / std.time.ns_per_ms),
-            ));
+            // At most `coalesce_ns` by construction -- the deadline is only
+            // ever set that far ahead -- so the cast cannot truncate.
+            const remaining_ns = p.deadline_ns -| sys.monotonicNs();
+            const remaining_ms: i32 = @intCast(remaining_ns / std.time.ns_per_ms);
             if (remaining_ms == 0 or !sys.waitReadable(self.fd, remaining_ms)) {
                 self.flushPendingResize() catch |err| {
                     log.warn("pending resize failed: {t}", .{err});
@@ -320,8 +320,15 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
 
     // Anything that is not another resize ends the run of them. Input in
     // particular: a keystroke must be answered at the size that was current
-    // when it was sent, not at one that arrived afterwards.
-    if (header.type != .resize) try self.flushPendingResize();
+    // when it was sent, not at one that arrived afterwards. Logged and not
+    // raised: a resize that failed is the resize's problem, and the frame in
+    // hand -- possibly the `attach` a desynced client is recovering with --
+    // still has to be handled.
+    if (header.type != .resize) {
+        self.flushPendingResize() catch |err| {
+            log.warn("pending resize failed: {t}", .{err});
+        };
+    }
 
     switch (header.type) {
         .hello => {
@@ -344,10 +351,8 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
                 // instead of as the sentence this refusal exists to produce.
                 return error.ProtocolRefused;
             }
-            self.wants_resized = req.value.resized;
             const bytes = try protocol.body.encode(arena, protocol.body.Welcome{
                 .server = illogical.version,
-                .resized = true,
             });
             try self.send(.welcome, protocol.control_session, bytes);
         },
@@ -423,12 +428,7 @@ fn dispatch(self: *Client, header: protocol.Header, payload: []const u8) !void {
                 sys.monotonicNs() + coalesce_ns;
             self.pending_resize = .{
                 .id = header.session,
-                .cols = req.value.cols,
-                .rows = req.value.rows,
-                .cell = .{
-                    .width = req.value.cell_width,
-                    .height = req.value.cell_height,
-                },
+                .size = req.value,
                 .deadline_ns = deadline,
             };
         },
@@ -741,13 +741,8 @@ fn onOutput(ctx: *anyopaque, terminal: session.TerminalId, bytes: []const u8) bo
 /// The terminal changed size: put the marker in this client's stream, at the
 /// point in it where that happened. Queued through the same path as output,
 /// so it cannot overtake or fall behind a byte of it.
-///
-/// Not sent to a client that did not ask. An older client fails to decode a
-/// frame type it has never heard of, and a resize would take its connection
-/// down -- which is what the capability in `hello` is for.
 fn onResized(ctx: *anyopaque, terminal: session.TerminalId, cols: u16, rows: u16) void {
     const self: *Client = @ptrCast(@alignCast(ctx));
-    if (!self.wants_resized) return;
     var buf: [64]u8 = undefined;
     const body = std.fmt.bufPrint(&buf, "{{\"cols\":{d},\"rows\":{d}}}", .{ cols, rows }) catch return;
     self.enqueue(.resized, terminal, body, .drop) catch {};
@@ -1497,7 +1492,7 @@ fn firstErrorCode(gpa: Allocator, bytes: []const u8) !u16 {
     return parsed.value.code;
 }
 
-test "a resized marker reaches only the client that asked for it" {
+test "a resized marker is queued with the size, through the output path" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
@@ -1517,28 +1512,6 @@ test "a resized marker reaches only the client that asked for it" {
 
     const client = try Client.create(server, pair.server_end);
     defer client.destroy();
-
-    // Before any hello, or after one that did not ask: nothing. This is the
-    // client that would fall over on a frame type it cannot decode.
-    onResized(client, 7, 100, 30);
-    try testing.expectEqual(@as(usize, 0), client.queue.items.len);
-
-    const hello = try protocol.body.encode(gpa, protocol.body.Hello{ .resized = true });
-    defer gpa.free(hello);
-    try client.dispatch(.{
-        .type = .hello,
-        .session = protocol.control_session,
-        .len = @intCast(hello.len),
-    }, hello);
-    // The welcome it was answered with says the server will do this.
-    {
-        const header, const payload = try firstFrame(client.queue.items);
-        try testing.expectEqual(protocol.FrameType.welcome, header.type);
-        const welcome = try protocol.body.decode(protocol.body.Welcome, gpa, payload);
-        defer welcome.deinit();
-        try testing.expect(welcome.value.resized);
-    }
-    client.queue.clearRetainingCapacity();
 
     onResized(client, 7, 100, 30);
     const header, const payload = try firstFrame(client.queue.items);
@@ -1589,8 +1562,8 @@ test "a run of resizes collapses to the newest, on the first one's deadline" {
         }, bytes);
 
         const pending = client.pending_resize orelse return error.ResizeWasNotHeld;
-        try testing.expectEqual(size[0], pending.cols);
-        try testing.expectEqual(size[1], pending.rows);
+        try testing.expectEqual(size[0], pending.size.cols);
+        try testing.expectEqual(size[1], pending.size.rows);
         // Ghostty's rule, and the reason a drag cannot outrun its own window:
         // a resize that arrives while one is already waiting replaces the size
         // and leaves the deadline where the first one put it.

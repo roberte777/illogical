@@ -1,6 +1,8 @@
 # Wire protocol
 
-Version 1. Implemented by [`src/core/protocol.zig`](../src/core/protocol.zig) and
+Version 2 — `resize` and `attach` carry the cell in pixels, the server sends
+`resized`, and a body key a peer does not know is read past rather than
+refused; a version-1 client is turned away at `hello`. Implemented by [`src/core/protocol.zig`](../src/core/protocol.zig) and
 [`IllogicalProtocol/Frame.swift`](../clients/macos/Packages/IllogicalKit/Sources/IllogicalProtocol/Frame.swift).
 Those two must stay byte-for-byte in step; both carry the same tests.
 
@@ -49,7 +51,7 @@ no parser.
 
 | Type | Name | Payload |
 | --- | --- | --- |
-| `0x01` | `hello` | protocol version, client name, capabilities (`resized`) |
+| `0x01` | `hello` | protocol version, client name |
 | `0x02` | `list` | — |
 | `0x03` | `create` | session name (validated — see [Names](#names)), terminal name, argv, env, cwd, initial size |
 | `0x04` | `attach` | size (cols, rows, cell px), scrollback budget |
@@ -66,7 +68,7 @@ no parser.
 
 | Type | Name | Payload |
 | --- | --- | --- |
-| `0x81` | `welcome` | protocol version, the server's own build, capabilities (`resized`) |
+| `0x81` | `welcome` | protocol version, and the server's own build |
 | `0x82` | `session_list` | sessions and their terminals |
 | `0x83` | `created` | new terminal id |
 | `0x84` | `snapshot_begin` | snapshot format version |
@@ -93,8 +95,7 @@ beyond forwarding it, and never rewrites `output`.
 and both default it to zero. The server has no font, so those are the only
 numbers it can give a program that asks for its size in pixels — DEC mode 2048's
 in-band report, or the pixel fields of a `winsize`. Zero means "unknown", which
-is what a client with no metrics of its own sends: the CLI, or a build older
-than the fields. See [ARCHITECTURE.md](ARCHITECTURE.md#terminal-queries) for why
+is what a client with no metrics of its own sends: the CLI. See [ARCHITECTURE.md](ARCHITECTURE.md#terminal-queries) for why
 the report matters — without it Neovim never learns that the window changed.
 
 `resized` is the size half of rule 2. A client's terminal is a replica of the
@@ -105,9 +106,9 @@ so it sits at exactly the byte where the server's own terminal changed: every
 byte before it was written for the old size and every byte after for the new.
 A client that reflowed on its own cue would be a size ahead of the bytes it is
 parsing for the length of a round trip, and during a drag that is every
-repaint. Capability-gated both ways: a client says `resized` in `hello` (an
-older one cannot decode the frame type), and a server says it in `welcome` (a
-client talking to an older one keeps sizing itself). See
+repaint. Every attached client is sent it; that is the frame that made this
+version 2, since a client that predates it cannot decode the header, and the
+version check at `hello` is what keeps such a client from ever seeing one. See
 [ARCHITECTURE.md](ARCHITECTURE.md#data-flow-resize).
 
 ### `err` codes

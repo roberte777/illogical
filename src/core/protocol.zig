@@ -28,7 +28,11 @@ const std = @import("std");
 
 /// Bumped on any incompatible change. The server refuses connections whose
 /// `hello` advertises a different major version.
-pub const version: u16 = 1;
+/// 2: `resize` and `attach` carry the cell in pixels, the server sends
+/// `resized`, and a body with a key the server does not know is read rather
+/// than refused. A client from before any of that is turned away at `hello`
+/// with `version_mismatch`, which the app already knows how to say.
+pub const version: u16 = 2;
 
 /// Reserved terminal id for connection-level control frames. Named for the
 /// header field it goes in; see `Header.session`.
@@ -102,7 +106,7 @@ pub const FrameType = enum(u8) {
     /// and everything after it at the new one, so a client that resizes its
     /// own terminal *here* -- and nowhere else -- stays a replica.
     ///
-    /// Only sent to a client whose `hello` said `resized`; see `body.Hello`.
+    /// Sent to every attached client.
     resized = 0x8e,
 
     pub fn isClientToServer(self: FrameType) bool {
@@ -177,22 +181,11 @@ pub const body = struct {
     pub const Hello = struct {
         version: u16 = version,
         client: []const u8 = "unknown",
-        /// This client understands `resized` frames and will size its own
-        /// terminal from them rather than from its window. A capability, and
-        /// defaulted off, because a client that does not know the frame type
-        /// fails to decode the header -- so the server must not send one to
-        /// a client that did not ask.
-        resized: bool = false,
     };
 
     pub const Welcome = struct {
         version: u16 = version,
         server: []const u8,
-        /// The server sends `resized` frames to a client that asked for them.
-        /// Defaulted off for the same reason as `Hello.resized`, from the
-        /// other side: a client talking to an older server gets no frames and
-        /// has to keep sizing its own terminal.
-        resized: bool = false,
     };
 
     pub const Create = struct {
@@ -315,27 +308,25 @@ pub const body = struct {
         return std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     }
 
+    /// A key this build does not know is skipped, not refused. That is what
+    /// lets a field be added to a body without a version bump: the peer that
+    /// sends it is ahead, and "ahead" is not a protocol error. The bump to 2
+    /// was needed precisely because 1 did not do this, so the first client to
+    /// send `cell_width` was turned away as malformed.
     pub fn decode(comptime T: type, alloc: std.mem.Allocator, bytes: []const u8) !std.json.Parsed(T) {
-        return std.json.parseFromSlice(T, alloc, bytes, .{ .allocate = .alloc_always });
+        return std.json.parseFromSlice(T, alloc, bytes, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        });
     }
 };
 
-test "resized is a server frame, and both ends of the capability default off" {
+test "resized is a server frame at 0x8e, and a key from the future is read past" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
     try testing.expectEqual(@as(u8, 0x8e), @intFromEnum(FrameType.resized));
     try testing.expect(!FrameType.resized.isClientToServer());
-
-    // The bodies both peers send when they predate the frame. An old client
-    // must not be sent one, and an old server will not send one -- so both
-    // sides read the missing key as "no".
-    const hello = try body.decode(body.Hello, alloc, "{\"version\":1,\"client\":\"old\"}");
-    defer hello.deinit();
-    try testing.expect(!hello.value.resized);
-    const welcome = try body.decode(body.Welcome, alloc, "{\"version\":1,\"server\":\"old\"}");
-    defer welcome.deinit();
-    try testing.expect(!welcome.value.resized);
 
     const want: body.Resized = .{ .cols = 132, .rows = 43 };
     const bytes = try body.encode(alloc, want);
@@ -343,6 +334,14 @@ test "resized is a server frame, and both ends of the capability default off" {
     const got = try body.decode(body.Resized, alloc, bytes);
     defer got.deinit();
     try testing.expectEqual(want, got.value);
+
+    // The other half of being version 2: a body from a client that knows a
+    // field this build does not still decodes. Under version 1 this was
+    // `error.UnknownField`, and the first client to send `cell_width` found
+    // out the hard way.
+    const ahead = try body.decode(body.Resized, alloc, "{\"cols\":1,\"rows\":2,\"later\":true}");
+    defer ahead.deinit();
+    try testing.expectEqual(@as(u16, 1), ahead.value.cols);
 }
 
 test "a resize carries cell metrics, and an older client's omission reads as zero" {

@@ -41,27 +41,26 @@ struct BodyTests {
         #expect(careful["only_if_empty"] as? Bool == true)
     }
 
-    @Test("hello asks for resized by name, and an old server's welcome says nothing")
-    func resizedCapability() throws {
-        // The key the daemon reads; a client that sends it is one that can
-        // decode the frame, which is the only client the daemon may send it to.
-        let hello = try keyedJSON(HelloBody(client: "test", resized: true))
-        #expect(hello["resized"] as? Bool == true)
-        let quiet = try keyedJSON(HelloBody(client: "test"))
-        #expect(quiet["resized"] as? Bool == false)
-
-        // A welcome from before the frame existed. It must decode, and it
-        // must read as "no": against that server the client sizes its own
-        // terminal, as it always did.
-        let old = try JSONDecoder().decode(
-            WelcomeBody.self, from: Data(#"{"version":1,"server":"old"}"#.utf8))
-        #expect(old.resized == nil)
-        let new = try JSONDecoder().decode(
-            WelcomeBody.self, from: Data(#"{"version":1,"server":"new","resized":true}"#.utf8))
-        #expect(new.resized == true)
+    @Test("the geometry bodies spell the cell the way the server reads it")
+    func geometryKeys() throws {
+        // Snake case, and the same four keys on both: the Zig `Resize` and
+        // `Attach` structs' field names are the keys, and `cellWidth` on its
+        // own would be a frame the daemon rejects at parse time.
+        for json in [
+            try keyedJSON(ResizeBody(cols: 100, rows: 30, cellWidth: 8, cellHeight: 16)),
+            try keyedJSON(AttachBody(cols: 100, rows: 30, cellWidth: 8, cellHeight: 16)),
+        ] {
+            #expect(Set(json.keys) == ["cols", "rows", "cell_width", "cell_height"])
+            #expect(json["cell_width"] as? UInt32 == 8)
+            #expect(json["cell_height"] as? UInt32 == 16)
+        }
+        // Absent on this side means zero on the wire, which is "unknown".
+        let bare = try keyedJSON(ResizeBody(cols: 100, rows: 30))
+        #expect(bare["cell_width"] as? UInt32 == 0)
 
         let resized = try JSONDecoder().decode(
-            ResizedBody.self, from: Data(#"{"cols":132,"rows":43}"#.utf8))
+            ResizedBody.self,
+            from: JSONEncoder().encode(ResizedBody(cols: 132, rows: 43)))
         #expect(resized.cols == 132)
         #expect(resized.rows == 43)
     }

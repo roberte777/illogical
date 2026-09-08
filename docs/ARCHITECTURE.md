@@ -247,7 +247,7 @@ cell travels on the wire — `resize` and `attach` both carry `cell_width` and
 `cell_height` in device pixels — and the daemon quotes back whatever the client
 that last sized the terminal said. Zero until one does, which is the value the
 spec reserves for "unknown" and the honest answer for a client with no metrics
-of its own (the CLI, or a build older than the field).
+of its own (the CLI).
 
 Open: which size to report when attached clients disagree. Provisionally the
 session's configured size, not any client's. The same open question decides
@@ -266,6 +266,16 @@ whose cell is quoted; today it is simply the last one to speak.
    with the output around it.
 4. The program repaints for the new size; those bytes are parsed by a client
    terminal that is already that size.
+
+Two details that are easy to get wrong. The report in step 2 is written to the
+PTY *after* the terminal lock is released, never under it: the master is a
+blocking descriptor, a child that has stopped reading fills the kernel's input
+queue in about a kilobyte, and a write blocked there with the lock held would
+park the reader thread — and with it every client of that terminal — behind a
+program that is not listening. And a parked terminal has no VT to reflow, so a
+resize while parked moves the PTY and tells the clients, and the unpark is what
+catches the VT up; without that the server would parse a repaint drawn for the
+new width into a grid of the old one.
 
 Step 1 is the one that matters. Ghostty has no step 3 because it has no second
 terminal: the resize sits at one point in one byte stream by construction. A

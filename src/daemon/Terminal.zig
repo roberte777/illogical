@@ -104,6 +104,12 @@ pub const Subscriber = struct {
     }
 };
 
+/// One cell in device pixels, as a client measures it.
+pub const CellSize = struct {
+    width: u32 = 0,
+    height: u32 = 0,
+};
+
 /// Where this terminal's PTY master is being read, and by what.
 ///
 /// The two regimes are not an implementation detail, they are the shape of the
@@ -152,10 +158,16 @@ compression_idle_since_ns: u64 = 0,
 cols: u16,
 rows: u16,
 /// One cell in device pixels, as the client that last sized this terminal
-/// measures it. Zero when nobody has said -- the CLI has no font, and neither
-/// does a build older than the field on the wire.
-cell_width: u32 = 0,
-cell_height: u32 = 0,
+/// measures it. Zero when nobody has said -- the CLI has no font.
+cell: CellSize = .{},
+/// Bytes the VT owes the child: query replies, size reports. Produced under
+/// `mutex` by `writePtyEffect` and drained by `flushPtyWrites` once the lock
+/// is gone -- see the latter for why they cannot be written where they are
+/// made.
+pty_out: std.ArrayList(u8) = .empty,
+/// Serialises `flushPtyWrites`, so two threads draining at once cannot
+/// interleave their chunks on the wire.
+pty_write_mutex: illogical.thread.Mutex = .{},
 residency: session.Residency = .live,
 exit_code: ?i32 = null,
 /// Monotonic timestamp of the last PTY *read*. This — not general activity —
@@ -330,6 +342,7 @@ pub fn destroy(self: *Terminal) void {
     self.vt = null;
     self.mutex.unlock();
     self.subscribers.deinit(self.gpa);
+    self.pty_out.deinit(self.gpa);
     self.gpa.free(self.name);
     self.gpa.free(self.command);
     self.gpa.free(self.cwd);
@@ -528,17 +541,22 @@ fn pollReadable(ctx: *anyopaque) bool {
 /// Both under one lock, so that `attach` can insert itself at an exact point
 /// in the byte stream and no client can miss or double-apply a chunk.
 fn ingest(self: *Terminal, bytes: []const u8) void {
-    self.mutex.lock();
-    defer self.mutex.unlock();
-    // A read is exactly what unparks a terminal. Do it before applying, or
-    // the bytes that woke us would be dropped on the floor.
-    if (self.residency == .parked) {
-        self.unparkLocked() catch |err|
-            log.err("terminal {d} failed to unpark: {t}", .{ self.id, err });
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // A read is exactly what unparks a terminal. Do it before applying, or
+        // the bytes that woke us would be dropped on the floor.
+        if (self.residency == .parked) {
+            self.unparkLocked() catch |err|
+                log.err("terminal {d} failed to unpark: {t}", .{ self.id, err });
+        }
+        if (self.stream) |*stream| stream.nextSlice(bytes);
+        self.last_read_ns = sys.monotonicNs();
+        self.fanOutLocked(bytes);
     }
-    if (self.stream) |*stream| stream.nextSlice(bytes);
-    self.last_read_ns = sys.monotonicNs();
-    self.fanOutLocked(bytes);
+    // Whatever the child asked for in those bytes, answered now that the lock
+    // is gone. See `flushPtyWrites`.
+    self.flushPtyWrites();
 }
 
 /// The exact same bytes, to everyone. No re-encoding. (G2)
@@ -715,12 +733,6 @@ pub fn writeInput(self: *Terminal, bytes: []const u8) !void {
     try sys.writeAll(self.pty_pair.master, bytes);
 }
 
-/// One cell in device pixels, as a client measures it.
-pub const CellSize = struct {
-    width: u32 = 0,
-    height: u32 = 0,
-};
-
 /// Resize the terminal, the PTY, and every program that asked to be told.
 ///
 /// Three notifications, not one, and a terminal that sends only the first two
@@ -737,23 +749,40 @@ pub const CellSize = struct {
 /// and a growing one never restores. libghostty-vt documents the difference on
 /// `Handler.resize`; the raw call has no way to reach `write_pty`.
 pub fn resize(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
-    self.mutex.lock();
-    defer self.mutex.unlock();
-    // Remembered whichever way the early return below goes: these are the
-    // numbers `sizeEffect` quotes, and a client whose cell changed while its
-    // grid did not -- a window dragged onto a display of another scale -- has
-    // still told us something we did not know.
-    self.cell_width = cell.width;
-    self.cell_height = cell.height;
-    if (cols == self.cols and rows == self.rows) return;
-    if (self.stream) |*stream| try stream.handler.resize(.{
-        .cols = cols,
-        .rows = rows,
-        // Non-null or the handler returns before writing anything: a report
-        // needs complete pixel geometry, and "we do not know" is spelled zero
-        // rather than absent. See `sizeEffect`.
-        .cell_size_px = .{ .width = cell.width, .height = cell.height },
-    });
+    const result = blk: {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        break :blk self.resizeLocked(cols, rows, cell);
+    };
+    // The report, if one was owed, goes out here and not a line earlier. See
+    // `flushPtyWrites` for the thread that would otherwise never wake.
+    self.flushPtyWrites();
+    return result;
+}
+
+fn resizeLocked(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
+    const grid_changed = cols != self.cols or rows != self.rows;
+    const cell_changed = cell.width != self.cell.width or cell.height != self.cell.height;
+    if (!grid_changed and !cell_changed) return;
+    self.cell = cell;
+    if (self.stream) |*stream| {
+        if (grid_changed) {
+            try stream.handler.resize(.{
+                .cols = cols,
+                .rows = rows,
+                // Non-null or the handler returns before writing anything: a
+                // report needs complete pixel geometry, and "we do not know"
+                // is spelled zero rather than absent. See `sizeEffect`.
+                .cell_size_px = .{ .width = cell.width, .height = cell.height },
+            });
+        } else {
+            // The grid held and the cell moved: a window dragged onto a
+            // display of another scale. Nothing to reflow, but the pixel
+            // size a program was told is now wrong, and it has to hear the
+            // new one from the same place it heard the old one.
+            self.reportSizeLocked(stream);
+        }
+    }
     try self.pty_pair.setSize(.{
         .cols = cols,
         .rows = rows,
@@ -766,22 +795,85 @@ pub fn resize(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
     // size changed: after the last output parsed at the old size, before the
     // first at the new. The reader thread cannot be fanning out right now --
     // it needs this same lock to -- and that is what makes the position exact
-    // rather than approximate.
+    // rather than approximate. Grid only: a client's mirror has no pixels to
+    // move.
+    if (!grid_changed) return;
     for (self.subscribers.items) |s| {
         if (s.resizeFn) |f| f(s.ctx, self.id, cols, rows);
     }
 }
 
+/// The mode 2048 report for the size the terminal already is, if the child
+/// asked for reports. What `Handler.resize` would have written had the grid
+/// changed, without the reflow that would have come with it.
+fn reportSizeLocked(self: *Terminal, stream: *ghostty.TerminalStream) void {
+    if (!stream.handler.terminal.modes.get(.in_band_size_reports)) return;
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    ghostty.size_report.encode(&writer, .mode_2048, .{
+        .rows = self.rows,
+        .columns = self.cols,
+        .cell_width = self.cell.width,
+        .cell_height = self.cell.height,
+    }) catch return;
+    self.queuePtyWrite(buf[0..writer.end]);
+}
+
 /// A grid dimension in pixels, for a `winsize`.
 ///
-/// Saturating, because the field is a `u16` and the product of two client-
-/// supplied numbers is not: a client claiming a 200-pixel cell across 400
-/// columns would otherwise wrap to a small number, which is worse than the
-/// clamp. Zero cells give zero, which is what the field meant before any
-/// client sent metrics.
+/// Saturating, because the field is a `u16` and the product of two numbers a
+/// client chose is not. Widened before the multiply: clamping a `u32` product
+/// after it wrapped is the mistake the first version of this made, and a
+/// client claiming a 1431655766-pixel cell across three columns got a
+/// two-pixel terminal out of it -- or a panic, in a build that checks.
 fn pixels(cells: u16, cell_px: u32) u16 {
-    const total = @as(u32, cells) * cell_px;
-    return @intCast(@min(total, std.math.maxInt(u16)));
+    return std.math.lossyCast(u16, @as(u64, cells) * cell_px);
+}
+
+/// Bytes the VT owes the child never go to the PTY under `mutex`. They wait
+/// in `pty_out` and are written here, once the lock is gone.
+///
+/// The master is a blocking descriptor, and a child that has stopped reading
+/// its terminal -- Neovim inside a synchronous `:!`, a stopped job -- fills
+/// the kernel's input queue in about a kilobyte. A `write` past that point
+/// blocks until the child reads again. Holding `mutex` across it would park
+/// the reader thread behind it in `ingest`, and with the reader parked no
+/// client of this terminal gets another byte, and no other client can attach,
+/// resize, or peek. `writeInput` has always been lock-free for exactly this
+/// reason; a report the daemon volunteers on a client's behalf, on a client's
+/// thread, has no better claim on the lock than a keystroke does.
+///
+/// Serialised by `pty_write_mutex` so that two threads draining at once keep
+/// the chunks in the order they were produced. A thread that blocks here
+/// blocks only itself -- the same thing a keystroke to that child would do.
+fn flushPtyWrites(self: *Terminal) void {
+    self.pty_write_mutex.lock();
+    defer self.pty_write_mutex.unlock();
+
+    self.mutex.lock();
+    var out = self.pty_out;
+    self.pty_out = .empty;
+    self.mutex.unlock();
+    defer out.deinit(self.gpa);
+
+    if (out.items.len == 0) return;
+    sys.writeAll(self.pty_pair.master, out.items) catch |err| {
+        log.warn("terminal {d}: failed writing to the pty: {t}", .{ self.id, err });
+    };
+}
+
+/// Caller holds `mutex`. Bounded, because a child that never reads again
+/// would otherwise collect every report it was ever sent; past the bound the
+/// newest is the one worth keeping, and a report is superseded by the next.
+fn queuePtyWrite(self: *Terminal, data: []const u8) void {
+    const max_pty_out = 64 * 1024;
+    if (self.pty_out.items.len + data.len > max_pty_out) {
+        log.warn("terminal {d}: child is not reading; dropping {d} bytes", .{ self.id, data.len });
+        return;
+    }
+    self.pty_out.appendSlice(self.gpa, data) catch |err| {
+        log.warn("terminal {d}: could not queue a pty write: {t}", .{ self.id, err });
+    };
 }
 
 /// Encode a complete snapshot of this terminal to `writer`.
@@ -1065,6 +1157,22 @@ fn unparkLocked(self: *Terminal) !void {
         .bytes => |bytes| self.stream.?.nextSlice(bytes),
     }
 
+    // Sized while it was on disk? `resize` had no VT to reflow then: it moved
+    // the PTY, told every client, and left this for here. Without it the
+    // server would parse the child's repaint -- drawn for the new width,
+    // because the winsize already said so -- into a grid of the old one, and
+    // the clients, sized from the marker, would disagree with it for good.
+    if (self.vt.?.cols != self.cols or self.vt.?.rows != self.rows) {
+        self.stream.?.handler.resize(.{
+            .cols = self.cols,
+            .rows = self.rows,
+            .cell_size_px = .{ .width = self.cell.width, .height = self.cell.height },
+        }) catch |err| log.warn(
+            "terminal {d}: unparked at {d}x{d}, could not reach {d}x{d}: {t}",
+            .{ self.id, self.vt.?.cols, self.vt.?.rows, self.cols, self.rows, err },
+        );
+    }
+
     self.residency = .rehydrating;
     self.rehydration = rehydration;
     rehydration.thread = std.Thread.spawn(.{ .stack_size = thread_stack_size }, restoreHistory, .{rehydration}) catch |err| {
@@ -1241,10 +1349,9 @@ fn writePtyEffect(h: *ghostty.TerminalStream.Handler, data: []const u8) void {
     const self = fromHandler(h);
     // We already hold `mutex` here: every caller does. This runs inside
     // `stream.nextSlice` for a query the child asked, and inside `resize` for
-    // the mode 2048 report it did not.
-    sys.writeAll(self.pty_pair.master, data) catch |err| {
-        log.warn("failed writing query response to pty: {t}", .{err});
-    };
+    // the mode 2048 report it did not -- which is why the bytes are queued
+    // rather than written. See `flushPtyWrites`.
+    self.queuePtyWrite(data);
 }
 
 /// Answer device attribute queries (CSI c, CSI > c, CSI = c).
@@ -1303,8 +1410,8 @@ fn sizeEffect(h: *ghostty.TerminalStream.Handler) ?ghostty.size_report.Size {
         // is zero until somebody has made one. Zero is also what the spec
         // reserves for "unknown", which is the honest answer for a headless
         // server nobody has told yet.
-        .cell_width = self.cell_width,
-        .cell_height = self.cell_height,
+        .cell_width = self.cell.width,
+        .cell_height = self.cell.height,
     };
 }
 
@@ -2273,43 +2380,14 @@ test "a resize under mode 2048 is reported in band as well as by signal" {
     defer t.hangup();
     try t.start();
 
-    try waitForScreen(gpa, t, "ARMED", error.ModeNeverEnabled);
+    try awaitMarker(t, gpa, "ARMED");
     try t.resize(100, 30, .{ .width = 8, .height = 16 });
 
     // `\x1b[48;{rows};{cols};{height_px};{width_px}t`, twice, as `od -An -c`
     // spells it. The pixels are the cell multiplied out: 30 rows of 16 is 480,
     // 100 columns of 8 is 800 -- which is the whole reason the cell size
     // travels on the wire at all.
-    try waitForScreen(
-        gpa,
-        t,
-        "SIZE<033[48;24;80;0;0t033[48;30;100;480;800t>",
-        error.ResizeNeverReportedInBand,
-    );
-}
-
-/// Poll the terminal's own screen until `needle` is on it.
-///
-/// The child writes its answers where `plainText` can see them rather than
-/// back to the test, because there is no back channel: the daemon owns the pty
-/// and a test holds a terminal, not a client.
-fn waitForScreen(
-    gpa: std.mem.Allocator,
-    t: *Terminal,
-    needle: []const u8,
-    on_timeout: anyerror,
-) !void {
-    var waited: usize = 0;
-    while (waited < 5000) : (waited += 10) {
-        const text = t.plainText(gpa) catch {
-            sys.sleepNs(10 * std.time.ns_per_ms);
-            continue;
-        };
-        defer gpa.free(text);
-        if (std.mem.indexOf(u8, text, needle) != null) return;
-        sys.sleepNs(10 * std.time.ns_per_ms);
-    }
-    return on_timeout;
+    try awaitMarker(t, gpa, "SIZE<033[48;24;80;0;0t033[48;30;100;480;800t>");
 }
 
 test "a resize tells every subscriber the new size, and a repeat tells nobody" {
@@ -2345,6 +2423,56 @@ test "a resize tells every subscriber the new size, and a repeat tells nobody" {
     // reflow its terminal for nothing.
     try t.resize(100, 30, .{});
     try testing.expectEqual(@as(usize, 1), seen.n);
+
+    // A cell that moved under a grid that did not is a change in pixels and
+    // in nothing a client's mirror can see: the winsize follows, the marker
+    // does not go out.
+    try t.resize(100, 30, .{ .width = 8, .height = 16 });
+    try testing.expectEqual(@as(usize, 1), seen.n);
+    const ws = t.pty_pair.getSize() orelse return error.NoWinsize;
+    try testing.expectEqual(@as(u16, 800), ws.width_px);
+    try testing.expectEqual(@as(u16, 480), ws.height_px);
+}
+
+test "a terminal resized while parked unparks at the new size" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-park-resize-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const marker = "PARKED_RESIZE_MARKER";
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = root },
+        .id = 1,
+        .session_id = 1,
+        .name = "park-resize",
+        .argv = &.{ "/bin/sh", "-c", "printf '" ++ marker ++ "\\n'; sleep 10" },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    defer t.hangup();
+    try t.start();
+    try awaitMarker(t, gpa, marker);
+
+    try t.park();
+    try testing.expect(t.vt == null);
+
+    // No VT to reflow: the PTY and the clients move, and the VT owes a size.
+    try t.resize(120, 40, .{});
+    try testing.expectEqual(@as(u16, 120), t.cols);
+
+    try t.unpark();
+    const vt = &(t.vt orelse return error.StillParked);
+    try testing.expectEqual(@as(u16, 120), vt.cols);
+    try testing.expectEqual(@as(u16, 40), vt.rows);
 }
 
 /// A subscriber that remembers the last size it was told and how often.
