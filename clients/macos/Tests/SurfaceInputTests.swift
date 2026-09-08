@@ -287,6 +287,16 @@ final class SurfaceInputTests: XCTestCase {
         return (view, engine, window)
     }
 
+    /// The same, with somewhere for what the surface sends to land.
+    private func recordingSurface() throws -> (
+        TerminalSurfaceView, TerminalEngine, NSWindow, Recorder
+    ) {
+        let (view, engine, window) = try windowedSurface()
+        let recorder = Recorder()
+        view.delegate = recorder
+        return (view, engine, window, recorder)
+    }
+
     /// Take the view out of its window first, which stops the render thread.
     private func tearDown(_ view: TerminalSurfaceView, _ window: NSWindow) {
         window.contentView = NSView(frame: view.frame)
@@ -459,6 +469,25 @@ final class SurfaceInputTests: XCTestCase {
         view.mouseDragged(with: try event(.leftMouseDragged, x: left + 4.8 * cell))
 
         XCTAssertEqual(engine.selectionText(), "line6")
+    }
+
+    /// And the same point, reported to the program rather than selected with.
+    ///
+    /// The other half of the same conversion, and the half with no coverage at
+    /// all: `InputTests` hands the encoder pixel positions directly, and every
+    /// wheel test here reports at the origin, where a negated y is still zero.
+    /// So a click in a full-screen program went unreported entirely — a
+    /// position off the surface encodes to no bytes at all — for exactly as
+    /// long as selection was landing on the first line, and nothing said so.
+    func testAReportedClickCarriesTheCellUnderIt() throws {
+        let (view, engine, window, recorder) = try recordingSurface()
+        defer { tearDown(view, window) }
+        write(engine, "\u{1b}[?1000h\u{1b}[?1006h")
+
+        view.mouseDown(with: try click(view, column: 3, row: 6, type: .leftMouseDown))
+
+        // SGR reports are 1-based: column 4, row 7.
+        XCTAssertEqual(recorder.text, "\u{1b}[<0;4;7M")
     }
 
     /// Typing drops the selection, as it does in every terminal.
