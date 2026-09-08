@@ -978,14 +978,21 @@ final class HangUpServer: @unchecked Sendable {
         /// Keep a client fd open for the life of the server. Closed by `stop`,
         /// which is what keeps the test from leaking descriptors into the rest
         /// of the suite.
-        func hold(_ fd: Int32) {
+        /// True if the socket is now held and a reader may be started on it.
+        /// The reader is counted *under the lock*, so `releaseHeld` cannot
+        /// find the group empty between a hold and its reader starting; and
+        /// a hold after `stop` closes the socket and returns false, so no
+        /// reader is ever started on a number that is already free.
+        func hold(_ fd: Int32) -> Bool {
             lock.lock()
             defer { lock.unlock() }
             if _stopped {
                 Darwin.close(fd)
-                return
+                return false
             }
             _held.append(fd)
+            readers.enter()
+            return true
         }
 
         /// The threads reading held sockets. `releaseHeld` waits for them
@@ -1102,15 +1109,15 @@ final class HangUpServer: @unchecked Sendable {
                 // these tests does deliberately -- must not be written to.
                 if spoke {
                     sendError(client, code: ProtocolErrorCode.noSuchSession, session: 1)
-                    state.hold(client)
                     // Keep reading the held socket. A test that provokes a
                     // reattach on it wants the attach it sends recorded, and
                     // the accept loop must not be the thread that waits for
                     // it: the same tests open a second connection meanwhile.
-                    state.readers.enter()
-                    Thread.detachNewThread {
-                        defer { state.readers.leave() }
-                        _ = Self.readFrames(client, state, count: .max)
+                    if state.hold(client) {
+                        Thread.detachNewThread {
+                            defer { state.readers.leave() }
+                            _ = Self.readFrames(client, state, count: .max)
+                        }
                     }
                 } else {
                     Darwin.close(client)

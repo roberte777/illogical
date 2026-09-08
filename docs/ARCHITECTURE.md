@@ -272,12 +272,15 @@ PTY *after* the terminal lock is released, never under it: the master is a
 blocking descriptor, a child that has stopped reading fills the kernel's input
 queue in about a kilobyte, and a write blocked there with the lock held would
 park the reader thread — and with it every client of that terminal — behind a
-program that is not listening. And a resize *wakes* a parked terminal. There is
-no VT on disk to reflow and no report to send from there, and a program that
-asked for reports ignores the SIGWINCH the winsize would raise — so it would
-never speak, never trigger the read that unparks, and never learn of the resize
-at all. Idle Neovim parks by default; someone dragging its window is the
-opposite of the idleness parking is for.
+program that is not listening. And a *parked* terminal has no VT: a resize
+moves the PTY and tells the clients, and that is all it can do. The report is
+not written (there is no VT to ask whether the child wants one), and once the
+terminal unparks its VT keeps the park width. Waking it for the resize is the
+obvious fix and the wrong one — the history restore is at the park width and
+every page is discarded once the VT is reflowed under it, so a drag across an
+idle pane emptied its scrollback. The design that keeps both parking and the
+streaming attach is
+[#82](https://github.com/roberte777/illogical/issues/82).
 
 Step 1 is the one that matters. Ghostty has no step 3 because it has no second
 terminal: the resize sits at one point in one byte stream by construction. A

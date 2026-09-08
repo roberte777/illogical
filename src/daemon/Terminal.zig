@@ -768,15 +768,17 @@ fn resizeLocked(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
     const grid_changed = cols != self.cols or rows != self.rows;
     const cell_changed = cell.width != self.cell.width or cell.height != self.cell.height;
     if (!grid_changed and !cell_changed) return;
-    // A resize wakes a parked terminal. There is no VT on disk to reflow and
-    // no mode 2048 report to send from there -- and a child that asked for
-    // reports ignores the SIGWINCH the winsize would raise, so it would never
-    // speak, never trigger the read that unparks, and never learn of the
-    // resize at all. Idle Neovim parks by default; this was "drag the window,
-    // nothing happens until you press a key". Someone is looking at this
-    // terminal, which is the opposite of the idleness parking is for.
-    if (self.residency == .parked) try self.unparkLocked();
     self.cell = cell;
+    // Parked, there is no VT: the PTY and the clients move, and the VT does
+    // not. That is a known gap, not a design. Waking the terminal here loses
+    // its scrollback (the history restore is at the park width and every
+    // page is discarded once the VT is reflowed under it), and the honest
+    // fix -- remember the mode 2048 bit at park time so the report can be
+    // written without a VT, reflow once the restore is done, send the marker
+    // after a park-file snapshot -- is its own change. Until then a program
+    // in a parked terminal that asked for reports gets none until something
+    // makes it speak, and the server's terminal keeps the park width once it
+    // does. See the issue named in docs/PARKING.md.
     if (self.stream) |*stream| {
         if (grid_changed) {
             try stream.handler.resize(.{
@@ -879,6 +881,12 @@ fn flushPtyWrites(self: *Terminal) void {
 
 /// Caller holds `pty_write_mutex`. Takes `mutex` only to swap the queue out,
 /// never across the write.
+///
+/// In the polled regime the master is non-blocking, so a child that is not
+/// reading answers with a short write and then EAGAIN. What did not fit goes
+/// back to the front of the queue for the next flush rather than on the
+/// floor: half a `CSI 48 ... t` is not a report, it is garbage in front of the
+/// child's next keystroke.
 fn drainPtyWrites(self: *Terminal) void {
     while (true) {
         self.mutex.lock();
@@ -887,9 +895,24 @@ fn drainPtyWrites(self: *Terminal) void {
         self.mutex.unlock();
         defer out.deinit(self.gpa);
         if (out.items.len == 0) return;
-        sys.writeAll(self.pty_pair.master, out.items) catch |err| {
-            log.warn("terminal {d}: failed writing to the pty: {t}", .{ self.id, err });
-        };
+
+        var off: usize = 0;
+        while (off < out.items.len) {
+            off += sys.writeSome(self.pty_pair.master, out.items[off..]) catch |err| switch (err) {
+                error.WouldBlock => {
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+                    self.pty_out.insertSlice(self.gpa, 0, out.items[off..]) catch |e| {
+                        log.warn("terminal {d}: could not requeue a pty write: {t}", .{ self.id, e });
+                    };
+                    return;
+                },
+                else => {
+                    log.warn("terminal {d}: failed writing to the pty: {t}", .{ self.id, err });
+                    return;
+                },
+            };
+        }
     }
 }
 
@@ -2456,7 +2479,7 @@ test "a resize tells every subscriber the new size, and a repeat tells nobody" {
     try testing.expectEqual(@as(u16, 480), ws.height_px);
 }
 
-test "a resize wakes a parked terminal, and every client hears the new size" {
+test "a resize while parked moves the PTY and the clients, and leaves the terminal parked" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
@@ -2490,18 +2513,16 @@ test "a resize wakes a parked terminal, and every client hears the new size" {
     try t.park();
     try testing.expect(t.vt == null);
 
-    // The same size is not a reason to wake anything.
-    try t.resize(80, 24, .{});
-    try testing.expect(t.vt == null);
-    try testing.expectEqual(@as(usize, 0), seen.n);
-
-    // A new one is: there is a VT again, it is that size, and the marker
-    // went out from the point where the server's terminal changed.
+    // What is promised while parked: the kernel and every client learn the
+    // size, and nothing is woken for it -- waking here is what loses the
+    // scrollback. The VT catching up is the open item the comment in
+    // `resizeLocked` names.
     try t.resize(120, 40, .{});
-    const vt = &(t.vt orelse return error.StillParked);
-    try testing.expectEqual(@as(u16, 120), vt.cols);
-    try testing.expectEqual(@as(u16, 40), vt.rows);
-    try testing.expect(t.summary().residency != .parked);
+    try testing.expect(t.vt == null);
+    try testing.expectEqual(session.Residency.parked, t.summary().residency);
+    const ws = t.pty_pair.getSize() orelse return error.NoWinsize;
+    try testing.expectEqual(@as(u16, 120), ws.cols);
+    try testing.expectEqual(@as(u16, 40), ws.rows);
     try testing.expectEqual(@as(usize, 1), seen.n);
     try testing.expectEqual(@as(u16, 120), seen.cols);
 }

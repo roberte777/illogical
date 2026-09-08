@@ -127,6 +127,22 @@ pub fn writeFd(fd: fd_t, buf: []const u8) Error!usize {
     }
 }
 
+/// One `write`, with EAGAIN as `error.WouldBlock` rather than folded into
+/// `WriteFailed`. For a caller that can keep the unwritten tail for later --
+/// a descriptor in non-blocking mode is not a failure, it is a queue that is
+/// full right now.
+pub fn writeSome(fd: fd_t, buf: []const u8) Error!usize {
+    while (true) {
+        const n = write(fd, buf.ptr, buf.len);
+        if (n >= 0) return @intCast(n);
+        return switch (errno()) {
+            EINTR => continue,
+            EAGAIN => error.WouldBlock,
+            else => error.WriteFailed,
+        };
+    }
+}
+
 pub fn writeAll(fd: fd_t, bytes: []const u8) Error!void {
     var off: usize = 0;
     while (off < bytes.len) off += try writeFd(fd, bytes[off..]);
