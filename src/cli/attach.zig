@@ -45,7 +45,7 @@ pub fn run(conn: *Conn, gpa: Allocator, io: std.Io, args: []const []const u8) !v
     // PTY on the far side only hears about it because we say so. Not for a
     // pipe: `illogical attach 3 </dev/null >log` is never sent a SIGWINCH, and
     // need not carry a thread and a pipe waiting for one.
-    if (winSize(sys.STDOUT) != null) {
+    if (isTerminal(sys.STDOUT)) {
         watchWindowSize(conn, id) catch |err| {
             std.log.warn("resizing this terminal will not resize the session: {t}", .{err});
         };
@@ -133,15 +133,29 @@ fn feedInput(conn: *Conn, id: u64) void {
     }
 }
 
-/// The size `fd` reports, in the shape the daemon is told, or null when it is
-/// not a terminal.
+/// Whether `fd` is a terminal at all.
 ///
-/// Separate from `terminalSize` because the answer "there is no terminal here"
-/// is worth having on its own: it is what decides whether following SIGWINCH
-/// is worth a thread.
+/// Deliberately not "does it report a size": a terminal whose size has not
+/// been set yet answers the ioctl and reports zeros -- an `openpty` is 0x0
+/// until something calls `TIOCSWINSZ` -- and it will still deliver a SIGWINCH
+/// once it is sized. Only ENOTTY means there is nothing here to follow, so
+/// only ENOTTY may decide against the thread.
+fn isTerminal(fd: sys.fd_t) bool {
+    var ws: c.struct_winsize = undefined;
+    return c.ioctl(fd, c.TIOCGWINSZ, &ws) == 0;
+}
+
+/// The size `fd` reports, in the shape the daemon is told, or null when it did
+/// not report one.
+///
+/// Null covers both "not a terminal" and "a terminal that has not been sized",
+/// because for a caller that wants a size those are the same answer: there is
+/// no number here to pass on. A zero on either axis is that, not a size --
+/// the daemon refuses one, and a caller that sent it would be sending noise.
 fn winSize(fd: sys.fd_t) ?protocol.body.Attach {
     var ws: c.struct_winsize = undefined;
-    if (c.ioctl(fd, c.TIOCGWINSZ, &ws) != 0 or ws.ws_col == 0) return null;
+    if (c.ioctl(fd, c.TIOCGWINSZ, &ws) != 0) return null;
+    if (ws.ws_col == 0 or ws.ws_row == 0) return null;
     return .{
         .cols = ws.ws_col,
         .rows = ws.ws_row,
@@ -150,7 +164,7 @@ fn winSize(fd: sys.fd_t) ?protocol.body.Attach {
         // zero -- and zero divided by a column count is zero, which is
         // exactly the "unknown" the server wants for them.
         .cell_width = @as(u32, ws.ws_xpixel) / ws.ws_col,
-        .cell_height = if (ws.ws_row > 0) @as(u32, ws.ws_ypixel) / ws.ws_row else 0,
+        .cell_height = @as(u32, ws.ws_ypixel) / ws.ws_row,
     };
 }
 
@@ -203,7 +217,12 @@ const ResizeWatch = struct {
     }
 
     fn send(self: ResizeWatch) !void {
-        const size = terminalSize(self.tty);
+        // Only a size the terminal actually reported. `terminalSize`'s 80x24
+        // is the answer to "we have to send something" at attach; here there
+        // is nothing we have to send, and a guess would resize the session --
+        // and every other client watching it -- to a number nobody asked for.
+        // A window on its way out reports zeros before it reports nothing.
+        const size = winSize(self.tty) orelse return;
         try self.conn.sendJson(.resize, self.id, protocol.body.Resize{
             .cols = size.cols,
             .rows = size.rows,
@@ -330,11 +349,53 @@ test "the cell comes out of the winsize the terminal reports" {
     try testing.expectEqual(@as(u32, 0), bare.cell_width);
     try testing.expectEqual(@as(u32, 0), bare.cell_height);
 
-    // Not a terminal at all, and so not worth a thread.
+    // A terminal that has not been sized reports no size -- but it is still a
+    // terminal, and will still raise SIGWINCH once something sizes it, so it
+    // is worth a thread. Only a pipe is not.
+    try pty.setSize(.{ .cols = 0, .rows = 0 });
+    try testing.expect(winSize(pty.master) == null);
+    try testing.expect(isTerminal(pty.master));
+
     const fds = try sys.pipeFds();
     defer sys.closeFd(fds[0]);
     defer sys.closeFd(fds[1]);
     try testing.expect(winSize(fds[0]) == null);
+    try testing.expect(!isTerminal(fds[0]));
+}
+
+test "a terminal that reports no size is not resized to a guess" {
+    const testing = std.testing;
+
+    var pty = try illogical.pty.Pty.open(.{ .cols = 80, .rows = 24 });
+    defer pty.deinit();
+    defer sys.closeFd(pty.slave);
+    // What a window on its way out looks like: the ioctl still answers, and
+    // answers zero.
+    try pty.setSize(.{ .cols = 0, .rows = 0 });
+
+    const frames = try sys.pipeFds();
+    defer sys.closeFd(frames[0]);
+    defer sys.closeFd(frames[1]);
+    const wake = try sys.pipeFds();
+    defer sys.closeFd(wake[0]);
+
+    var conn: Conn = .{ .read_fd = frames[0], .write_fd = frames[1], .gpa = testing.allocator };
+    defer conn.read_buf.deinit(testing.allocator);
+
+    const watch: ResizeWatch = .{ .conn = &conn, .id = 7, .tty = pty.master, .wake = wake[0] };
+    const runner = try std.Thread.spawn(.{}, ResizeWatch.loop, .{watch});
+
+    resize_pending.store(true, .release);
+    try sys.writeAll(wake[1], &[_]u8{0});
+    sys.closeFd(wake[1]);
+    runner.join();
+
+    // Nothing on the wire. `terminalSize` would have substituted 80x24 here,
+    // and sending that would have resized the session -- and every other
+    // client on it -- to a size the terminal never reported.
+    sys.setNonblock(frames[0], true);
+    var trailing: [1]u8 = undefined;
+    try testing.expectError(error.WouldBlock, sys.readFdOnce(frames[0], &trailing));
 }
 
 test "a window-size change is sent on as a resize frame" {
