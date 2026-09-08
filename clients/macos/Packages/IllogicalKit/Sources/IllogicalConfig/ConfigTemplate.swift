@@ -162,6 +162,15 @@ public enum ConfigTemplate {
         # cursor-color = cell-foreground
         # cursor-text = cell-background
         #
+        # # Whether macOS draws its own bits of the window -- the traffic
+        # # lights, a sheet, the buttons on the "no terminals" screen -- light
+        # # or dark. The chrome we draw ourselves always follows the theme;
+        # # this is for the parts we do not draw.
+        # #
+        # # auto reads the theme's background, which is the default. system
+        # # follows the desktop; light and dark force one.
+        # window-theme = auto
+        #
         # # Force a WCAG contrast ratio between text and its own background,
         # # 1 through 21. 1 is off, and off is the default: this overrides the
         # # colour a program asked for. 1.1 avoids invisible text; 3 or more

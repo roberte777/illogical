@@ -161,6 +161,22 @@ public struct Config: Equatable, Sendable {
     /// keeping it dark-to-light. No effect unless `palette-generate` is on.
     public var paletteHarmonious = false
 
+    /// Whether the window's controls -- the traffic lights, the buttons on a
+    /// placeholder screen, a sheet -- draw light or dark.
+    ///
+    /// The chrome we paint ourselves follows the theme whatever this says;
+    /// what this decides is the `NSAppearance` AppKit hands to everything we
+    /// do *not* paint. A cream terminal in a window macOS still thinks is dark
+    /// gets white-on-white system buttons, which is the one part of a light
+    /// theme that cannot be fixed by choosing better colours.
+    ///
+    /// `auto` reads the theme's own background, which is libghostty's default
+    /// and its rule: light above a perceived luminance of 0.5. Except with a
+    /// light/dark theme *pair*, where `auto` would fight the pair -- the
+    /// appearance is what chose the theme in the first place -- so it defers
+    /// to `system`, exactly as libghostty does.
+    public var windowTheme: ConfigWindowTheme = .auto
+
     /// The WCAG contrast ratio to force between a cell's text and its own
     /// background, 1 through 21. 1 is off.
     ///
@@ -320,6 +336,21 @@ public struct Config: Equatable, Sendable {
             apply(entry, to: \.paletteGenerate, report: report)
         case "palette-harmonious":
             apply(entry, to: \.paletteHarmonious, report: report)
+
+        case "window-theme":
+            guard let value = entry.value else {
+                report("value required")
+                return
+            }
+            if value.isEmpty {
+                windowTheme = Config().windowTheme
+                return
+            }
+            guard let parsed = ConfigWindowTheme(rawValue: value) else {
+                report("invalid value \"\(value)\"")
+                return
+            }
+            windowTheme = parsed
 
         case "minimum-contrast":
             guard let value = entry.value else {

@@ -65,16 +65,27 @@ enum MenuMetrics {
         width - 2 * padding - 2 * rowPadding - iconColumn - iconToTitle
 }
 
+/// The menu's own colours, on the same three relationships the rest of the
+/// chrome uses — see `Palette`. The panel is lit from the top and the field
+/// inside it is cut in, so the gradient runs from a tint down through the
+/// background to a shade, and the field is a shade further still.
 extension Palette {
-    static let menuTop = rgb(0x20_2C_3A)
-    static let menuBottom = rgb(0x15_1F_2B)
-    static let menuStroke = Color.white.opacity(0.09)
-    static let menuField = rgb(0x11_1B_25)
-    static let menuSeparator = rgb(0x1A_24_30)
-    static let menuHighlight = rgb(0x5C_9D_F9)
-    static let menuHighlightText = rgb(0x0D_1B_2E)
-    static let menuText = rgb(0xD3_DB_DE)
-    static let menuShortcut = rgb(0x7E_93_A4)
+    static var menuTop: Color { tint(0.08) }
+    static var menuBottom: Color { shade(0.06) }
+    static var menuStroke: Color { color(source.foreground).opacity(0.09) }
+    static var menuField: Color { shade(0.12) }
+    static var menuSeparator: Color { tint(0.04) }
+    /// The theme's own blue. A selected row is the one place in the window
+    /// with a colour rather than a shade, and taking it from the palette is
+    /// what stops a Rosé Pine menu having a stock macOS blue in the middle
+    /// of it.
+    static var menuHighlight: Color { color(source.blue) }
+    /// On that blue, whichever of the terminal's two colours can be read
+    /// against it — which is the background on nearly every theme, and the
+    /// foreground on the ones whose blue is dark.
+    static var menuHighlightText: Color { readable(on: source.blue) }
+    static var menuText: Color { text(0.0) }
+    static var menuShortcut: Color { text(0.37) }
 }
 
 struct SessionMenu: View {
@@ -604,7 +615,10 @@ struct AddRemoteHost: View {
             }
         }
         .padding(20)
-        .background(Palette.background)
+        // The panel colour, not the terminal's: this is a sheet over the
+        // window, and the only thing in the app that is the terminal's colour
+        // is a terminal.
+        .background(Palette.menuBottom)
     }
 
     private func commit() {

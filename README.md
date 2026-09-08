@@ -177,6 +177,12 @@ tried. A theme file is an ordinary config file — the same syntax, the same
 seven colour keys below — and the only thing it may not set is another
 `theme`.
 
+A theme repaints the whole window, not just the terminal: the toolbar, the tab
+strip, the find bar and the session menu are all derived from the theme's
+background and foreground, and the tab badge and the selected menu row take
+the theme's own green and blue. `window-theme` decides the appearance macOS
+draws its own parts of the window in.
+
 The light/dark pair is resolved at launch, so switching the system between
 light and dark needs the app restarted for now.
 
@@ -220,6 +226,13 @@ selection-foreground = #1e1e2e
 # `selection-invert-fg-bg` are the older spellings, and still read.)
 cursor-color = cell-foreground
 cursor-text = cell-background
+
+# Whether macOS draws its own parts of the window — the traffic lights, a
+# sheet, the buttons on the "no terminals" screen — light or dark. The chrome
+# Illogical draws itself always follows the theme; this is for the rest.
+# `auto` reads the theme's background, `system` follows the desktop, and
+# `light`/`dark` force one. Default `auto`.
+window-theme = auto
 
 # Force a WCAG contrast ratio between text and its own background, 1 to 21.
 # 1 is off, and off is the default — this overrides the colour a program

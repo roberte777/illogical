@@ -13,6 +13,7 @@
 import AppKit
 import Foundation
 import IllogicalConfig
+import SwiftUI
 import os
 
 enum AppConfig {
@@ -83,21 +84,47 @@ enum AppConfig {
 
     /// Which half of `theme = light:x,dark:y` applies right now.
     ///
-    /// `NSAppearance` rather than the `AppleInterfaceStyle` default, because
-    /// the two can disagree: the default is the *system's* setting, and an
-    /// app whose own appearance is forced -- by `NSRequiresAquaSystemAppearance`
-    /// in its Info.plist, or by a person setting it per-app -- draws in the
-    /// one it was forced to. The theme has to match what the window actually
-    /// looks like.
+    /// The *desktop's* setting, and deliberately not
+    /// `NSApp.effectiveAppearance`: this app sets its own appearance from the
+    /// theme (`windowAppearance`), so asking AppKit what appearance we are in
+    /// would sometimes be asking what we told it a moment ago. `light:x,dark:y`
+    /// has to follow the machine, not itself.
     ///
-    /// Read at launch, so a config change or a system switch needs the app
-    /// restarted to take effect -- the same rule the font and the colours
-    /// follow, and the same follow-up (#39).
+    /// Absent means light, which is the convention: macOS writes this default
+    /// only in dark mode.
+    ///
+    /// Read at launch, so switching the system between light and dark needs
+    /// the app restarted to take effect -- the same rule the font and the
+    /// colours follow, and the same follow-up (#39).
     static var systemAppearance: ConfigAppearance {
-        let match = NSApplication.shared.effectiveAppearance.bestMatch(from: [
-            .aqua, .darkAqua,
-        ])
-        return match == .darkAqua ? .dark : .light
+        UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark" ? .dark : .light
+    }
+
+    /// The appearance AppKit should draw everything we do not paint in.
+    ///
+    /// Nil is never returned: the point of this is to *stop* deferring to the
+    /// system when the theme disagrees with it, and `window-theme = system` is
+    /// spelled by resolving the system's own appearance rather than by handing
+    /// AppKit a nil and hoping.
+    static var windowAppearance: NSAppearance? {
+        NSAppearance(named: resolvedAppearance == .light ? .aqua : .darkAqua)
+    }
+
+    /// The same answer, for SwiftUI. Both are needed: `WindowChrome` sets the
+    /// `NSAppearance` so that AppKit's own title bar draws correctly, and
+    /// SwiftUI's `preferredColorScheme` outranks it inside the hosted view --
+    /// so a window that set only the first had light traffic lights above
+    /// dark buttons.
+    static var windowColorScheme: ColorScheme {
+        resolvedAppearance == .light ? .light : .dark
+    }
+
+    private static var resolvedAppearance: ConfigAppearance {
+        let config = current
+        return config.windowTheme.appearance(
+            background: config.background,
+            system: systemAppearance,
+            conditional: config.theme?.isConditional ?? false)
     }
 
     /// Whether the window has anything to be translucent *over*.
@@ -121,6 +148,23 @@ enum AppConfig {
         let result = Config.loadDefaults(
             bundleID: Bundle.main.bundleIdentifier, appearance: systemAppearance)
         storage.withLock { $0 = result.config }
+
+        // The chrome, from the same colours. Here rather than lazily inside
+        // `Palette` for the reason loading is explicit at all: a lazy read
+        // would have the first SwiftUI body to ask for a divider colour
+        // resolve a 256-entry palette, on whatever thread and in whatever
+        // process happened to ask first.
+        let colors = TerminalColors.from(result.config)
+        Palette.adopt(
+            Palette.Source(
+                background: result.config.background,
+                foreground: result.config.foreground,
+                green: ConfigColor(
+                    r: colors.palette[2].r, g: colors.palette[2].g,
+                    b: colors.palette[2].b),
+                blue: ConfigColor(
+                    r: colors.palette[4].r, g: colors.palette[4].g,
+                    b: colors.palette[4].b)))
 
         for source in result.sources {
             logger.info("read \(source.path, privacy: .public)")

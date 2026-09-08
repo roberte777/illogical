@@ -86,6 +86,17 @@ struct WindowChrome<Toolbar: View>: NSViewRepresentable {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
 
+        // Everything AppKit draws for us rather than us for it: the traffic
+        // lights, the buttons on the two placeholder screens, a sheet, a
+        // scroller. Our own chrome follows the theme by being derived from it
+        // (`Palette`), but none of these are ours to paint, and a light
+        // terminal in a window macOS still believes is dark comes with
+        // white-on-white system buttons.
+        //
+        // `window-theme` decides it; `auto` reads the theme's background. See
+        // `ConfigWindowTheme`.
+        window.appearance = AppConfig.windowAppearance
+
         // A translucent terminal needs a window that is not opaque, or what
         // shows through the surface is the window's own background rather
         // than the desktop. Left alone at the default when nobody asked for

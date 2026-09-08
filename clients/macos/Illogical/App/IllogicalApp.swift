@@ -275,7 +275,13 @@ struct ContentView: View {
             Text(pending.message)
         }
         .frame(minWidth: 720, minHeight: 460)
-        .preferredColorScheme(.dark)
+        // Dark, unless the theme is light. This was `.dark` outright, from
+        // when the app had one set of colours and they were dark ones -- and
+        // it outranks the `NSAppearance` `WindowChrome` sets, so leaving it
+        // alone made `window-theme` do nothing at all. What it decides is
+        // every control we do not draw: the alert above, the buttons on the
+        // two placeholder screens, a sheet.
+        .preferredColorScheme(AppConfig.windowColorScheme)
         .background(
             WindowChrome(toolbarHeight: Metrics.toolbarHeight) {
                 Toolbar().environment(store)
@@ -453,6 +459,18 @@ struct Toolbar: View {
     }
 }
 
+/// The two screens that stand in for a terminal, and the reason both are
+/// `Palette.toolbar` rather than `Palette.background`.
+///
+/// There is no terminal on either of them, so there is no terminal colour to
+/// use: what fills the window here is the same frame that surrounds a pane
+/// when there is one. It matters more than it sounds, because the content view
+/// runs *under* the title bar -- `titlebarAppearsTransparent`, so that the tab
+/// strip can be an accessory -- and whatever this paints is therefore also the
+/// strip behind the traffic lights. Painted in the terminal's colour, a
+/// window with no terminals in it had a band of Gruvbox cream across a
+/// window that was otherwise chrome. Invisible before there were themes,
+/// when the two colours were four units apart.
 struct EmptyState: View {
     @Environment(SessionStore.self) private var store
 
@@ -470,7 +488,7 @@ struct EmptyState: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Palette.background)
+        .background(Palette.toolbar)
     }
 }
 
@@ -497,7 +515,7 @@ struct ServerUnavailable: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Palette.background)
+        .background(Palette.toolbar)
     }
 }
 

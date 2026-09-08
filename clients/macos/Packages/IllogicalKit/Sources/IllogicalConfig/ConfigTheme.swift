@@ -96,3 +96,49 @@ public struct ConfigTheme: Equatable, Sendable {
         return home.appending(path: String(path.dropFirst(1))).path
     }
 }
+
+/// What `window-theme` can say.
+///
+/// libghostty's set minus `ghostty`, which is its own Linux-only window
+/// decoration and has nothing to correspond to here. Reported as an invalid
+/// value rather than quietly read as `auto`: somebody who wrote it wanted
+/// something, and it is not this.
+public enum ConfigWindowTheme: String, Equatable, Sendable {
+    /// From the theme's own background colour.
+    case auto
+    /// From the system, whatever the theme looks like.
+    case system
+    case light
+    case dark
+
+    /// Which appearance to draw system controls in.
+    ///
+    /// `background` is the terminal's, and `system` the appearance the desktop
+    /// is in. `conditional` says the config named a light/dark theme *pair*,
+    /// which turns `auto` into `system`: the appearance chose the theme, so
+    /// letting the theme choose the appearance is a loop with a wrong answer
+    /// at every step.
+    public func appearance(
+        background: ConfigColor, system: ConfigAppearance, conditional: Bool
+    ) -> ConfigAppearance {
+        switch self {
+        case .light: return .light
+        case .dark: return .dark
+        case .system: return system
+        case .auto:
+            guard !conditional else { return system }
+            // libghostty's rule, and its formula: a background is light above
+            // a *perceived* luminance of 0.5, which is not the W3C relative
+            // luminance used for contrast -- it weights green far less
+            // steeply, and puts the boundary where an eye would put it.
+            return background.perceivedLuminance > 0.5 ? .light : .dark
+        }
+    }
+}
+
+extension ConfigColor {
+    /// Perceived luminance, 0 through 1. libghostty's `perceivedLuminance`.
+    public var perceivedLuminance: Double {
+        0.299 * (Double(r) / 255) + 0.587 * (Double(g) / 255) + 0.114 * (Double(b) / 255)
+    }
+}
