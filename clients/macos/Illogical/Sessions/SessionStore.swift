@@ -450,7 +450,7 @@ final class SessionStore {
         if let joining, let match = host.sessions.first(where: { $0.id == joining.session }) {
             return match.name
         }
-        return frontSessionName(on: host) ?? "default"
+        return frontSessionName(on: host) ?? CreateBody.defaultSessionName
     }
 
     /// What the dropdown offers for what has been typed into its filter field.

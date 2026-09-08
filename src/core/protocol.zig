@@ -189,7 +189,12 @@ pub const body = struct {
     };
 
     pub const Create = struct {
-        session_name: []const u8 = "default",
+        /// Capitalized because it is user-visible: it is the name the session
+        /// dropdown and `illogical ls` show for anyone who never named one.
+        /// `sessionByNameLocked` matches exactly, so this literal and every
+        /// client's have to agree byte for byte -- otherwise a client that
+        /// omits the field lands in a session of its own.
+        session_name: []const u8 = "Default",
         name: []const u8 = "",
         argv: []const []const u8 = &.{},
         cwd: ?[]const u8 = null,

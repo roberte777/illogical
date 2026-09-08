@@ -281,6 +281,14 @@ public struct ResizedBody: Codable, Sendable {
 }
 
 public struct CreateBody: Codable, Sendable {
+    /// The session a `create` lands in when nobody named one. Capitalized
+    /// because it is user-visible — it is what the dropdown shows for a
+    /// session the user never named — and it must match the server's own
+    /// default (`protocol.body.Create` in src/core/protocol.zig) byte for
+    /// byte, because the server matches session names exactly. Two spellings
+    /// would be two sessions.
+    public static let defaultSessionName = "Default"
+
     public var sessionName: String
     public var name: String
     public var argv: [String]
@@ -294,7 +302,7 @@ public struct CreateBody: Codable, Sendable {
     }
 
     public init(
-        sessionName: String = "default",
+        sessionName: String = CreateBody.defaultSessionName,
         name: String = "",
         argv: [String] = [],
         cwd: String? = nil,
