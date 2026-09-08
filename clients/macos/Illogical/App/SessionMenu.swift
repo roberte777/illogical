@@ -2,7 +2,7 @@
 //  The session dropdown, matched to Superlogical's.
 //
 //      ┌────────────────────────────────┐
-//      │ ⊜  Filter or create...         │  capsule field, 17pt
+//      │ ⊜  Filter or create...         │  capsule field, 22pt
 //      │                                │
 //      │ ✓   Demo                       │  22pt row, ✓ in the icon column
 //      │ ─────────────────────────────  │
@@ -43,7 +43,11 @@ enum MenuMetrics {
     static let iconToTitle: CGFloat = 9
     static let cornerRadius: CGFloat = 10
     static let rowCornerRadius: CGFloat = 7
-    static let fieldHeight: CGFloat = 17
+    /// The same height as a row, rather than the 17pt the reference measured.
+    /// At 17 a 13pt field had two points of air above and below the text and
+    /// read as squished; matching `rowHeight` gives the field and the rows
+    /// under it one vertical rhythm.
+    static let fieldHeight: CGFloat = rowHeight
     static let fieldToRows: CGFloat = 8
     static let separatorInset: CGFloat = 7
     static let separatorPadding: CGFloat = 6
@@ -254,6 +258,9 @@ struct SessionMenu: View {
                 )
                 .shadow(color: .black.opacity(0.45), radius: 14, y: 6)
         }
+        // Everything in the panel is something to click, so the whole panel is
+        // an arrow. The filter field puts the I-beam back over itself.
+        .cursor(.arrow)
         // File ▸ Rename Session… has no field to reach: `SessionMenu` only
         // exists while the dropdown is open. It leaves the session on the
         // store instead, and these are the two ways this view finds out —
@@ -321,6 +328,9 @@ struct SessionMenu: View {
             Capsule().fill(Palette.menuField)
                 .overlay(Capsule().strokeBorder(Color.white.opacity(0.06), lineWidth: 1))
         )
+        // The one part of the panel that is text to type in rather than
+        // something to click, so it opts back out of the arrow above.
+        .cursor(.iBeam)
     }
 
     private func select(_ session: SessionSummary, on host: HostConnection) {

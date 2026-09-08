@@ -215,7 +215,11 @@ fn cmdNew(
     out: *Io.Writer,
     args: []const []const u8,
 ) !void {
-    var session_name: []const u8 = "default";
+    // The struct's own default rather than a second, different literal: the
+    // server matches session names exactly, so `illogical new` and a client
+    // that omits the field have to name the same session.
+    const default: protocol.body.Create = .{};
+    var session_name: []const u8 = default.session_name;
     var name: []const u8 = "";
     var argv: std.ArrayList([]const u8) = .empty;
 
