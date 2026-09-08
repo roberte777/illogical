@@ -157,9 +157,12 @@ fn appleSdkPaths(b: *std.Build, exe: *std.Build.Step.Compile) void {
 /// This is ghostty's own build step (`src/build/GhosttyResources.zig`) over
 /// ghostty's own source, so what we ship describes the pin we build against.
 ///
-/// `cp -R` rather than an install-directory step because `tic` writes the
-/// entry's aliases as links, which Zig's own step does not preserve. A no-op
-/// when the submodule is not checked out, like everything else here.
+/// `cp -R` rather than `addInstallDirectory`, because what `tic` writes is
+/// `tic`'s business and not ours: here it is a plain file per name, but ncurses
+/// built with `--enable-symlinks` writes the aliases as links, and Zig's own
+/// step does not preserve those. Copying keeps whatever shape the host's `tic`
+/// produced. A no-op when the submodule is not checked out, like everything
+/// else here.
 fn terminfoDatabase(
     b: *std.Build,
     target: std.Build.ResolvedTarget,

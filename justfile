@@ -178,7 +178,12 @@ stage-daemon:
     # tarball already built rather than building a second copy.
     terminfo="${ILLOGICAL_TERMINFO_DIR:-zig-out/share/terminfo}"
     if [ ! -d "$terminfo" ]; then
-        echo "no terminfo database at $terminfo (did zig build run?)" >&2
+        if [ -n "${ILLOGICAL_DAEMON_BIN:-}" ]; then
+            echo "no terminfo database at $terminfo -- set ILLOGICAL_TERMINFO_DIR" >&2
+            echo "to the one beside the prebuilt daemon (the tarball carries it)" >&2
+        else
+            echo "no terminfo database at $terminfo (did zig build run?)" >&2
+        fi
         exit 1
     fi
     rm -rf clients/macos/Illogical/Supporting/terminfo

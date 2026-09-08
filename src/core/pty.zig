@@ -184,6 +184,10 @@ const terminfo_system = [_][]const u8{
     "/etc/terminfo",
     "/lib/terminfo",
     "/usr/lib/terminfo",
+    // FreeBSD keeps entries that are not ncurses' own in `site-terminfo`,
+    // which is where ghostty's build installs them there.
+    "/usr/local/share/site-terminfo",
+    "/usr/share/site-terminfo",
 };
 
 /// What the daemon's own environment says about where entries live. The child
