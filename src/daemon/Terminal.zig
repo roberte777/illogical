@@ -15,6 +15,7 @@
 const Terminal = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sys = illogical.sys;
 const Allocator = std.mem.Allocator;
 const flate = std.compress.flate;
@@ -591,7 +592,14 @@ fn ingest(self: *Terminal, bytes: []const u8) void {
         // the bytes that woke us would be dropped on the floor.
         if (self.residency == .parked) {
             self.unparkLocked() catch |err| {
-                log.err("terminal {d} failed to unpark: {t}", .{ self.id, err });
+                // Worth a line in the daemon's log, and worth suppressing in
+                // the two tests that provoke it on purpose -- the build runner
+                // fails a test step that logged an error, and those tests
+                // assert on the terminal that comes out rather than on the
+                // message. Same trade as `Client.desyncLocked`.
+                if (!builtin.is_test) {
+                    log.err("terminal {d} failed to unpark: {t}", .{ self.id, err });
+                }
                 self.recoverFromFailedUnparkLocked();
             };
         }
@@ -1409,8 +1417,24 @@ fn unparkLocked(self: *Terminal) !void {
 /// the scrollback was already gone with the file, and this is the difference
 /// between losing it and losing the session.
 ///
+/// **Only when the file is actually gone.** Every other failure may well work
+/// on the next read -- an allocation that did not fit, a descriptor limit a
+/// busy daemon touched for a moment -- and starting a fresh terminal for one of
+/// those would throw away a scrollback that is still on disk and still
+/// readable. At this project's scale that is the likelier failure of the two,
+/// so those leave the terminal parked and the next read tries again, which is
+/// what happened before this existed.
+///
 /// Caller holds `mutex`.
 fn recoverFromFailedUnparkLocked(self: *Terminal) void {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = self.store.snapshotPath(&path_buf, self.id) catch return;
+    const gone = if (std.Io.Dir.cwd().access(self.io, path, .{}))
+        false
+    else |err|
+        err == error.FileNotFound;
+    if (!gone) return;
+
     self.vt = ghostty.Terminal.init(self.tiny_io.io(), self.gpa, .{
         .cols = self.cols,
         .rows = self.rows,
@@ -1427,7 +1451,7 @@ fn recoverFromFailedUnparkLocked(self: *Terminal) void {
     });
     self.stream.?.handler.effects = effects;
     self.residency = .live;
-    log.warn("terminal {d}: park file unreadable; continuing without its history", .{self.id});
+    log.warn("terminal {d}: park file is gone; continuing without its history", .{self.id});
 }
 
 /// Phase 2: prepend history pages, newest first, off the critical path.
@@ -2975,6 +2999,123 @@ test "attaching to a parked terminal at another size is told where the size went
     try testing.expectEqualStrings("GHOSTSNP", aw.written()[0..8]);
     try testing.expectEqual(session.Residency.parked, t.summary().residency);
     try testing.expect(t.vt == null);
+}
+
+test "a park file that is gone leaves a working terminal, not a stuck one" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-park-gone-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    // Something cleared the state directory under a running daemon. Left
+    // alone, this terminal stays parked with no VT for the life of the
+    // process: every byte the child writes is fanned out and applied to
+    // nothing, and every read logs the same failure.
+    const script =
+        \\printf 'BEFORE_THE_PARK\n'
+        \\sleep 2
+        \\printf 'WOKE\n'
+        \\sleep 10
+    ;
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = root },
+        .id = 1,
+        .session_id = 1,
+        .name = "park-gone",
+        .argv = &.{ "/bin/sh", "-c", script },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    defer t.hangup();
+    try t.start();
+    try awaitMarker(t, gpa, "BEFORE_THE_PARK");
+
+    try t.park();
+    // And resized while it was away, so the terminal it comes back as is the
+    // size it is now rather than the size the file was.
+    try t.resize(120, 40, .{});
+    t.store.discard(io, t.id);
+
+    try awaitMarker(t, gpa, "WOKE");
+    try testing.expectEqual(session.Residency.live, t.summary().residency);
+
+    t.mutex.lock();
+    const cols = t.vt.?.cols;
+    const rows = t.vt.?.rows;
+    t.mutex.unlock();
+    try testing.expectEqual(@as(u16, 120), cols);
+    try testing.expectEqual(@as(u16, 40), rows);
+
+    // Empty, because the history went with the file. That is the trade: this
+    // is the difference between losing a scrollback and losing a session.
+    const text = try t.plainText(gpa);
+    defer gpa.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "BEFORE_THE_PARK") == null);
+}
+
+test "a park file that is merely unreadable is left alone to be tried again" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-park-unreadable-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const script =
+        \\printf 'BEFORE_THE_PARK\n'
+        \\sleep 2
+        \\printf 'WOKE\n'
+        \\sleep 10
+    ;
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = root },
+        .id = 1,
+        .session_id = 1,
+        .name = "park-unreadable",
+        .argv = &.{ "/bin/sh", "-c", script },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    defer t.hangup();
+
+    var ticks: Ticks = .{};
+    try t.subscribe(ticks.subscriber());
+    try t.start();
+    try awaitMarker(t, gpa, "BEFORE_THE_PARK");
+    const before = ticks.count();
+
+    try t.park();
+
+    // A file that is there but will not decode. The recovery above must not
+    // fire for this: the failure may be this daemon's and not the file's, and
+    // a scrollback still sitting on disk is not ours to throw away over one
+    // failed read. The terminal stays parked and the next read tries again.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try t.store.snapshotPath(&path_buf, t.id);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "not a snapshot" });
+
+    // The child speaks, so a read really did reach `ingest` and really did try
+    // to unpark. Without this the assertion below passes on a terminal that
+    // was simply never woken.
+    try testing.expect(ticks.advancedPast(before));
+    try testing.expectEqual(session.Residency.parked, t.summary().residency);
+    try testing.expect(t.vt == null);
+    // And the file it could not read is still there to be looked at.
+    try testing.expect(t.store.snapshotSize(io, t.id) != null);
 }
 
 /// Rows of scrollback this terminal is holding.
