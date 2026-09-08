@@ -1101,8 +1101,31 @@ A process that never calls `AppConfig.load()` gets the defaults, which is the
 right answer for all of them. `ILLOGICAL_CONFIG` names one file instead of
 both, the same seam as `ILLOGICAL_SOCK` and `ILLOGICAL_DAEMON`.
 
+**The command line wins, and it replaces rather than appends.** Arguments are
+applied after every file, so `--font-size=15` outranks what is on disk. A
+list-valued key is the case that needs its own rule: every entry appends, which
+is what makes `font-family` a fallback chain rather than four spellings of one
+name, and it would leave `--font-family=Menlo` meaning "and also Menlo" with no
+way to say "Menlo instead". So the first argument for such a key resets the
+list before adding to it — libghostty's rule, and its stated reason is that you
+should not have to pass an empty value first. Two arguments for the same key
+still build a list between themselves.
+
+The reset is spelled as a synthetic `font-family = ""` entry rather than as a
+flag on the apply path, because `""` already means reset and an entry is
+something the loader already knows how to carry: it replays underneath a theme
+and it reports a diagnostic, with no new argument threaded anywhere. Only
+`--key=value` and a bare `--key` are recognised, never `--key value` — a Mac
+app is handed its arguments by whoever launched it, and a two-token form cannot
+tell a value from a file path the Finder appended. Anything not starting with
+`--` is skipped rather than reported, which is load-bearing: AppKit adds
+`-NSDocumentRevisionsDebugMode YES` and friends to any app launched from Xcode,
+and reporting those would mean a warning per launch about a flag nobody typed.
+
 **Everything is a warning.** A misspelled key is reported with its file, line
-and spelling and the rest of the file still applies. A config file is not a
+and spelling and the rest of the file still applies. One typed on the command
+line is reported without a file, since naming a config file for a mistake that
+is not in it sends somebody to the wrong place. A config file is not a
 program, and refusing to open a terminal over a typo is a poor trade when the
 terminal is how the file gets fixed. They go to `os.Logger` rather than only to
 `Trace`, because a config warning is the one kind of message that has to reach

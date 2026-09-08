@@ -508,6 +508,43 @@ public struct Config: Equatable, Sendable {
         if fontFamilyItalic.isEmpty { fontFamilyItalic = fontFamily }
         if fontFamilyBoldItalic.isEmpty { fontFamilyBoldItalic = fontFamily }
     }
+
+    /// The keys whose entries append to a list rather than setting a value.
+    ///
+    /// Beside `apply` on purpose: these are exactly the cases up there that
+    /// route to the `[String]` overload, and the two have to be changed
+    /// together. `listValuedKeysAreTheOnesThatAppend` in the tests is what
+    /// says so if they drift.
+    public static let listValuedKeys: Set<String> = [
+        "font-family", "font-family-bold", "font-family-italic", "font-family-bold-italic",
+    ]
+
+    /// `entries` with a reset in front of the first appearance of each
+    /// list-valued key.
+    ///
+    /// This is what makes a command line *replace* what the config files set
+    /// rather than adding to it, which is libghostty's rule and the one thing
+    /// about `font-family` that a person cannot work around: every entry
+    /// appends, so without this `--font-family=X` would mean "and also X" and
+    /// there would be no way to say "X instead" at all.
+    ///
+    /// Spelled as a synthetic `key = ""` entry rather than as a flag on the
+    /// apply path, because `""` already means reset and an entry is a thing
+    /// the rest of the loader already knows how to carry: it replays under a
+    /// theme, it reports diagnostics with a line number, and it needed no new
+    /// argument anywhere. Only the *first* appearance gets one, so two
+    /// `--font-family` arguments still build a list between themselves.
+    public static func resettingLists(_ entries: [ConfigEntry]) -> [ConfigEntry] {
+        var seen: Set<String> = []
+        var result: [ConfigEntry] = []
+        for entry in entries {
+            if listValuedKeys.contains(entry.key), seen.insert(entry.key).inserted {
+                result.append(ConfigEntry(key: entry.key, value: "", line: entry.line))
+            }
+            result.append(entry)
+        }
+        return result
+    }
 }
 
 /// Something wrong with a config file, in the words libghostty uses for the

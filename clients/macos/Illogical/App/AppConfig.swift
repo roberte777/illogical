@@ -143,10 +143,18 @@ enum AppConfig {
     /// of a file that is almost always in the page cache, against a font grid
     /// built a few milliseconds later that cannot be built twice. Only the
     /// first launch on a machine writes anything, and it writes one 2 KB file.
+    /// `arguments` defaults to this process's, minus its own path. Injectable
+    /// so a test can drive the seam without `CommandLine`, which is global,
+    /// unsettable, and full of whatever the test runner put there.
     @discardableResult
-    static func load() -> ConfigLoad {
+    static func load(
+        arguments: [String] = Array(CommandLine.arguments.dropFirst())
+    )
+        -> ConfigLoad
+    {
         let result = Config.loadDefaults(
-            bundleID: Bundle.main.bundleIdentifier, appearance: systemAppearance)
+            bundleID: Bundle.main.bundleIdentifier, appearance: systemAppearance,
+            arguments: arguments)
         storage.withLock { $0 = result.config }
 
         // The chrome, from the same colours. Here rather than lazily inside

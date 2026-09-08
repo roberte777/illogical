@@ -57,12 +57,13 @@ extension Config {
         bundleID: String?,
         resources: URL? = Bundle.main.resourceURL,
         appearance: ConfigAppearance = .dark,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        arguments: [String] = []
     ) -> ConfigLoad {
         let files = ConfigPath.defaults(bundleID: bundleID, environment: environment)
         var result = load(
             files: files, bundleID: bundleID, resources: resources, appearance: appearance,
-            environment: environment)
+            environment: environment, arguments: arguments)
         guard result.sources.isEmpty, environment[ConfigPath.overrideVariable] == nil else {
             return result
         }
@@ -89,12 +90,16 @@ extension Config {
     ///
     /// Then, if any of them named a `theme`, the whole lot is applied a second
     /// time on top of it. See `applying(theme:)`.
+    /// `arguments` are applied last, after every file, so a command line
+    /// outranks what is on disk. A list-valued key given there *replaces* the
+    /// files' list rather than appending to it — see `Config.resettingLists`.
     public static func load(
         files: [URL],
         bundleID: String? = nil,
         resources: URL? = nil,
         appearance: ConfigAppearance = .dark,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        arguments: [String] = []
     ) -> ConfigLoad {
         var config = Config()
         var diagnostics: [ConfigDiagnostic] = []
@@ -103,7 +108,7 @@ extension Config {
         // Kept here rather than on `Config` deliberately: two configs holding
         // the same colours have to compare equal however they were arrived
         // at, and a record of the lines that produced them would break that.
-        var replay: [(entry: ConfigEntry, path: String)] = []
+        var replay: [(entry: ConfigEntry, path: String?)] = []
 
         for file in files {
             guard let text = read(file, diagnostics: &diagnostics) else { continue }
@@ -112,6 +117,19 @@ extension Config {
                 config.apply(entry, path: file.path, diagnostics: &diagnostics)
                 replay.append((entry, file.path))
             }
+        }
+
+        // The command line, last. In the replay too, and for the same reason
+        // the files are: `--theme` has to lose to the colours given beside
+        // it, and a theme named in a *file* has to lose to a colour given
+        // here. Both fall out of applying the theme underneath everything.
+        //
+        // The path is nil rather than a file, so a diagnostic reads
+        // `--font-famly: unknown field` instead of naming a file that does
+        // not have that line in it.
+        for entry in Config.resettingLists(ConfigSyntax.entries(ofArguments: arguments)) {
+            config.apply(entry, path: nil, diagnostics: &diagnostics)
+            replay.append((entry, nil))
         }
 
         if let theme = config.theme {
@@ -148,7 +166,7 @@ extension Config {
     /// arbitrary; that it is exactly one of them is not.
     private static func applying(
         theme: ConfigTheme,
-        replay: [(entry: ConfigEntry, path: String)],
+        replay: [(entry: ConfigEntry, path: String?)],
         bundleID: String?,
         resources: URL?,
         appearance: ConfigAppearance,
