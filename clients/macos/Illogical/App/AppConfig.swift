@@ -10,6 +10,7 @@
 //  A process that has not called `load()` gets the defaults, and that is the
 //  correct answer for all of them.
 
+import AppKit
 import Foundation
 import IllogicalConfig
 import os
@@ -80,6 +81,25 @@ enum AppConfig {
         return renderer
     }
 
+    /// Which half of `theme = light:x,dark:y` applies right now.
+    ///
+    /// `NSAppearance` rather than the `AppleInterfaceStyle` default, because
+    /// the two can disagree: the default is the *system's* setting, and an
+    /// app whose own appearance is forced -- by `NSRequiresAquaSystemAppearance`
+    /// in its Info.plist, or by a person setting it per-app -- draws in the
+    /// one it was forced to. The theme has to match what the window actually
+    /// looks like.
+    ///
+    /// Read at launch, so a config change or a system switch needs the app
+    /// restarted to take effect -- the same rule the font and the colours
+    /// follow, and the same follow-up (#39).
+    static var systemAppearance: ConfigAppearance {
+        let match = NSApplication.shared.effectiveAppearance.bestMatch(from: [
+            .aqua, .darkAqua,
+        ])
+        return match == .darkAqua ? .dark : .light
+    }
+
     /// Whether the window has anything to be translucent *over*.
     ///
     /// Both halves, because either alone is a no-op: blur with an opaque
@@ -98,7 +118,8 @@ enum AppConfig {
     /// first launch on a machine writes anything, and it writes one 2 KB file.
     @discardableResult
     static func load() -> ConfigLoad {
-        let result = Config.loadDefaults(bundleID: Bundle.main.bundleIdentifier)
+        let result = Config.loadDefaults(
+            bundleID: Bundle.main.bundleIdentifier, appearance: systemAppearance)
         storage.withLock { $0 = result.config }
 
         for source in result.sources {

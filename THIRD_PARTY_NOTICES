@@ -22,6 +22,7 @@ Contents
   * Zig standard library     -- MIT (Expat)
   * musl libc                -- MIT (Linux builds only)
   * X11 rgb.txt              -- MIT/X11 (the Mac app only)
+  * iTerm2-Color-Schemes     -- MIT (the Mac app only)
 
 ----------------------------------------------------------------------------
 ghostty
@@ -371,3 +372,21 @@ The MIT/X11 text is the one reproduced under `ghostty` at the top of this
 file, with the X.Org Foundation and its contributors in place of the copyright
 holders named there. The upstream repository above carries the authoritative
 copy.
+
+----------------------------------------------------------------------------
+iTerm2-Color-Schemes
+https://github.com/mbadolato/iTerm2-Color-Schemes -- fetched by build.zig.zon
+as `iterm2_themes`, from Ghostty's own pinned tarball at
+https://deps.files.ghostty.org
+----------------------------------------------------------------------------
+
+The theme collection, converted to Ghostty's config format. Copied into
+`Illogical.app/Contents/Resources/themes` so that `theme = <name>` resolves
+without a download; data, not code, and not carried by `illogicald` or the
+CLI, neither of which reads a theme.
+
+The tarball is the one Ghostty's own `build.zig.zon` names, at the same URL
+and the same hash, and it unpacks to the theme files alone -- no LICENSE among
+them. So the terms are not reproducible from this tree; they are in the
+upstream repository above, which states the MIT licence. Copyright is
+Michael Badolato and the scheme authors, per that repository.

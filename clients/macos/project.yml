@@ -38,6 +38,9 @@ targets:
           # `78/xterm-ghostty` keeps its directory. Swept up here it would land
           # as a flat file in Resources, where no ncurses would look for it.
           - "Supporting/terminfo/**"
+          # And the theme collection, a folder reference below for the same
+          # reason: `theme = <name>` looks a file up inside the directory.
+          - "Supporting/themes/**"
           # Supporting/Fonts/ is a resource directory, so everything in it is
           # copied into the bundle. OFL.txt has to be; its manifest does not.
           - Supporting/Fonts/README.md
@@ -76,6 +79,18 @@ targets:
       # in `Contents/MacOS` looks for it -- the same layout ghostty's own
       # bundle uses, for the same reason. See `src/core/pty.zig`.
       - path: Illogical/Supporting/terminfo
+        type: folder
+      # The theme collection, put here by `just stage-daemon` from
+      # zig-out/share/illogical and gitignored like everything else staged. A
+      # folder reference for the same reason terminfo is one: the directory
+      # *is* the artifact, and `theme = Catppuccin Mocha` is a lookup by file
+      # name inside it. Scanned as a group instead, 600 extensionless files
+      # would land flat in Resources and collide with everything else there.
+      #
+      # Lands in `Contents/Resources/themes`, which is where `ConfigPath`
+      # looks -- after the user's own themes directory, so a file of your own
+      # always wins over one we shipped.
+      - path: Illogical/Supporting/themes
         type: folder
     dependencies:
       - package: IllogicalKit
