@@ -221,3 +221,84 @@ struct GridMetrics: Equatable {
         return result
     }
 }
+
+/// How a fallback face is scaled so it sits with the face beside it.
+///
+/// Ported from libghostty's `Collection.SizeAdjustment`. A fallback loaded at
+/// the same point size as the primary is not the same *apparent* size — two
+/// families at 13pt can differ by a third in how tall their letters actually
+/// are — so the face is scaled until a chosen metric matches. libghostty's
+/// own note is that this "functions very much like the `font-size-adjust` CSS
+/// property".
+enum SizeAdjustment {
+    /// Leave the face at the size it was asked for.
+    case none
+    /// Match the width of an ideograph, which is what lines a CJK face up on
+    /// the grid. libghostty's default for every fallback.
+    case icWidth
+    case exHeight
+    case capHeight
+    case lineHeight
+}
+
+extension FaceMetrics {
+    /// Whether the font actually stated a metric, rather than us estimating
+    /// one for it. A zero or negative value is a font saying nothing in a
+    /// more annoying way, so it counts as absent.
+    private static func stated(_ value: Double?) -> Bool { (value ?? 0) > 0 }
+
+    /// What to multiply `face`'s size by so that it matches `primary` under
+    /// `adjustment`.
+    ///
+    /// Both sides are normalized to ems before they are compared, which is
+    /// what makes the answer independent of the sizes the two faces happen to
+    /// be loaded at.
+    ///
+    /// The chain is libghostty's, and the reason for it is that the metric
+    /// asked for may be one this particular font never stated: a face with no
+    /// ideographs usually has no `ic_width`, and scaling by an *estimate* of
+    /// one would be scaling by a number derived from the very face we are
+    /// trying to correct. So each step falls through to a metric more fonts
+    /// bother to carry, ending at line height, which every font has because
+    /// it is computed rather than read.
+    static func scaleFactor(
+        primary: FaceMetrics, face: FaceMetrics, adjustment: SizeAdjustment
+    ) -> Double {
+        guard adjustment != .none else { return 1 }
+        guard primary.pxPerEm > 0, face.pxPerEm > 0 else { return 1 }
+
+        // Per em, so the sizes the faces were measured at drop out.
+        let primaryScale = 1 / primary.pxPerEm
+        let faceScale = 1 / face.pxPerEm
+
+        var step = adjustment
+        // Walk to the first metric this face actually states. `lineHeight`
+        // terminates it, so this cannot spin.
+        while true {
+            switch step {
+            case .icWidth where !stated(face.icWidth): step = .exHeight
+            case .exHeight where !stated(face.exHeight): step = .capHeight
+            case .capHeight where !stated(face.capHeight): step = .lineHeight
+            default:
+                let (p, f): (Double, Double) = {
+                    switch step {
+                    case .icWidth: return (primary.resolvedIcWidth(), face.resolvedIcWidth())
+                    case .exHeight: return (primary.resolvedExHeight(), face.resolvedExHeight())
+                    case .capHeight:
+                        return (primary.resolvedCapHeight(), face.resolvedCapHeight())
+                    default: return (primary.lineHeight, face.lineHeight)
+                    }
+                }()
+
+                let factor = (p * primaryScale) / (f * faceScale)
+                // A face that measures as zero or worse would otherwise be
+                // reloaded at a size of infinity or nothing. libghostty has
+                // no such guard because its metrics come from FreeType, which
+                // will not hand back a degenerate face; CoreText, asked about
+                // a font it half-understands, will.
+                guard factor.isFinite, factor > 0 else { return 1 }
+                return factor
+            }
+        }
+    }
+}
