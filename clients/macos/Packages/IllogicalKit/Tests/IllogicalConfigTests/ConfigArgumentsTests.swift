@@ -67,6 +67,15 @@ struct ConfigArgumentsTests {
         #expect(entries.map(\.key) == ["font-size"])
     }
 
+    /// `--=value` names nothing, so it is skipped like any other argument
+    /// that is not ours. Reported, it would be a warning whose key is the
+    /// empty string, which tells whoever typed it precisely nothing.
+    @Test("an argument with an empty key is skipped")
+    func skipsEmptyKeys() {
+        #expect(ConfigSyntax.entries(ofArguments: ["--=value"]).isEmpty)
+        #expect(ConfigSyntax.entries(ofArguments: ["--", "--font-size=9"]).isEmpty)
+    }
+
     @Test("a bare -- ends the options")
     func endOfOptions() {
         let entries = ConfigSyntax.entries(ofArguments: ["--font-size=15", "--", "--font-size=9"])
@@ -108,23 +117,21 @@ struct ConfigArgumentsTests {
         #expect(Config.resettingLists(given) == given)
     }
 
-    /// `listValuedKeys` is a hand-written set beside the switch that routes
-    /// these keys, so this is what says the two have not drifted: every key
-    /// in it must actually append on a repeat, and a key outside it must not.
-    @Test("every key in listValuedKeys is one that appends, and others do not")
+    /// `apply` routes the list-valued keys through `listValuedKeys` itself,
+    /// so the table cannot drift from the behaviour — there is only one of
+    /// it. What is still worth asserting is that its entries really are
+    /// appending keys, and that each one lands in the list it names.
+    @Test("every key in listValuedKeys appends, into the list it points at")
     func listValuedKeysAreTheOnesThatAppend() {
-        for key in Config.listValuedKeys {
+        for (key, keyPath) in Config.listValuedKeys {
             var config = Config()
             var diagnostics: [ConfigDiagnostic] = []
             config.apply(ConfigEntry(key: key, value: "A", line: 1), diagnostics: &diagnostics)
             config.apply(ConfigEntry(key: key, value: "B", line: 2), diagnostics: &diagnostics)
             #expect(diagnostics.isEmpty, "\(key) reported \(diagnostics)")
-
-            let lists = [
-                config.fontFamily, config.fontFamilyBold, config.fontFamilyItalic,
-                config.fontFamilyBoldItalic,
-            ]
-            #expect(lists.contains(["A", "B"]), "\(key) did not append")
+            // The list this key names, not merely some list — a table with
+            // two keys pointing at one property would otherwise pass.
+            #expect(config[keyPath: keyPath] == ["A", "B"], "\(key) did not append")
         }
 
         var scalar = Config()
@@ -132,7 +139,7 @@ struct ConfigArgumentsTests {
         scalar.apply(ConfigEntry(key: "font-size", value: "15", line: 1), diagnostics: &diagnostics)
         scalar.apply(ConfigEntry(key: "font-size", value: "16", line: 2), diagnostics: &diagnostics)
         #expect(scalar.fontSize == 16)
-        #expect(!Config.listValuedKeys.contains("font-size"))
+        #expect(Config.listValuedKeys["font-size"] == nil)
     }
 
     // MARK: - Through the loader
@@ -213,6 +220,63 @@ struct ConfigArgumentsTests {
         #expect(diagnostic.file == nil)
         #expect(diagnostic.key == "font-famly")
         #expect(diagnostic.description == "font-famly: unknown field")
+    }
+
+    /// A bare `--font-family` is a mistake, and answering it by emptying the
+    /// list the config file built would be a poor way to say so — the warning
+    /// even says the argument was ignored. So the reset needs a value beside
+    /// it, which is where libghostty puts its own check too.
+    @Test("a valueless list argument does not clear the list")
+    func valuelessListArgumentDoesNotReset() throws {
+        let home = try Home()
+        let result = try load(
+            "font-family = Berkeley Mono", arguments: ["--font-family"], home: home)
+        #expect(result.config.fontFamily == ["Berkeley Mono"])
+        #expect(result.config.fontFamilyBold == ["Berkeley Mono"])
+        #expect(result.diagnostics.map(\.message) == ["value required"])
+    }
+
+    /// And it leaves the reset unspent, so a real argument after it still
+    /// replaces rather than appends.
+    @Test("a valueless argument does not use up the reset")
+    func valuelessArgumentLeavesTheResetArmed() throws {
+        let home = try Home()
+        let result = try load(
+            "font-family = Berkeley Mono",
+            arguments: ["--font-family", "--font-family=Menlo"], home: home)
+        #expect(result.config.fontFamily == ["Menlo"])
+    }
+
+    // MARK: - Under a theme
+
+    /// The command line is replayed under a theme along with the files, and
+    /// nothing else here would notice if it stopped being: deleting that one
+    /// line leaves every other test in this file green while silently
+    /// discarding every argument on any machine whose config names a theme.
+    @Test("arguments still apply when a config file names a theme")
+    func argumentsSurviveATheme() throws {
+        let home = try Home()
+        try home.write("background = #123456", to: ".config/illogical/themes/Probe")
+        let result = try load(
+            "theme = Probe\nfont-family = Berkeley Mono",
+            arguments: ["--font-family=Menlo", "--font-size=21"], home: home)
+        #expect(result.config.fontFamily == ["Menlo"])
+        #expect(result.config.fontFamilyBold == ["Menlo"])
+        #expect(result.config.fontSize == 21)
+        // The theme took effect, so this is a real theme run and not a
+        // config that quietly failed to find one.
+        #expect(result.config.background == ConfigColor(r: 0x12, g: 0x34, b: 0x56))
+    }
+
+    /// And a colour on the command line beats a theme named in a file, which
+    /// is the ordering the replay exists to produce.
+    @Test("a colour given on the command line outranks the file's theme")
+    func argumentsOutrankATheme() throws {
+        let home = try Home()
+        try home.write("background = #123456", to: ".config/illogical/themes/Probe")
+        let result = try load(
+            "theme = Probe", arguments: ["--background=#abcdef"], home: home)
+        #expect(result.config.background == ConfigColor(r: 0xAB, g: 0xCD, b: 0xEF))
     }
 
     /// A `--key` with no value is the same warning a config line with no `=`

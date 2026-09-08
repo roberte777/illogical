@@ -128,7 +128,9 @@ public enum ConfigSyntax {
     ///
     /// `line` is the argument's position, counted from 1 over everything
     /// passed in including what was skipped, so it points at the argument a
-    /// person actually typed.
+    /// person actually typed. `ConfigDiagnostic` does not print it — it shows
+    /// a position only alongside a file — so today it is carried rather than
+    /// shown, and a command-line warning names the key and not the argument.
     public static func entries(ofArguments arguments: [String]) -> [ConfigEntry] {
         var entries: [ConfigEntry] = []
 
@@ -137,7 +139,6 @@ public enum ConfigSyntax {
             guard argument.hasPrefix("--") else { continue }
 
             let body = argument.dropFirst(2)
-            if body.isEmpty { continue }
 
             guard let equals = body.firstIndex(of: "=") else {
                 entries.append(
@@ -146,6 +147,10 @@ public enum ConfigSyntax {
             }
 
             let key = body[..<equals].trimmed
+            // `--=value` names nothing. Skipped rather than reported, like
+            // any other argument that is not ours: a warning whose key is
+            // the empty string tells whoever typed it precisely nothing.
+            if key.isEmpty { continue }
             var value = body[body.index(after: equals)...].trimmed
             // The same quote-stripping a config line gets. A shell usually
             // eats the quotes first, but `--font-family=""` typed into a
