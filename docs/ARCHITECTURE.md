@@ -149,6 +149,23 @@ clients started from where. And a `$SHELL` with no `-l` at all — elvish is the
 one in circulation — opens a terminal that exits immediately on a usage error;
 `create.argv` is the way to say otherwise.
 
+**`TERM` names something the child can look up.** The client draws with
+libghostty-vt, so `xterm-ghostty` is the truthful answer — but that entry is not
+part of ncurses. It ships with ghostty, and on a machine that has never had
+ghostty on it the name resolves to nothing at all. A child in that position has
+no terminfo whatever: no `cuu1`, so zsh cannot repaint its prompt where it
+stands, and answers every `SIGWINCH` by printing a fresh prompt on a new line
+and leaving the old one on the screen. One split, two prompts.
+
+So the daemon does what ghostty does (`src/termio/Exec.zig`): `zig build`
+compiles ghostty's own terminfo source into `share/terminfo`, the app bundle
+carries it as `Contents/Resources/terminfo` and the tarball carries it beside
+the binaries, and `pty.zig` points the child's `TERMINFO` at whichever it finds.
+Where the entry is already installed on the machine, `TERM` alone is enough and
+nothing is pointed anywhere. Where there is no database to be found — a daemon
+installed by some other means, on a host with no ghostty — the child is told
+`xterm-256color`, which is a smaller terminal but a real one.
+
 **Threading.** A terminal is never touched by two threads at once — libghostty-vt
 requires this. Each terminal has a lock; its hot PTY thread holds it while
 writing. Snapshot encode/decode and scrollback compression run on a pool and take

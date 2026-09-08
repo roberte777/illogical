@@ -52,6 +52,12 @@
             # Build glue
             just
             pkg-config
+            # `tic`, which compiles ghostty's terminfo source into the database
+            # the app and the tarball carry. Without it `zig build` fails at the
+            # step that produces `share/terminfo` -- deliberately, because a
+            # build that quietly skipped it would ship terminals whose `TERM`
+            # names an entry nothing can look up. See `src/core/pty.zig`.
+            ncurses
 
             # Repo hygiene
             alejandra # nix formatter

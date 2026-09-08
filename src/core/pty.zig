@@ -132,10 +132,161 @@ pub const Pty = struct {
 };
 
 const base_env = [_]Pty.EnvPair{
-    .{ .name = "TERM", .value = "xterm-ghostty" },
     .{ .name = "TERM_PROGRAM", .value = "illogical" },
     .{ .name = "COLORTERM", .value = "truecolor" },
 };
+
+// -- the child's terminal type ---------------------------------------------
+//
+// `xterm-ghostty` is the truthful answer -- the client draws with
+// libghostty-vt, so what that entry describes is what a program is talking to
+// -- but only on a machine that can look the name up. The entry is not part of
+// ncurses: it ships with ghostty, and a machine that has never had ghostty on
+// it has never heard of it.
+//
+// A child told `TERM=xterm-ghostty` there gets no terminfo at all, which is
+// much worse than being handed a smaller terminal. With no `cuu1` zsh cannot
+// repaint its prompt where it stands: on every SIGWINCH it prints a fresh one
+// on a new line and leaves the old one on the screen, so one ⌘D leaves the
+// pane with two prompts in it. Measured against the same zsh: under
+// `xterm-256color` a resize is answered with `\r\x1b[A\x1b[A\x1b[J` and the
+// prompt is redrawn in place; under an unknown `xterm-ghostty` it is answered
+// with `\r\r\n` and drawn below.
+//
+// So: what ghostty itself does (`src/termio/Exec.zig`) -- ship the compiled
+// database, point `TERMINFO` at it, and name it in `TERM`. With no database to
+// point at, ask for `xterm-256color`, which every machine has.
+
+const term_ghostty = "xterm-ghostty";
+const term_fallback = "xterm-256color";
+
+/// Where a database shipped beside the daemon sits, relative to the directory
+/// holding it. The Mac app keeps `illogicald` in `Contents/MacOS` and its
+/// resources in `Contents/Resources`; the tarball is the usual `bin`/`share`.
+const terminfo_bundled = [_][]const u8{
+    // The Mac app: `Contents/MacOS/illogicald`, resources one level up.
+    "../Resources/terminfo",
+    // The tarball, unpacked onto a PATH: the database travels beside the two
+    // binaries, because the tarball has no directories in it to speak of.
+    "terminfo",
+    // `zig build --prefix`, which is what a package manager would install.
+    "../share/terminfo",
+};
+
+/// Databases already on the machine. Searched only to answer whether the name
+/// resolves without our help: a daemon installed by something that is neither
+/// the app nor the tarball ships no database of its own, but may be running on
+/// a host where ghostty has already put one.
+const terminfo_system = [_][]const u8{
+    "/usr/share/terminfo",
+    "/usr/local/share/terminfo",
+    "/opt/homebrew/share/terminfo",
+    "/etc/terminfo",
+    "/lib/terminfo",
+    "/usr/lib/terminfo",
+};
+
+/// What the daemon's own environment says about where entries live. The child
+/// inherits these, so a database named here is one it can find by itself.
+const TerminfoEnv = struct {
+    home: ?[]const u8 = null,
+    terminfo: ?[]const u8 = null,
+    terminfo_dirs: ?[]const u8 = null,
+};
+
+/// The terminal type a child is told about, and the database that backs it.
+const ChildTerminal = struct {
+    term: [:0]const u8,
+    /// Set only when the entry was found somewhere the child would not look on
+    /// its own -- a database we shipped. Null when it is already on the search
+    /// path, or when there is none and `term` is the fallback.
+    terminfo: ?[:0]const u8 = null,
+};
+
+/// Decide what to tell the child about its terminal.
+///
+/// `exe_dir` holds this executable, `env` is what the daemon's own environment
+/// says about terminfo, `buf` backs the returned path, and `exists` reports
+/// whether a path is there. Pure but for `exists`, so a test can lay out a
+/// machine that has the entry, or has never heard of it, without one.
+fn childTerminal(
+    exe_dir: ?[]const u8,
+    env: TerminfoEnv,
+    buf: []u8,
+    exists: *const fn (path: []const u8) bool,
+) ChildTerminal {
+    // Ours first. A database we shipped is the one that matches the client
+    // actually drawing the terminal, and it is the only one we can be sure
+    // says what this version says.
+    if (exe_dir) |dir| {
+        for (terminfo_bundled) |relative| {
+            const candidate = std.fmt.bufPrintZ(buf, "{s}/{s}", .{ dir, relative }) catch continue;
+            if (terminfoEntryIn(candidate, term_ghostty, exists)) {
+                return .{ .term = term_ghostty, .terminfo = candidate };
+            }
+        }
+    }
+
+    // Then wherever the child's own ncurses would look. Nothing to hand it if
+    // we find the entry there -- it is already on the path.
+    if (terminfoOnSearchPath(env, exists)) return .{ .term = term_ghostty };
+
+    return .{ .term = term_fallback };
+}
+
+/// Whether `xterm-ghostty` resolves through the daemon's own environment or
+/// the system databases.
+fn terminfoOnSearchPath(env: TerminfoEnv, exists: *const fn (path: []const u8) bool) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    if (env.terminfo) |dir| {
+        if (terminfoEntryIn(dir, term_ghostty, exists)) return true;
+    }
+    if (env.home) |home| {
+        if (std.fmt.bufPrint(&buf, "{s}/.terminfo", .{home})) |dir| {
+            if (terminfoEntryIn(dir, term_ghostty, exists)) return true;
+        } else |_| {}
+    }
+    if (env.terminfo_dirs) |list| {
+        var it = std.mem.splitScalar(u8, list, ':');
+        while (it.next()) |dir| {
+            // ncurses reads an empty element as "the system database", which
+            // the loop below covers anyway.
+            if (dir.len == 0) continue;
+            if (terminfoEntryIn(dir, term_ghostty, exists)) return true;
+        }
+    }
+    for (terminfo_system) |dir| {
+        if (terminfoEntryIn(dir, term_ghostty, exists)) return true;
+    }
+    return false;
+}
+
+/// Whether `dir` is a terminfo database holding a compiled entry for `name`.
+///
+/// Both spellings of the bucket an entry sits in: the entry's first character,
+/// which is what ncurses writes on Linux, and that character's hex code, which
+/// is what macOS ships (`78/xterm-ghostty`).
+fn terminfoEntryIn(
+    dir: []const u8,
+    name: []const u8,
+    exists: *const fn (path: []const u8) bool,
+) bool {
+    if (name.len == 0) return false;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    if (std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ dir, name[0..1], name })) |path| {
+        if (exists(path)) return true;
+    } else |_| {}
+
+    const digits = "0123456789abcdef";
+    const hex = [_]u8{ digits[name[0] >> 4], digits[name[0] & 0xf] };
+    if (std.fmt.bufPrint(&buf, "{s}/{s}/{s}", .{ dir, &hex, name })) |path| {
+        if (exists(path)) return true;
+    } else |_| {}
+
+    return false;
+}
 
 // -- the child's locale ----------------------------------------------------
 //
@@ -163,9 +314,10 @@ const ctype_vars = [_][:0]const u8{ "LC_ALL", "LC_CTYPE", "LANG" };
 const utf8_fallbacks = [_][:0]const u8{ "en_US.UTF-8", "C.UTF-8", "UTF-8" };
 
 var env_mutex: thread.Mutex = .{};
-var env_storage: [base_env.len + 1]Pty.EnvPair = undefined;
+var env_storage: [base_env.len + 3]Pty.EnvPair = undefined;
 var env_len: ?usize = null;
 var locale_buf: [64]u8 = undefined;
+var terminfo_buf: [std.fs.max_path_bytes]u8 = undefined;
 
 /// Environment every terminal's child gets, on top of the daemon's own.
 ///
@@ -178,6 +330,31 @@ pub fn childEnv() []const Pty.EnvPair {
     if (env_len == null) {
         @memcpy(env_storage[0..base_env.len], &base_env);
         var len: usize = base_env.len;
+
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_dir: ?[]const u8 = if (sys.selfExePath(&exe_buf)) |path|
+            std.fs.path.dirname(path)
+        else |_|
+            null;
+        const terminal = childTerminal(exe_dir, .{
+            .home = sys.getenv("HOME"),
+            .terminfo = sys.getenv("TERMINFO"),
+            .terminfo_dirs = sys.getenv("TERMINFO_DIRS"),
+        }, &terminfo_buf, sys.pathExists);
+        env_storage[len] = .{ .name = "TERM", .value = terminal.term.ptr };
+        len += 1;
+        if (terminal.terminfo) |dir| {
+            env_storage[len] = .{ .name = "TERMINFO", .value = dir.ptr };
+            len += 1;
+            log.info("terminfo database: {s}", .{dir});
+        } else if (std.mem.eql(u8, terminal.term, term_fallback)) {
+            // Not fatal, and not silent either: it changes what every program
+            // in every terminal thinks it is talking to.
+            log.warn(
+                "no {s} terminfo entry on this machine; children will be told TERM={s}",
+                .{ term_ghostty, term_fallback },
+            );
+        }
 
         var current: [ctype_vars.len]?[]const u8 = undefined;
         for (ctype_vars, 0..) |name, i| current[i] = sys.getenv(name.ptr);
@@ -273,6 +450,127 @@ fn localeExists(name: [:0]const u8) bool {
     const locale = c.newlocale(c.LC_CTYPE_MASK, name.ptr, null) orelse return false;
     _ = c.freelocale(locale);
     return true;
+}
+
+/// Stand-ins for whatever terminfo databases the machine running the tests has,
+/// so that what is under test is where we look and what we conclude.
+const fake_terminfo = struct {
+    /// A machine with nothing installed anywhere.
+    fn none(_: []const u8) bool {
+        return false;
+    }
+
+    /// A Mac app bundle carrying its own database, macOS's hex bucket and all.
+    fn bundled(path: []const u8) bool {
+        return std.mem.eql(u8, path, "/Apps/Illogical.app/Contents/MacOS/../Resources/terminfo/78/xterm-ghostty");
+    }
+
+    /// The tarball, unpacked onto a PATH.
+    fn besideTheBinary(path: []const u8) bool {
+        return std.mem.eql(u8, path, "/usr/local/bin/terminfo/78/xterm-ghostty");
+    }
+
+    /// A host where somebody has already installed ghostty's entry, in the
+    /// per-user database and in ncurses' own spelling of the bucket.
+    fn inUsersHome(path: []const u8) bool {
+        return std.mem.eql(u8, path, "/home/e/.terminfo/x/xterm-ghostty");
+    }
+
+    /// A host with it in the system database.
+    fn systemWide(path: []const u8) bool {
+        return std.mem.eql(u8, path, "/usr/share/terminfo/78/xterm-ghostty");
+    }
+};
+
+test "a database beside the daemon is the one the child is pointed at" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const term = childTerminal(
+        "/Apps/Illogical.app/Contents/MacOS",
+        .{},
+        &buf,
+        fake_terminfo.bundled,
+    );
+    try std.testing.expectEqualStrings("xterm-ghostty", term.term);
+    try std.testing.expectEqualStrings(
+        "/Apps/Illogical.app/Contents/MacOS/../Resources/terminfo",
+        term.terminfo orelse return error.TestExpectedTerminfo,
+    );
+}
+
+test "the tarball's database, beside the two binaries" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const term = childTerminal("/usr/local/bin", .{}, &buf, fake_terminfo.besideTheBinary);
+    try std.testing.expectEqualStrings("xterm-ghostty", term.term);
+    try std.testing.expectEqualStrings(
+        "/usr/local/bin/terminfo",
+        term.terminfo orelse return error.TestExpectedTerminfo,
+    );
+}
+
+test "an entry already on the search path needs no TERMINFO of its own" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    // The user's own database, which ncurses reads without being told to.
+    const home = childTerminal(null, .{ .home = "/home/e" }, &buf, fake_terminfo.inUsersHome);
+    try std.testing.expectEqualStrings("xterm-ghostty", home.term);
+    try std.testing.expect(home.terminfo == null);
+
+    // And the system one.
+    const system = childTerminal(null, .{}, &buf, fake_terminfo.systemWide);
+    try std.testing.expectEqualStrings("xterm-ghostty", system.term);
+    try std.testing.expect(system.terminfo == null);
+}
+
+test "TERMINFO and TERMINFO_DIRS are searched, empty elements skipped" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const env: TerminfoEnv = .{ .terminfo_dirs = "::/opt/ti:" };
+    const term = childTerminal(null, env, &buf, struct {
+        fn exists(path: []const u8) bool {
+            return std.mem.eql(u8, path, "/opt/ti/x/xterm-ghostty");
+        }
+    }.exists);
+    try std.testing.expectEqualStrings("xterm-ghostty", term.term);
+    try std.testing.expect(term.terminfo == null);
+}
+
+test "a machine that has never heard of ghostty is told xterm-256color" {
+    // The whole point: TERM has to name something the child can look up. An
+    // unknown terminal leaves a shell unable to move its own cursor, and it
+    // redraws a prompt by printing a second one.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const term = childTerminal("/usr/local/bin", .{ .home = "/home/e" }, &buf, fake_terminfo.none);
+    try std.testing.expectEqualStrings("xterm-256color", term.term);
+    try std.testing.expect(term.terminfo == null);
+}
+
+test "a bundled database wins over one already installed" {
+    // Ours describes the pin the client draws with; the machine's describes
+    // whichever ghostty happened to be installed.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const term = childTerminal("/usr/local/bin", .{}, &buf, struct {
+        fn exists(path: []const u8) bool {
+            return fake_terminfo.besideTheBinary(path) or fake_terminfo.systemWide(path);
+        }
+    }.exists);
+    try std.testing.expectEqualStrings(
+        "/usr/local/bin/terminfo",
+        term.terminfo orelse return error.TestExpectedTerminfo,
+    );
+}
+
+test "both spellings of a database's bucket are looked in" {
+    // ncurses writes `x/xterm-ghostty`; macOS ships `78/xterm-ghostty`.
+    try std.testing.expect(terminfoEntryIn("/db", "xterm-ghostty", struct {
+        fn exists(path: []const u8) bool {
+            return std.mem.eql(u8, path, "/db/x/xterm-ghostty");
+        }
+    }.exists));
+    try std.testing.expect(terminfoEntryIn("/db", "xterm-ghostty", struct {
+        fn exists(path: []const u8) bool {
+            return std.mem.eql(u8, path, "/db/78/xterm-ghostty");
+        }
+    }.exists));
+    try std.testing.expect(!terminfoEntryIn("/db", "xterm-ghostty", fake_terminfo.none));
 }
 
 /// Stand-ins for whatever locales the machine running the tests happens to
@@ -378,10 +676,12 @@ test "this machine has a utf-8 locale to fall back on" {
     try std.testing.expect(found);
 }
 
-test "childEnv keeps the base environment and adds at most a locale" {
+test "childEnv keeps the base environment and adds what it resolved" {
     const env = childEnv();
-    try std.testing.expect(env.len >= base_env.len);
-    try std.testing.expect(env.len <= base_env.len + 1);
+    // TERM always, TERMINFO only where a database had to be pointed at, and a
+    // locale only where the daemon's own is not UTF-8.
+    try std.testing.expect(env.len >= base_env.len + 1);
+    try std.testing.expect(env.len <= env_storage.len);
     for (base_env, 0..) |expected, i| {
         try std.testing.expectEqualStrings(
             std.mem.span(expected.name),
@@ -390,6 +690,19 @@ test "childEnv keeps the base environment and adds at most a locale" {
     }
     // Idempotent: resolved once and cached.
     try std.testing.expectEqual(env.len, childEnv().len);
+}
+
+test "every child is told what terminal it is talking to" {
+    // Whichever way it resolved on this machine, the one thing that must not
+    // happen is a child left with the daemon's own TERM -- or with none.
+    var term: ?[]const u8 = null;
+    for (childEnv()) |pair| {
+        if (std.mem.eql(u8, std.mem.span(pair.name), "TERM")) term = std.mem.span(pair.value);
+    }
+    const value = term orelse return error.TestExpectedTerm;
+    try std.testing.expect(
+        std.mem.eql(u8, value, term_ghostty) or std.mem.eql(u8, value, term_fallback),
+    );
 }
 
 test "the resolved locale reaches the child" {

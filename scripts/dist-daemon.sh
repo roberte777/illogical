@@ -93,6 +93,8 @@ case "$target" in
       lipo -create -output "$work/out/$binary" \
         "$work/arm64/bin/$binary" "$work/x86_64/bin/$binary"
     done
+    # One database for both Macs: it is compiled terminfo, not machine code.
+    prefix="$work/arm64"
     ;;
   native)
     # Spelled the way the zig triples are, so `native` and an explicit target
@@ -109,6 +111,7 @@ case "$target" in
     build native "$work/native"
     mkdir -p "$work/out"
     cp "$work/native/bin/illogicald" "$work/native/bin/illogical" "$work/out/"
+    prefix="$work/native"
     ;;
   *)
     # `x86_64-linux-musl` -> `linux-x86_64`. The abi is not in the name: musl
@@ -121,8 +124,18 @@ case "$target" in
     build "$target" "$work/$target"
     mkdir -p "$work/out"
     cp "$work/$target/bin/illogicald" "$work/$target/bin/illogical" "$work/out/"
+    prefix="$work/$target"
     ;;
 esac
+
+# The terminfo database travels with them too. `illogicald` tells every child
+# TERM=xterm-ghostty and points its TERMINFO at this, which is the only way that
+# name resolves on a host that has never had ghostty on it -- and a child with
+# no terminfo at all cannot move its own cursor, so its shell redraws a prompt
+# by printing a second one. Beside the binaries rather than in a `share/`,
+# because the tarball is unpacked onto a PATH: `src/core/pty.zig` looks for it
+# in the directory holding the daemon.
+cp -R "$prefix/share/terminfo" "$work/out/terminfo"
 
 # The licences travel with the binaries, because MIT's one condition is that
 # the notice accompanies copies -- and `illogicald` statically links ghostty,
@@ -134,7 +147,7 @@ cp "$root/LICENSE" "$root/THIRD_PARTY_NOTICES" "$work/out/"
 # through `releases/latest/download/...` -- which is the URL the README hands
 # people, and which 404'd against every name this script used to produce.
 tarball="$dist/illogicald-$label.tar.gz"
-tar -czf "$tarball" -C "$work/out" illogicald illogical LICENSE THIRD_PARTY_NOTICES
+tar -czf "$tarball" -C "$work/out" illogicald illogical terminfo LICENSE THIRD_PARTY_NOTICES
 echo "==> $tarball"
 
 # Beside the tarballs rather than inside one, and rewritten from whatever is in

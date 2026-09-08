@@ -168,6 +168,21 @@ stage-daemon:
         cp zig-out/bin/illogicald clients/macos/Illogical/Supporting/bin/illogicald
     fi
     chmod +x clients/macos/Illogical/Supporting/bin/illogicald
+    # The terminfo database beside it, into Contents/Resources/terminfo. The
+    # daemon points every child's TERMINFO here, which is what makes
+    # TERM=xterm-ghostty a name the shell can look up -- without it a shell has
+    # no terminfo at all and cannot move its own cursor. See src/core/pty.zig.
+    #
+    # ILLOGICAL_TERMINFO_DIR names a prebuilt database for the same reason
+    # ILLOGICAL_DAEMON_BIN names a prebuilt daemon: a release stages what the
+    # tarball already built rather than building a second copy.
+    terminfo="${ILLOGICAL_TERMINFO_DIR:-zig-out/share/terminfo}"
+    if [ ! -d "$terminfo" ]; then
+        echo "no terminfo database at $terminfo (did zig build run?)" >&2
+        exit 1
+    fi
+    rm -rf clients/macos/Illogical/Supporting/terminfo
+    cp -R "$terminfo" clients/macos/Illogical/Supporting/terminfo
 
 # Test the pure-Swift client core. Needs no XCFramework.
 test-swift:
