@@ -17,6 +17,12 @@
 //  That two-phase split is the whole reason libghostty's render state exists:
 //  "This allows the render state to minimally impact terminal IO performance
 //  and also allows the renderer to be safely multi-threaded." (render.h)
+//
+//  One renderer, though, and that is not a detail. The render state is per
+//  *terminal*: `begin_update` "consumes terminal/screen dirty state", so a
+//  second renderer pulling frames from this engine takes the changed rows the
+//  first one needed and leaves it painting a screen from before they arrived.
+//  `bind` is what enforces it — see `TerminalRenderSink`.
 
 import Foundation
 import GhosttyVt
@@ -25,6 +31,21 @@ final class TerminalEngine: @unchecked Sendable {
     private var terminal: GhosttyTerminal?
     private var renderState: GhosttyRenderState?
     private let lock = NSLock()
+
+    /// Serializes `updateSnapshot` against itself.
+    ///
+    /// `lock` is not enough and is not meant to be: it covers the terminal, and
+    /// is deliberately dropped for the whole extraction so the reader thread
+    /// can keep writing. What the extraction then reads — the render state, the
+    /// row iterator, the row cells — is engine-owned and single-threaded by
+    /// assumption, and the assumption holds only while one renderer is pulling
+    /// frames. `bind` sees to that, but not instantly: the displaced surface's
+    /// render thread can be *inside* this call when its replacement binds, and
+    /// two threads sharing one row iterator is a garbled row, not a late one.
+    ///
+    /// Uncontended in every steady state, which is what makes it cheap enough
+    /// to hold across the whole call.
+    private let frameLock = NSLock()
 
     /// Selection gesture state. Owned here because it holds *tracked*
     /// references into `terminal`, which have to be released against that
@@ -113,11 +134,39 @@ final class TerminalEngine: @unchecked Sendable {
     /// Main-actor only. `markDirty` reads `wake` and never this.
     private weak var boundView: AnyObject?
 
+    /// The renderer `boundView` draws with, so the one it displaced can be
+    /// stopped.
+    ///
+    /// Weak, and for the same reason `boundView` is: a surface holds its
+    /// renderer, and both outlive nothing here.
+    ///
+    /// Main-actor only.
+    private weak var boundSink: TerminalRenderSink?
+
     /// Bind `view` to this engine, displacing whatever was bound before.
+    ///
+    /// The displaced surface's renderer is stopped rather than merely ignored.
+    /// Both surfaces are on screen for the length of the transition, both have
+    /// a render thread, and both would otherwise call `updateSnapshot` — which
+    /// drives one render state, one row iterator and one set of dirty flags.
+    /// The frames the displaced one takes are frames the live one never sees:
+    /// its rows stay as they were before the split until something forces a
+    /// full rebuild, which in practice meant clicking the pane.
     @MainActor
-    func bind(_ view: AnyObject, wake: @escaping @Sendable () -> Void) {
+    func bind(
+        _ view: AnyObject,
+        sink: TerminalRenderSink? = nil,
+        wake: @escaping @Sendable () -> Void
+    ) {
+        if boundSink !== sink { boundSink?.setActive(false) }
         boundView = view
+        boundSink = sink
         self.wake = wake
+        sink?.setActive(true)
+        // Whatever the outgoing renderer consumed before the handover is dirty
+        // state the incoming one will never be told about, so it starts from a
+        // whole screen rather than from the rows that happen to be marked.
+        invalidate()
     }
 
     /// Unbind `view`. A no-op unless `view` is still the bound one, which is
@@ -125,7 +174,9 @@ final class TerminalEngine: @unchecked Sendable {
     @MainActor
     func unbind(_ view: AnyObject) {
         guard boundView === view else { return }
+        boundSink?.setActive(false)
         boundView = nil
+        boundSink = nil
         wake = nil
     }
 
@@ -322,10 +373,14 @@ final class TerminalEngine: @unchecked Sendable {
     /// The same flag a viewport move sets, for the same reason: neither a
     /// selection nor a search match changes a cell, so libghostty's per-row
     /// dirty flags — which describe content, not what is on screen — do not
-    /// describe them either. It also has to *wake* the render loop, which
-    /// pauses after a second of quiet: a terminal sitting idle while its find
-    /// bar is typed into would otherwise not draw the highlights at all.
-    func markHighlightsDirty() {
+    /// describe them either. A surface handover is the third caller, and its
+    /// reason is the opposite one: the rows *did* change, and the renderer that
+    /// is about to draw them was not the one told about it.
+    ///
+    /// It also has to *wake* the render loop, which pauses after a second of
+    /// quiet: a terminal sitting idle while its find bar is typed into would
+    /// otherwise not draw the highlights at all.
+    func invalidate() {
         lock.lock()
         forceFullRebuild = true
         lock.unlock()
@@ -546,9 +601,14 @@ final class TerminalEngine: @unchecked Sendable {
 
     /// Take a consistent view of the terminal into `snapshot`.
     ///
-    /// The terminal lock is held for the `begin_update` call only.
+    /// The terminal lock is held for the `begin_update` call only. `frameLock`
+    /// is held for all of it: everything read after `begin_update` belongs to
+    /// the render state, and there is one of those.
     func updateSnapshot(into snapshot: TerminalSnapshot) -> Bool {
         guard let renderState, let rowIterator, let rowCells else { return false }
+
+        frameLock.lock()
+        defer { frameLock.unlock() }
 
         lock.lock()
         guard let terminal else {
@@ -563,6 +623,13 @@ final class TerminalEngine: @unchecked Sendable {
         search.viewportSpans(
             terminal: terminal, columns: cols, rows: rows, into: &searchSpans)
         let beginResult = ghostty_render_state_begin_update(renderState, terminal)
+        // Cleared here, under the same lock `write` takes and before it is
+        // dropped, so that a write landing a moment from now sets it again and
+        // earns the frame it is owed. Cleared *after* the unlock — as it was —
+        // it erases exactly those writes: the bytes are in the terminal, no
+        // frame is pending for them, and the pane holds a stale screen until
+        // the next byte or the next click.
+        if beginResult == GHOSTTY_SUCCESS { dirtyFlag.store(false) }
         // Highlights change no cell, so a match arriving, moving or being
         // stepped onto is invisible to libghostty's per-row dirty flags. This
         // is what makes it visible.
@@ -580,7 +647,6 @@ final class TerminalEngine: @unchecked Sendable {
         lock.unlock()
 
         guard beginResult == GHOSTTY_SUCCESS else { return false }
-        dirtyFlag.store(false)
 
         // Deferred work that needs no terminal access. The reader thread is
         // free to keep writing from here on.

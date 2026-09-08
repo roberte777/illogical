@@ -57,6 +57,23 @@ final class TerminalRenderer: @unchecked Sendable {
     /// clears it, and skips the whole frame if it was already clear.
     private var cellsRebuilt = false
 
+    /// Whether this renderer is the one its engine answers to.
+    ///
+    /// Two renderers can exist over one engine — a split, a pane closing and a
+    /// zoom all rehome the surviving pane, and SwiftUI keeps the outgoing
+    /// surface alive for the length of the transition — and only one of them
+    /// may pull frames. libghostty's render state is per *terminal*, so
+    /// `begin_update` consumes the terminal's dirty rows: a second renderer
+    /// asking for them is a first renderer that is never told about them, and
+    /// what it draws is the screen from before the split.
+    ///
+    /// False until `TerminalEngine.bind` says otherwise. A displaced renderer
+    /// keeps the last surface it drew, which is the right thing to show on a
+    /// view that is fading out anyway.
+    ///
+    /// Guarded by `mutex`.
+    private var active = false
+
     /// Called on the render thread when the first frame carrying an adopted
     /// snapshot is submitted, with the moment it happened.
     ///
@@ -148,6 +165,20 @@ final class TerminalRenderer: @unchecked Sendable {
         return size
     }
 
+    /// Start or stop pulling frames from the engine. See `active`.
+    func setActive(_ active: Bool) {
+        mutex.lock()
+        defer { mutex.unlock() }
+        guard self.active != active else { return }
+        self.active = active
+        // Taking the engine back means the rows it changed while we were not
+        // watching are rows we never extracted, and `updateFrame` alone would
+        // only ask for the ones marked since. `bind` invalidates the engine for
+        // exactly this; the flag here is what makes the display link tick at
+        // all, since `needsFrame` has been answering no.
+        if active { cellsRebuilt = true }
+    }
+
     func setFocus(_ focused: Bool) {
         mutex.lock()
         defer { mutex.unlock() }
@@ -212,9 +243,13 @@ final class TerminalRenderer: @unchecked Sendable {
     /// Whether anything has changed that would make a new frame differ from
     /// the last one. Cheap enough to call from the display link every tick.
     var needsFrame: Bool {
-        if let source, source.isDirty { return true }
         mutex.lock()
         defer { mutex.unlock() }
+        // Before the engine is consulted, and not after: `isDirty` is the one
+        // question a displaced renderer must not act on, since acting on it
+        // means taking the frame from the renderer that replaced it.
+        guard active else { return false }
+        if let source, source.isDirty { return true }
         if cellsRebuilt { return true }
         // A blinking cursor needs frames even when nothing else changes —
         // but only when the phase actually flips. Redrawing on every tick
@@ -242,6 +277,11 @@ final class TerminalRenderer: @unchecked Sendable {
 
         mutex.lock()
         defer { mutex.unlock() }
+
+        // A displaced renderer draws nothing new. `layout` reaches here too —
+        // the outgoing surface is laid out for as long as it fades — so the
+        // display link is not the only caller this has to hold for.
+        guard active else { return }
 
         // The only part of this that touches the terminal is inside
         // `updateSnapshot`, which takes and releases the terminal lock
@@ -918,6 +958,19 @@ protocol TerminalRenderSource: AnyObject {
 extension TerminalRenderSource {
     func consumeSnapshotAdopted() -> Bool { false }
 }
+
+/// The other direction: what the engine needs from whatever draws it.
+///
+/// One method, and it is the whole reason this exists. The engine can be bound
+/// by two surfaces at once but may only be *drawn* by one, so binding has to be
+/// able to stop the renderer it displaced. A protocol rather than the concrete
+/// type because the engine has no other business knowing what Metal is.
+protocol TerminalRenderSink: AnyObject, Sendable {
+    /// Start or stop pulling frames from the engine.
+    func setActive(_ active: Bool)
+}
+
+extension TerminalRenderer: TerminalRenderSink {}
 
 /// Carries a non-Sendable value across a concurrency boundary where the
 /// author has checked that it is safe.

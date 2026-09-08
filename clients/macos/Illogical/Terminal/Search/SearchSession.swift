@@ -213,7 +213,7 @@ final class SearchSession {
             // same change, but it may be asleep: the display link pauses after
             // a second of quiet, and a terminal sitting idle while its find bar
             // is typed into is exactly that.
-            engine.markHighlightsDirty()
+            engine.invalidate()
         }
     }
 }

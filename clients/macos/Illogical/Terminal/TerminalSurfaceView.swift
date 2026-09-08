@@ -228,12 +228,17 @@ final class TerminalSurfaceView: NSView {
                 }
             }
             self.renderer = renderer
-            updateSurfaceSize()
-
             let loop = RenderLoop(renderer: renderer)
             renderThread = loop
-            loop.start(hostView: self)
+
+            // Bound before the first frame rather than after it. A renderer
+            // the engine has not handed the right to draw to skips
+            // `updateFrame` outright, and `updateSurfaceSize` below is the
+            // synchronous first frame — without this it would draw an empty
+            // grid and the real one would wait a vsync for the display link.
             attachEngine()
+            updateSurfaceSize()
+            loop.start(hostView: self)
         } catch {
             Trace.log("renderer init failed: \(error)")
         }
@@ -272,8 +277,13 @@ final class TerminalSurfaceView: NSView {
 
         // Restart a paused display link when output arrives. This is the
         // other half of stopping it when idle.
+        //
+        // The renderer goes with it: binding is also what hands over the right
+        // to draw, and the surface being displaced has a render thread of its
+        // own that must stop calling `updateSnapshot`. Nil on the first pass
+        // through here — the renderer is built below, which calls this again.
         let loop = renderThread
-        engine.bind(self) { [weak loop] in loop?.wake() }
+        engine.bind(self, sink: renderer) { [weak loop] in loop?.wake() }
         if renderer == nil {
             setupRenderingIfNeeded()
         } else {

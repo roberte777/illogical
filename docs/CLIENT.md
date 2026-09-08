@@ -863,7 +863,7 @@ rather than at the call sites, so the app has a vocabulary instead of eleven
 magic numbers.
 
 One consequence of animating the split tree is worth knowing about, because it
-bit once. A topology change moves the surviving pane to a new position in the
+bit twice. A topology change moves the surviving pane to a new position in the
 view tree, so SwiftUI builds it a **new** `TerminalSurfaceView` over the *same*
 `TerminalEngine` and keeps the old one alive for the length of the transition.
 Anything the engine holds per-view therefore has two claimants at once, and the
@@ -873,6 +873,27 @@ stopped repainting until it was clicked. `TerminalEngine.bind`/`unbind` are
 keyed on view identity for that reason, and `reportSizeIfNeeded` checks the same
 thing so a displaced surface cannot resize the PTY out from under its
 replacement.
+
+The **renderer** is the same slot, and the second bite. Each surface builds its
+own `TerminalRenderer` on its own render thread, so for the length of the
+transition two of them called `updateSnapshot` on one engine — and libghostty's
+render state belongs to the *terminal*, not to a view. `begin_update` "consumes
+terminal/screen dirty state" (`render.h`), and one row iterator was being
+advanced by two threads. The rows the displaced surface took were rows its
+replacement was never told about, so a fresh split came up showing a screen from
+before it: a stale prompt above the real one, and lines with characters
+duplicated and dropped where the two extractions interleaved. Clicking the pane
+repaired it, because a click starts a selection and a selection calls
+`invalidate`.
+
+So binding hands over the right to draw as well. `bind` takes a
+`TerminalRenderSink` — the renderer — stops whichever one it displaces, and
+invalidates the engine so the incoming renderer starts from a whole screen
+rather than from whichever rows happen to still be marked. A displaced renderer
+keeps the last IOSurface it drew, which is the right thing to show on a view
+that is fading out anyway. `frameLock` closes the rest: `bind` cannot stop a
+render thread that is already *inside* an extraction, and two threads sharing
+one row iterator is a garbled row rather than a late one.
 
 The replacement has to *say* what size it is, and that is the other half. A
 surface's first layout is exempt from `reportSizeIfNeeded` because the size

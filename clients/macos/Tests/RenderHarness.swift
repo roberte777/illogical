@@ -166,6 +166,10 @@ final class RenderHarness {
         configure?(&config)
         renderer = TerminalRenderer(
             context: context, grid: grid, layer: layer, source: renderSource, config: config)
+        // In the app this is `TerminalEngine.bind`, which hands the right to
+        // draw to one renderer at a time. There is no engine here, so the
+        // harness says it: without it every frame below would be skipped.
+        renderer.setActive(true)
 
         let width = columns * cellWidth
         let height = rows * cellHeight
