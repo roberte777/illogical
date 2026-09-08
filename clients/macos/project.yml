@@ -167,6 +167,12 @@ targets:
       # driven from a unit test -- both were checked against the running app.
       - path: Illogical/App/WindowChrome.swift
       - path: Illogical/App/EscapeKey.swift
+      # ⌃⇥'s monitor. The monitor itself is in the same position as the two
+      # above -- no unit test can drive one -- but the decision it makes is
+      # not: `TabCycle.direction` is a pure function of a keycode and a
+      # modifier mask, and it is the part that has to be right, because every
+      # chord it wrongly claims is a keystroke the terminal stops receiving.
+      - path: Illogical/App/TabCycleKey.swift
       # The font the app ships. Without it in the test bundle the renderer
       # tests would resolve the default family to the system's fixed-pitch
       # face and measure a grid the app never draws.

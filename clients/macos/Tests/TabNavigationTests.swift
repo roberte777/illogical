@@ -1,12 +1,16 @@
 //  TabNavigationTests.swift
-//  ⇧⌘] , ⇧⌘[ and ⌘1–⌘9, as store operations.
+//  ⇧⌘] , ⇧⌘[ , ⌘1–⌘9 and ⌃⇥ , as store operations and one matcher.
 //
 //  The chords are menu items in `IllogicalApp`, but everything they decide is
 //  here: which tabs are reachable, what wrapping does at the ends, and that
 //  ⌘9 means the last tab rather than the ninth. All of it scoped to
 //  `visibleTabs` — the strip shows one session at a time, and a keystroke must
 //  not jump the window to another machine.
+//
+//  ⌃⇥ is the one chord no menu item holds, so its own half — which events
+//  belong to it — is tested beside them at the end.
 
+import AppKit
 import IllogicalProtocol
 import XCTest
 
@@ -231,5 +235,133 @@ final class TabNavigationTests: XCTestCase {
         let before = store.focusGeneration
         store.focusTerminal()
         XCTAssertNotEqual(store.focusGeneration, before)
+    }
+
+    // MARK: - ⌃⇥
+    //
+    // The monitor itself needs a window and cannot be driven from here; the
+    // decision it makes can. Every chord `TabCycle.direction` wrongly claims
+    // is a keystroke that stops reaching the terminal, so the negatives below
+    // matter more than the two positives.
+
+    private func direction(
+        _ mods: NSEvent.ModifierFlags, keyCode: UInt16 = TabCycle.tabKeyCode
+    ) -> TabCycle.Direction? {
+        TabCycle.direction(keyCode: keyCode, modifiers: mods)
+    }
+
+    func testControlTabCyclesForwardsAndControlShiftTabBack() {
+        XCTAssertEqual(direction(.control), .next)
+        XCTAssertEqual(direction([.control, .shift]), .previous)
+    }
+
+    /// Bare ⇥ is completion in every shell, and ⇧⇥ is the way back out of it.
+    /// Neither is ours.
+    func testTabWithoutControlBelongsToTheTerminal() {
+        XCTAssertNil(direction([]))
+        XCTAssertNil(direction(.shift))
+    }
+
+    /// ⌃ **and nothing else**. A `contains(.control)` test would have eaten
+    /// all three of these.
+    func testControlWithAnotherModifierIsNotTheChord() {
+        XCTAssertNil(direction([.control, .option]))
+        XCTAssertNil(direction([.control, .command]))
+        XCTAssertNil(direction([.control, .shift, .option]))
+    }
+
+    /// The other half of "and nothing else": ⌃ on any other key is the
+    /// program's. ⌃C is the one that would be missed.
+    func testControlOnAnotherKeyIsNotTheChord() {
+        XCTAssertNil(direction(.control, keyCode: 8), "⌃C")
+        XCTAssertNil(direction(.control, keyCode: 36), "⌃↩")
+    }
+
+    /// AppKit sets bits on a real event that are not modifiers a user pressed:
+    /// caps lock, and the left/right bit saying which ⌃ it was. Both have to
+    /// wash out, or the chord works on one keyboard half and not the other.
+    func testTheBitsAppKitAddsDoNotCount() {
+        XCTAssertEqual(direction([.control, .capsLock]), .next)
+        // `NX_DEVICELCTLKEYMASK` — the left-control device bit, as it arrives
+        // alongside `.control` in a live `keyDown`.
+        XCTAssertEqual(direction(NSEvent.ModifierFlags(rawValue: 0x04_0001)), .next)
+    }
+
+    // MARK: - ⌃⇥'s key-up debt
+    //
+    // A chord whose press is dropped owes a dropped release. Every other chord
+    // in the app carries ⌘, and AppKit delivers no `keyUp` while ⌘ is held, so
+    // this bookkeeping exists nowhere else — and under the Kitty protocol a
+    // stray release is a real event a program is told about.
+
+    private func down(
+        _ mods: NSEvent.ModifierFlags, _ matcher: inout TabCycle.Matcher,
+        keyCode: UInt16 = TabCycle.tabKeyCode
+    ) -> TabCycle.Claim {
+        matcher.claim(isKeyUp: false, keyCode: keyCode, modifiers: mods)
+    }
+
+    private func up(
+        _ mods: NSEvent.ModifierFlags, _ matcher: inout TabCycle.Matcher,
+        keyCode: UInt16 = TabCycle.tabKeyCode
+    ) -> TabCycle.Claim {
+        matcher.claim(isKeyUp: true, keyCode: keyCode, modifiers: mods)
+    }
+
+    /// The release usually carries no ⌃ at all — letting go of the modifier
+    /// first is how anyone releases this chord — so it is matched to the press
+    /// that was taken, not to its own modifiers.
+    func testTheReleaseOfAClaimedChordIsDroppedWhateverItCarries() {
+        var matcher = TabCycle.Matcher()
+        XCTAssertEqual(down(.control, &matcher), .cycle(.next))
+        XCTAssertEqual(up([], &matcher), .drop, "⌃ released before ⇥")
+    }
+
+    /// One press, one dropped release. A second release is somebody else's.
+    func testOnlyOneReleaseIsOwed() {
+        var matcher = TabCycle.Matcher()
+        XCTAssertEqual(down([.control, .shift], &matcher), .cycle(.previous))
+        XCTAssertEqual(up([], &matcher), .drop)
+        XCTAssertEqual(up([], &matcher), .pass)
+    }
+
+    /// A held chord repeats: many downs, one up.
+    func testARepeatingChordStillOwesOneRelease() {
+        var matcher = TabCycle.Matcher()
+        XCTAssertEqual(down(.control, &matcher), .cycle(.next))
+        XCTAssertEqual(down(.control, &matcher), .cycle(.next))
+        XCTAssertEqual(up([], &matcher), .drop)
+        XCTAssertEqual(up([], &matcher), .pass)
+    }
+
+    /// Bare ⇥ passes through in both halves, or completion would work and its
+    /// release would not.
+    func testAnUnclaimedTabPassesBothWays() {
+        var matcher = TabCycle.Matcher()
+        XCTAssertEqual(down([], &matcher), .pass)
+        XCTAssertEqual(up([], &matcher), .pass)
+    }
+
+    /// The debt cannot outlive the next ordinary ⇥.
+    ///
+    /// A chord pressed and then ⌘⇥ away leaves the release in another app, so
+    /// the debt is never collected. Without the press of a plain ⇥ settling it,
+    /// that stranded flag would eat *its* release — a program under the Kitty
+    /// protocol told about a press whose release never comes.
+    func testADebtStrandedByAReleaseDeliveredElsewhereIsSettledByTheNextTab() {
+        var matcher = TabCycle.Matcher()
+        XCTAssertEqual(down(.control, &matcher), .cycle(.next))
+        // The release went to whatever the user switched to. Back here, an
+        // ordinary ⇥ is typed.
+        XCTAssertEqual(down([], &matcher), .pass)
+        XCTAssertEqual(up([], &matcher), .pass, "the stranded debt ate a real release")
+    }
+
+    /// And a release of some *other* key never settles it — the debt is a ⇥.
+    func testAnotherKeysReleaseIsNotTheOneOwed() {
+        var matcher = TabCycle.Matcher()
+        XCTAssertEqual(down(.control, &matcher), .cycle(.next))
+        XCTAssertEqual(up([], &matcher, keyCode: 8), .pass, "⌃C's release")
+        XCTAssertEqual(up([], &matcher), .drop)
     }
 }

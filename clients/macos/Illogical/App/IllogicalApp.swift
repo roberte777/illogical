@@ -239,6 +239,16 @@ struct ContentView: View {
             .animation(
                 Motion.menu.animation(reduceMotion: reduceMotion), value: store.sessionMenuOpen)
         }
+        // ⌃⇥ / ⌃⇧⇥, the one pair of tab chords the Window menu cannot also
+        // carry: a menu item holds a single key equivalent, and those items
+        // already spend theirs on ⇧⌘] and ⇧⌘[. TabCycleKey says why that
+        // leaves a monitor, and why the terminal must never see the chord.
+        .onTabCycle { direction in
+            switch direction {
+            case .next: store.selectNextTab()
+            case .previous: store.selectPreviousTab()
+            }
+        }
         // The menu's filter field held the keyboard while it was open, and
         // nothing in the split tree changed when the overlay went away — so
         // without this, typing after Esc went nowhere. W15.

@@ -540,6 +540,7 @@ never be typed into a terminal.
 | ⇧⌘K | Change Session — toggles the dropdown | View |
 | ⌘R | Refresh Sessions | View |
 | ⇧⌘] / ⇧⌘[ | Show Next / Previous Tab, wrapping | Window |
+| ⌃⇥ / ⌃⇧⇥ | The same two, under the chord every browser uses | `ContentView.onTabCycle` — a local `NSEvent` monitor |
 | ⌘1 … ⌘8 | Select that tab | Window |
 | ⌘9 | Last tab (the iTerm/Ghostty/browser convention, not the ninth) | Window |
 | ⌘F | Find — opens the find bar over the focused pane, keeping the last query | Edit |
@@ -557,6 +558,22 @@ nowhere. That is honesty, not safety: a *disabled* menu item still consumes its
 key equivalent — `performKeyEquivalent` reports the chord handled and simply
 does not fire the action — so ⌘5 with two tabs open never reaches the terminal
 either way.
+
+⌃⇥ is the one tab chord that is not a menu item, because it cannot be: AppKit
+gives a menu item a single key equivalent, and Show Next Tab spends its on the
+⇧⌘] the Window menu has to go on displaying. Safari and Terminal.app carry both
+by hanging a second, hidden item off the same action, which SwiftUI's `commands`
+has no spelling for — so it is `onEscape`'s local monitor again, which runs
+inside `sendEvent(_:)` and drops what it claims, and therefore keeps the same
+promise the menu bar does. It claims ⌃⇥ **and ⌃⇧⇥ only**: bare ⇥ is completion
+in every shell, ⌃C is the program's, and a `contains(.control)` test would have
+taken both. It claims them even with one tab open, so the chord means one thing
+rather than depending on how many tabs happen to be there.
+
+The monitor also swallows the matching key-*up*, matched to the key-down it
+took rather than to the release's own modifiers — the rule the scroll chords
+follow, for the same reason. Nothing else in the app needs it: every other
+chord carries ⌘, and AppKit delivers no `keyUp` at all while ⌘ is held.
 
 The four scroll chords are the only keys taken in `keyDown`, and they are taken
 **before** `KeyTranslation` and the encoder. That order is the whole point: a
