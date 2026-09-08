@@ -284,8 +284,12 @@ private to the process and never turn up in the user's font list.
 
 The icons ship too. Neovim's file trees and statuslines draw with Nerd Font
 glyphs, which live in the private use area and are in no ordinary text font;
-on a machine with no Nerd Font installed the cascade came back empty and the
-cell drew nothing. The bundle carries Symbols Nerd Font, the symbols-only face
+on a machine with no Nerd Font installed the cascade came back empty. What the
+cell then drew was not nothing: `TextShaper` substitutes U+FFFD for a
+codepoint no face resolves, JetBrains Mono has that glyph, and the constraint
+is computed from the cell's *own* codepoint — so a file tree came out as a row
+of replacement characters, each one rescaled by the patcher rule belonging to
+the icon it stood in for. The bundle carries Symbols Nerd Font, the symbols-only face
 the nerd-fonts project publishes for exactly this, from the tarball ghostty
 pins at the same hash, and the grid searches it last for every style. That is
 ghostty's arrangement rather than a patched JetBrains Mono, and the reason is

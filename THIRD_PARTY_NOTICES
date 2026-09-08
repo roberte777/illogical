@@ -23,6 +23,8 @@ Contents
   * musl libc                -- MIT (Linux builds only)
   * X11 rgb.txt              -- MIT/X11 (the Mac app only)
   * iTerm2-Color-Schemes     -- MIT (the Mac app only)
+  * JetBrains Mono           -- OFL-1.1 (the Mac app only)
+  * Nerd Fonts symbols       -- MIT (the Mac app only)
 
 ----------------------------------------------------------------------------
 ghostty
@@ -390,3 +392,47 @@ and the same hash, and it unpacks to the theme files alone -- no LICENSE among
 them. So the terms are not reproducible from this tree; they are in the
 upstream repository above, which states the MIT licence. Copyright is
 Michael Badolato and the scheme authors, per that repository.
+
+----------------------------------------------------------------------------
+JetBrains Mono
+https://github.com/JetBrains/JetBrainsMono -- fetched by build.zig.zon as
+`jetbrains_mono`, from Ghostty's own pinned tarball at
+https://deps.files.ghostty.org
+----------------------------------------------------------------------------
+
+The default text face, in its two variable files. Copied into
+`Illogical.app/Contents/Resources` and used when no `font-family` is
+configured; data, not code, and not carried by `illogicald` or the CLI,
+neither of which draws anything.
+
+The tarball is the one Ghostty's own `build.zig.zon` names, at the same URL
+and the same hash, and it carries `OFL.txt`, which ships in the bundle beside
+the fonts. The terms are therefore reproducible from this tree: see
+`clients/macos/Illogical/Supporting/Fonts/OFL.txt`, whose manifest README
+records the provenance. Copyright 2020 The JetBrains Mono Project Authors,
+under the SIL Open Font License 1.1.
+
+----------------------------------------------------------------------------
+Nerd Fonts symbols
+https://github.com/ryanoasis/nerd-fonts -- fetched by build.zig.zon as
+`nerd_fonts_symbols_only`, from Ghostty's own pinned tarball at
+https://deps.files.ghostty.org
+----------------------------------------------------------------------------
+
+The icon face, `SymbolsNerdFont-Regular.ttf`, from the Symbols Only release.
+Copied into `Illogical.app/Contents/Resources` and searched last for every
+style, so that a codepoint no text font carries still draws; data, not code,
+and not carried by `illogicald` or the CLI.
+
+The tarball is the one Ghostty's own `build.zig.zon` names, at the same URL
+and the same hash, and it carries a LICENSE, which ships in the bundle as
+`NerdFonts-LICENSE.txt`. The terms are therefore reproducible from this tree.
+
+MIT License, Copyright (c) 2014 Ryan L McIntyre. The MIT text is the one
+reproduced under `ghostty` at the top of this file, with that copyright
+holder in place of the one named there.
+
+The icon sets the symbols face aggregates are each under their own permissive
+licence -- Font Awesome, Devicons, Octicons, Material Design Icons and the
+rest. The upstream repository above enumerates them, with their terms, under
+*Glyph Sets*.

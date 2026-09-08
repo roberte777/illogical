@@ -24,11 +24,14 @@ ghostty pins:
     sha256-xXppHouCrQmLWWPzlZAy5AOPORCHr3cViFulkEYQXMQ=
 
 which is the `.jetbrains_mono` dependency in `vendor/ghostty/build.zig.zon`,
-at the same version and hash. To refresh them:
+at the same version. `build.zig.zon` itself carries Zig's own multihash; the
+base64 SRI quoted above is the one in `build.zig.zon.json` beside it. To
+refresh them:
 
 ```bash
 curl -sSLO https://deps.files.ghostty.org/JetBrainsMono-2.304.tar.gz
-shasum -a 256 JetBrainsMono-2.304.tar.gz   # must match the hash above
+# Base64 SRI, which is not what `shasum` prints. Must match the hash above.
+openssl dgst -sha256 -binary JetBrainsMono-2.304.tar.gz | base64
 tar xzf JetBrainsMono-2.304.tar.gz 'fonts/variable/*' OFL.txt
 ```
 
@@ -54,11 +57,13 @@ naming a font of their own. Byte-for-byte out of the tarball ghostty pins:
     sha256-EWTRuVbUveJI17LwmYxDzJT1ICQxoVZKeTiVsec7DQQ=
 
 which is the `.nerd_fonts_symbols_only` dependency in
-`vendor/ghostty/build.zig.zon`, at the same version and hash. To refresh:
+`vendor/ghostty/build.zig.zon`, at the same version, and again quoted from
+`build.zig.zon.json` rather than from the multihash beside it. To refresh:
 
 ```bash
 curl -sSLO https://deps.files.ghostty.org/NerdFontsSymbolsOnly-3.4.0.tar.gz
-shasum -a 256 NerdFontsSymbolsOnly-3.4.0.tar.gz   # must match the hash above
+# Base64 SRI, which is not what `shasum` prints. Must match the hash above.
+openssl dgst -sha256 -binary NerdFontsSymbolsOnly-3.4.0.tar.gz | base64
 tar xzf NerdFontsSymbolsOnly-3.4.0.tar.gz SymbolsNerdFont-Regular.ttf LICENSE
 mv LICENSE NerdFonts-LICENSE.txt
 ```
