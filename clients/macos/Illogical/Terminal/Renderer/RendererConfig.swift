@@ -42,6 +42,18 @@ struct RendererConfig {
     var windowPaddingX: Double = 8
     var windowPaddingY: Double = 8
 
+    /// What to do with the space a grid of whole cells cannot fill.
+    ///
+    /// `.none`, which is libghostty's own default for `window-padding-balance`
+    /// and the only value that holds still: the top-left cell hugs the corner
+    /// and the slack — up to a cell in each axis — sits at the right and the
+    /// bottom, where nothing is drawn. Balancing splits that slack between the
+    /// opposite edges instead, which means the grid's origin is a function of
+    /// the surface size: drag a window edge and every row on screen slides by
+    /// half a cell and snaps back on each row the grid gains, which reads as
+    /// the text jittering under the pointer.
+    var windowPaddingBalance: PaddingBalance = .none
+
     /// What fills the padding around the grid.
     enum PaddingColor {
         /// The default background colour.

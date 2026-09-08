@@ -132,7 +132,7 @@ final class TerminalRenderer: @unchecked Sendable {
         let padY = UInt32((config.windowPaddingY * scale).rounded())
         size.balancePadding(
             explicit: EdgePadding(top: padY, bottom: padY, right: padX, left: padX),
-            mode: .balanced)
+            mode: config.windowPaddingBalance)
 
         updateScreenSizeUniformsLocked()
     }
