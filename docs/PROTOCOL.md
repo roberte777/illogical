@@ -111,6 +111,17 @@ version 2, since a client that predates it cannot decode the header, and the
 version check at `hello` is what keeps such a client from ever seeing one. See
 [ARCHITECTURE.md](ARCHITECTURE.md#data-flow-resize).
 
+One `resized` is not a change of size but a statement of one. An attach whose
+snapshot is at a size the terminal has since left is followed by a marker
+saying where it went, queued under the same lock as the snapshot so no real
+resize can overtake it. That is the ordinary case for a *parked* terminal: its
+park file stays at the park size on purpose, because serving it untouched is
+what keeps attach latency independent of scrollback, so the client decodes the
+snapshot at the size it was written at and reflows to the current one in stream
+order — the same thing it does for a resize another window made. A client that
+is restoring history should hold that reflow until the last page has landed;
+see [PARKING.md](PARKING.md).
+
 ### `err` codes
 
 | Code | Name | Meaning |
