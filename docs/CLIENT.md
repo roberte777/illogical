@@ -1141,6 +1141,30 @@ bold is the bold one. `FontGridSet` keys its shared grids on the whole
 `FontConfig` plus the display scale, so panes that agree about the font still
 share one atlas and panes that do not are not silently handed each other's.
 
+**Every fallback is scaled to the face it sits behind.** Two families at the
+same point size are not the same apparent size — Courier New's ex height is
+three quarters of JetBrains Mono's — so a fallback loaded at the grid's own size
+reads as visibly larger or smaller than the text around it. `FaceMetrics`
+`scaleFactor` is libghostty's `Collection.scaleFactor`: it compares one metric
+between the two faces, normalized to ems so the sizes they were measured at
+drop out, and the face is loaded at the grid's size times that ratio. The
+metric is `ic_width`, the width of 水, which is what lines a CJK face up on the
+grid, and it is what libghostty uses for every fallback it adds.
+
+A font that never states the metric asked for falls through to one more fonts
+bother to carry — ex height, then cap height, then line height, which every
+font has because it is computed rather than read. That path is the common one
+rather than the exotic one: no ordinary Latin monospace font contains an
+ideograph, so a Latin fallback is matched on its ex height. The estimate is
+never used as a *substitute* for the metric, because scaling by a number
+derived from the face being corrected would correct nothing.
+
+Two faces are exempt, both with libghostty's reasoning. The Nerd Font symbols
+keep the grid's size, because fitting an icon to its cell is
+`NerdFontConstraints`' job and a scale factor would fight it. Colour faces keep
+it too: Apple Color Emoji is a bitmap strike whose ex height has nothing to do
+with text, so a factor computed from it would resize emoji for no reason.
+
 What is deliberately still missing: reload while running, `font-style`,
 `font-feature`, `font-variation`, the `adjust-*` metric modifiers, and
 codepoint maps. #39 and #42.

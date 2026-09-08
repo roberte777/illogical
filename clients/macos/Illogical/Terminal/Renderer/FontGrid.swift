@@ -83,6 +83,13 @@ final class FontGrid: @unchecked Sendable {
 
     /// Immutable after init: derived from the primary regular face.
     let metrics: GridMetrics
+
+    /// That face's own measurements, kept because a fallback is scaled
+    /// against them and `resolveLocked` discovers fallbacks long after init.
+    private let primaryFaceMetrics: FaceMetrics
+
+    /// The size faces are loaded at, before any per-face adjustment.
+    private let pixelSize: Double
     let sprite: SpriteFace
 
     /// The fonts and display scale this grid was built for. Part of
@@ -136,13 +143,18 @@ final class FontGrid: @unchecked Sendable {
 
         // CoreText is asked for the font at its *pixel* size, so all the
         // metrics come back in pixels and no scaling is needed downstream.
-        let built = Self.build(font: font, pixelSize: font.pointSize * scale)
+        pixelSize = font.pointSize * scale
+        let built = Self.build(font: font, pixelSize: pixelSize)
         faces = built.faces
         styleSlots = built.styleSlots
         discovered = Array(repeating: [], count: FontStyle.allCases.count)
 
-        metrics = GridMetrics.calc(
-            built.faces[Int(built.styleSlots[FontStyle.regular.rawValue][0])].faceMetrics())
+        // Measured once. It is both what the grid is derived from and what
+        // every later fallback is scaled against, and `faceMetrics` reads
+        // four OpenType tables to produce it.
+        primaryFaceMetrics =
+            built.faces[Int(built.styleSlots[FontStyle.regular.rawValue][0])].faceMetrics()
+        metrics = GridMetrics.calc(primaryFaceMetrics)
         sprite = SpriteFace(metrics: metrics)
 
         atlasGrayscale = Atlas(size: Self.initialAtlasSize, format: .grayscale)
@@ -227,7 +239,12 @@ final class FontGrid: @unchecked Sendable {
         }
 
         // 3. The font we ship, behind whatever the config asked for.
-        if let builtin = builtinFaces(size: pixelSize) {
+        // Scaled to the configured family, if there is one. When there is
+        // not, ours *is* the primary and the factor comes out 1.
+        let primaryMetrics = slots[FontStyle.regular.rawValue].first.map {
+            faces[Int($0)].faceMetrics()
+        }
+        if let builtin = builtinFaces(size: pixelSize, matching: primaryMetrics) {
             for style in FontStyle.allCases {
                 append(builtin[style.rawValue], to: style)
             }
@@ -285,23 +302,52 @@ final class FontGrid: @unchecked Sendable {
     /// Mono ships italic separately, and asking CoreText for the italic
     /// trait on the upright variable face returns the upright face, which
     /// would quietly leave every italic cell synthetically skewed.
-    private static func builtinFaces(size: Double) -> [FontFace]? {
+    /// `matching` is the face this one sits behind, or nil when nothing was
+    /// configured and ours is the primary. libghostty adds all four of these
+    /// with `default_fallback_adjustment`, which is `.ic_width`.
+    private static func builtinFaces(
+        size: Double, matching primary: FaceMetrics?
+    ) -> [FontFace]? {
         guard let upright = EmbeddedFont.variable,
             let slanted = EmbeddedFont.variableItalic
         else { return nil }
 
         // The faces are parsed once at a nominal size and copied to the size
         // wanted here, which is libghostty's `initFontCopy`.
-        let regular = FontFace(font: CTFontCreateCopyWithAttributes(upright, size, nil, nil))
-        let italic = FontFace(font: CTFontCreateCopyWithAttributes(slanted, size, nil, nil))
+        func sized(_ base: CTFont) -> FontFace {
+            FontFace(
+                font: CTFontCreateCopyWithAttributes(
+                    base, adjusted(size, of: base, to: primary, by: .icWidth), nil, nil))
+        }
+
+        let regular = sized(upright)
+        let italic = sized(slanted)
         let bold = EmbeddedFont.boldWeight
         let axis = EmbeddedFont.weightAxis
+        // The two varied faces inherit the adjusted size: `withVariation`
+        // copies at size 0, which keeps whatever size the face already has.
         return [
             regular,
             regular.withVariation(axis: axis, value: bold),
             italic,
             italic.withVariation(axis: axis, value: bold),
         ]
+    }
+
+    /// The size to load `base` at so it sits with `primary`.
+    ///
+    /// Measuring costs four OpenType table reads, so this is only reached for
+    /// a face that is actually being added — never on the per-glyph path.
+    /// A nil `primary` means there is nothing to match yet, which happens for
+    /// the very first face in the grid.
+    private static func adjusted(
+        _ size: Double, of base: CTFont, to primary: FaceMetrics?, by adjustment: SizeAdjustment
+    ) -> Double {
+        guard let primary, adjustment != .none else { return size }
+        let candidate = FontFace(font: CTFontCreateCopyWithAttributes(base, size, nil, nil))
+        return size
+            * FaceMetrics.scaleFactor(
+                primary: primary, face: candidate.faceMetrics(), adjustment: adjustment)
     }
 
     /// The Nerd Font symbols at this size, or nil when the file is not in
@@ -457,7 +503,25 @@ final class FontGrid: @unchecked Sendable {
             return nil
         }
 
-        let face = FontFace(font: fallback)
+        // Scaled to the primary face. Without this a CJK fallback at the
+        // same point size renders visibly larger or smaller than the Latin
+        // text beside it, which is the whole reason libghostty adds every
+        // discovered fallback with `default_fallback_adjustment`.
+        //
+        // Colour faces are exempt. Apple Color Emoji is a bitmap strike with
+        // no ideographs and an ex height that has nothing to do with text,
+        // so a factor computed from it would resize emoji for no reason;
+        // libghostty passes `.none` for the emoji font too.
+        let unscaled = FontFace(font: fallback)
+        let face =
+            unscaled.hasColor
+            ? unscaled
+            : FontFace(
+                font: CTFontCreateCopyWithAttributes(
+                    fallback,
+                    Self.adjusted(
+                        pixelSize, of: fallback, to: primaryFaceMetrics, by: .icWidth),
+                    nil, nil))
         guard let g = face.glyphIndex(cp), g != 0 else { return nil }
 
         let slot = UInt16(faces.count)
