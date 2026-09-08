@@ -85,6 +85,41 @@ struct WindowChrome<Toolbar: View>: NSViewRepresentable {
 
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
+
+        // A translucent terminal needs a window that is not opaque, or what
+        // shows through the surface is the window's own background rather
+        // than the desktop. Left alone at the default when nobody asked for
+        // one: a non-opaque window is composited differently whether or not
+        // anything in it is actually see-through, and the terminal is the
+        // one view in the app that would pay for that.
+        //
+        // Only the terminal *is* see-through, in any case. Every piece of
+        // chrome paints its own opaque background, so the clear window colour
+        // is visible nowhere but inside a pane.
+        if AppConfig.isTranslucent {
+            window.isOpaque = false
+            window.backgroundColor = .clear
+
+            // Clear is right for the content, where the terminal is, and
+            // wrong for the title bar — and the title bar is not entirely
+            // ours to paint. AppKit insets the accessory past the traffic
+            // lights (see `Metrics.toolbarLeading`) and leaves a sliver at
+            // the trailing end, so the strip behind the lights and that
+            // sliver are the window's own background. With a clear window
+            // they became the only see-through chrome in the app: the tab
+            // strip opaque, the traffic lights sitting on the desktop.
+            //
+            // So the title bar's own view gets the colour the accessory is
+            // already painting, and the two meet without a seam. Asked for by
+            // its close button because that is the one handle on the view
+            // AppKit will admit to owning.
+            if let titlebar = window.standardWindowButton(.closeButton)?.superview {
+                titlebar.wantsLayer = true
+                titlebar.layer?.backgroundColor = Palette.toolbar.cgColor
+            }
+
+            WindowBlur.apply(radius: AppConfig.current.backgroundBlurRadius, to: window)
+        }
         // Never true: it would turn clicks on the toolbar into window drags.
         // The accessory view gives us dragging on its empty space anyway.
         //
@@ -110,5 +145,61 @@ struct WindowChrome<Toolbar: View>: NSViewRepresentable {
         accessory.fullScreenMinHeight = toolbarHeight
         window.addTitlebarAccessoryViewController(accessory)
         context.coordinator.accessory = accessory
+    }
+}
+
+/// Blurring what shows through the window, the way Ghostty does it.
+///
+/// `CGSSetWindowBackgroundBlurRadius` is a private CoreGraphics call, and the
+/// reason to reach for one is that the public alternative is a different
+/// feature wearing the same word. `NSVisualEffectView` blurs behind a *view*,
+/// at a radius the system picks, and tints what it blurs with a material —
+/// which is right for a sidebar and wrong for a terminal, where the point is
+/// that the wallpaper is dimmer and softer, not that it has been recoloured.
+/// It is also why `background-blur` can take a radius here at all: with the
+/// effect view there would be no number to honour.
+///
+/// Resolved with `dlsym` rather than declared with `@_silgen_name`, which is
+/// what Ghostty uses. The two produce the same call; the difference is what
+/// happens on the macOS that finally drops the symbol. A `@_silgen_name`
+/// declaration is a link-time reference, so the app would fail to launch at
+/// all — over a blur. This way the lookup returns nil, the window is
+/// unblurred, and the terminal opens.
+enum WindowBlur {
+    /// `(connection ID, window number, radius) -> OSStatus`.
+    private typealias SetRadius = @convention(c) (UInt32, UInt32, Int32) -> Int32
+    private typealias DefaultConnection = @convention(c) () -> UInt32
+
+    /// Looked up once. `RTLD_DEFAULT` is `-2` on Darwin: search every image
+    /// already loaded, which CoreGraphics always is.
+    private static let entryPoints: (connection: DefaultConnection, setRadius: SetRadius)? = {
+        let global = UnsafeMutableRawPointer(bitPattern: -2)
+        guard let connection = dlsym(global, "CGSDefaultConnectionForThread"),
+            let setRadius = dlsym(global, "CGSSetWindowBackgroundBlurRadius")
+        else {
+            Trace.log("background blur unavailable: CGS symbols not found")
+            return nil
+        }
+        return (
+            unsafeBitCast(connection, to: DefaultConnection.self),
+            unsafeBitCast(setRadius, to: SetRadius.self)
+        )
+    }()
+
+    /// Blur `radius` pixels of whatever is behind `window`.
+    ///
+    /// Behind the *window*, so this is only visible where the window is
+    /// see-through — which is the terminal and nothing else, since every
+    /// piece of chrome paints its own opaque background. That is what makes
+    /// one window-wide call the right shape for a per-terminal setting.
+    static func apply(radius: Int, to window: NSWindow) {
+        guard radius > 0, let entryPoints else { return }
+        // Zero until the window is on screen, and a blur set against it goes
+        // nowhere. Every caller here runs from a `DispatchQueue.main.async`
+        // after the window exists, so this is a guard rather than a wait.
+        guard window.windowNumber > 0 else { return }
+        let status = entryPoints.setRadius(
+            entryPoints.connection(), UInt32(window.windowNumber), Int32(radius))
+        if status != 0 { Trace.log("background blur refused: status \(status)") }
     }
 }

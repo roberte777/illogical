@@ -87,8 +87,60 @@ enum Metrics {
     static let paneButtonTrailing: CGFloat = 8
     static let plusTrailing: CGFloat = 12
     static let plusWidth: CGFloat = 28
-    /// The breadcrumb glyph starts at 27pt of ink in the reference.
-    static let breadcrumbLeading: CGFloat = 24
+    /// Inside the card, so the glyph lands ~24pt from the window's edge once
+    /// the bezel is added — where it sat before there was one, and where the
+    /// reference puts it (23pt of ink).
+    static let breadcrumbLeading: CGFloat = 18
+
+    /// The bezel: how far a pane is held off the window's edges, with the
+    /// chrome colour showing in the gap.
+    ///
+    /// Measured off a *light-mode* capture of the reference, where the chrome
+    /// and the card are far enough apart in tone to find an edge at all: 8px
+    /// of chrome either side of the card and 8px below it, on a window whose
+    /// traffic lights are 16px across — so a 4:3 capture, and 6pt. It is what
+    /// makes a pane read as a card the window holds rather than as the
+    /// window's own lining, and it is the one piece of the chrome that is a
+    /// *colour* difference rather than a layout one: the gap is
+    /// `Palette.toolbar`, which is darker than `Palette.background`.
+    ///
+    /// A pane, and not a terminal: the breadcrumb is inside the card, because
+    /// the cwd, the command and the split controls on it all belong to the
+    /// terminal below rather than to the window around it.
+    ///
+    /// **Three sides, not four.** In the reference the card's top edge is
+    /// flush against the toolbar — the toolbar ends at 52px and the card's
+    /// border is the next pixel down — so the card's own edge is what
+    /// separates the two. There is no gap above the card and no hairline
+    /// under the tab strip; a bezel *and* a divider would be two separators
+    /// doing one job.
+    ///
+    /// Not the same thing as `RendererConfig.windowPadding`, which is slack
+    /// *inside* the surface painted in the terminal's own background. That
+    /// one keeps a glyph off the edge; this one frames the terminal.
+    static let terminalInset: CGFloat = 6
+    /// The card's corners.
+    ///
+    /// Fitted rather than guessed, but against a *ratio* rather than a
+    /// number. In the reference the card's curve leaves the straight edge
+    /// 13px from the corner and the window's own leaves it at 18px, so the
+    /// card is roughly 0.72 of the window it sits in — and it is the window
+    /// that this has to stay clear of. A corner tighter than that reads as
+    /// crowding the window's border along the bottom, because the two curves
+    /// stop running parallel and the gap closes at the diagonal.
+    ///
+    /// The window's radius cannot be read back: the window server owns that
+    /// rounding and every layer in the hierarchy reports 0, so this is the
+    /// ratio applied to what macOS 26 draws rather than a measurement of it.
+    /// Each point here buys about 0.3pt of clearance at the diagonal, so the
+    /// step from 10 was deliberately small — it is one line if it wants to be
+    /// rounder still.
+    static let terminalCornerRadius: CGFloat = 12
+    /// The card's edge. The reference draws one on all four sides, a single
+    /// pixel a little darker than both the chrome outside it and the terminal
+    /// within — and with the top edge flush against the toolbar, this is the
+    /// line that divides them.
+    static let terminalBorderWidth: CGFloat = 1
 }
 
 // MARK: - Shared pieces

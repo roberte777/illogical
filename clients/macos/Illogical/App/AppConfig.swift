@@ -50,6 +50,28 @@ enum AppConfig {
             pointSize: config.fontSize)
     }
 
+    /// The renderer half of it, the same way `font` is the font half: the
+    /// `Renderer/` directory does not import the config package, so this is
+    /// the one place the two vocabularies meet.
+    ///
+    /// Read when a surface is built, so a config change needs the surface
+    /// rebuilt to take effect — the same rule the font follows, and for the
+    /// same reason (#39).
+    static var renderer: RendererConfig {
+        var renderer = RendererConfig()
+        renderer.backgroundOpacity = current.backgroundOpacity
+        return renderer
+    }
+
+    /// Whether the window has anything to be translucent *over*.
+    ///
+    /// Both halves, because either alone is a no-op: blur with an opaque
+    /// terminal has nothing behind it to blur, and a translucent terminal in
+    /// an opaque window shows the window's own background rather than the
+    /// desktop. `WindowChrome` reads this to decide whether the window stops
+    /// being opaque at all.
+    static var isTranslucent: Bool { current.backgroundOpacity < 1 }
+
     /// Read the config files, create one if this machine has none, and say
     /// what happened.
     ///

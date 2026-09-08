@@ -100,6 +100,27 @@ public enum ConfigSyntax {
 
         return entries
     }
+
+    /// `background-blur`'s value as a radius in pixels, which libghostty
+    /// spells as a bool *or* a number. Nil when it is neither.
+    ///
+    /// 20 for the bare `true`, which is the radius libghostty picks for the
+    /// same word, so that the two files agree about what "on" looks like and
+    /// not merely about how to spell it. The bool spellings are its set too.
+    ///
+    /// Capped at 255. The call this ends up in takes a C `int` and the blur
+    /// stops getting visibly heavier long before that; a four-digit radius is
+    /// a typo, and clamping it beats handing the window server a number it
+    /// will spend real time on.
+    public static func blurRadius(_ value: String) -> Int? {
+        switch value.lowercased() {
+        case "true", "yes", "y", "t": return 20
+        case "false", "no", "n", "f": return 0
+        default:
+            guard let radius = Int(value), radius >= 0 else { return nil }
+            return min(radius, 255)
+        }
+    }
 }
 
 extension Substring {

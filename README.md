@@ -134,9 +134,19 @@ font-family-bold-italic = Iosevka Bold Oblique
 # Points. Fractional sizes are real — the cell is measured in pixels, so 13.5
 # at 2x is a 27px cell. Default 13.
 font-size = 13
+
+# How opaque the terminal is. Only the terminal — the toolbar, the tabs and
+# the breadcrumb stay solid at any value, so the window is still something you
+# can aim at. Default 1.
+background-opacity = 0.9
+
+# Blur what shows through, in pixels. Does nothing on its own: with an opaque
+# terminal there is nothing behind it to blur. `true` is 20, the radius
+# Ghostty picks for the same word, or write your own.
+background-blur = true
 ```
 
-The font is all there is so far;
+The font and the window are all there is so far;
 [#39](https://github.com/roberte777/illogical/issues/39) tracks the rest.
 Unknown keys and unparseable values are warnings — they go to the unified log
 (`log stream --predicate 'subsystem == "dev.illogical.Illogical"'`) and the
