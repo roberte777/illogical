@@ -49,7 +49,7 @@ extension TerminalEngine {
                 Self.install(selection, on: terminal)
                 return selection != nil
             } ?? false
-        markHighlightsDirty()
+        invalidate()
         return produced
     }
 
@@ -70,7 +70,7 @@ extension TerminalEngine {
             Self.install(selection, on: terminal)
             return true
         }
-        markHighlightsDirty()
+        invalidate()
     }
 
     /// Extend the selection to the edge row the pointer is being held past,
@@ -91,7 +91,7 @@ extension TerminalEngine {
             Self.install(selection, on: terminal)
             return true
         }
-        markHighlightsDirty()
+        invalidate()
     }
 
     /// Which way a held drag wants the viewport to move, if either.
@@ -122,7 +122,7 @@ extension TerminalEngine {
             Self.install(selection, on: terminal)
             return true
         }
-        markHighlightsDirty()
+        invalidate()
     }
 
     func clearSelection() {
@@ -131,7 +131,7 @@ extension TerminalEngine {
             Self.install(nil, on: terminal)
             return true
         }
-        markHighlightsDirty()
+        invalidate()
     }
 
     var hasSelection: Bool {

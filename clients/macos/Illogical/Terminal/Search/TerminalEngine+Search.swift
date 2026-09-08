@@ -29,7 +29,7 @@ extension TerminalEngine {
             search.setNeedle(query)
             return true
         }
-        markHighlightsDirty()
+        invalidate()
     }
 
     /// Catch the search up with the terminal and make bounded progress.
@@ -55,15 +55,14 @@ extension TerminalEngine {
     ///
     /// The viewport follows: libghostty scrolls to the newly selected match
     /// when it is not already on screen. That moves every row on screen
-    /// without changing a cell, which is exactly what `markHighlightsDirty`
-    /// exists for.
+    /// without changing a cell, which is exactly what `invalidate` exists for.
     @discardableResult
     func selectNextMatch() -> Bool {
         let moved =
             withTerminal { _ -> Bool? in
                 search.selectNext()
             } ?? false
-        markHighlightsDirty()
+        invalidate()
         return moved
     }
 
@@ -74,7 +73,7 @@ extension TerminalEngine {
             withTerminal { _ -> Bool? in
                 search.selectPrevious()
             } ?? false
-        markHighlightsDirty()
+        invalidate()
         return moved
     }
 
