@@ -845,9 +845,7 @@ final class TerminalSurfaceView: NSView {
     ) {
         guard let inputEncoder else { return }
         inputEncoder.anyButtonPressed = buttonsDown > 0
-        // Surface pixels: the space the renderer lays the grid out in, origin
-        // at the top-left, padding included.
-        let backing = convertToBacking(point)
+        let backing = surfacePixels(point)
         let spec = MouseEventSpec(
             action: action,
             button: button,
@@ -915,7 +913,25 @@ final class TerminalSurfaceView: NSView {
     /// The pointer in surface pixels — the space the renderer lays the grid
     /// out in, origin at the top-left, padding included.
     private func surfacePoint(of event: NSEvent) -> CGPoint {
-        convertToBacking(convert(event.locationInWindow, from: nil))
+        surfacePixels(convert(event.locationInWindow, from: nil))
+    }
+
+    /// A point in this view's own coordinates, in surface pixels.
+    ///
+    /// Scaled by hand rather than by `convertToBacking`, and that is the whole
+    /// of a bug worth writing down: the backing store's coordinate system is
+    /// the *window's*, which is bottom-up, so converting a point out of a
+    /// flipped view into it negates y. A click 300pt down a 400pt surface
+    /// arrived as -600 rather than 600, every row clamped to zero, and every
+    /// selection landed on the first visible line however far down the pane
+    /// you dragged. The x axis has no flip to get wrong, which is why the
+    /// columns were right and only the rows were not.
+    ///
+    /// There is nothing to convert *from* here in any case: a surface pixel is
+    /// a view point times the backing scale factor, top-down in both.
+    private func surfacePixels(_ point: NSPoint) -> CGPoint {
+        let scale = window?.backingScaleFactor ?? 1
+        return CGPoint(x: point.x * scale, y: point.y * scale)
     }
 
     // MARK: - Clipboard

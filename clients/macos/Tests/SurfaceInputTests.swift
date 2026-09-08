@@ -287,6 +287,16 @@ final class SurfaceInputTests: XCTestCase {
         return (view, engine, window)
     }
 
+    /// The same, with somewhere for what the surface sends to land.
+    private func recordingSurface() throws -> (
+        TerminalSurfaceView, TerminalEngine, NSWindow, Recorder
+    ) {
+        let (view, engine, window) = try windowedSurface()
+        let recorder = Recorder()
+        view.delegate = recorder
+        return (view, engine, window, recorder)
+    }
+
     /// Take the view out of its window first, which stops the render thread.
     private func tearDown(_ view: TerminalSurfaceView, _ window: NSWindow) {
         window.contentView = NSView(frame: view.frame)
@@ -297,18 +307,25 @@ final class SurfaceInputTests: XCTestCase {
     ///
     /// `across` is where in the cell horizontally, because libghostty
     /// includes a cell in a drag only once the pointer is past its midpoint.
-    /// The grid does not start at the view's origin — the renderer balances
-    /// padding around it — so this goes through the renderer's own geometry
-    /// rather than assuming.
+    /// The grid does not start at the view's origin — the renderer pads it —
+    /// so this goes through the renderer's own geometry rather than assuming.
+    ///
+    /// The arithmetic here is deliberately AppKit-free: divide the renderer's
+    /// pixels by the scale, then flip against the view's height, because a
+    /// window point is bottom-up. Building it with `convertFromBacking`
+    /// instead would produce whatever point the view's own conversion is the
+    /// inverse of — which passes every test below even when that conversion is
+    /// wrong, and did.
     private func click(
         _ view: TerminalSurfaceView, column: Int, row: Int, across: Double = 0.5,
         type: NSEvent.EventType
     ) throws -> NSEvent {
         let size = try XCTUnwrap(view.rendererSizeForTesting)
+        let scale = view.window?.backingScaleFactor ?? 1
         let backing = NSPoint(
             x: Double(size.padding.left) + (Double(column) + across) * Double(size.cell.width),
             y: Double(size.padding.top) + (Double(row) + 0.5) * Double(size.cell.height))
-        let local = view.convertFromBacking(backing)
+        let local = NSPoint(x: backing.x / scale, y: backing.y / scale)
         return try XCTUnwrap(
             NSEvent.mouseEvent(
                 with: type,
@@ -337,6 +354,140 @@ final class SurfaceInputTests: XCTestCase {
 
         XCTAssertEqual(engine.selectionText(), "hello")
         XCTAssertTrue(engine.hasSelection)
+    }
+
+    /// The same drag, several rows down. Row 0 is the one row where an error
+    /// in the pointer-to-row mapping is invisible, so the test above cannot
+    /// see one; this is that test at a row the arithmetic has to reach.
+    func testDragSelectsOnARowBelowTheFirst() throws {
+        let (view, engine, window) = try windowedSurface()
+        defer { tearDown(view, window) }
+        for i in 0..<10 { write(engine, "line\(i) here\r\n") }
+
+        view.mouseDown(with: try click(view, column: 0, row: 7, type: .leftMouseDown))
+        view.mouseDragged(
+            with: try click(view, column: 4, row: 7, across: 0.8, type: .leftMouseDragged))
+        view.mouseUp(with: try click(view, column: 4, row: 7, across: 0.8, type: .leftMouseUp))
+
+        XCTAssertEqual(engine.selectionText(), "line7")
+    }
+
+    /// And the row the renderer is told to highlight is the row that was
+    /// dragged over. The text being right is only half of it: the selection
+    /// reaches the frame as a per-row range, and a frame that highlights row 0
+    /// for a selection on row 7 looks exactly like a broken hit test.
+    func testHighlightLandsOnTheDraggedRow() throws {
+        let (view, engine, window) = try windowedSurface()
+        defer { tearDown(view, window) }
+        for i in 0..<10 { write(engine, "line\(i) here\r\n") }
+
+        view.mouseDown(with: try click(view, column: 0, row: 7, type: .leftMouseDown))
+        view.mouseDragged(
+            with: try click(view, column: 4, row: 7, across: 0.8, type: .leftMouseDragged))
+
+        let snapshot = TerminalSnapshot()
+        XCTAssertTrue(engine.updateSnapshot(into: snapshot))
+        XCTAssertNotNil(snapshot.rowData[7].selection, "row 7 is not highlighted")
+        XCTAssertNil(snapshot.rowData[0].selection, "row 0 is highlighted and should not be")
+    }
+
+    /// A real session has history behind it. The viewport is then a window
+    /// into a page list rather than the whole of one, which is the state the
+    /// tests above never reach.
+    func testDragSelectsWithHistoryBehindTheViewport() throws {
+        let (view, engine, window) = try windowedSurface()
+        defer { tearDown(view, window) }
+        for i in 0..<60 { write(engine, "line\(i) here\r\n") }
+
+        view.mouseDown(with: try click(view, column: 0, row: 5, type: .leftMouseDown))
+        view.mouseDragged(
+            with: try click(view, column: 4, row: 5, across: 0.8, type: .leftMouseDragged))
+
+        let snapshot = TerminalSnapshot()
+        XCTAssertTrue(engine.updateSnapshot(into: snapshot))
+        XCTAssertNotNil(snapshot.rowData[5].selection, "row 5 is not highlighted")
+        XCTAssertNil(snapshot.rowData[0].selection, "row 0 is highlighted and should not be")
+        XCTAssertEqual(engine.selectionText()?.hasSuffix(" "), false)
+    }
+
+    /// The highlight follows the drag rather than accumulating behind it: a
+    /// row that was selected a moment ago and is not now must stop being
+    /// drawn as selected, even though nothing in it changed.
+    func testHighlightLeavesNoTrailBehindTheDrag() throws {
+        let (view, engine, window) = try windowedSurface()
+        defer { tearDown(view, window) }
+        for i in 0..<60 { write(engine, "line\(i) here\r\n") }
+
+        let snapshot = TerminalSnapshot()
+        view.mouseDown(with: try click(view, column: 0, row: 8, type: .leftMouseDown))
+        view.mouseDragged(
+            with: try click(view, column: 4, row: 8, across: 0.8, type: .leftMouseDragged))
+        XCTAssertTrue(engine.updateSnapshot(into: snapshot))
+        XCTAssertNotNil(snapshot.rowData[8].selection)
+
+        // Drag back up to the anchor's own row, so row 8 is no longer in it.
+        view.mouseDragged(
+            with: try click(view, column: 4, row: 6, across: 0.8, type: .leftMouseDragged))
+        XCTAssertTrue(engine.updateSnapshot(into: snapshot))
+        XCTAssertNotNil(snapshot.rowData[6].selection, "row 6 is not highlighted")
+        XCTAssertNotNil(snapshot.rowData[7].selection, "row 7 is not highlighted")
+    }
+
+    /// A press at a point measured from the *bottom* of the window — which is
+    /// the only kind AppKit delivers — selects the row the renderer drew at
+    /// that height.
+    ///
+    /// Stated without a single view conversion in it, because the conversions
+    /// are what this is testing. `convertToBacking` negates y on a flipped
+    /// view: the surface is measured from the top and the backing store is
+    /// measured from the bottom, so a press two thirds of the way down a pane
+    /// arrived as a negative surface y, clamped to the first row, and every
+    /// selection landed on the first visible line.
+    func testAPressSelectsTheRowUnderIt() throws {
+        let (view, engine, window) = try windowedSurface()
+        defer { tearDown(view, window) }
+        for i in 0..<15 { write(engine, "line\(i) here\r\n") }
+
+        let size = try XCTUnwrap(view.rendererSizeForTesting)
+        let scale = window.backingScaleFactor
+        // The middle of row 6, down from the top of the surface, in points.
+        let topDown = (Double(size.padding.top) + 6.5 * Double(size.cell.height)) / scale
+        let left = Double(size.padding.left) / scale
+
+        func event(_ type: NSEvent.EventType, x: Double) throws -> NSEvent {
+            try XCTUnwrap(
+                NSEvent.mouseEvent(
+                    with: type,
+                    location: NSPoint(x: x, y: view.bounds.height - topDown),
+                    modifierFlags: [], timestamp: 0,
+                    windowNumber: window.windowNumber, context: nil,
+                    eventNumber: 0, clickCount: 1, pressure: 1))
+        }
+
+        let cell = Double(size.cell.width) / scale
+        view.mouseDown(with: try event(.leftMouseDown, x: left + 0.5 * cell))
+        view.mouseDragged(with: try event(.leftMouseDragged, x: left + 4.8 * cell))
+
+        XCTAssertEqual(engine.selectionText(), "line6")
+    }
+
+    /// And the same point, reported to the program rather than selected with.
+    ///
+    /// The other half of the same conversion, and the half with no coverage at
+    /// all: `InputTests` hands the encoder pixel positions directly, and every
+    /// wheel test here reports at the origin, where a negated y is still zero.
+    /// So a click in a full-screen program went unreported entirely — a
+    /// position off the surface encodes to no bytes at all — for exactly as
+    /// long as selection was landing on the first line, and nothing said so.
+    func testAReportedClickCarriesTheCellUnderIt() throws {
+        let (view, engine, window, recorder) = try recordingSurface()
+        defer { tearDown(view, window) }
+        write(engine, "\u{1b}[?1000h\u{1b}[?1006h")
+
+        view.mouseDown(with: try click(view, column: 3, row: 6, type: .leftMouseDown))
+
+        // SGR reports are 1-based: column 4, row 7.
+        XCTAssertEqual(recorder.text, "\u{1b}[<0;4;7M")
     }
 
     /// Typing drops the selection, as it does in every terminal.
