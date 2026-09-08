@@ -359,14 +359,25 @@ pub const Store = struct {
 /// general activity timestamp — keystrokes and client attachment must not reset
 /// it, or terminals that are being typed into but producing nothing will never
 /// park.
+///
+/// `wake_idle_ns` is time since the terminal last asked its child something it
+/// is expected to answer with output — a resize, today. Deliberately not folded
+/// into the one above: "idle" has to keep meaning *reads*, or a terminal
+/// somebody is typing into never parks. This is only about the window between
+/// the question and the answer. A resize a moment before the timer expires
+/// would otherwise park the terminal, the repaint it asked for would unpark it
+/// again, and the next tick would park it once more — a decode/encode/fsync
+/// cycle per drag step, under the terminal lock.
 pub fn shouldPark(
     cfg: Config,
     residency: session.Residency,
     pty_read_idle_ns: u64,
+    wake_idle_ns: u64,
     attached: u32,
 ) bool {
     if (residency != .live) return false;
     if (attached > 0 and !cfg.park_while_attached) return false;
+    if (wake_idle_ns < cfg.park_after_ns) return false;
     return pty_read_idle_ns >= cfg.park_after_ns;
 }
 
@@ -426,15 +437,30 @@ test "shouldPark honours residency, PTY-read idle time and attachment" {
     const cfg: Config = .{};
     const idle = default_park_after_ns;
 
-    try testing.expect(shouldPark(cfg, .live, idle, 0));
-    try testing.expect(shouldPark(cfg, .live, idle, 3));
-    try testing.expect(!shouldPark(cfg, .live, idle - 1, 0));
-    try testing.expect(!shouldPark(cfg, .parked, idle, 0));
-    try testing.expect(!shouldPark(cfg, .exited, idle, 0));
+    try testing.expect(shouldPark(cfg, .live, idle, idle, 0));
+    try testing.expect(shouldPark(cfg, .live, idle, idle, 3));
+    try testing.expect(!shouldPark(cfg, .live, idle - 1, idle, 0));
+    try testing.expect(!shouldPark(cfg, .parked, idle, idle, 0));
+    try testing.expect(!shouldPark(cfg, .exited, idle, idle, 0));
 
     const keep: Config = .{ .park_while_attached = false };
-    try testing.expect(!shouldPark(keep, .live, idle, 1));
-    try testing.expect(shouldPark(keep, .live, idle, 0));
+    try testing.expect(!shouldPark(keep, .live, idle, idle, 1));
+    try testing.expect(shouldPark(keep, .live, idle, idle, 0));
+}
+
+test "a terminal that was just resized gets the whole delay to answer" {
+    const testing = std.testing;
+    const cfg: Config = .{};
+    const idle = default_park_after_ns;
+
+    // A child that has been quiet for the whole delay but was asked for a
+    // repaint a moment ago. Parking it now costs an encode, an fsync, and a
+    // decode the moment the repaint lands -- every step of the drag.
+    try testing.expect(!shouldPark(cfg, .live, idle, 0, 1));
+    try testing.expect(!shouldPark(cfg, .live, idle, idle - 1, 1));
+    // And a child that never answered still parks, once the delay has run
+    // from the question rather than from the last read.
+    try testing.expect(shouldPark(cfg, .live, idle, idle, 1));
 }
 
 test "store paths" {

@@ -207,6 +207,9 @@ pub fn maintenanceTick(self: *Server) void {
             self.park_config,
             summary.residency,
             summary.pty_read_idle_ns,
+            // Not on the summary: it is a scheduling detail of this tick, and
+            // the summary is what `illogical list` prints.
+            t.wakeIdleNs(),
             summary.attached,
         )) {
             t.park() catch |err| log.warn("terminal {d} failed to park: {t}", .{ id, err });

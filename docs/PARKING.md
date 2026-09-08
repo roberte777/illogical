@@ -37,17 +37,44 @@ The consequence is the whole point:
 
 So a terminal that is attached, focused, and being typed into is **still parked**
 if the child is producing no output. Our `park.shouldPark` must key on
-`last_pty_read_ns`, never on a general "activity" timestamp.
+`last_pty_read_ns`, never on a general "activity" timestamp. The one thing that
+sits beside it is a *question* the terminal asked the child and is waiting on —
+rule 4 below — which is not activity and not a read.
 
-A resize does not wake it — deliberately, for now. Waking it reflows the VT
-under a history restore that is still at the park width, and every page after
-that is discarded: a drag across an idle pane emptied its scrollback. So a
-resize while parked moves the PTY winsize and tells every attached client, and
-the VT keeps the park width once it unparks; a program that asked for mode 2048
-size reports gets none until something else makes it speak. What it should do
-instead — write the report from the mode bit the park file already carries,
-reflow once the restore is done, send the marker after the park-file snapshot
-on attach — is [#82](https://github.com/roberte777/illogical/issues/82).
+### A resize does not wake it
+
+A parked terminal is still a terminal, so everything a resize owes its child is
+paid while it is on disk. What is *not* done is waking it: waking reflows the VT
+under a history restore that is still at the park width, and libghostty's
+decoder discards every page whose width no longer matches, so a drag across an
+idle pane emptied its scrollback. That was tried and reverted in
+[#81](https://github.com/roberte777/illogical/pull/81); what replaced it is
+[#82](https://github.com/roberte777/illogical/issues/82), and it is four rules:
+
+1. **The report is written without a VT.** `park` keeps the child's
+   `in_band_size_reports` bit — the snapshot carries it, so this is a copy of
+   something already on disk — and a resize while parked encodes the mode 2048
+   report from it and queues it to the PTY. Neovim stops handling `SIGWINCH`
+   once mode 2048 is on, so without this a parked pane it is running in learns
+   nothing at all from a drag.
+2. **The VT catches up when the restore ends, not at unpark.** Unpark restores
+   the park file at the park width and leaves it there; the reflow to the
+   terminal's current size happens after the last history page has landed, when
+   the pages and the grid are one width again. The same rule covers a resize
+   that arrives *during* a restore.
+3. **An attach at another size is told so.** The park file is served as it is —
+   that is what makes attach cost the same whatever the scrollback is — and the
+   client is handed a `resized` marker behind it, so it adopts the park size and
+   reflows to the current one in stream order. The Mac client holds that reflow
+   until its own history restore finishes, for the reason in rule 2: the two
+   replicas run the same restore and make the same reflow over the same content.
+4. **A resized terminal gets the full delay to answer.** `shouldPark` waits
+   `park_after_ns` from the resize as well as from the last PTY read, so a
+   terminal resized just before the timer expires is not parked out from under
+   the repaint it asked for and immediately woken again by it.
+
+What a resize while parked still does not do is unpark. The winsize moves, the
+clients are told, the child is told, and the terminal stays on disk.
 
 ### Lifecycle
 
@@ -97,10 +124,13 @@ for the duration. Encode cost scales with scrollback, hence a pool thread and
 Triggered by a PTY read. **Not by attach** — see below.
 
 1. `ghostty_snapshot_decoder_new` over a streaming reader on the file.
-2. `ghostty_snapshot_decoder_ready()` → renderable terminal. **Usable here.**
-   Pending PTY bytes are applied.
+2. `ghostty_snapshot_decoder_ready()` → renderable terminal, at the width it
+   was parked at. **Usable here.** Pending PTY bytes are applied.
 3. `ghostty_snapshot_decoder_next()` on a background thread, prepending history
    newest-first, until `GHOSTTY_NO_VALUE`.
+4. Only now, if the terminal was resized while it was away, the VT is reflowed
+   to the size everything else has been at since. Doing it at step 2 instead is
+   what discards the pages step 3 is delivering.
 
 Step 2 is bounded by the active screen, not by scrollback. Measured by
 Superlogical at **~200 µs for a 64 MB compressed scrollback, excluding disk

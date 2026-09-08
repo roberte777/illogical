@@ -13,6 +13,7 @@
 //  asserted below is mostly *when* rather than *what*.
 
 import Darwin
+import GhosttyVt
 import IllogicalProtocol
 import XCTest
 
@@ -808,6 +809,83 @@ final class ReconnectTests: XCTestCase {
             Frame(type: .resized, terminal: 1, payload: Data(#"{"cols":120,"rows":40}"#.utf8)))
         XCTAssertEqual(controller.engine.cols, 120)
         XCTAssertEqual(controller.engine.rows, 40)
+    }
+
+    /// A `resized` that arrives while a snapshot is still being restored waits
+    /// for the last history page, and then moves the mirror.
+    ///
+    /// This is the ordinary case for a parked terminal, not a corner. Its park
+    /// file is at the size it parked at; a resize since then moved the winsize,
+    /// the child and every attached client and deliberately left the file
+    /// alone, because reflowing a terminal under a history restore discards
+    /// every page whose width no longer matches. So the server serves the old
+    /// size and says where it went, and the marker lands by construction in the
+    /// middle of the restore. Applied there it would empty the very scrollback
+    /// the restore is delivering — the mirror at the right size with nothing
+    /// above the screen. The server holds its own terminal back for the same
+    /// window (`reflowLocked`), which is what keeps the two replicas equal.
+    func testAResizeDuringASnapshotWaitsForTheHistory() async throws {
+        let server = try HangUpServer(mode: .errorThenHold)
+        defer { server.stop() }
+
+        let controller = try TerminalController(
+            terminalID: 1, host: .local(socketPath: server.path), size: .test(cols: 80, rows: 24))
+        defer { controller.disconnect() }
+        controller.connect(.test(cols: 80, rows: 24))
+        try await waitFor("the pane to attach") { server.accepted == 1 }
+
+        // A real snapshot with real history in it, at the size a park file
+        // would have been written at.
+        var handle: GhosttyTerminal?
+        try check("ghostty_terminal_new") { ghostty_terminal_new(nil, &handle, 80, 24) }
+        let source = try XCTUnwrap(handle)
+        defer { ghostty_terminal_free(source) }
+        // Unlimited scrollback, so the history is deep enough to arrive in
+        // more than one page — one page would be restored before the reflow
+        // could throw the rest away, and the test would pass without the fix.
+        _ = ghostty_terminal_set(source, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, nil)
+        let text = Array((0..<20_000).map { "line \($0)\r\n" }.joined().utf8)
+        text.withUnsafeBufferPointer { buf in
+            ghostty_terminal_vt_write(source, buf.baseAddress, buf.count)
+        }
+        var ptr: UnsafeMutablePointer<UInt8>?
+        var len = 0
+        try check("ghostty_snapshot_encode_alloc") {
+            ghostty_snapshot_encode_alloc(source, nil, &ptr, &len)
+        }
+        let raw = try XCTUnwrap(ptr)
+        defer { ghostty_free(nil, raw, len) }
+        let snapshot = Data(bytes: raw, count: len)
+
+        controller.handleForTesting(Frame(type: .snapshotBegin, terminal: 1, payload: Data()))
+        controller.handleForTesting(Frame(type: .snapshotChunk, terminal: 1, payload: snapshot))
+        controller.handleForTesting(Frame(type: .snapshotReady, terminal: 1, payload: Data()))
+        XCTAssertEqual(controller.engine.cols, 80, "the snapshot decoded at its own size")
+
+        // The marker the server queues behind a park file it served at a size
+        // it has since left.
+        controller.handleForTesting(
+            Frame(type: .resized, terminal: 1, payload: Data(#"{"cols":120,"rows":40}"#.utf8)))
+        XCTAssertEqual(controller.engine.cols, 80, "the mirror reflowed under its own restore")
+
+        controller.handleForTesting(Frame(type: .snapshotEnd, terminal: 1, payload: Data()))
+        // Both halves, because neither is the end of the restore on its own.
+        // The mirror moving is: the held size is applied in the same
+        // main-actor step that clears the pending count, and nothing else
+        // moves it. The count is what makes the rows below honest — until it
+        // is cleared the scrollbar reports the extent the snapshot *declared*
+        // at READY, whether those pages ever landed or not — but it passes
+        // through zero on the way when the pages deliver more rows than were
+        // declared, so waiting on it alone lands mid-restore.
+        try await waitFor("the mirror to reach the size the server is at", timeout: 10) {
+            controller.engine.cols == 120 && controller.engine.scrollbar.pending == 0
+        }
+        XCTAssertEqual(controller.engine.rows, 40)
+
+        let bar = controller.engine.scrollbar
+        XCTAssertGreaterThan(
+            bar.total - bar.length, 10_000,
+            "the reflow took the history with it")
     }
 
     /// A desync reattaches at the size the *window* is, not the size the
