@@ -180,6 +180,20 @@ It is **not** the fast path — it has to re-emit VT into whatever terminal it i
 running inside, which is architecturally the compatibility mode Mitchell
 describes: *"the same trade-off as other multiplexers"* [ARCH t=507].
 
+It follows `SIGWINCH`, so resizing the terminal it runs in resizes the session's
+PTY — step 1 of [Data flow: resize](#data-flow-resize). A handler may do almost
+nothing: no allocation, no lock, certainly no frames. So it raises an atomic
+flag and writes one byte into a pipe, and a thread blocked on the other end
+re-reads `TIOCGWINSZ` and sends the `resize`. The byte is what makes a resize
+land with no further input — a thread that only checked a flag would check it
+and *then* block, and a signal arriving in between would sit unnoticed until the
+user typed. The flag is the other half: it collapses a drag's worth of signals
+into one frame.
+
+Step 3 is where it parts company with a real client. It has no mirror to reflow,
+so it ignores `resized`: the terminal it is running inside is the only grid
+there is, and that one reflowed itself when its window moved.
+
 ### `Illogical.app` — the macOS client (Swift)
 
 | Layer | Technology |
