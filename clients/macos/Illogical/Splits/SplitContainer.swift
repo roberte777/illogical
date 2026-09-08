@@ -118,7 +118,7 @@ struct SplitPair: View {
                     .contentShape(Rectangle())
                     .onHover { inside in
                         hovering = inside
-                        syncCursor()
+                        syncCursor(dragging: dragOrigin != nil)
                     }
                     // A divider that leaves the screen while the pointer is on
                     // it — the other pane closed, the tab changed — still owes
@@ -151,11 +151,11 @@ struct SplitPair: View {
                                 let usable = max(1, total - Self.dividerThickness)
                                 store.setRatio(
                                     origin + moved / usable, forSplit: split.id, in: tab)
-                                syncCursor()
+                                syncCursor(dragging: true)
                             }
                             .onEnded { _ in
                                 dragOrigin = nil
-                                syncCursor()
+                                syncCursor(dragging: false)
                             })
             }
     }
@@ -166,9 +166,15 @@ struct SplitPair: View {
     // run it: a drag held past the clamp puts the pointer outside the grab
     // area with the drag still live, and popping there would flip the pointer
     // back to the terminal's I-beam in the middle of a resize.
+    //
+    // `dragging` is passed rather than read back off `dragOrigin`, because the
+    // two callers that know the answer have just written it: reading `@State`
+    // in the same closure that set it is not a guarantee SwiftUI makes, and a
+    // stale read on the way *out* of a drag would leave a pushed cursor with
+    // no later event to pop it — the stuck resize arrow this is here to avoid.
 
-    private func syncCursor() {
-        if hovering || dragOrigin != nil {
+    private func syncCursor(dragging: Bool) {
+        if hovering || dragging {
             pushCursor()
         } else {
             popCursor()
