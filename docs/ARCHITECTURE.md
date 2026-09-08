@@ -227,6 +227,21 @@ screen is chopped, grow it again and the chop stays. `Terminal.resize` therefore
 goes through the stream handler rather than resizing the VT directly, which is
 what puts the report on the PTY beside the signal.
 
+**Resizes are coalesced, not queued.** Ghostty's rule, and ghostty's 25ms
+(`termio/Thread.zig`): the first resize arms a window, later ones replace the
+size inside it without pushing the deadline back, and when it expires the
+newest wins. A drag then costs one resize per window rather than one per frame.
+
+The window is arithmetic, not politeness. The VT reflow is cheap — 5ms with a
+child that ignores it — but a full-screen program answers *every* size with a
+full repaint, and the daemon parses that repaint under the same lock the next
+resize needs. Measured against Neovim: 27ms a step, so a one-second drag ran
+half a second behind and walked visibly through sizes the window had already
+left. Coalescing took the same drag to settling 14ms after the last frame.
+
+Anything that is not a resize flushes the pending one first, so a keystroke is
+never handled at a size that was asked for after it.
+
 That report quotes a text area in *pixels*, and the server has no font. So the
 cell travels on the wire — `resize` and `attach` both carry `cell_width` and
 `cell_height` in device pixels — and the daemon quotes back whatever the client
