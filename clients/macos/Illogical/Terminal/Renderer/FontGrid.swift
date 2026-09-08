@@ -90,6 +90,11 @@ final class FontGrid: @unchecked Sendable {
 
     /// The size faces are loaded at, before any per-face adjustment.
     private let pixelSize: Double
+
+    /// The first slot that is a fallback rather than a family somebody named.
+    /// Everything at or above it we reached for ourselves; below it is the
+    /// configured font, which gets the last word about its own glyphs.
+    private let fallbackFrom: UInt16
     let sprite: SpriteFace
 
     /// The fonts and display scale this grid was built for. Part of
@@ -147,6 +152,7 @@ final class FontGrid: @unchecked Sendable {
         let built = Self.build(font: font, pixelSize: pixelSize)
         faces = built.faces
         styleSlots = built.styleSlots
+        fallbackFrom = built.fallbackFrom
         discovered = Array(repeating: [], count: FontStyle.allCases.count)
 
         // Measured once. It is both what the grid is derived from and what
@@ -210,7 +216,7 @@ final class FontGrid: @unchecked Sendable {
     ///    face a grid measures its cells from.
     private static func build(
         font config: FontConfig, pixelSize: Double
-    ) -> (faces: [FontFace], styleSlots: [[UInt16]]) {
+    ) -> (faces: [FontFace], styleSlots: [[UInt16]], fallbackFrom: UInt16) {
         var faces: [FontFace] = []
         var slots: [[UInt16]] = Array(repeating: [], count: FontStyle.allCases.count)
 
@@ -237,6 +243,11 @@ final class FontGrid: @unchecked Sendable {
                         size: pixelSize, from: regular), to: style)
             }
         }
+
+        // Everything from here down is a *fallback* in libghostty's sense —
+        // a face we reached for, not one anybody named — and that is a
+        // distinction the presentation rule in `resolveLocked` needs.
+        let fallbackFrom = UInt16(faces.count)
 
         // 3. The font we ship, behind whatever the config asked for.
         // Scaled to the configured family, if there is one. When there is
@@ -274,8 +285,28 @@ final class FontGrid: @unchecked Sendable {
             for style in FontStyle.allCases { slots[style.rawValue].append(slot) }
         }
 
-        return (faces, slots)
+        // 6. Apple Color Emoji, behind even that. Pinned by exact name
+        //    rather than left to the cascade, which is libghostty's decision
+        //    and its stated reason: "in case people add other emoji fonts to
+        //    their system, we always want to prefer the official one." A
+        //    configured family is still searched first, so naming an emoji
+        //    font of your own is how you override this.
+        //
+        //    One slot for every style, like the symbols: emoji have no bold
+        //    or italic. No size adjustment, also libghostty's — a bitmap
+        //    strike's ex height has nothing to do with text, so a factor
+        //    computed from it would resize emoji for no reason.
+        if let emoji = font(named: Self.appleColorEmoji, size: pixelSize) {
+            let slot = UInt16(faces.count)
+            faces.append(FontFace(font: emoji))
+            for style in FontStyle.allCases { slots[style.rawValue].append(slot) }
+        }
+
+        return (faces, slots, fallbackFrom)
     }
+
+    /// The emoji font every Mac has. Pinned by name on purpose; see step 6.
+    static let appleColorEmoji = "Apple Color Emoji"
 
     /// One family's face for one style: the family's own, or synthesized from
     /// it. Regular is the family itself, with nothing asked of it — asking
@@ -445,6 +476,54 @@ final class FontGrid: @unchecked Sendable {
         return resolved
     }
 
+    /// Whether this codepoint arrives as emoji when nobody said otherwise.
+    ///
+    /// Unicode's `Emoji_Presentation`, which is the only thing that can tell
+    /// U+2714 ✔ (text, and it must keep taking the cell's foreground colour)
+    /// from U+26A1 ⚡ (emoji, and it must arrive in colour). They are
+    /// neighbours in the same blocks; nothing but the table separates them.
+    private static func defaultsToEmoji(_ cp: UInt32) -> Bool {
+        EmojiPresentation.isEmojiPresentation(cp)
+    }
+
+    /// This face's answer for the codepoint, if it is allowed to give one.
+    ///
+    /// libghostty's presentation rule, which is the whole of what keeps the
+    /// emoji font from eating text. A colour glyph and a monochrome one are
+    /// not interchangeable: a colour glyph goes into the BGRA atlas and the
+    /// shader samples it as-is, so the cell's foreground is *discarded* —
+    /// which is right for 😀 and quite wrong for the green ✔ a test runner
+    /// just printed.
+    ///
+    /// - An explicit request decides on its own: `.emoji` takes only colour
+    ///   glyphs, `.text` only monochrome ones. U+FE0E is how a person says
+    ///   they meant the text one, and it has to be obeyed.
+    /// - With nothing stated, the codepoint decides — but only for the faces
+    ///   *we* reached for. A family somebody configured gets the last word
+    ///   about its own glyphs, which is libghostty's rule too: it promotes
+    ///   `.default` to `.explicit` for fallback entries only.
+    ///
+    /// Judged per glyph rather than per face. `hasColor` is a property of the
+    /// font's tables, and a font can carry colour tables that this glyph is
+    /// not in.
+    private func accept(
+        _ slot: UInt16, cp: UInt32, presentation: FontPresentation?
+    ) -> FontIndex? {
+        let face = faces[Int(slot)]
+        guard let g = face.glyphIndex(cp), g != 0 else { return nil }
+        let isColor = face.isColorGlyph(g)
+
+        switch presentation {
+        case .emoji: guard isColor else { return nil }
+        case .text: guard !isColor else { return nil }
+        case nil:
+            if slot >= fallbackFrom {
+                guard isColor == Self.defaultsToEmoji(cp) else { return nil }
+            }
+        }
+        return FontIndex(slot: slot)
+    }
+
     /// Caller must hold the write lock.
     private func resolveLocked(
         cp: UInt32, style: FontStyle, presentation: FontPresentation?
@@ -455,32 +534,24 @@ final class FontGrid: @unchecked Sendable {
             return .sprite
         }
 
-        let wantEmoji = presentation == .emoji
+        // What the caller asked for, or what the codepoint asks for on its
+        // own behalf when nobody said. libghostty's `CodepointResolver`
+        // builds the same thing out of `is_emoji_presentation`.
+        let wantEmoji = presentation == .emoji || (presentation == nil && Self.defaultsToEmoji(cp))
 
         // The faces this style was built with, in order: every family the
         // config named, then the text font we ship, then the Nerd Font
-        // symbols. First one that has the codepoint wins, which is what makes
-        // `font-family` repeating a fallback list rather than four ways to
-        // say the same thing.
-        //
-        // Never for an explicit emoji request — none of these carry colour
-        // glyphs, and asking the cascade is the whole point of that request.
+        // symbols, then Apple Color Emoji. First one that can answer wins,
+        // which is what makes `font-family` repeating a fallback list rather
+        // than four ways to say the same thing.
         let primary = faces[Int(styleSlots[style.rawValue][0])]
-        if !wantEmoji {
-            for slot in styleSlots[style.rawValue] {
-                if let g = faces[Int(slot)].glyphIndex(cp), g != 0 {
-                    return FontIndex(slot: slot)
-                }
-            }
+        for slot in styleSlots[style.rawValue] {
+            if let index = accept(slot, cp: cp, presentation: presentation) { return index }
         }
 
         // Anything the cascade already turned up for this style.
         for slot in discovered[style.rawValue] {
-            let face = faces[Int(slot)]
-            if wantEmoji && !face.hasColor { continue }
-            if let g = face.glyphIndex(cp), g != 0 {
-                return FontIndex(slot: slot)
-            }
+            if let index = accept(slot, cp: cp, presentation: presentation) { return index }
         }
 
         // Ask the system. CTFontCreateForString walks the platform's own
@@ -498,9 +569,8 @@ final class FontGrid: @unchecked Sendable {
         let name = (CTFontCopyPostScriptName(fallback) as String?) ?? ""
         let dedupeKey = "\(name)|\(style.rawValue)"
         if let slot = fallbackSlots[dedupeKey] {
-            let face = faces[Int(slot)]
-            if let g = face.glyphIndex(cp), g != 0 { return FontIndex(slot: slot) }
-            return nil
+            if let index = accept(slot, cp: cp, presentation: presentation) { return index }
+            return lastResort(cp: cp, style: style, presentation: presentation)
         }
 
         // Scaled to the primary face. Without this a CJK fallback at the
@@ -532,7 +602,31 @@ final class FontGrid: @unchecked Sendable {
         // weight the next time it came up.
         discovered[style.rawValue].append(slot)
         fallbackSlots[dedupeKey] = slot
-        return FontIndex(slot: slot)
+        if let index = accept(slot, cp: cp, presentation: presentation) { return index }
+        return lastResort(cp: cp, style: style, presentation: presentation)
+    }
+
+    /// Anything at all that has the glyph, presentation be damned.
+    ///
+    /// libghostty's last step, and it exists so the rule above can be strict
+    /// without ever making a codepoint *disappear*. An emoji-presentation
+    /// codepoint that no colour font on the machine carries should be drawn
+    /// by whatever monochrome face does have it, not replaced by U+FFFD.
+    ///
+    /// Only over faces already loaded: the cascade has been asked by the time
+    /// this runs, and asking it again would add the same face twice.
+    ///
+    /// Never for an *explicit* request. Somebody who typed U+FE0E asked for
+    /// the text glyph and would rather have none than the colour one.
+    private func lastResort(
+        cp: UInt32, style: FontStyle, presentation: FontPresentation?
+    ) -> FontIndex? {
+        guard presentation == nil else { return nil }
+        for slot in styleSlots[style.rawValue] + discovered[style.rawValue] {
+            let face = faces[Int(slot)]
+            if let g = face.glyphIndex(cp), g != 0 { return FontIndex(slot: slot) }
+        }
+        return nil
     }
 
     /// Whether a specific face can render a codepoint. Used when checking

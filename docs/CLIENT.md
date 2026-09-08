@@ -1130,11 +1130,51 @@ typeface if it is skipped:
    the system cascade is asked.
 4. **The system's fixed-pitch face** only if the bundle lost its font
    resources.
-5. **The Nerd Font symbols, behind everything.** One face for all four
-   styles — icons have no bold or italic — searched last, so a family that
-   carries its own icons is still asked first. Last on purpose: the grid's
-   metrics are read off the first regular face, and a symbols-only font must
-   never be it.
+5. **The Nerd Font symbols, behind all of that.** One face for all four
+   styles — icons have no bold or italic — so a family that carries its own
+   icons is still asked first. After the system fixed-pitch face on purpose:
+   the grid's metrics are read off the first regular face, and a symbols-only
+   font must never be it.
+6. **Apple Color Emoji, behind even that.** Pinned by exact name rather than
+   left to the cascade, which is libghostty's decision and its stated reason:
+   "in case people add other emoji fonts to their system, we always want to
+   prefer the official one." One face for all four styles again. A configured
+   family is searched first, so naming an emoji font of your own is how you
+   override it.
+
+**Which face may answer is a question about presentation, not just coverage.**
+A colour glyph and a monochrome one are not interchangeable: a colour glyph
+goes into the BGRA atlas and the shader samples the bitmap as it is, so the
+cell's foreground colour is *discarded*. That is right for 😀 and quite wrong
+for the green ✔ a test runner just printed. So a face is asked whether it has
+the codepoint *and* whether the glyph it would draw is the kind that was
+asked for:
+
+- **U+FE0F or U+FE0E decides on its own.** An explicit emoji request takes
+  only colour glyphs, an explicit text request only monochrome ones.
+- **With neither, the codepoint decides**, from Unicode's
+  `Emoji_Presentation` property — `EmojiPresentation.swift`, generated from
+  the `emoji-data.txt` in the uucode package ghostty pins, which is the same
+  data behind libghostty's `is_emoji_presentation`. U+26A0 ⚠ and U+26A1 ⚡ are
+  adjacent, are both in JetBrains Mono and both in Apple Color Emoji, and
+  nothing a font can see tells them apart; the table is the only reason ⚠
+  comes back as text and ⚡ in colour.
+- **A configured family is exempt from that second rule.** Somebody who names
+  Menlo gets Menlo's monochrome ⚡, because the rule is for the faces we
+  reached for and not for the one they chose. libghostty draws the line in the
+  same place, promoting a default presentation to an explicit one only for
+  entries it marked as fallbacks.
+- **And if that leaves nothing**, a last pass takes any face that has the
+  glyph at all. Strictness must not make a codepoint vanish: an
+  emoji-presentation codepoint that no colour font on the machine carries is
+  better drawn monochrome than replaced by U+FFFD. An explicit request gets no
+  such pass, because somebody who typed U+FE0E would rather have nothing than
+  the colour glyph.
+
+Without the rule, adding the emoji face to that list would have quietly
+rerouted ✔ ♥ ➡ ☑ and every other text-presentation symbol Apple Color Emoji
+happens to carry, turning monochrome symbols that took the cell's colour into
+full-colour bitmaps.
 
 The cascade is asked last and per style, so the CJK face CoreText returns for
 bold is the bold one. `FontGridSet` keys its shared grids on the whole
