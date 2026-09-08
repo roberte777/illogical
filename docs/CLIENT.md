@@ -16,7 +16,7 @@ Illogical.app
 ├── App/            window, menus, session dropdown
 ├── Sessions/       connection state, session + terminal lists
 ├── Supporting/
-│   └── Fonts/      JetBrains Mono, shipped as the default face
+│   └── Fonts/      JetBrains Mono and the Nerd Font symbols, shipped
 ├── Terminal/
 │   ├── TerminalEngine.swift     libghostty-vt wrapper + snapshot extraction
 │   ├── TerminalColors.swift     the config's colours, resolved for libghostty
@@ -282,7 +282,24 @@ on a variable upright face hands the upright face straight back. The faces are
 built from their bytes and never registered with `CTFontManager`, so they are
 private to the process and never turn up in the user's font list.
 
-A configured family wins, and the shipped font stays behind it as a fallback
+The icons ship too. Neovim's file trees and statuslines draw with Nerd Font
+glyphs, which live in the private use area and are in no ordinary text font;
+on a machine with no Nerd Font installed the cascade came back empty. What the
+cell then drew was not nothing: `TextShaper` substitutes U+FFFD for a
+codepoint no face resolves, JetBrains Mono has that glyph, and the constraint
+is computed from the cell's *own* codepoint — so a file tree came out as a row
+of replacement characters, each one rescaled by the patcher rule belonging to
+the icon it stood in for. The bundle carries Symbols Nerd Font, the symbols-only face
+the nerd-fonts project publishes for exactly this, from the tarball ghostty
+pins at the same hash, and the grid searches it last for every style. That is
+ghostty's arrangement rather than a patched JetBrains Mono, and the reason is
+the fallback order: the symbols sit behind every configured family, so the
+icons survive a `font-family` of the user's own. The file is the unpatched
+one, so the icons are fitted to their cells per codepoint by
+`NerdFontConstraints`, which is the patcher's own arithmetic transpiled from
+libghostty.
+
+A configured family wins, and the shipped fonts stay behind it as fallbacks
 rather than being replaced by it — see **Configuration** below.
 
 **Sprites.** Cursors, the five underline styles, strikethrough, overline, box
@@ -1108,11 +1125,16 @@ typeface if it is skipped:
    to `font-family` in bold — never to another family, because bold text in a
    different typeface than the text around it looks wrong in a way a missing
    bold does not.
-3. **The font we ship, behind all of it.** A fallback, not a default: a
+3. **The text font we ship, behind all of it.** A fallback, not a default: a
    codepoint the configured family lacks is drawn from JetBrains Mono before
    the system cascade is asked.
 4. **The system's fixed-pitch face** only if the bundle lost its font
    resources.
+5. **The Nerd Font symbols, behind everything.** One face for all four
+   styles — icons have no bold or italic — searched last, so a family that
+   carries its own icons is still asked first. Last on purpose: the grid's
+   metrics are read off the first regular face, and a symbols-only font must
+   never be it.
 
 The cascade is asked last and per style, so the CJK face CoreText returns for
 bold is the bold one. `FontGridSet` keys its shared grids on the whole
@@ -1120,8 +1142,8 @@ bold is the bold one. `FontGridSet` keys its shared grids on the whole
 share one atlas and panes that do not are not silently handed each other's.
 
 What is deliberately still missing: reload while running, `font-style`,
-`font-feature`, `font-variation`, the `adjust-*` metric modifiers, codepoint
-maps, and the Nerd Font symbols fallback. #39 and #42.
+`font-feature`, `font-variation`, the `adjust-*` metric modifiers, and
+codepoint maps. #39 and #42.
 
 ### A translucent terminal, and the bezel that frames it
 

@@ -98,8 +98,9 @@ final class FontGrid: @unchecked Sendable {
     private var faces: [FontFace]
 
     /// Which faces answer for each style, in the order they are searched:
-    /// the configured families first, then the font we ship behind them.
-    /// Indexed by `FontStyle.rawValue`, and never empty for any style.
+    /// the configured families first, then the text font we ship behind
+    /// them, then the Nerd Font symbols behind that. Indexed by
+    /// `FontStyle.rawValue`, and never empty for any style.
     private var styleSlots: [[UInt16]]
 
     /// Faces the system cascade turned up, per style, in discovery order.
@@ -182,13 +183,19 @@ final class FontGrid: @unchecked Sendable {
     ///    style is never taken from another family: `font-family-bold` naming
     ///    something uninstalled falls back to `font-family` in bold, not to
     ///    the next family in the bold list.
-    /// 3. **The font we ship, behind all of it.** A fallback rather than a
-    ///    default: a codepoint the configured family lacks is drawn from ours
-    ///    before the system cascade is asked. libghostty adds it here for the
-    ///    stated reason that "we want to ensure our built-in styles are
+    /// 3. **The text font we ship, behind all of it.** A fallback rather than
+    ///    a default: a codepoint the configured family lacks is drawn from
+    ///    ours before the system cascade is asked. libghostty adds it here for
+    ///    the stated reason that "we want to ensure our built-in styles are
     ///    fallbacks to the configured styles".
     /// 4. **The system's fixed-pitch face, if there is nothing else.** Only
     ///    reachable in a build whose bundle lost its font resources.
+    /// 5. **The Nerd Font symbols, behind everything.** One face, shared by
+    ///    all four styles: icons have no bold or italic, and
+    ///    `SharedGridSet.zig` adds the same file once, as regular, with no
+    ///    size adjustment. After step 4 on purpose — `metrics` is read off
+    ///    the first regular face, and a symbols-only font must never be the
+    ///    face a grid measures its cells from.
     private static func build(
         font config: FontConfig, pixelSize: Double
     ) -> (faces: [FontFace], styleSlots: [[UInt16]]) {
@@ -239,6 +246,17 @@ final class FontGrid: @unchecked Sendable {
             }
         }
 
+        // 5. The Nerd Font symbols, behind everything. A single slot that
+        //    every style searches last, so an icon rasterized for regular
+        //    text is the same atlas entry when it turns up in bold — and so
+        //    a configured family that carries its own icons, a patched Nerd
+        //    Font say, is still asked first.
+        if let symbols = symbolsFace(size: pixelSize) {
+            let slot = UInt16(faces.count)
+            faces.append(symbols)
+            for style in FontStyle.allCases { slots[style.rawValue].append(slot) }
+        }
+
         return (faces, slots)
     }
 
@@ -284,6 +302,19 @@ final class FontGrid: @unchecked Sendable {
             italic,
             italic.withVariation(axis: axis, value: bold),
         ]
+    }
+
+    /// The Nerd Font symbols at this size, or nil when the file is not in
+    /// the bundle.
+    ///
+    /// No size adjustment, as in `SharedGridSet.zig`. This is the unpatched
+    /// symbols file, so fitting each icon to its cell is `NerdFontConstraints`'
+    /// job at render time — the patcher's own per-icon arithmetic, which no
+    /// single scale factor could stand in for on a face whose glyphs were
+    /// drawn at wildly different natural sizes.
+    private static func symbolsFace(size: Double) -> FontFace? {
+        guard let symbols = EmbeddedFont.symbols else { return nil }
+        return FontFace(font: CTFontCreateCopyWithAttributes(symbols, size, nil, nil))
     }
 
     /// Derive a styled face, synthesizing whatever the family doesn't have.
@@ -338,7 +369,7 @@ final class FontGrid: @unchecked Sendable {
     /// system cascade is asked.
     ///
     /// That order *is* the font configuration's behaviour — the families
-    /// somebody named, in the order they named them, and the font we ship
+    /// somebody named, in the order they named them, and the fonts we ship
     /// behind all of them — and it is invisible from the outside otherwise: a
     /// grid that dropped the fallbacks still draws every ordinary character
     /// correctly.
@@ -381,9 +412,10 @@ final class FontGrid: @unchecked Sendable {
         let wantEmoji = presentation == .emoji
 
         // The faces this style was built with, in order: every family the
-        // config named, then the font we ship. First one that has the
-        // codepoint wins, which is what makes `font-family` repeating a
-        // fallback list rather than four ways to say the same thing.
+        // config named, then the text font we ship, then the Nerd Font
+        // symbols. First one that has the codepoint wins, which is what makes
+        // `font-family` repeating a fallback list rather than four ways to
+        // say the same thing.
         //
         // Never for an explicit emoji request — none of these carry colour
         // glyphs, and asking the cascade is the whole point of that request.

@@ -1,11 +1,18 @@
 //  EmbeddedFontTests.swift
-//  The font the app ships, and the four styles it has to cover.
+//  The fonts the app ships: the text face and its four styles, and the Nerd
+//  Font symbols behind them.
 //
 //  Two variable files stand in for four faces, and both halves of that trick
 //  fail quietly if they break. A bold that lost its `wght` axis is still a
 //  legible face, just the wrong weight; an italic that fell through to the
 //  synthetic path is still slanted, just sheared rather than drawn. Neither
 //  shows up in a pixel test, so assert on the faces themselves.
+//
+//  The third file is the symbols, and what it has to get right is the
+//  fallback order: behind the text face, behind every configured family,
+//  and never the face a grid measures its cells from. Each of those is an
+//  ordering in `FontGrid.build`, and each one fails as text drawn from the
+//  wrong face rather than as anything a compiler would notice.
 
 import CoreText
 import XCTest
@@ -51,9 +58,8 @@ final class EmbeddedFontTests: XCTestCase {
     /// back to the system's fixed-pitch face without them and still pass
     /// some of its assertions, so check this first and on its own.
     ///
-    /// Walking `allCases` rather than the two named properties so that a
-    /// face added to `Resource` — the nerd-font symbols fallback is the next
-    /// one — is covered the moment it exists.
+    /// Walking `allCases` rather than the named properties so that a face
+    /// added to `Resource` is covered the moment it exists.
     func testBundleCarriesEveryEmbeddedFace() throws {
         for resource in EmbeddedFont.Resource.allCases {
             XCTAssertNotNil(
@@ -61,6 +67,7 @@ final class EmbeddedFontTests: XCTestCase {
         }
         XCTAssertNotNil(EmbeddedFont.variable)
         XCTAssertNotNil(EmbeddedFont.variableItalic)
+        XCTAssertNotNil(EmbeddedFont.symbols)
     }
 
     /// No configured family resolves to what we ship, not to Menlo or SF
@@ -168,22 +175,25 @@ final class EmbeddedFontTests: XCTestCase {
         // implementation that registers on load.
         XCTAssertNotNil(EmbeddedFont.variable)
         XCTAssertNotNil(EmbeddedFont.variableItalic)
+        XCTAssertNotNil(EmbeddedFont.symbols)
 
         // A descriptor matching by family, resolved against what is
-        // installed. The embedded face is not, so this finds nothing —
-        // unless the developer happens to have JetBrains Mono installed,
-        // in which case the file backing it is theirs and not ours.
-        let descriptor = CTFontDescriptorCreateWithAttributes(
-            [kCTFontFamilyNameAttribute: "JetBrains Mono"] as CFDictionary)
-        let matches =
-            CTFontDescriptorCreateMatchingFontDescriptors(descriptor, nil)
-            as? [CTFontDescriptor] ?? []
+        // installed. The embedded faces are not, so this finds nothing —
+        // unless the developer happens to have the family installed, in
+        // which case the file backing it is theirs and not ours.
         let ours = Bundle(for: FontFace.self).bundleURL.standardizedFileURL.path
-        for match in matches {
-            let url = CTFontDescriptorCopyAttribute(match, kCTFontURLAttribute) as? URL
-            XCTAssertFalse(
-                url?.standardizedFileURL.path.hasPrefix(ours) ?? false,
-                "an embedded face was registered system-wide: \(url?.path ?? "?")")
+        for family in ["JetBrains Mono", "Symbols Nerd Font"] {
+            let descriptor = CTFontDescriptorCreateWithAttributes(
+                [kCTFontFamilyNameAttribute: family] as CFDictionary)
+            let matches =
+                CTFontDescriptorCreateMatchingFontDescriptors(descriptor, nil)
+                as? [CTFontDescriptor] ?? []
+            for match in matches {
+                let url = CTFontDescriptorCopyAttribute(match, kCTFontURLAttribute) as? URL
+                XCTAssertFalse(
+                    url?.standardizedFileURL.path.hasPrefix(ours) ?? false,
+                    "an embedded face was registered system-wide: \(url?.path ?? "?")")
+            }
         }
     }
 
@@ -226,5 +236,169 @@ final class EmbeddedFontTests: XCTestCase {
         XCTAssertGreaterThan(metrics.cellHeight, metrics.cellWidth)
         XCTAssertGreaterThan(metrics.cellBaseline, 0)
         XCTAssertLessThan(metrics.cellBaseline, metrics.cellHeight)
+    }
+
+    // MARK: - Nerd Font symbols
+
+    /// Codepoints from the icon sets Neovim's plugins draw with: a Seti
+    /// folder, a devicon, Font Awesome's folder and a Material Design icon
+    /// off the supplementary plane. None is in JetBrains Mono; all are in
+    /// the symbols face.
+    private static let icons: [UInt32] = [0xE5FF, 0xE7C5, 0xF07B, 0xF0388]
+
+    private func family(of index: FontIndex, in grid: FontGrid) throws -> String {
+        CTFontCopyFamilyName(try XCTUnwrap(grid.face(index)).font) as String
+    }
+
+    /// A Nerd Font icon resolves to the symbols face we ship, in every
+    /// style. Before that file was in the bundle the cascade was asked and,
+    /// on a machine with no Nerd Font installed, came back empty — which
+    /// `TextShaper` turns into a U+FFFD the text face does have, drawn under
+    /// the constraint of the icon it replaced. Neovim's file tree came out as
+    /// a column of rescaled replacement characters.
+    func testNerdFontIconsResolveToTheSymbolsFace() throws {
+        let grid = defaultGrid()
+        for style in FontStyle.allCases {
+            for cp in Self.icons {
+                let index = try XCTUnwrap(
+                    grid.index(codepoint: cp, style: style, presentation: nil),
+                    "U+\(String(cp, radix: 16, uppercase: true)) resolved to nothing in \(style)")
+                XCTAssertFalse(index.isSprite)
+                XCTAssertEqual(
+                    try family(of: index, in: grid), "Symbols Nerd Font", "style \(style)")
+            }
+        }
+    }
+
+    /// One slot for all four styles. Icons have no bold or italic, and a
+    /// slot per style would rasterize the same folder four times into the
+    /// atlas.
+    func testTheSymbolsFaceIsOneSlotSharedByEveryStyle() throws {
+        let grid = defaultGrid()
+        let regular = try XCTUnwrap(
+            grid.index(codepoint: 0xF07B, style: .regular, presentation: nil))
+        for style in FontStyle.allCases {
+            XCTAssertEqual(
+                grid.index(codepoint: 0xF07B, style: style, presentation: nil), regular,
+                "style \(style)")
+        }
+    }
+
+    /// The symbols face sits behind the text face, not beside it. U+26A1 is
+    /// in both, and JetBrains Mono's is the one drawn: the face that sets
+    /// the cell metrics should draw everything it can.
+    func testTheTextFaceWinsWhereBothHaveTheGlyph() throws {
+        let grid = defaultGrid()
+        let bolt: UInt32 = 0x26A1
+        for style in FontStyle.allCases {
+            let text = try XCTUnwrap(grid.face(style: style))
+            XCTAssertTrue(text.hasCodepoint(bolt), "JetBrains Mono lost U+26A1; pick another")
+            let index = try XCTUnwrap(
+                grid.index(codepoint: bolt, style: style, presentation: nil))
+            XCTAssertEqual(try family(of: index, in: grid), "JetBrains Mono", "style \(style)")
+        }
+    }
+
+    /// The icons survive a configured family. This is why the symbols are
+    /// a file of their own rather than a patched JetBrains Mono: someone
+    /// who names Menlo still gets a folder in their file tree.
+    func testIconsSurviveANamedFamily() throws {
+        let grid = FontGridSet.grid(family: "Menlo", pointSize: Self.pointSize, scale: Self.scale)
+        let regular = try XCTUnwrap(grid.face(style: .regular))
+        XCTAssertEqual(CTFontCopyFamilyName(regular.font) as String, "Menlo")
+        for cp in Self.icons {
+            let index = try XCTUnwrap(
+                grid.index(codepoint: cp, style: .regular, presentation: nil))
+            XCTAssertEqual(try family(of: index, in: grid), "Symbols Nerd Font")
+        }
+    }
+
+    /// And the configured family is still asked *first*. That is the whole
+    /// reason the symbols go last rather than beside the text face, and the
+    /// test above cannot show it: it probes codepoints Menlo lacks, so it
+    /// proves the fallback and says nothing about the precedence.
+    ///
+    /// U+26A1 and U+276E are in Menlo, in the symbols face, and in the
+    /// constraint table — the exact overlap where a wrong order would draw
+    /// somebody's text in a patcher's icon instead of their own font.
+    func testAConfiguredFamilyIsAskedBeforeTheSymbols() throws {
+        let grid = FontGridSet.grid(family: "Menlo", pointSize: Self.pointSize, scale: Self.scale)
+        let menlo = try XCTUnwrap(grid.face(style: .regular))
+        for cp in [UInt32(0x26A1), 0x276E] {
+            XCTAssertTrue(menlo.hasCodepoint(cp), "Menlo lost U+\(String(cp, radix: 16))")
+            XCTAssertNotNil(NerdFontConstraints.constraint(for: cp))
+            let index = try XCTUnwrap(
+                grid.index(codepoint: cp, style: .regular, presentation: nil))
+            XCTAssertEqual(try family(of: index, in: grid), "Menlo")
+        }
+    }
+
+    /// The per-icon patcher rules still cover the icons we probe with.
+    ///
+    /// Asserted directly, because the render test below cannot do it. Every
+    /// one of these codepoints is `CellRules.isSymbol`, so a constraint table
+    /// that stopped covering them falls to `.fit` rather than to nothing —
+    /// and `.fit` clamps a glyph into its cell too. The two paths differ in
+    /// how the icon is *scaled*, which no neighbouring-cell assertion sees.
+    func testTheProbeIconsHaveTheirPatcherRules() {
+        for cp in Self.icons {
+            XCTAssertNotNil(
+                NerdFontConstraints.constraint(for: cp),
+                "U+\(String(cp, radix: 16, uppercase: true)) lost its constraint")
+            XCTAssertTrue(CellRules.isSymbol(cp))
+        }
+    }
+
+    /// Last in every style's search order, and never first: `metrics` is
+    /// read off the first regular face, and a grid measured against a
+    /// symbols-only font would have no cell to speak of.
+    func testTheSymbolsFaceIsLastAndNeverFirst() throws {
+        let grid = defaultGrid()
+        for style in FontStyle.allCases {
+            let faces = grid.faces(style: style)
+            XCTAssertGreaterThan(faces.count, 1, "style \(style)")
+            XCTAssertEqual(
+                CTFontCopyFamilyName(try XCTUnwrap(faces.first).font) as String,
+                "JetBrains Mono", "style \(style)")
+            XCTAssertEqual(
+                CTFontCopyFamilyName(try XCTUnwrap(faces.last).font) as String,
+                "Symbols Nerd Font", "style \(style)")
+        }
+    }
+
+    /// Through the whole pipeline: shaped, constrained to the cell,
+    /// rasterized, drawn. Every icon cell has to carry ink, and the empty
+    /// cells on either side of the row must not.
+    ///
+    /// What this does *not* prove is which constraint was applied. All four
+    /// probes are `CellRules.isSymbol`, so a lost patcher rule falls through
+    /// to `.fit`, which clamps the glyph into its cell just as effectively —
+    /// the difference is the scale, not the spill.
+    /// `testTheProbeIconsHaveTheirPatcherRules` is what guards that.
+    func testNerdFontIconsReachThePixels() throws {
+        let icons = Self.icons.compactMap(Unicode.Scalar.init).map(String.init)
+        let harness = try RenderHarness(columns: icons.count + 2, rows: 1, family: nil)
+        for (i, icon) in icons.enumerated() {
+            harness.source.write(icon, row: 0, column: 1 + i)
+        }
+        let image = try harness.render()
+        image.dump(named: "nerd-font-symbols")
+
+        let background = ColorMath.expected(harness.source.snapshot.background)
+        func ink(column: Int) -> Int {
+            let r = harness.cellRect(column: column, row: 0)
+            return image.countDiffering(from: background, x: r.x, y: r.y, w: r.w, h: r.h)
+        }
+        XCTAssertEqual(ink(column: 0), 0, "an icon spilled into the cell to its left")
+        // The right-hand guard is the direction an over-wide icon actually
+        // goes: `alignedX` clamps the left edge in every branch, so a glyph
+        // that outgrew its cell shows up here first. Each probe is pinned to
+        // one cell by `CellRules.constraintWidth` — the cell before it holds
+        // a symbol — so this column is guaranteed clean.
+        XCTAssertEqual(
+            ink(column: icons.count + 1), 0, "an icon spilled into the cell to its right")
+        for i in 0..<icons.count {
+            XCTAssertGreaterThan(ink(column: 1 + i), 0, "icon \(i) drew nothing")
+        }
     }
 }

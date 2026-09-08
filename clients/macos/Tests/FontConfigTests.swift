@@ -17,6 +17,10 @@ final class FontConfigTests: XCTestCase {
     private static let pointSize: Double = 13
     private static let scale: Double = 2
 
+    /// The fonts we ship, in the order they sit behind whatever is
+    /// configured: the text face, then the Nerd Font symbols behind it.
+    private static let shipped = ["JetBrains Mono", "Symbols Nerd Font"]
+
     private func families(_ grid: FontGrid, _ style: FontStyle) -> [String] {
         grid.faces(style: style).map { CTFontCopyFamilyName($0.font) as String }
     }
@@ -35,17 +39,20 @@ final class FontConfigTests: XCTestCase {
             FontConfig(family: nil, pointSize: Self.pointSize)
                 .with(regular: ["Menlo", "Courier New"]))
         XCTAssertEqual(
-            families(grid, .regular), ["Menlo", "Courier New", "JetBrains Mono"])
+            families(grid, .regular), ["Menlo", "Courier New"] + Self.shipped)
     }
 
-    /// The font we ship is a *fallback* behind a configured family, not a
-    /// default that a configured family replaces. libghostty adds it in the
-    /// same place and for the same stated reason.
-    func testTheShippedFontSitsBehindAConfiguredFamily() {
+    /// The fonts we ship are *fallbacks* behind a configured family, not a
+    /// default that a configured family replaces. libghostty adds them in the
+    /// same place and for the same stated reason — and in the same order,
+    /// the symbols last, so a family with icons of its own is asked first.
+    func testTheShippedFontsSitBehindAConfiguredFamily() {
         let grid = grid(FontConfig(family: "Menlo", pointSize: Self.pointSize))
         for style in FontStyle.allCases {
             XCTAssertEqual(families(grid, style).first, "Menlo", "style \(style)")
-            XCTAssertEqual(families(grid, style).last, "JetBrains Mono", "style \(style)")
+            XCTAssertEqual(
+                Array(families(grid, style).suffix(Self.shipped.count)), Self.shipped,
+                "style \(style)")
         }
     }
 
@@ -59,15 +66,15 @@ final class FontConfigTests: XCTestCase {
         let grid = grid(
             FontConfig(family: nil, pointSize: Self.pointSize)
                 .with(regular: ["ThisFontIsNotInstalled12345", "Menlo"]))
-        XCTAssertEqual(families(grid, .regular), ["Menlo", "JetBrains Mono"])
+        XCTAssertEqual(families(grid, .regular), ["Menlo"] + Self.shipped)
     }
 
-    /// Nothing configured at all is the font we ship, which is what every
-    /// install that has never been configured gets.
-    func testNoFamilyIsTheShippedFont() {
+    /// Nothing configured at all is the fonts we ship and nothing else,
+    /// which is what every install that has never been configured gets.
+    func testNoFamilyIsTheShippedFonts() {
         let grid = grid(FontConfig(family: nil, pointSize: Self.pointSize))
         for style in FontStyle.allCases {
-            XCTAssertEqual(families(grid, style), ["JetBrains Mono"], "style \(style)")
+            XCTAssertEqual(families(grid, style), Self.shipped, "style \(style)")
         }
     }
 
@@ -137,8 +144,8 @@ final class FontConfigTests: XCTestCase {
     // MARK: - Resolution
 
     /// The ordering, through the code that uses it: a codepoint the
-    /// configured family does not have is drawn from the font we ship before
-    /// the system cascade is asked for anything.
+    /// configured family does not have is drawn from the text font we ship
+    /// before the system cascade is asked for anything.
     ///
     /// The codepoint is searched for rather than hard-coded — which font has
     /// which glyph is a property of the machine, and a literal here would
@@ -147,7 +154,8 @@ final class FontConfigTests: XCTestCase {
     func testACodepointMenloLacksComesFromTheShippedFont() throws {
         let grid = grid(FontConfig(family: "Menlo", pointSize: Self.pointSize))
         let menlo = try XCTUnwrap(grid.face(style: .regular))
-        let ours = try XCTUnwrap(grid.faces(style: .regular).last)
+        // The text font we ship: right behind Menlo, ahead of the symbols.
+        let ours = try XCTUnwrap(grid.faces(style: .regular).dropLast().last)
         XCTAssertEqual(CTFontCopyFamilyName(ours.font) as String, "JetBrains Mono")
 
         // Sprites are drawn by us whatever the font says, so they can never

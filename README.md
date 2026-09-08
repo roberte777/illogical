@@ -388,7 +388,7 @@ src/cli/                   illogical
 clients/macos/
   project.yml              XcodeGen source of truth (.xcodeproj is generated)
   Illogical/               the app
-  Illogical/Supporting/Fonts/  JetBrains Mono, shipped as the default face
+  Illogical/Supporting/Fonts/  JetBrains Mono and the Nerd Font symbols, shipped
   Packages/IllogicalKit/   pure-Swift protocol core
 
 scripts/                   build-xcframework.sh, dist-daemon.sh, dist-app.sh

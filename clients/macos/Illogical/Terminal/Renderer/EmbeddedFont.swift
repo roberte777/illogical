@@ -2,10 +2,11 @@
 //  The fonts that ship inside the app bundle.
 //
 //  Ported from libghostty's `src/font/embedded.zig`, which embeds JetBrains
-//  Mono into the binary so a fresh install looks right without the user
-//  installing anything. Zig has `@embedFile`; a Mac app has bundle
-//  resources, so the bytes live in `Contents/Resources` instead of in
-//  `__TEXT` — but everything downstream is the same, and deliberately so:
+//  Mono and the Nerd Font symbols into the binary so a fresh install looks
+//  right — text and icons both — without the user installing anything. Zig
+//  has `@embedFile`; a Mac app has bundle resources, so the bytes live in
+//  `Contents/Resources` instead of in `__TEXT` — but everything downstream
+//  is the same, and deliberately so:
 //
 //  - The bytes are turned into a face with
 //    `CTFontManagerCreateFontDescriptorFromData`, which is the singular call
@@ -31,6 +32,15 @@ enum EmbeddedFont {
     static var variable: CTFont? { font(.variable) }
     static var variableItalic: CTFont? { font(.variableItalic) }
 
+    /// The icons: Symbols Nerd Font, the symbols-only face the nerd-fonts
+    /// project publishes so a terminal can draw the icons beside *any* text
+    /// face instead of needing a patched copy of each one. libghostty embeds
+    /// this same file rather than the patched JetBrains Mono, and for the
+    /// reason that matters here: it goes behind every configured family, so
+    /// the icons survive the user naming a font of their own. One file for
+    /// all four styles — icons have no bold or italic.
+    static var symbols: CTFont? { font(.symbols) }
+
     /// One embedded face, at the nominal size. The two properties above are
     /// what the grid asks for by name; this is what a test walking
     /// `Resource.allCases` uses, so that conformance stays honest as more
@@ -44,12 +54,14 @@ enum EmbeddedFont {
     enum Resource: String, CaseIterable {
         case variable = "JetBrainsMono[wght]"
         case variableItalic = "JetBrainsMono-Italic[wght]"
+        case symbols = "SymbolsNerdFont-Regular"
     }
 
     /// Faces are created at a nominal size and copied to the size actually
     /// wanted, the way libghostty's `initFontCopy` does. Caching them here
-    /// means the ~300 KB of each file is parsed once per process rather than
-    /// once per font grid, and a grid is built per display scale and size.
+    /// means each file — 300 KB for a text face, 2.4 MB for the symbols — is
+    /// parsed once per process rather than once per font grid, and a grid is
+    /// built per display scale and size.
     private static let cacheLock = NSLock()
     // Guarded by `cacheLock`; the compiler can't see that, hence the
     // annotation.
@@ -79,8 +91,8 @@ enum EmbeddedFont {
                 forResource: resource.rawValue, withExtension: "ttf"),
             // Mapped rather than read: CoreText holds these bytes for as
             // long as the face lives, which is the life of the process, and
-            // mapped pages are file-backed and evictable where a read is
-            // 300 KB of dirty memory that never comes back.
+            // mapped pages are file-backed and evictable where a read is up
+            // to 2.4 MB of dirty memory that never comes back.
             let data = try? Data(contentsOf: url, options: .mappedIfSafe),
             let descriptor = CTFontManagerCreateFontDescriptorFromData(data as CFData)
         else { return nil }
