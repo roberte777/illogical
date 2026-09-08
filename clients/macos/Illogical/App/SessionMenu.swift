@@ -258,6 +258,9 @@ struct SessionMenu: View {
                 )
                 .shadow(color: .black.opacity(0.45), radius: 14, y: 6)
         }
+        // Everything in the panel is something to click, so the whole panel is
+        // an arrow. The filter field puts the I-beam back over itself.
+        .cursor(.arrow)
         // File ▸ Rename Session… has no field to reach: `SessionMenu` only
         // exists while the dropdown is open. It leaves the session on the
         // store instead, and these are the two ways this view finds out —
@@ -325,6 +328,9 @@ struct SessionMenu: View {
             Capsule().fill(Palette.menuField)
                 .overlay(Capsule().strokeBorder(Color.white.opacity(0.06), lineWidth: 1))
         )
+        // The one part of the panel that is text to type in rather than
+        // something to click, so it opts back out of the arrow above.
+        .cursor(.iBeam)
     }
 
     private func select(_ session: SessionSummary, on host: HostConnection) {

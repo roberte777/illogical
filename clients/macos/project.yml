@@ -187,6 +187,11 @@ targets:
       # driven from a unit test -- both were checked against the running app.
       - path: Illogical/App/WindowChrome.swift
       - path: Illogical/App/EscapeKey.swift
+      # The dropdown's pointer, here for the same reason: SessionMenu does not
+      # compile without `cursor(_:)`. In the same position too -- a cursor rect
+      # is resolved by the window against the views under the mouse, so nothing
+      # short of a running app exercises it.
+      - path: Illogical/App/Cursor.swift
       # ⌃⇥'s monitor. The monitor itself is in the same position as the two
       # above -- no unit test can drive one -- but the decision it makes is
       # not: `TabCycle.direction` is a pure function of a keycode and a
