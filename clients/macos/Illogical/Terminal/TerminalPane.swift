@@ -228,6 +228,16 @@ struct TerminalSurface: NSViewRepresentable {
             controller.search.bind(surface: view)
             view.statusText = nil
             view.needsDisplay = true
+            // The size travels in the attach — but only for a controller this
+            // call *made*. A split, a zoom, or a pane closing builds a new
+            // surface over a controller that is already connected, and that one
+            // is still at the geometry of the pane it used to fill: half a
+            // window wide after a ⌘D, a whole window wide after an unzoom. A
+            // surface's first layout is exempt from `reportSizeIfNeeded`, so
+            // without this nothing ever tells the terminal, and the pane draws
+            // a grid twice its width with the right-hand half past the edge.
+            // A no-op when the attach above already carried this size.
+            controller.resize(cols: size.cols, rows: size.rows)
             Trace.log(
                 "attached to \(terminal.host.displayName) terminal \(terminal.terminal) "
                     + "at \(size.cols)x\(size.rows)")
