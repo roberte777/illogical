@@ -1182,7 +1182,8 @@ known 12pt, which fixes the scale at 4:3, and then:
 | bezel, top | 0 | 0 |
 | card corner radius | 13px | 10pt |
 | card border | 1px | 1pt, `Palette.divider` |
-| padding inside the surface | 11px | 8pt |
+| padding inside the surface, left / right | 11px | 8pt |
+| padding inside the surface, top / bottom | 11px | 4pt |
 
 Two of those are worth saying out loud. **The top is flush**: the toolbar ends
 and the card's border is the next pixel down, so the card's own edge is what
@@ -1192,22 +1193,31 @@ plus a divider is two separators doing one job. And **the padding inside the
 surface is ours, not libghostty's**: `RendererConfig.windowPadding` defaults to
 2 there, which inside a rounded corner reads as text touching the edge.
 
+**The vertical is half the horizontal**, which is the one row of that table
+that is not the reference's number. Left and right, the padding is the only
+thing between a glyph and the card's border, so it stays at the measured 8.
+Top and bottom it is never alone: the breadcrumb already puts 27pt above the
+first row, and the bezel and the leftover-row slack already sit below the last
+one. Another 8 on each end read as a gap rather than as a margin. The 8pt this
+frees is about half a row at the default 13pt, so it buys a tighter margin
+rather than reliably another line of output.
+
 That padding is not the bezel and the two are easy to confuse: the bezel is
 chrome *outside* the card, and the padding is slack *inside* the surface,
 painted in the terminal's own background. In a split each pane carries its own
 card, so the gutter between two of them is two bezels with the divider line
 down the middle.
 
-**The 8pt is the top and the left; the leftover goes to the bottom and the
-right.** A surface is almost never a whole number of cells, and libghostty
+**Those numbers are the top and the left; the leftover goes to the bottom and
+the right.** A surface is almost never a whole number of cells, and libghostty
 either leaves that remainder past the last row and column or splits it between
 opposite edges — `window-padding-balance`, which defaults to off. We leave it,
 because balancing makes the grid's origin a function of the surface size: the
 top padding ramps up by half a cell as a window is dragged and drops back the
 moment another row fits, so every glyph on screen — the scrollback being read
 included — slides and snaps once per row for as long as the drag lasts. The
-price is that the gap under the last row is 8pt plus up to a cell where the gap
-above the first is 8pt exactly. Both are the terminal's own background, so it
+price is that the gap under the last row is 4pt plus up to a cell where the gap
+above the first is 4pt exactly. Both are the terminal's own background, so it
 reads as a slightly deeper gutter at the bottom of the card rather than as an
 edge in the wrong place.
 

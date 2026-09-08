@@ -34,13 +34,27 @@ struct RendererConfig {
 
     /// Padding around the grid, in points, before scaling.
     ///
-    /// 8 rather than libghostty's 2, and the one place in this file where the
+    /// Larger than libghostty's 2, and the one place in this file where the
     /// default is ours rather than its. The terminal is a card inset in the
     /// window now, and 2pt inside a rounded corner reads as text touching the
     /// edge — the reference leaves 11px, which on the 4:3 capture the rest of
     /// the chrome was measured from is 8pt.
+    ///
+    /// **The axes are not equal, and that is the point.** Horizontally the
+    /// padding is the only thing between a glyph and the card's border, so it
+    /// keeps the reference's 8. Vertically there is more than the border on
+    /// each side: the breadcrumb's own 27pt above the first row, and the bezel
+    /// plus the leftover-row slack below the last one. 8 on top of all of that
+    /// read as a gap rather than as a margin, so the vertical is half the
+    /// horizontal.
+    ///
+    /// The 8pt this frees is about half a row at the default 13pt, so it is a
+    /// tighter margin rather than reliably another line of output — whether a
+    /// row appears depends on where the remainder already sat. And because
+    /// `windowPaddingBalance` is `.none` it comes off the top exactly and off
+    /// the bottom on top of a remainder that is already up to a whole cell.
     var windowPaddingX: Double = 8
-    var windowPaddingY: Double = 8
+    var windowPaddingY: Double = 4
 
     /// What to do with the space a grid of whole cells cannot fill.
     ///
