@@ -274,8 +274,28 @@ final class FontGrid: @unchecked Sendable {
             for style in FontStyle.allCases { slots[style.rawValue].append(slot) }
         }
 
+        // 6. Apple Color Emoji, behind even that. Pinned by exact name
+        //    rather than left to the cascade, which is libghostty's decision
+        //    and its stated reason: "in case people add other emoji fonts to
+        //    their system, we always want to prefer the official one." A
+        //    configured family is still searched first, so naming an emoji
+        //    font of your own is how you override this.
+        //
+        //    One slot for every style, like the symbols: emoji have no bold
+        //    or italic. No size adjustment, also libghostty's — a bitmap
+        //    strike's ex height has nothing to do with text, so a factor
+        //    computed from it would resize emoji for no reason.
+        if let emoji = font(named: Self.appleColorEmoji, size: pixelSize) {
+            let slot = UInt16(faces.count)
+            faces.append(FontFace(font: emoji))
+            for style in FontStyle.allCases { slots[style.rawValue].append(slot) }
+        }
+
         return (faces, slots)
     }
+
+    /// The emoji font every Mac has. Pinned by name on purpose; see step 6.
+    static let appleColorEmoji = "Apple Color Emoji"
 
     /// One family's face for one style: the family's own, or synthesized from
     /// it. Regular is the family itself, with nothing asked of it — asking
@@ -459,18 +479,21 @@ final class FontGrid: @unchecked Sendable {
 
         // The faces this style was built with, in order: every family the
         // config named, then the text font we ship, then the Nerd Font
-        // symbols. First one that has the codepoint wins, which is what makes
-        // `font-family` repeating a fallback list rather than four ways to
-        // say the same thing.
+        // symbols, then Apple Color Emoji. First one that has the codepoint
+        // wins, which is what makes `font-family` repeating a fallback list
+        // rather than four ways to say the same thing.
         //
-        // Never for an explicit emoji request — none of these carry colour
-        // glyphs, and asking the cascade is the whole point of that request.
+        // An explicit emoji request skips the faces that cannot answer it
+        // rather than skipping the list — the same rule the discovered
+        // fallbacks below have always used. It used to skip the whole list on
+        // the grounds that none of these carried colour glyphs, which stopped
+        // being true the moment the emoji face was added to it.
         let primary = faces[Int(styleSlots[style.rawValue][0])]
-        if !wantEmoji {
-            for slot in styleSlots[style.rawValue] {
-                if let g = faces[Int(slot)].glyphIndex(cp), g != 0 {
-                    return FontIndex(slot: slot)
-                }
+        for slot in styleSlots[style.rawValue] {
+            let face = faces[Int(slot)]
+            if wantEmoji && !face.hasColor { continue }
+            if let g = face.glyphIndex(cp), g != 0 {
+                return FontIndex(slot: slot)
             }
         }
 

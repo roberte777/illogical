@@ -349,20 +349,26 @@ final class EmbeddedFontTests: XCTestCase {
         }
     }
 
-    /// Last in every style's search order, and never first: `metrics` is
-    /// read off the first regular face, and a grid measured against a
-    /// symbols-only font would have no cell to speak of.
-    func testTheSymbolsFaceIsLastAndNeverFirst() throws {
+    /// Behind the text face in every style's search order, and never first:
+    /// `metrics` is read off the first regular face, and a grid measured
+    /// against a symbols-only font would have no cell to speak of.
+    ///
+    /// Not *last* any more — Apple Color Emoji sits behind it — so this
+    /// asserts the relative order of the two, which is the part that
+    /// matters. A codepoint in both should come from the symbols.
+    func testTheSymbolsFaceIsBehindTheTextFaceAndNeverFirst() throws {
         let grid = defaultGrid()
         for style in FontStyle.allCases {
-            let faces = grid.faces(style: style)
-            XCTAssertGreaterThan(faces.count, 1, "style \(style)")
-            XCTAssertEqual(
-                CTFontCopyFamilyName(try XCTUnwrap(faces.first).font) as String,
-                "JetBrains Mono", "style \(style)")
-            XCTAssertEqual(
-                CTFontCopyFamilyName(try XCTUnwrap(faces.last).font) as String,
-                "Symbols Nerd Font", "style \(style)")
+            let names = grid.faces(style: style).map {
+                CTFontCopyFamilyName($0.font) as String
+            }
+            XCTAssertEqual(names.first, "JetBrains Mono", "style \(style)")
+            let symbols = try XCTUnwrap(
+                names.firstIndex(of: "Symbols Nerd Font"), "style \(style)")
+            XCTAssertGreaterThan(symbols, 0, "style \(style)")
+            if let emoji = names.firstIndex(of: "Apple Color Emoji") {
+                XCTAssertLessThan(symbols, emoji, "style \(style)")
+            }
         }
     }
 

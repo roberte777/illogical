@@ -17,9 +17,12 @@ final class FontConfigTests: XCTestCase {
     private static let pointSize: Double = 13
     private static let scale: Double = 2
 
-    /// The fonts we ship, in the order they sit behind whatever is
-    /// configured: the text face, then the Nerd Font symbols behind it.
-    private static let shipped = ["JetBrains Mono", "Symbols Nerd Font"]
+    /// The faces that sit behind whatever is configured, in order: the text
+    /// face we ship, the Nerd Font symbols behind it, and Apple Color Emoji
+    /// behind that. The last is the system's rather than ours, but it is
+    /// pinned by name rather than discovered, so it is as fixed a part of
+    /// the list as the two files in the bundle. Every Mac has it.
+    private static let shipped = ["JetBrains Mono", "Symbols Nerd Font", "Apple Color Emoji"]
 
     private func families(_ grid: FontGrid, _ style: FontStyle) -> [String] {
         grid.faces(style: style).map { CTFontCopyFamilyName($0.font) as String }
@@ -155,8 +158,12 @@ final class FontConfigTests: XCTestCase {
         let grid = grid(FontConfig(family: "Menlo", pointSize: Self.pointSize))
         let menlo = try XCTUnwrap(grid.face(style: .regular))
         // The text font we ship: right behind Menlo, ahead of the symbols.
-        let ours = try XCTUnwrap(grid.faces(style: .regular).dropLast().last)
-        XCTAssertEqual(CTFontCopyFamilyName(ours.font) as String, "JetBrains Mono")
+        // Found by name rather than by position, because the tail has grown
+        // twice now and each time took this line with it.
+        let ours = try XCTUnwrap(
+            grid.faces(style: .regular).first {
+                (CTFontCopyFamilyName($0.font) as String) == "JetBrains Mono"
+            })
 
         // Sprites are drawn by us whatever the font says, so they can never
         // reach a face and have to come out of the search.

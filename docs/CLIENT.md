@@ -1130,11 +1130,24 @@ typeface if it is skipped:
    the system cascade is asked.
 4. **The system's fixed-pitch face** only if the bundle lost its font
    resources.
-5. **The Nerd Font symbols, behind everything.** One face for all four
-   styles — icons have no bold or italic — searched last, so a family that
-   carries its own icons is still asked first. Last on purpose: the grid's
-   metrics are read off the first regular face, and a symbols-only font must
-   never be it.
+5. **The Nerd Font symbols, behind all of that.** One face for all four
+   styles — icons have no bold or italic — so a family that carries its own
+   icons is still asked first. After the system fixed-pitch face on purpose:
+   the grid's metrics are read off the first regular face, and a symbols-only
+   font must never be it.
+6. **Apple Color Emoji, behind even that.** Pinned by exact name rather than
+   left to the cascade, which is libghostty's decision and its stated reason:
+   "in case people add other emoji fonts to their system, we always want to
+   prefer the official one." One face for all four styles again. A configured
+   family is searched first, so naming an emoji font of your own is how you
+   override it.
+
+An explicit emoji request — a codepoint followed by U+FE0F — skips the faces
+in that list that carry no colour glyphs, rather than skipping the list. It
+used to skip the whole thing, on the reasoning that none of these faces had
+colour glyphs at all; that stopped being true the moment the emoji face joined
+the list, and had it not been changed the pin would have been dead code for
+the one request it exists to answer.
 
 The cascade is asked last and per style, so the CJK face CoreText returns for
 bold is the bold one. `FontGridSet` keys its shared grids on the whole
