@@ -1143,7 +1143,7 @@ share one atlas and panes that do not are not silently handed each other's.
 
 **Every fallback is scaled to the face it sits behind.** Two families at the
 same point size are not the same apparent size — Courier New's ex height is
-four fifths of JetBrains Mono's — so a fallback loaded at the grid's own size
+three quarters of JetBrains Mono's — so a fallback loaded at the grid's own size
 reads as visibly larger or smaller than the text around it. `FaceMetrics`
 `scaleFactor` is libghostty's `Collection.scaleFactor`: it compares one metric
 between the two faces, normalized to ems so the sizes they were measured at

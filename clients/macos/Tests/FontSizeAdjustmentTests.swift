@@ -83,7 +83,7 @@ final class FontSizeAdjustmentTests: XCTestCase {
     func testAFaceWithNoIdeographFallsThroughToExHeight() {
         let primary = metrics(exHeight: 50, icWidth: 100)
         let noIC = metrics(exHeight: 25, icWidth: nil)
-        // Not the ic ratio, which the estimator would have made 1.
+        // 2, and not the 4/3 the ic-width estimator would have produced.
         XCTAssertEqual(factor(primary, noIC, .icWidth), 2, accuracy: 1e-12)
     }
 
@@ -101,12 +101,16 @@ final class FontSizeAdjustmentTests: XCTestCase {
     /// A stated-but-nonsense metric counts as absent. A zero ex height is a
     /// font saying nothing in a more annoying way, and dividing by it is how
     /// a face ends up loaded at a size of infinity.
+    ///
+    /// Asserted as an exact 1 rather than merely as finite. Both faces state
+    /// the same cap height, so a chain that correctly walks past the two
+    /// zeroed metrics lands there and gets exactly 1 — where a `stated()`
+    /// that only checked for nil would stop at ic width, estimate it from the
+    /// very face it is meant to be correcting, and return 4/3.
     func testAZeroMetricIsTreatedAsAbsent() {
         let primary = metrics(exHeight: 50, icWidth: 100)
         let zeroed = metrics(exHeight: 0, icWidth: 0)
-        let f = factor(primary, zeroed, .icWidth)
-        XCTAssertTrue(f.isFinite)
-        XCTAssertGreaterThan(f, 0)
+        XCTAssertEqual(factor(primary, zeroed, .icWidth), 1, accuracy: 1e-12)
     }
 
     /// A face CoreText half-understands can measure as zero on every axis.
@@ -121,9 +125,53 @@ final class FontSizeAdjustmentTests: XCTestCase {
         XCTAssertEqual(factor(degenerate, primary, .icWidth), 1)
     }
 
+    /// The other degenerate shape, and the only one that reaches the final
+    /// guard: a face that states a size but measures as nothing on every
+    /// axis. `pxPerEm` is positive, so the early return does not fire; the
+    /// chain walks all the way to line height, finds zero there too, and the
+    /// division would hand back infinity — a face loaded at an infinite size.
+    func testAFaceThatMeasuresAsNothingIsNotScaled() {
+        let primary = metrics()
+        let empty = metrics(
+            pxPerEm: 100, cellWidth: 0, ascent: 0, descent: 0, lineGap: 0, capHeight: 0,
+            exHeight: 0, asciiHeight: 0, icWidth: 0)
+        XCTAssertEqual(factor(primary, empty, .icWidth), 1)
+    }
+
+    /// The shape that actually occurs, which none of the cases above cover:
+    /// the *primary* states no ideograph width and the *face* does. That is
+    /// every CJK fallback behind a Latin font — JetBrains Mono has no 水 — so
+    /// the primary's side of the ratio is its estimate while the face's is
+    /// real. A chain that bailed whenever the primary lacked the metric would
+    /// leave every one of those fallbacks unscaled, and every other unit test
+    /// here would still pass.
+    func testTheFaceStatesTheMetricAndThePrimaryDoesNot() {
+        // Estimated: min(asciiHeight 75, 2 * cellWidth 120) = 75.
+        let primary = metrics(icWidth: nil)
+        XCTAssertEqual(primary.resolvedIcWidth(), 75, accuracy: 1e-12)
+
+        let wide = metrics(icWidth: 150)
+        XCTAssertEqual(factor(primary, wide, .icWidth), 0.5, accuracy: 1e-12)
+    }
+
     // MARK: - Through the grid
 
     private func size(_ face: FontFace) -> Double { Double(CTFontGetSize(face.font)) }
+
+    /// Courier New ships with macOS but can be disabled in Font Book, and
+    /// these tests need it specifically: its ex height is three quarters of
+    /// the shipped font's, where Menlo's is within half a percent and would
+    /// make "was it scaled?" unanswerable. Skip rather than fail, and say
+    /// why — a red test on somebody's machine because of a font they turned
+    /// off years ago is a bad hour.
+    private func skipUnlessCourierNewIsInstalled() throws {
+        let descriptor = CTFontDescriptorCreateWithAttributes(
+            [kCTFontFamilyNameAttribute: "Courier New"] as CFDictionary)
+        let mandatory = Set([kCTFontFamilyNameAttribute as String]) as NSSet as CFSet
+        try XCTSkipIf(
+            CTFontDescriptorCreateMatchingFontDescriptor(descriptor, mandatory) == nil,
+            "Courier New is not installed")
+    }
 
     private func face(_ grid: FontGrid, _ family: String) throws -> FontFace {
         let match = grid.faces(style: .regular).first {
@@ -147,6 +195,7 @@ final class FontSizeAdjustmentTests: XCTestCase {
     /// than the font we ship, so behind it our face is loaded smaller — and
     /// the two now measure the same on screen, which is what "matches" means.
     func testTheShippedFontIsScaledToAConfiguredFamily() throws {
+        try skipUnlessCourierNewIsInstalled()
         let grid = FontGridSet.grid(
             family: "Courier New", pointSize: Self.pointSize, scale: Self.scale)
         let courier = try face(grid, "Courier New")
@@ -165,6 +214,7 @@ final class FontSizeAdjustmentTests: XCTestCase {
     /// Every style is scaled, not just regular. A bold that kept the
     /// unadjusted size would jump a size mid-line.
     func testEveryStyleOfTheShippedFontIsScaled() throws {
+        try skipUnlessCourierNewIsInstalled()
         let grid = FontGridSet.grid(
             family: "Courier New", pointSize: Self.pointSize, scale: Self.scale)
         for style in FontStyle.allCases {
@@ -180,6 +230,7 @@ final class FontSizeAdjustmentTests: XCTestCase {
     /// whatever family is in front of it. Scaling it would fight
     /// `NerdFontConstraints`, which fits each icon to the cell itself.
     func testTheSymbolsFaceIsNeverScaled() throws {
+        try skipUnlessCourierNewIsInstalled()
         for family in [nil, "Courier New"] {
             let grid = FontGridSet.grid(
                 family: family, pointSize: Self.pointSize, scale: Self.scale)
@@ -207,7 +258,12 @@ final class FontSizeAdjustmentTests: XCTestCase {
         else { throw XCTSkip("no CJK font on this machine") }
 
         XCTAssertNotEqual(CTFontCopyFamilyName(han.font) as String, "JetBrains Mono")
-        XCTAssertNotNil(han.faceMetrics().icWidth, "the fallback states no ic width")
+        // A skip and not a failure: `FontFace` discards an ic width whose
+        // glyph is wider than its own advance, which is what a CJK font run
+        // through the Nerd Font patcher looks like. If the cascade hands back
+        // one of those there is nothing here to measure.
+        try XCTSkipIf(
+            han.faceMetrics().icWidth == nil, "the CJK fallback states no ic width")
 
         let target = try XCTUnwrap(grid.face(style: .regular)).faceMetrics().resolvedIcWidth()
         XCTAssertEqual(han.faceMetrics().resolvedIcWidth(), target, accuracy: 0.5)
