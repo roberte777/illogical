@@ -19,6 +19,7 @@ Illogical.app
 │   └── Fonts/      JetBrains Mono, shipped as the default face
 ├── Terminal/
 │   ├── TerminalEngine.swift     libghostty-vt wrapper + snapshot extraction
+│   ├── TerminalColors.swift     the config's colours, resolved for libghostty
 │   ├── SnapshotRestore.swift    two-phase attach decode
 │   ├── TerminalController.swift one connection, one terminal
 │   ├── TerminalSurfaceView.swift  NSView host, layer, input
@@ -34,6 +35,8 @@ Packages/IllogicalKit/
 └── IllogicalConfig             the config file, in Ghostty's format
     ├── ConfigSyntax.swift      key = value, comments, quoting
     ├── Config.swift            the keys, and what setting one does
+    ├── ConfigColor.swift       colours, palette entries, cell-relative ones
+    ├── X11Colors.swift         rgb.txt, embedded and read on first use
     ├── ConfigPath.swift        XDG and Application Support
     ├── ConfigLoad.swift        reading the files, and the diagnostics
     └── ConfigTemplate.swift    the file written when a machine has none

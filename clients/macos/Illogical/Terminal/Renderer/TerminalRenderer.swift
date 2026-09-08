@@ -365,12 +365,18 @@ final class TerminalRenderer: @unchecked Sendable {
             // inversion are applied.
             let bgStyle = cell.bg
             let fgStyle = cell.fg.present ? cell.fg : defaultFg
+            let inverse = cell.flags.contains(.inverse)
 
             let bg: PackedRGB = {
                 switch paint {
                 case .selection:
                     if let c = config.selectionBackground {
-                        return PackedRGB(r: c.r, g: c.g, b: c.b)
+                        // Against the cell's own colours, with `bgStyle` left
+                        // unresolved: a selected cell with no background of
+                        // its own falls through to `defaultBg` below, exactly
+                        // as an unselected one does.
+                        return c.resolve(
+                            foreground: fgStyle, background: bgStyle, inverse: inverse)
                     }
                     // With no configured colour, the selection background is
                     // the foreground colour, which reads correctly against
@@ -387,17 +393,22 @@ final class TerminalRenderer: @unchecked Sendable {
                     // background: the inverse flag, and a "covering" glyph such
                     // as FULL BLOCK, where using fg as bg is what makes padding
                     // extension look right. If both are true they cancel.
-                    let inverse = cell.flags.contains(.inverse)
                     if inverse != CellRules.isCovering(cell.codepoint) { return fgStyle }
                     return bgStyle
                 }
             }()
 
             let fg: PackedRGB = {
+                // The cell's background, resolved — which is what a foreground
+                // asking for `cell-background` has to be given, since drawing
+                // text in "no colour at all" is not a thing.
+                let finalBg = bgStyle.present ? bgStyle : defaultBg
+
                 switch paint {
                 case .selection:
                     if let c = config.selectionForeground {
-                        return PackedRGB(r: c.r, g: c.g, b: c.b)
+                        return c.resolve(
+                            foreground: fgStyle, background: finalBg, inverse: inverse)
                     }
                     return defaultBg
                 case .searchMatch:
@@ -407,8 +418,7 @@ final class TerminalRenderer: @unchecked Sendable {
                     let c = config.searchSelectedForeground
                     return PackedRGB(r: c.r, g: c.g, b: c.b)
                 case .plain:
-                    let finalBg = bgStyle.present ? bgStyle : defaultBg
-                    return cell.flags.contains(.inverse) ? finalBg : fgStyle
+                    return inverse ? finalBg : fgStyle
                 }
             }()
 
@@ -624,9 +634,25 @@ final class TerminalRenderer: @unchecked Sendable {
             x = snapshot.cursor.x
         }
 
+        // The cell the cursor covers, resolved. Both of the colours below can
+        // be asked to match it rather than be fixed, and the cursor is not
+        // always on a cell that has any — a cursor past the end of a line is
+        // on a blank, whose colours are the terminal's own.
+        let cellFg: PackedRGB =
+            (cursorCell?.fg).flatMap { $0.present ? $0 : nil } ?? snapshot.foreground
+        let cellBg: PackedRGB =
+            (cursorCell?.bg).flatMap { $0.present ? $0 : nil } ?? snapshot.background
+        let cellInverse = cursorCell?.flags.contains(.inverse) ?? false
+
         let color: PackedRGB = {
-            // OSC 12 wins if the program set it.
+            // OSC 12 wins if the program set it. A fixed `cursor-color` from
+            // the config is already in here too, via the terminal's default —
+            // see `TerminalEngine.applyThemeLocked`.
             if snapshot.cursorColor.present { return snapshot.cursorColor }
+            if let configured = config.cursorColor {
+                return configured.resolve(
+                    foreground: cellFg, background: cellBg, inverse: cellInverse)
+            }
             return snapshot.foreground
         }()
 
@@ -678,8 +704,11 @@ final class TerminalRenderer: @unchecked Sendable {
             uniforms.cursor_pos = SIMD2<UInt16>(x, snapshot.cursor.y)
             uniforms.cursor_wide = wide
             // Text under the cursor is drawn in the background colour, so it
-            // reads as a knockout.
-            let textColor = snapshot.background
+            // reads as a knockout — unless `cursor-text` says otherwise.
+            let textColor =
+                config.cursorText?.resolve(
+                    foreground: cellFg, background: cellBg, inverse: cellInverse)
+                ?? snapshot.background
             uniforms.cursor_color = SIMD4<UInt8>(textColor.r, textColor.g, textColor.b, 255)
         }
     }

@@ -126,6 +126,11 @@ targets:
       # the pure geometry the find bar gets out of the way with, and the only
       # part of "the bar dodges what it found" a test can hold without a window.
       - path: Illogical/Terminal/Search
+      # The config's colours in the terminal's own terms, including the
+      # palette libghostty generates. Here because `TerminalEngine` no longer
+      # compiles without it, and worth testing on its own: it is the only
+      # place the app calls libghostty's colour maths.
+      - path: Illogical/Terminal/TerminalColors.swift
       - path: Illogical/Terminal/TerminalSurfaceView.swift
       - path: Illogical/Terminal/ScrollAccumulator.swift
       - path: Illogical/Terminal/ScrollbarOverlay.swift

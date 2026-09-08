@@ -94,6 +94,67 @@ public struct Config: Equatable, Sendable {
     /// private call Ghostty uses.
     public var backgroundBlurRadius: Int = 0
 
+    // MARK: - Colours
+
+    /// The terminal's default background and foreground: what a cell that
+    /// carries no colour of its own is drawn in.
+    ///
+    /// Not libghostty's defaults, and this is the one place the two files
+    /// deliberately disagree. Ghostty defaults to `#282C34` under white; the
+    /// app draws the dark blue it has drawn since before there was a config
+    /// file, so that installing it does not silently repaint a terminal to
+    /// look like a different program's. Every *theme* is Ghostty's, which is
+    /// the part that matters — these two are only what you get having named
+    /// no theme at all.
+    public var background = ConfigColor(0x0C_1F_2F)
+    public var foreground = ConfigColor(0xC8_D6_E0)
+
+    /// The cursor's block, and the text under it. Nil leaves both to the
+    /// renderer: the foreground for the block, the background for the text
+    /// beneath it.
+    ///
+    /// `ConfigTerminalColor` rather than a plain colour because a theme may
+    /// say `cell-foreground` or `cell-background` instead of naming one — a
+    /// cursor that inverts whatever character it is standing on rather than
+    /// being one fixed colour. That pair is also all `cursor-invert-fg-bg`
+    /// ever meant, and it is applied as exactly that.
+    public var cursorColor: ConfigTerminalColor?
+    public var cursorText: ConfigTerminalColor?
+
+    /// The selection's two colours, with the same three spellings.
+    ///
+    /// Nil for both inverts: selected text is drawn in the background colour
+    /// on the foreground colour, which reads correctly under any theme and is
+    /// what the app did before it could be told otherwise.
+    public var selectionBackground: ConfigTerminalColor?
+    public var selectionForeground: ConfigTerminalColor?
+
+    /// The `palette = N=COLOR` overrides. Whatever is not overridden is
+    /// libghostty's own default palette — see `ConfigPalette`.
+    public var palette = ConfigPalette()
+
+    /// Derive indices 16–255 from the base sixteen rather than using the
+    /// xterm cube and ramp, so that a theme naming only the first sixteen
+    /// colours gets a whole palette in keeping with them.
+    ///
+    /// Off, which is libghostty's default and for its stated reason: a great
+    /// deal of software hardcodes what the xterm cube's indices are, and
+    /// moving them out from under it makes that software unreadable rather
+    /// than merely differently coloured.
+    public var paletteGenerate = false
+
+    /// Run the generated cube light-to-dark under a light theme instead of
+    /// keeping it dark-to-light. No effect unless `palette-generate` is on.
+    public var paletteHarmonious = false
+
+    /// The WCAG contrast ratio to force between a cell's text and its own
+    /// background, 1 through 21. 1 is off.
+    ///
+    /// Off by default, which is libghostty's default and the right one: this
+    /// overrides the colour a program actually asked for, and a program that
+    /// asked for grey on grey usually meant it.
+    public var minimumContrast: Double = 1
+
     // MARK: - Applying a file
 
     /// Apply every `key = value` in `text`, appending diagnostics for
@@ -196,9 +257,160 @@ public struct Config: Equatable, Sendable {
             }
             backgroundBlurRadius = radius
 
+        case "background":
+            apply(entry, to: \.background, report: report)
+        case "foreground":
+            apply(entry, to: \.foreground, report: report)
+
+        case "cursor-color":
+            apply(entry, to: \.cursorColor, report: report)
+        case "cursor-text":
+            apply(entry, to: \.cursorText, report: report)
+        case "selection-background":
+            apply(entry, to: \.selectionBackground, report: report)
+        case "selection-foreground":
+            apply(entry, to: \.selectionForeground, report: report)
+
+        case "palette":
+            guard let value = entry.value else {
+                report("value required")
+                return
+            }
+            if value.isEmpty {
+                palette.removeAll()
+                return
+            }
+            guard let override = ConfigPalette.parseEntry(value) else {
+                report("invalid value \"\(value)\"")
+                return
+            }
+            palette.set(override.index, to: override.color)
+
+        case "palette-generate":
+            apply(entry, to: \.paletteGenerate, report: report)
+        case "palette-harmonious":
+            apply(entry, to: \.paletteHarmonious, report: report)
+
+        case "minimum-contrast":
+            guard let value = entry.value else {
+                report("value required")
+                return
+            }
+            if value.isEmpty {
+                minimumContrast = Config().minimumContrast
+                return
+            }
+            guard let ratio = Double(value), ratio.isFinite else {
+                report("invalid value \"\(value)\"")
+                return
+            }
+            // 1 through 21 is the whole range a WCAG ratio has — 1 is a colour
+            // against itself and 21 is black against white — so anything
+            // outside it is a number somebody guessed at rather than measured.
+            // Clamped rather than refused, for the same reason
+            // `background-opacity` is.
+            minimumContrast = min(21, max(1, ratio))
+
+        // Ghostty 1.2 replaced these two with the `cell-foreground` and
+        // `cell-background` values above, and still accepts them. So do we,
+        // and by setting exactly what it sets: a config carried over from an
+        // older Ghostty should keep working rather than warn about a key that
+        // was correct when it was written.
+        case "cursor-invert-fg-bg":
+            guard let on = compatFlag(entry, report: report) else { return }
+            if on {
+                cursorColor = .cellForeground
+                cursorText = .cellBackground
+            }
+        case "selection-invert-fg-bg":
+            guard let on = compatFlag(entry, report: report) else { return }
+            if on {
+                selectionForeground = .cellBackground
+                selectionBackground = .cellForeground
+            }
+
         default:
             report("unknown field")
         }
+    }
+
+    /// A colour that must always have a value: an empty one resets it.
+    private mutating func apply(
+        _ entry: ConfigEntry,
+        to keyPath: WritableKeyPath<Config, ConfigColor>,
+        report: (String) -> Void
+    ) {
+        guard let value = entry.value else {
+            report("value required")
+            return
+        }
+        if value.isEmpty {
+            self[keyPath: keyPath] = Config()[keyPath: keyPath]
+            return
+        }
+        guard let color = ConfigColor.parse(value) else {
+            report("invalid value \"\(value)\"")
+            return
+        }
+        self[keyPath: keyPath] = color
+    }
+
+    /// A colour that may be unset, where empty means "unset" rather than "the
+    /// default colour" — because for these four there is no default colour,
+    /// only a rule the renderer follows in their absence.
+    private mutating func apply(
+        _ entry: ConfigEntry,
+        to keyPath: WritableKeyPath<Config, ConfigTerminalColor?>,
+        report: (String) -> Void
+    ) {
+        guard let value = entry.value else {
+            report("value required")
+            return
+        }
+        if value.isEmpty {
+            self[keyPath: keyPath] = nil
+            return
+        }
+        guard let color = ConfigTerminalColor.parse(value) else {
+            report("invalid value \"\(value)\"")
+            return
+        }
+        self[keyPath: keyPath] = color
+    }
+
+    /// A flag, in libghostty's spelling of one.
+    private mutating func apply(
+        _ entry: ConfigEntry,
+        to keyPath: WritableKeyPath<Config, Bool>,
+        report: (String) -> Void
+    ) {
+        guard let value = entry.value else {
+            report("value required")
+            return
+        }
+        if value.isEmpty {
+            self[keyPath: keyPath] = Config()[keyPath: keyPath]
+            return
+        }
+        guard let flag = ConfigSyntax.bool(value) else {
+            report("invalid value \"\(value)\"")
+            return
+        }
+        self[keyPath: keyPath] = flag
+    }
+
+    /// The flag half of a compatibility key, which differs from a real one in
+    /// two ways: a bare key means true rather than "value required", and
+    /// false does nothing at all rather than restoring a default. Both are
+    /// libghostty's behaviour, and both follow from the key not having a
+    /// field of its own to hold — there is nothing for `false` to undo.
+    private func compatFlag(_ entry: ConfigEntry, report: (String) -> Void) -> Bool? {
+        let value = entry.value ?? "t"
+        guard let flag = ConfigSyntax.bool(value.isEmpty ? "t" : value) else {
+            report("invalid value \"\(value)\"")
+            return nil
+        }
+        return flag
     }
 
     /// The repeatable-string rule, which is the same for all four families.
