@@ -80,6 +80,22 @@ public enum ConfigTemplate {
         # # pixels, so 13.5 on a 2x display is a real 27px cell.
         # font-size = 13
 
+        # Window
+        # ======
+        # # How opaque the terminal is, from 0 to 1. Only the terminal: the
+        # # toolbar, the tabs and the breadcrumb above them stay solid at any
+        # # value, so the window is still something you can aim at.
+        # background-opacity = 0.9
+        #
+        # # Blur what shows through, in pixels. Does nothing unless you also
+        # # set an opacity below 1 -- with an opaque terminal there is nothing
+        # # behind it to blur.
+        # #
+        # # true is 20, which is the radius Ghostty picks for the same word,
+        # # or write the number you want:
+        # background-blur = true
+        # background-blur = 30
+
         """
     }
 

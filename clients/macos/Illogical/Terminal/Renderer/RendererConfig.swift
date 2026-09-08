@@ -1,9 +1,11 @@
 //  RendererConfig.swift
 //  The knobs libghostty exposes for rendering, with its defaults.
 //
-//  We have no config file yet, so these are constants. They live in one type
-//  rather than scattered through the renderer so that wiring a config up
-//  later is a matter of filling this in from it.
+//  Defaults, and only defaults. What the config file says about any of them
+//  is applied by `AppConfig.renderer`, which is the only thing that knows
+//  both this vocabulary and the file's -- nothing under `Renderer/` imports
+//  the config package. A knob the file has no key for is simply the constant
+//  below, which is the state most of them are still in.
 
 import Foundation
 
@@ -31,8 +33,14 @@ struct RendererConfig {
     var backgroundOpacityCells: Bool = false
 
     /// Padding around the grid, in points, before scaling.
-    var windowPaddingX: Double = 2
-    var windowPaddingY: Double = 2
+    ///
+    /// 8 rather than libghostty's 2, and the one place in this file where the
+    /// default is ours rather than its. The terminal is a card inset in the
+    /// window now, and 2pt inside a rounded corner reads as text touching the
+    /// edge — the reference leaves 11px, which on the 4:3 capture the rest of
+    /// the chrome was measured from is 8pt.
+    var windowPaddingX: Double = 8
+    var windowPaddingY: Double = 8
 
     /// What fills the padding around the grid.
     enum PaddingColor {

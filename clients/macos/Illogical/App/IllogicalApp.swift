@@ -173,9 +173,12 @@ struct ContentView: View {
 
     var body: some View {
         @Bindable var store = store
+        // No hairline under the toolbar. The card's own border is directly
+        // beneath it — its top edge is flush against the tab strip — so a
+        // divider here would be a second line doing the first one's job, and
+        // it would run the full width of the window rather than stopping at
+        // the bezel the way the reference's does.
         VStack(spacing: 0) {
-            Rectangle().fill(Palette.divider).frame(height: 1)
-
             // A tab wins over an error, and that order is load-bearing. A
             // server that goes away is reconnected to and the terminals on the
             // far side never stopped, so replacing the screen with "no server"
@@ -206,7 +209,13 @@ struct ContentView: View {
             // crossfade instead, so it only ever runs between screens.
             .animation(Motion.screen.animation(reduceMotion: reduceMotion), value: screen)
         }
-        .background(Palette.background)
+        // Clear when the terminal is translucent, because this sits behind
+        // the panes and would be what shows through them — the desktop is the
+        // point. Opaque otherwise, so a sliver uncovered mid-transition is the
+        // chrome colour rather than the window's own. Not `Palette.background`
+        // any more: with a bezel around it, every pixel this still reaches is
+        // frame rather than terminal.
+        .background(AppConfig.isTranslucent ? Color.clear : Palette.toolbar)
         .overlay {
             // The ZStack is unconditional so the *removal* transition has
             // something to run inside. With the `if` outside it, closing the

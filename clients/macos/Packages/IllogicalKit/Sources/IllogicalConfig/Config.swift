@@ -67,6 +67,33 @@ public struct Config: Equatable, Sendable {
     /// already drew before there was a config file.
     public var fontSize: Double = 13
 
+    // MARK: - Window
+
+    /// Alpha for the terminal's background, 0 through 1.
+    ///
+    /// The *terminal's*, and nothing else's: the toolbar, the tab strip and
+    /// the breadcrumb stay opaque whatever this says. That is what keeps a
+    /// translucent window usable -- chrome you can see through is chrome you
+    /// cannot find -- and it is where libghostty draws the line too.
+    ///
+    /// 1 by default, which is also libghostty's default. Nobody gets a
+    /// see-through terminal without asking for one.
+    public var backgroundOpacity: Double = 1
+
+    /// How hard to blur whatever shows through a translucent terminal, in
+    /// pixels. 0 is no blur.
+    ///
+    /// Does nothing on its own. With `background-opacity = 1` there is
+    /// nothing behind the terminal to blur, so this alone is a line that
+    /// quietly has no effect; the two go together.
+    ///
+    /// Written as a bool *or* a radius, which is libghostty's own spelling:
+    /// `background-blur = true` is 20, the radius it picks for the same word,
+    /// and `background-blur = 30` is 30. Both are honoured -- see
+    /// `WindowChrome`, which sets exactly this radius through the same
+    /// private call Ghostty uses.
+    public var backgroundBlurRadius: Int = 0
+
     // MARK: - Applying a file
 
     /// Apply every `key = value` in `text`, appending diagnostics for
@@ -135,6 +162,39 @@ public struct Config: Equatable, Sendable {
                 return
             }
             fontSize = size
+
+        case "background-opacity":
+            guard let value = entry.value else {
+                report("value required")
+                return
+            }
+            if value.isEmpty {
+                backgroundOpacity = Config().backgroundOpacity
+                return
+            }
+            guard let alpha = Double(value), alpha.isFinite else {
+                report("invalid value \"\(value)\"")
+                return
+            }
+            // Clamped rather than rejected, which is what libghostty does
+            // with the same value. `0.5` and `50` are both attempts to say
+            // half, and only one of them is a mistake worth stopping for.
+            backgroundOpacity = min(1, max(0, alpha))
+
+        case "background-blur", "background-blur-radius":
+            guard let value = entry.value else {
+                report("value required")
+                return
+            }
+            if value.isEmpty {
+                backgroundBlurRadius = Config().backgroundBlurRadius
+                return
+            }
+            guard let radius = ConfigSyntax.blurRadius(value) else {
+                report("invalid value \"\(value)\"")
+                return
+            }
+            backgroundBlurRadius = radius
 
         default:
             report("unknown field")

@@ -1097,6 +1097,98 @@ What is deliberately still missing: reload while running, `font-style`,
 `font-feature`, `font-variation`, the `adjust-*` metric modifiers, codepoint
 maps, and the Nerd Font symbols fallback. #39 and #42.
 
+### A translucent terminal, and the bezel that frames it
+
+`background-opacity` is the terminal's alpha and nothing else's. The toolbar,
+the tab strip and the breadcrumb stay opaque at any value, which is where
+libghostty draws the line too: chrome you can see through is chrome you cannot
+find. It is 1 by default, so the app looks the same until somebody asks.
+
+Three things have to agree for one pixel to be see-through, and each of them
+was, at some point in writing this, the one that was not:
+
+1. **The renderer leaves the background alone.** A cell with no explicit
+   background of its own is written with alpha 0, so the full-screen background
+   triangle shows through it at `background-opacity`. This part predates the
+   option — it is how libghostty's shaders already worked.
+2. **The renderer is given the config.** `TerminalRenderer`'s `config:`
+   argument defaults to `RendererConfig()`, and `TerminalSurfaceView` was
+   building one without it: the view read the file, used it for its own layer
+   colour, and handed the renderer the constants. An opacity of 0.2 was
+   pixel-identical to 1.
+3. **Nothing opaque is painted behind the surface.** The window stops being
+   opaque and its background goes clear, and — the part that is easy to miss —
+   the pane draws its bezel as a *ring* rather than a fill. A
+   chrome-coloured rectangle behind the card is exactly what
+   `background-opacity` would then show you: the frame, at 20%, instead of the
+   desktop.
+4. **The title bar is painted too.** AppKit insets the toolbar accessory past
+   the traffic lights and leaves a sliver at the trailing end, so those two
+   strips are the *window's* background rather than ours — and a clear window
+   made them the only see-through chrome in the app, the tab strip solid and
+   the traffic lights sitting on the desktop. The title bar view itself
+   (reached through its close button, the one handle on it AppKit admits to
+   owning) gets the colour the accessory is already painting.
+5. **Nothing *translucent* is painted behind the surface either.** The surface layer's
+   own `backgroundColor` used to carry the opacity too, on the reasoning that
+   it is what shows before the first frame. Two translucent fills do not agree
+   to disagree, they stack: 0.9 under 0.9 composites to 0.99, so the terminal
+   came out very nearly opaque while the breadcrumb above it — a single true
+   0.9 — did not, and the seam between them ran across the top of every card.
+   The layer's colour is now dropped entirely once the terminal is
+   translucent. What that costs is the moment before the first frame, where an
+   opaque terminal shows its background colour and a translucent one shows the
+   desktop, which is the right way round.
+
+**The bezel** is that frame. A *pane*, so the breadcrumb is inside the card
+rather than out on the frame — the cwd, the command and the split controls on
+that row all act on the terminal below it, and a header on the frame would
+read as belonging to the window. It follows that the header sits on
+`Palette.background` at `background-opacity`, the same surface the terminal
+draws on, and not on the chrome.
+
+Every number in it is measured off a **light-mode** capture of the reference,
+which is the only way to find these edges: in dark mode the chrome and the
+terminal are four levels of grey apart and JPEG noise is larger than the
+signal. In light mode the card, the frame and the border between them all
+separate cleanly. The capture's traffic lights are 16px across against a
+known 12pt, which fixes the scale at 4:3, and then:
+
+| | reference | ours |
+|---|---|---|
+| toolbar height | 52px | 39pt |
+| bezel, left / right / bottom | 8px | 6pt |
+| bezel, top | 0 | 0 |
+| card corner radius | 13px | 10pt |
+| card border | 1px | 1pt, `Palette.divider` |
+| padding inside the surface | 11px | 8pt |
+
+Two of those are worth saying out loud. **The top is flush**: the toolbar ends
+and the card's border is the next pixel down, so the card's own edge is what
+separates the tab strip from the terminal. There is no hairline under the
+toolbar — there used to be, running the full width of the window, and a bezel
+plus a divider is two separators doing one job. And **the padding inside the
+surface is ours, not libghostty's**: `RendererConfig.windowPadding` defaults to
+2 there, which inside a rounded corner reads as text touching the edge.
+
+That padding is not the bezel and the two are easy to confuse: the bezel is
+chrome *outside* the card, and the padding is slack *inside* the surface,
+painted in the terminal's own background. In a split each pane carries its own
+card, so the gutter between two of them is two bezels with the divider line
+down the middle.
+
+**`background-blur` is a radius**, spelled as a bool or a number the way
+libghostty spells it, and honoured either way — `true` is 20, which is the
+radius it picks for the same word. That it can be honoured at all is why the
+blur is `CGSSetWindowBackgroundBlurRadius`, a private CoreGraphics call, and
+not `NSVisualEffectView`: the public class blurs behind a *view* at a radius
+the system chooses and tints the result with a material, which is right for a
+sidebar and wrong for a terminal. The symbols are resolved with `dlsym` rather
+than declared with `@_silgen_name` as Ghostty declares them — the call is the
+same, but a link-time reference to a private symbol means the day Apple drops
+it the app fails to launch, over a blur. This way the lookup returns nil and
+the terminal opens unblurred.
+
 ## Not sandboxed
 
 The client talks to a unix socket outside a container and spawns `ssh`, so

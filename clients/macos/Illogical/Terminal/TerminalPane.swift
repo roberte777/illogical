@@ -18,10 +18,32 @@ struct TerminalPane: View {
         store.tabs.first { $0.id == tab }?.focused == pane.id
     }
 
+    /// What the header sits on: the terminal's own background, at the
+    /// terminal's own opacity.
+    ///
+    /// Read once. `background-opacity` does not change while the app runs
+    /// (#39) and this is a `body`. Left as the plain colour at 1 rather than
+    /// `.opacity(1)`, so the ordinary case is the same value the surface
+    /// itself paints and no alpha ever enters the comparison.
+    private static let cardBackground: Color = {
+        let alpha = AppConfig.current.backgroundOpacity
+        return alpha >= 1 ? Palette.background : Palette.background.opacity(alpha)
+    }()
+
     var body: some View {
         VStack(spacing: 0) {
             PaneHeader(pane: pane, tab: tab, isFocused: isFocused)
                 .environment(store)
+                // The terminal's own background, at the terminal's own
+                // opacity: the breadcrumb is *inside* the card, so it reads as
+                // part of the surface it names rather than as a strip of
+                // chrome above it.
+                //
+                // Behind the header only, and never behind the whole pane.
+                // The surface paints this same colour itself, so a second
+                // translucent layer under it would multiply into a third
+                // opacity nobody asked for — 0.8 twice is 0.96.
+                .background(Self.cardBackground)
             // `focusGeneration` is read *here*, in a body, so the store's
             // observation registers it. Handing it to the representable is
             // what guarantees an `updateNSView` when something — the session
@@ -51,8 +73,65 @@ struct TerminalPane: View {
                     }
                 }
         }
-        .background(Palette.background)
+        // The bezel, around the whole pane rather than around the surface
+        // alone. The breadcrumb goes inside the card with the terminal it
+        // names — the cwd, the command and the split controls all belong to
+        // that terminal, and a header sitting out on the frame would read as
+        // belonging to the window.
+        //
+        // Three sides. The top edge is flush against the toolbar, and the
+        // card's own border is what divides them; see `Metrics.terminalInset`.
+        .clipShape(
+            RoundedRectangle(
+                cornerRadius: Metrics.terminalCornerRadius, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(
+                cornerRadius: Metrics.terminalCornerRadius, style: .continuous
+            )
+            .strokeBorder(Palette.divider, lineWidth: Metrics.terminalBorderWidth)
+        }
+        .padding(.horizontal, Metrics.terminalInset)
+        .padding(.bottom, Metrics.terminalInset)
+        .background { Bezel() }
         .traceFrame("pane-\(pane.terminal.terminal)")
+    }
+}
+
+/// The chrome the terminal is inset into: everything inside this view except
+/// the card itself.
+///
+/// A ring, and not a rectangle behind the card, which is the whole reason it
+/// is a `Path` rather than a colour. A translucent terminal shows whatever is
+/// painted behind it, so a chrome-coloured fill under the card is precisely
+/// the thing `background-opacity` would then show you — the frame, at 20%,
+/// instead of your desktop. Measured the hard way: the first version of this
+/// was `.background(Palette.toolbar)` on the pane, and a window set to 0.8
+/// opacity was pixel-identical to one set to 1.
+///
+/// Sized to the padded pane, so the hole and the card are laid out by the same
+/// numbers rather than by two copies of them.
+private struct Bezel: View {
+    var body: some View {
+        GeometryReader { geometry in
+            let card = CGRect(
+                x: Metrics.terminalInset,
+                y: 0,
+                width: max(0, geometry.size.width - 2 * Metrics.terminalInset),
+                height: max(0, geometry.size.height - Metrics.terminalInset))
+            Path { path in
+                path.addRect(CGRect(origin: .zero, size: geometry.size))
+                path.addRoundedRect(
+                    in: card,
+                    cornerSize: CGSize(
+                        width: Metrics.terminalCornerRadius,
+                        height: Metrics.terminalCornerRadius),
+                    style: .continuous)
+            }
+            // Even-odd: the second subpath punches the first rather than
+            // adding to it.
+            .fill(Palette.toolbar, style: FillStyle(eoFill: true))
+        }
     }
 }
 

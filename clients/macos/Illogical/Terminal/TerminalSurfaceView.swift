@@ -91,7 +91,10 @@ final class TerminalSurfaceView: NSView {
     private var scrollbar: ScrollbarOverlay?
     private var scrollbarHideWork: DispatchWorkItem?
 
-    private let config = RendererConfig()
+    /// The renderer's knobs, with the config file applied. Read once, here,
+    /// for the reason `font` below is read once: the values decide how the
+    /// surface is built, and rebuilding it is not free.
+    private let config = AppConfig.renderer
     private lazy var scrollAccumulator = ScrollAccumulator(
         precisionMultiplier: config.scrollMultiplierPrecision,
         discreteMultiplier: config.scrollMultiplierDiscrete)
@@ -113,7 +116,22 @@ final class TerminalSurfaceView: NSView {
         // Top-left gravity means a resize doesn't stretch the last frame
         // while we draw the next one.
         layer?.contentsGravity = .topLeft
-        layer?.backgroundColor = Palette.background.cgColor
+        // Nothing at all once the terminal is translucent, and that is not
+        // an oversight. The renderer already paints this colour at
+        // `background-opacity` into every background pixel of the frame, so a
+        // second translucent fill *underneath* it does not make the terminal
+        // more visible -- it stacks: 0.9 over 0.9 composites to 0.99, and the
+        // breadcrumb above, which is a true 0.9, no longer matches the
+        // terminal it names. Measured as a visible seam across the top of the
+        // card.
+        //
+        // What this costs is the moment before the first frame, where an
+        // opaque terminal shows its background and a translucent one shows
+        // the desktop. That is the right way round: the see-through window is
+        // the one that was asked for.
+        layer?.backgroundColor =
+            config.backgroundOpacity >= 1 ? Palette.background.cgColor : nil
+        layer?.isOpaque = config.backgroundOpacity >= 1
     }
 
     required init?(coder: NSCoder) { fatalError("not supported") }
@@ -180,8 +198,14 @@ final class TerminalSurfaceView: NSView {
                 // answer, but there is nothing to render.
                 return
             }
+            // `config:` explicitly, and it has to be: the default argument is
+            // `RendererConfig()`, so a renderer built without it draws with
+            // the constants rather than with the config file. That is what
+            // made `background-opacity` do nothing at all — the view read it,
+            // used it for the layer's own colour, and never handed it to the
+            // thing that paints the background.
             let renderer = TerminalRenderer(
-                context: context, grid: grid, layer: layer, source: engine)
+                context: context, grid: grid, layer: layer, source: engine, config: config)
             renderer.onSnapshotFrame = { [weak self] moment in
                 Task { @MainActor in
                     guard let self else { return }
