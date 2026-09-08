@@ -101,6 +101,9 @@ final class TerminalController {
     /// Set once `ready()` has produced a terminal the engine adopted, so
     /// `snapshot_end` knows there is a decode to carry on with.
     private var readyDecoded = false
+    /// A size the server moved to while a snapshot was still being restored,
+    /// held until the last history page has landed. See `applyServerSize`.
+    private var deferredServerSize: (cols: UInt16, rows: UInt16)?
 
     /// The attach timeline, for the launch budget. `ready` to first frame is
     /// the number docs/CLIENT.md says must not vary with scrollback size: if
@@ -365,14 +368,10 @@ final class TerminalController {
         case .resized:
             // In stream order with `output`, which is what makes this the one
             // right moment: every byte before this frame was written for the
-            // old size and every byte after it for the new. The cell is ours
-            // to add — the server has no font, and the mirror's own size
-            // reports go nowhere anyway.
+            // old size and every byte after it for the new.
             guard let body = try? JSONDecoder().decode(ResizedBody.self, from: frame.payload)
             else { return }
-            engine.resize(
-                cols: body.cols, rows: body.rows,
-                cellWidth: size.cell.width, cellHeight: size.cell.height)
+            applyServerSize(cols: body.cols, rows: body.rows)
 
         case .exited:
             let code = (try? JSONDecoder().decode(ExitedBody.self, from: frame.payload))?.code ?? 0
@@ -410,6 +409,52 @@ final class TerminalController {
         String(format: "%.2fms", seconds * 1000)
     }
 
+    /// Reflow the mirror to a size the server's terminal has moved to.
+    ///
+    /// Held back while a snapshot is being restored, and that is not a nicety:
+    /// the decoder discards every history page whose width no longer matches
+    /// the terminal it is being prepended to, so a reflow in the middle of a
+    /// restore silently drops the rest of the scrollback that restore is
+    /// delivering. It is the same rule the server keeps for its own terminal —
+    /// `reflowLocked` in src/daemon/Terminal.zig — and keeping it on both
+    /// sides is what makes the two the same terminal: each parses the output
+    /// in between at the old width, and each reflows once its pages are in.
+    ///
+    /// A parked terminal is where this shows up. Its park file is at the size
+    /// it was parked at, a resize since then moved everything but the file, so
+    /// attaching hands the client the old size and a marker saying where it
+    /// went — arriving, by construction, while the snapshot is still being
+    /// restored.
+    ///
+    /// The cell is ours to add: the server has no font, and the mirror's own
+    /// size reports go nowhere anyway.
+    private func applyServerSize(cols: UInt16, rows: UInt16) {
+        guard restore == nil else {
+            // Only the last one matters. The server reflows to wherever the
+            // grid ended up rather than replaying each step it missed, so a
+            // mirror that queued them would end up somewhere else.
+            deferredServerSize = (cols, rows)
+            return
+        }
+        engine.resize(
+            cols: cols, rows: rows,
+            cellWidth: size.cell.width, cellHeight: size.cell.height)
+    }
+
+    /// The restore is over, so a size it was holding back can be applied.
+    ///
+    /// Called from every path that ends one, including the ones that end it
+    /// early — a snapshot that would not decode is still a restore that is not
+    /// going to deliver any more pages, and the mirror must not be left at a
+    /// size the server has left.
+    private func applyDeferredServerSize() {
+        guard let deferred = deferredServerSize else { return }
+        deferredServerSize = nil
+        engine.resize(
+            cols: deferred.cols, rows: deferred.rows,
+            cellWidth: size.cell.width, cellHeight: size.cell.height)
+    }
+
     /// Open a pipe for the snapshot the server is about to send.
     private func beginSnapshot() {
         // Before anything can free or replace the terminal a previous restore
@@ -425,6 +470,9 @@ final class TerminalController {
         restore = try? SnapshotRestore(stream: SnapshotStream())
         readyDecoded = false
         snapshotBytes = 0
+        // A size the last snapshot never got round to is not owed any more:
+        // this one arrives at whatever size the server's terminal is now.
+        deferredServerSize = nil
     }
 
     /// The server has passed the READY marker: everything needed to paint is
@@ -470,16 +518,22 @@ final class TerminalController {
             self.restore?.stream.abandon()
             self.restore = nil
             engine.clearPendingHistory()
+            applyDeferredServerSize()
             becameLive()
         }
     }
 
     /// The last history byte has arrived. Close the pipe and start prepending.
     private func endSnapshot() {
-        guard let restore else { return }
+        guard let restore else {
+            // No snapshot in flight, so nothing is holding a size back either.
+            applyDeferredServerSize()
+            return
+        }
         restore.stream.close()
         guard readyDecoded else {
             self.restore = nil
+            applyDeferredServerSize()
             return
         }
         restoreHistory(restore)
@@ -609,6 +663,9 @@ final class TerminalController {
                     // applied fewer rows than promised would otherwise leave a
                     // sliver of the bar pending for the terminal's lifetime.
                     self?.engine.clearPendingHistory()
+                    // Every page is in and they are all one width, so a resize
+                    // that arrived during the restore can move the mirror now.
+                    self?.applyDeferredServerSize()
                 }
                 Trace.log(
                     "terminal \(terminalID): restored \(restored) history pages, "

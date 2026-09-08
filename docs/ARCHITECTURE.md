@@ -272,14 +272,20 @@ PTY *after* the terminal lock is released, never under it: the master is a
 blocking descriptor, a child that has stopped reading fills the kernel's input
 queue in about a kilobyte, and a write blocked there with the lock held would
 park the reader thread — and with it every client of that terminal — behind a
-program that is not listening. And a *parked* terminal has no VT: a resize
-moves the PTY and tells the clients, and that is all it can do. The report is
-not written (there is no VT to ask whether the child wants one), and once the
-terminal unparks its VT keeps the park width. Waking it for the resize is the
-obvious fix and the wrong one — the history restore is at the park width and
-every page is discarded once the VT is reflowed under it, so a drag across an
-idle pane emptied its scrollback. The design that keeps both parking and the
-streaming attach is
+program that is not listening.
+
+And the reflow is the only part of step 2 that ever waits. It waits when there
+is no VT to reflow (the terminal is parked) and when one is being restored under
+(it is rehydrating); the winsize, the marker and the report go out either way —
+the report from the `in_band_size_reports` bit `park` kept, so a program that
+stopped handling `SIGWINCH` in a parked pane still hears about the drag — and
+the VT is reflowed once the last history page has landed. Reflowing it sooner is
+the obvious fix and the wrong one: libghostty's decoder discards every page
+whose width no longer matches, so a drag across an idle pane emptied its
+scrollback. An attach in between is served the snapshot at the size it is on
+disk, with a `resized` marker behind it: the client adopts the one and reflows
+to the other, holding that reflow until its own restore ends, for the same
+reason. See docs/PARKING.md and
 [#82](https://github.com/roberte777/illogical/issues/82).
 
 Step 1 is the one that matters. Ghostty has no step 3 because it has no second

@@ -110,6 +110,28 @@ pub const CellSize = struct {
     height: u32 = 0,
 };
 
+/// The two things about a VT that a parked terminal still has to answer for.
+///
+/// A parked terminal holds no terminal state in memory, and both of these are
+/// in the park file — but reading it back is the expensive thing parking
+/// exists to avoid, and a resize must not pay it. So they are kept here at
+/// park time, three fields' worth, and the file stays shut.
+const Parked = struct {
+    /// The grid the park file was encoded at.
+    ///
+    /// `cols`/`rows` move on while parked -- a resize sets the winsize and
+    /// tells the clients -- so this is the size of the snapshot rather than
+    /// the size of the terminal, and the two differing is exactly what an
+    /// attaching client has to be told about. See `attach`.
+    cols: u16 = 0,
+    rows: u16 = 0,
+    /// Whether the child had DEC mode 2048 on. The snapshot carries it (bit
+    /// 41 of the mode set), so this is what the VT would have said had it
+    /// been in memory to ask -- and it is what lets a parked resize write the
+    /// in-band size report the child is waiting for. See `reportSizeLocked`.
+    in_band_size_reports: bool = false,
+};
+
 /// Where this terminal's PTY master is being read, and by what.
 ///
 /// The two regimes are not an implementation detail, they are the shape of the
@@ -160,6 +182,12 @@ rows: u16,
 /// One cell in device pixels, as the client that last sized this terminal
 /// measures it. Zero when nobody has said -- the CLI has no font.
 cell: CellSize = .{},
+/// What a terminal with no VT in memory remembers about the one it had. Set
+/// by `park`, read while `residency == .parked`. See `Parked`.
+parked: Parked = .{},
+/// The scrollback bound this terminal was created with, kept for the one path
+/// that has to build a second VT: `recoverFromFailedUnparkLocked`.
+max_scrollback_bytes: ?usize,
 /// Bytes the VT owes the child: query replies, size reports. Produced under
 /// `mutex` by `writePtyEffect` and drained by `flushPtyWrites` once the lock
 /// is gone -- see the latter for why they cannot be written where they are
@@ -173,6 +201,19 @@ exit_code: ?i32 = null,
 /// Monotonic timestamp of the last PTY *read*. This — not general activity —
 /// is what drives parking. See docs/PARKING.md.
 last_read_ns: u64,
+/// Monotonic timestamp of the last thing that asked the child a question it is
+/// expected to answer with output. A resize, today: the winsize raises
+/// SIGWINCH and the mode 2048 report goes out, and a full-screen program
+/// repaints for the new size.
+///
+/// Separate from `last_read_ns` because that one has to keep meaning *reads*
+/// — a terminal being typed into that produces nothing must still park, which
+/// is the whole argument of docs/PARKING.md. This is the other half of it:
+/// `park.shouldPark` gives a terminal the full `park_after_ns` from here as
+/// well, so one that was resized a moment before the timer expired is not
+/// parked out from under the repaint it just asked for and immediately woken
+/// again by it.
+last_wake_ns: u64,
 /// Monotonic timestamp at which the last subscriber went away, or zero while
 /// one is attached. Drives the demotion delay in `park.ptyRegime`. Guarded by
 /// `mutex`, like the list it is derived from.
@@ -265,7 +306,9 @@ pub fn create(gpa: Allocator, opts: SpawnOptions) !*Terminal {
         .stream = undefined,
         .cols = opts.cols,
         .rows = opts.rows,
+        .max_scrollback_bytes = opts.max_scrollback_bytes,
         .last_read_ns = sys.monotonicNs(),
+        .last_wake_ns = sys.monotonicNs(),
         // Nobody is watching a terminal that has just been created, and the
         // clock starts now rather than at the first `unsubscribe`.
         .unobserved_since_ns = sys.monotonicNs(),
@@ -547,8 +590,10 @@ fn ingest(self: *Terminal, bytes: []const u8) void {
         // A read is exactly what unparks a terminal. Do it before applying, or
         // the bytes that woke us would be dropped on the floor.
         if (self.residency == .parked) {
-            self.unparkLocked() catch |err|
+            self.unparkLocked() catch |err| {
                 log.err("terminal {d} failed to unpark: {t}", .{ self.id, err });
+                self.recoverFromFailedUnparkLocked();
+            };
         }
         if (self.stream) |*stream| stream.nextSlice(bytes);
         self.last_read_ns = sys.monotonicNs();
@@ -684,6 +729,34 @@ pub fn attach(self: *Terminal, sub: Subscriber, snapshot_writer: *std.Io.Writer)
     // reach the client *behind* live output, and a client that applies output
     // before the snapshot it belongs after has a wrong screen.
     try snapshot_writer.flush();
+
+    // What we just sent is a terminal of a particular size, and it need not be
+    // the size this terminal is: a resize while parked moves the winsize and
+    // the clients and leaves the park file where it is, and one during a
+    // history restore leaves the VT where it is (`reflowLocked`). So the new
+    // subscriber is told, through the same callback a live resize uses -- it
+    // adopts the snapshot's size, and reflows to ours in stream order.
+    //
+    // Under the lock, and before this returns, for the reason the fan-out
+    // marker is: a resize cannot interleave here, so the size the client is
+    // left holding is the size the terminal is. Queued after the `attach` came
+    // back it could be overtaken by a real resize and would then walk the
+    // client's mirror backwards to a size the terminal has already left.
+    const snap = self.snapshotSizeLocked();
+    if (snap.cols != self.cols or snap.rows != self.rows) {
+        if (sub.resizeFn) |f| f(sub.ctx, self.id, self.cols, self.rows);
+    }
+}
+
+/// The grid of the snapshot `attach` and `serveSnapshot` would write right now:
+/// the VT's own size when there is one in memory, and the park file's when
+/// there is not.
+///
+/// Read off the VT rather than off `cols`/`rows`, because the whole point is
+/// the case where the two disagree.
+fn snapshotSizeLocked(self: *Terminal) struct { cols: u16, rows: u16 } {
+    if (self.vt) |*vt| return .{ .cols = vt.cols, .rows = vt.rows };
+    return .{ .cols = self.parked.cols, .rows = self.parked.rows };
 }
 
 pub fn subscribe(self: *Terminal, sub: Subscriber) !void {
@@ -748,6 +821,12 @@ pub fn writeInput(self: *Terminal, bytes: []const u8) !void {
 /// it keeps painting the grid it started with, which a shrinking window chops
 /// and a growing one never restores. libghostty-vt documents the difference on
 /// `Handler.resize`; the raw call has no way to reach `write_pty`.
+///
+/// All three go out whether or not this terminal has a VT in memory, which is
+/// the property #82 is about: a parked terminal is a terminal, and a program
+/// inside one that asked for reports gets them. Only the reflow can wait, and
+/// only for as long as a history restore is arriving under it. See
+/// `resizeLocked` and `reflowLocked`.
 pub fn resize(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
     const result = blk: {
         self.mutex.lock();
@@ -769,18 +848,20 @@ fn resizeLocked(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
     const cell_changed = cell.width != self.cell.width or cell.height != self.cell.height;
     if (!grid_changed and !cell_changed) return;
     self.cell = cell;
-    // Parked, there is no VT: the PTY and the clients move, and the VT does
-    // not. That is a known gap, not a design. Waking the terminal here loses
-    // its scrollback (the history restore is at the park width and every
-    // page is discarded once the VT is reflowed under it), and the honest
-    // fix -- remember the mode 2048 bit at park time so the report can be
-    // written without a VT, reflow once the restore is done, send the marker
-    // after a park-file snapshot -- is its own change. Until then a program
-    // in a parked terminal that asked for reports gets none until something
-    // makes it speak, and the server's terminal keeps the park width once it
-    // does. See the issue named in docs/PARKING.md.
+    // Three of the four notifications happen here whatever state this terminal
+    // is in: the winsize below, the marker at the bottom, and the report just
+    // here. Only the reflow has a reason to wait, and there are two of them.
+    //
+    // Parked, there is no VT to reflow: it is on disk at the park width, and
+    // it catches up at `unpark`. Rehydrating, there is one, and reflowing it
+    // is precisely what must not happen -- libghostty's decoder discards every
+    // history page whose width no longer matches the terminal it is being
+    // prepended to, so a reflow under a running restore empties the scrollback
+    // it is in the middle of delivering. That is what a drag across an idle
+    // pane used to do, and why waking a terminal on resize was reverted in
+    // #81. `reflowLocked` does it when the last page has landed instead.
     if (self.stream) |*stream| {
-        if (grid_changed) {
+        if (grid_changed and self.residency != .rehydrating) {
             try stream.handler.resize(.{
                 .cols = cols,
                 .rows = rows,
@@ -790,12 +871,19 @@ fn resizeLocked(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
                 .cell_size_px = .{ .width = cell.width, .height = cell.height },
             });
         } else {
-            // The grid held and the cell moved: a window dragged onto a
-            // display of another scale. Nothing to reflow, but the pixel
-            // size a program was told is now wrong, and it has to hear the
-            // new one from the same place it heard the old one.
-            self.reportSizeLocked(stream);
+            // A reflow that is waiting for a restore, or a grid that held
+            // while the cell moved -- a window dragged onto a display of
+            // another scale. Either way the size a program was told is now
+            // wrong, and it has to hear the new one from the same place it
+            // heard the old one.
+            self.reportSizeLocked(cols, rows);
         }
+    } else {
+        // Parked: the report is written from the mode bit `park` kept, with
+        // no VT anywhere in it. Without this a program that asked for reports
+        // and stopped handling SIGWINCH for them -- Neovim -- learns nothing
+        // from a resize until something else makes it speak.
+        self.reportSizeLocked(cols, rows);
     }
     try self.pty_pair.setSize(.{
         .cols = cols,
@@ -805,6 +893,9 @@ fn resizeLocked(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
     });
     self.cols = cols;
     self.rows = rows;
+    // A resize is a question, and the child gets the whole of `park_after_ns`
+    // to answer it. See `last_wake_ns`.
+    self.last_wake_ns = sys.monotonicNs();
     // Under the lock, so it lands in every client's stream exactly where the
     // size changed: after the last output parsed at the old size, before the
     // first at the new. The reader thread cannot be fanning out right now --
@@ -817,20 +908,64 @@ fn resizeLocked(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
     }
 }
 
-/// The mode 2048 report for the size the terminal already is, if the child
-/// asked for reports. What `Handler.resize` would have written had the grid
-/// changed, without the reflow that would have come with it.
-fn reportSizeLocked(self: *Terminal, stream: *ghostty.TerminalStream) void {
-    if (!stream.handler.terminal.modes.get(.in_band_size_reports)) return;
+/// The mode 2048 report for a size this terminal is moving to, if the child
+/// asked for reports. What `Handler.resize` would have written, without the
+/// reflow that comes with it.
+///
+/// The size is passed rather than read off `self`, because two of the three
+/// callers are mid-resize: the fields are updated after the notifications go
+/// out, and a report quoting the size we are leaving is worse than none.
+///
+/// Whether the child asked comes from the VT when there is one and from
+/// `parked` when there is not. That is the only difference parking makes
+/// here -- the report itself is bytes, and encoding them needs no terminal.
+fn reportSizeLocked(self: *Terminal, cols: u16, rows: u16) void {
+    const enabled = if (self.stream) |*stream|
+        stream.handler.terminal.modes.get(.in_band_size_reports)
+    else
+        self.parked.in_band_size_reports;
+    if (!enabled) return;
+
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     ghostty.size_report.encode(&writer, .mode_2048, .{
-        .rows = self.rows,
-        .columns = self.cols,
+        .rows = rows,
+        .columns = cols,
         .cell_width = self.cell.width,
         .cell_height = self.cell.height,
     }) catch return;
     self.queuePtyWrite(buf[0..writer.end]);
+}
+
+/// Catch the VT up to the size the rest of the terminal has already moved to.
+///
+/// The other half of the deferral in `resizeLocked`: a resize that arrived
+/// while history was still being restored left the VT alone, so that no page
+/// was discarded for being the wrong width. Every page is in by the time this
+/// runs, so the reflow is one operation on the whole terminal -- the same one
+/// the client's mirror makes when its own restore ends, over the same content.
+///
+/// No report goes with it. The child was told the new size when it was asked
+/// for, which is where a program expects to hear it; repeating it here would
+/// be a second report for a resize that has already happened.
+///
+/// Caller holds `mutex`.
+fn reflowLocked(self: *Terminal) void {
+    const vt = &(self.vt orelse return);
+    if (vt.cols == self.cols and vt.rows == self.rows) return;
+    vt.resize(self.gpa, .{
+        .cols = self.cols,
+        .rows = self.rows,
+        .cell_size_px = .{ .width = self.cell.width, .height = self.cell.height },
+    }) catch |err| {
+        // The PTY, the child and every client are already at the new size, so
+        // this is the one replica left behind: it renders and snapshots at the
+        // old width until the next resize, which is bad but is not a terminal
+        // that has stopped working.
+        log.warn("terminal {d}: could not catch the vt up to {d}x{d}: {t}", .{
+            self.id, self.cols, self.rows, err,
+        });
+    };
 }
 
 /// A grid dimension in pixels, for a `winsize`.
@@ -995,6 +1130,15 @@ pub fn ptyReadIdleNs(self: *Terminal) u64 {
     return if (now > self.last_read_ns) now - self.last_read_ns else 0;
 }
 
+/// Nanoseconds since this terminal last asked its child something. See
+/// `last_wake_ns`; `park.shouldPark` takes it alongside the read idle time.
+pub fn wakeIdleNs(self: *Terminal) u64 {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const now = sys.monotonicNs();
+    return if (now > self.last_wake_ns) now - self.last_wake_ns else 0;
+}
+
 pub fn summary(self: *Terminal) session.TerminalSummary {
     self.mutex.lock();
     const residency = self.residency;
@@ -1131,6 +1275,16 @@ pub fn park(self: *Terminal) !void {
     }
     try cwd.rename(staging, cwd, final, self.io);
 
+    // What the file on disk is, and what the child asked for, before the only
+    // copy of either goes away. Both are *in* the snapshot; keeping them here
+    // is what lets a resize while parked answer without opening it. See
+    // `Parked`.
+    if (self.vt) |*vt| self.parked = .{
+        .cols = vt.cols,
+        .rows = vt.rows,
+        .in_band_size_reports = vt.modes.get(.in_band_size_reports),
+    };
+
     if (self.stream) |*stream| stream.deinit();
     if (self.vt) |*vt| vt.deinit(self.gpa);
     self.stream = null;
@@ -1235,8 +1389,45 @@ fn unparkLocked(self: *Terminal) !void {
         self.residency = .live;
         self.rehydration = null;
         rehydration.destroy();
+        // There is no restore left to protect, so a resize that came in while
+        // this terminal was parked applies now rather than never.
+        self.reflowLocked();
         return;
     };
+}
+
+/// A park file we cannot read is the end of a terminal's history, not the end
+/// of the terminal.
+///
+/// Reachable for real: the park store is a directory under
+/// `$XDG_STATE_HOME`, and something that clears it while the daemon is running
+/// leaves every parked terminal with a snapshot path that opens with `ENOENT`.
+/// Left as it was, such a terminal stays `parked` forever with no VT -- every
+/// byte its child writes is fanned out to the clients and applied to nothing,
+/// every read logs the same failure, and every attach serves a file that is no
+/// longer there. So it starts again, empty, at the size the terminal is now:
+/// the scrollback was already gone with the file, and this is the difference
+/// between losing it and losing the session.
+///
+/// Caller holds `mutex`.
+fn recoverFromFailedUnparkLocked(self: *Terminal) void {
+    self.vt = ghostty.Terminal.init(self.tiny_io.io(), self.gpa, .{
+        .cols = self.cols,
+        .rows = self.rows,
+        .max_scrollback_bytes = self.max_scrollback_bytes,
+    }) catch |err| {
+        // Out of memory, which the next read will try again for.
+        log.err("terminal {d}: no terminal to recover into: {t}", .{ self.id, err });
+        return;
+    };
+    self.stream = .init(.{
+        .allocator = self.gpa,
+        .handler = self.vt.?.vtHandler(),
+        .continuation_max_bytes = max_continuation_bytes,
+    });
+    self.stream.?.handler.effects = effects;
+    self.residency = .live;
+    log.warn("terminal {d}: park file unreadable; continuing without its history", .{self.id});
 }
 
 /// Phase 2: prepend history pages, newest first, off the critical path.
@@ -1262,7 +1453,13 @@ fn restoreHistory(r: *Rehydration) void {
     }
 
     self.mutex.lock();
-    if (self.residency == .rehydrating) self.residency = .live;
+    if (self.residency == .rehydrating) {
+        self.residency = .live;
+        // Every page is in and they are all the width the grid is, so a resize
+        // that arrived during the restore can finally move the VT. See
+        // `reflowLocked`.
+        self.reflowLocked();
+    }
     self.rehydration = null;
     self.mutex.unlock();
     r.destroy();
@@ -2521,10 +2718,10 @@ test "a resize while parked moves the PTY and the clients, and leaves the termin
     try t.park();
     try testing.expect(t.vt == null);
 
-    // What is promised while parked: the kernel and every client learn the
-    // size, and nothing is woken for it -- waking here is what loses the
-    // scrollback. The VT catching up is the open item the comment in
-    // `resizeLocked` names.
+    // The kernel and every client learn the size, and nothing is woken for it
+    // -- waking here is what loses the scrollback (#81). The VT catches up
+    // when the terminal next unparks; the two tests below are about that half
+    // and about the report the child gets in the meantime.
     try t.resize(120, 40, .{});
     try testing.expect(t.vt == null);
     try testing.expectEqual(session.Residency.parked, t.summary().residency);
@@ -2533,6 +2730,263 @@ test "a resize while parked moves the PTY and the clients, and leaves the termin
     try testing.expectEqual(@as(u16, 40), ws.rows);
     try testing.expectEqual(@as(usize, 1), seen.n);
     try testing.expectEqual(@as(u16, 120), seen.cols);
+}
+
+test "a resize while parked is reported in band, from the mode bit the park kept" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-park-report-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    // The same handshake as the live in-band test, with a park in the middle.
+    // Neovim asks for mode 2048 and then stops handling SIGWINCH, so a parked
+    // pane it is running in learns nothing at all from a drag unless the
+    // report goes out without a VT to write it from -- which is what the mode
+    // bit `park` keeps is for.
+    //
+    // 35 bytes is both reports again: one for enabling the mode, at the size
+    // the terminal already was, and one for the resize that happens while the
+    // terminal is on disk.
+    const script =
+        \\stty raw -echo
+        \\printf '\033[?2048h'
+        \\printf 'ARMED'
+        \\R=$(dd bs=1 count=35 2>/dev/null | od -An -c | tr -d ' \n')
+        \\printf 'SIZE<%s>' "$R"
+        \\sleep 10
+    ;
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = root },
+        .id = 1,
+        .session_id = 1,
+        .name = "park-inband",
+        .argv = &.{ "/bin/sh", "-c", script },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    // As in the live test: without a report this child sits in `dd` forever,
+    // and SIGHUP is what turns that hang into a five-second failure.
+    defer t.hangup();
+    try t.start();
+
+    try awaitMarker(t, gpa, "ARMED");
+    try t.park();
+    try testing.expect(t.vt == null);
+
+    try t.resize(120, 40, .{ .width = 8, .height = 16 });
+    // Still parked: the report is written to the PTY, not through a terminal.
+    try testing.expectEqual(session.Residency.parked, t.summary().residency);
+
+    // The child answers, which is what unparks it -- so this also pins that
+    // the reply to a parked resize arrives at a terminal that is coming back.
+    try awaitMarker(t, gpa, "SIZE<033[48;24;80;0;0t033[48;40;120;640;960t>");
+}
+
+test "a resize while parked reaches the VT when the history restore lands" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-park-reflow-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    // Scrollback worth losing, then a pause long enough to park and resize
+    // inside, then a line that wakes it. Every line is short enough not to
+    // wrap at either width, so the row count is the same terminal before and
+    // after the reflow and any drop in it is pages that were thrown away.
+    const script =
+        \\awk 'BEGIN{for(i=0;i<500;i++) print "LINE " i}'
+        \\sleep 2
+        \\printf 'AWAKE\n'
+        \\sleep 10
+    ;
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = root },
+        .id = 1,
+        .session_id = 1,
+        .name = "park-reflow",
+        .argv = &.{ "/bin/sh", "-c", script },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    defer t.hangup();
+    try t.start();
+    try awaitMarker(t, gpa, "LINE 499");
+
+    const before = scrollbackRows(t);
+    try testing.expect(before > 400);
+
+    try t.park();
+    try t.resize(120, 40, .{});
+
+    // The child's next line unparks it; the history restore follows on its own
+    // thread, and the reflow waits for the end of it.
+    try awaitMarker(t, gpa, "AWAKE");
+    var settle: usize = 0;
+    while (settle < 5000) : (settle += 10) {
+        if (t.summary().residency == .live) break;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    } else return error.NeverBecameLive;
+
+    // The VT is the size everything else has been since the resize...
+    t.mutex.lock();
+    const vt_cols = t.vt.?.cols;
+    const vt_rows = t.vt.?.rows;
+    t.mutex.unlock();
+    try testing.expectEqual(@as(u16, 120), vt_cols);
+    try testing.expectEqual(@as(u16, 40), vt_rows);
+
+    // ...and it still has the scrollback. Reflowing at unpark instead -- the
+    // obvious fix, reverted in #81 -- leaves a handful of rows here: every
+    // history page whose width no longer matches is discarded as it arrives.
+    try testing.expect(scrollbackRows(t) > 400);
+}
+
+test "a resize during a history restore waits for it" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    const t = try Terminal.create(gpa, .{
+        .io = threaded.io(),
+        .store = .{ .root = "/tmp/illogical-unused" },
+        .id = 1,
+        .session_id = 1,
+        .name = "rehydrating",
+        .argv = &.{ "/bin/sh", "-c", "sleep 10" },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    defer t.hangup();
+    try t.start();
+
+    // The residency is set by hand rather than by racing a real restore: what
+    // is being pinned is a rule about a window, and a test that has to win a
+    // race to be inside it fails for the wrong reason on a busy machine.
+    t.mutex.lock();
+    t.residency = .rehydrating;
+    t.mutex.unlock();
+
+    var seen = Resizes{};
+    try t.subscribe(seen.subscriber());
+    try t.resize(120, 40, .{});
+
+    // Everything that is not the VT has moved: the kernel, the clients, and
+    // the child's own idea of its size.
+    const ws = t.pty_pair.getSize() orelse return error.NoWinsize;
+    try testing.expectEqual(@as(u16, 120), ws.cols);
+    try testing.expectEqual(@as(usize, 1), seen.n);
+    try testing.expectEqual(@as(u16, 120), seen.cols);
+
+    // The VT has not, because reflowing it under a restore is what discards
+    // the pages that restore is delivering.
+    t.mutex.lock();
+    const during = t.vt.?.cols;
+    t.mutex.unlock();
+    try testing.expectEqual(@as(u16, 80), during);
+
+    // And the last page landing is what moves it -- the tail `restoreHistory`
+    // runs, here without the thread that would have run it.
+    t.mutex.lock();
+    t.residency = .live;
+    t.reflowLocked();
+    const after_cols = t.vt.?.cols;
+    const after_rows = t.vt.?.rows;
+    t.mutex.unlock();
+    try testing.expectEqual(@as(u16, 120), after_cols);
+    try testing.expectEqual(@as(u16, 40), after_rows);
+}
+
+test "attaching to a parked terminal at another size is told where the size went" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/illogical-park-attach-size-{d}", .{std.c.getpid()});
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    const marker = "PARKED_ATTACH_SIZE";
+    const t = try Terminal.create(gpa, .{
+        .io = io,
+        .store = .{ .root = root },
+        .id = 1,
+        .session_id = 1,
+        .name = "park-attach-size",
+        .argv = &.{ "/bin/sh", "-c", "printf '" ++ marker ++ "\\n'; sleep 10" },
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.destroy();
+    defer t.hangup();
+    try t.start();
+    try awaitMarker(t, gpa, marker);
+    try t.park();
+
+    // A client arriving at the size the park file is already at has nothing to
+    // be told: it decodes the snapshot and is right.
+    var same: std.ArrayList(u8) = .empty;
+    defer same.deinit(gpa);
+    var same_aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &same);
+    defer same_aw.deinit();
+    var quiet = Resizes{};
+    try t.attach(quiet.subscriber(), &same_aw.writer);
+    try testing.expectEqual(@as(usize, 0), quiet.n);
+    t.unsubscribe(&quiet);
+
+    // Now the pane is dragged while nobody is watching it, and a client
+    // attaches at the new size. The park file is still 80x24 -- serving it is
+    // what makes attach cost the same whatever the scrollback is -- so the
+    // client is handed the old size and told, in stream order, where it went.
+    try t.resize(120, 40, .{});
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &buf);
+    defer aw.deinit();
+    var seen = Resizes{};
+    try t.attach(seen.subscriber(), &aw.writer);
+
+    try testing.expectEqual(@as(usize, 1), seen.n);
+    try testing.expectEqual(@as(u16, 120), seen.cols);
+    try testing.expectEqual(@as(u16, 40), seen.rows);
+    // Served from disk, and still parked: an attach that told the client
+    // something must not have woken anything to do it.
+    try testing.expectEqualStrings("GHOSTSNP", aw.written()[0..8]);
+    try testing.expectEqual(session.Residency.parked, t.summary().residency);
+    try testing.expect(t.vt == null);
+}
+
+/// Rows of scrollback this terminal is holding.
+///
+/// The number a reflow under a running history restore quietly takes away, so
+/// the tests that are about the order of those two operations watch it.
+fn scrollbackRows(t: *Terminal) usize {
+    t.mutex.lock();
+    defer t.mutex.unlock();
+    const vt = &(t.vt orelse return 0);
+    const bar = vt.screens.active.pages.scrollbar();
+    return bar.total - bar.len;
 }
 
 /// A subscriber that remembers the last size it was told and how often.
