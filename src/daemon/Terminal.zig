@@ -761,9 +761,21 @@ pub fn resize(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
 }
 
 fn resizeLocked(self: *Terminal, cols: u16, rows: u16, cell: CellSize) !void {
+    // Before anything is touched, and before a parked terminal is woken for
+    // it: libghostty refuses the same value, and a client that sent it must
+    // not get a zero-column winsize out of the refusal.
+    if (cols == 0 or rows == 0) return error.InvalidValue;
     const grid_changed = cols != self.cols or rows != self.rows;
     const cell_changed = cell.width != self.cell.width or cell.height != self.cell.height;
     if (!grid_changed and !cell_changed) return;
+    // A resize wakes a parked terminal. There is no VT on disk to reflow and
+    // no mode 2048 report to send from there -- and a child that asked for
+    // reports ignores the SIGWINCH the winsize would raise, so it would never
+    // speak, never trigger the read that unparks, and never learn of the
+    // resize at all. Idle Neovim parks by default; this was "drag the window,
+    // nothing happens until you press a key". Someone is looking at this
+    // terminal, which is the opposite of the idleness parking is for.
+    if (self.residency == .parked) try self.unparkLocked();
     self.cell = cell;
     if (self.stream) |*stream| {
         if (grid_changed) {
@@ -843,28 +855,49 @@ fn pixels(cells: u16, cell_px: u32) u16 {
 /// reason; a report the daemon volunteers on a client's behalf, on a client's
 /// thread, has no better claim on the lock than a keystroke does.
 ///
-/// Serialised by `pty_write_mutex` so that two threads draining at once keep
-/// the chunks in the order they were produced. A thread that blocks here
-/// blocks only itself -- the same thing a keystroke to that child would do.
+/// One thread drains at a time, and nobody waits for it. `pty_write_mutex`
+/// is only ever *tried*: a thread that finds it held leaves its bytes for the
+/// holder, who keeps draining until the queue is empty and then looks once
+/// more after letting go, for anything queued in between. So the reader
+/// thread -- which flushes after every chunk -- can never be parked behind a
+/// client thread that is blocked in `write` on a child that is not reading.
+/// A thread that blocks here blocks only itself, the same thing a keystroke
+/// to that child would do, and it blocks holding nothing the reader needs.
 fn flushPtyWrites(self: *Terminal) void {
-    self.pty_write_mutex.lock();
-    defer self.pty_write_mutex.unlock();
+    while (true) {
+        if (!self.pty_write_mutex.tryLock()) return;
+        self.drainPtyWrites();
+        self.pty_write_mutex.unlock();
+        // A producer that queued after the last look and found the lock held
+        // has left it to us. If there is anything, go round again.
+        self.mutex.lock();
+        const more = self.pty_out.items.len != 0;
+        self.mutex.unlock();
+        if (!more) return;
+    }
+}
 
-    self.mutex.lock();
-    var out = self.pty_out;
-    self.pty_out = .empty;
-    self.mutex.unlock();
-    defer out.deinit(self.gpa);
-
-    if (out.items.len == 0) return;
-    sys.writeAll(self.pty_pair.master, out.items) catch |err| {
-        log.warn("terminal {d}: failed writing to the pty: {t}", .{ self.id, err });
-    };
+/// Caller holds `pty_write_mutex`. Takes `mutex` only to swap the queue out,
+/// never across the write.
+fn drainPtyWrites(self: *Terminal) void {
+    while (true) {
+        self.mutex.lock();
+        var out = self.pty_out;
+        self.pty_out = .empty;
+        self.mutex.unlock();
+        defer out.deinit(self.gpa);
+        if (out.items.len == 0) return;
+        sys.writeAll(self.pty_pair.master, out.items) catch |err| {
+            log.warn("terminal {d}: failed writing to the pty: {t}", .{ self.id, err });
+        };
+    }
 }
 
 /// Caller holds `mutex`. Bounded, because a child that never reads again
-/// would otherwise collect every report it was ever sent; past the bound the
-/// newest is the one worth keeping, and a report is superseded by the next.
+/// would otherwise collect every report it was ever sent. Past the bound the
+/// incoming bytes are the ones dropped: a child that has not read 64 KiB of
+/// its own replies is not waiting on one more, and the next resize sends a
+/// fresh report either way.
 fn queuePtyWrite(self: *Terminal, data: []const u8) void {
     const max_pty_out = 64 * 1024;
     if (self.pty_out.items.len + data.len > max_pty_out) {
@@ -1079,9 +1112,14 @@ pub fn park(self: *Terminal) !void {
 /// Restore from disk. Returns once the terminal is renderable; history pages
 /// keep arriving on a background thread.
 pub fn unpark(self: *Terminal) !void {
-    self.mutex.lock();
-    defer self.mutex.unlock();
-    return self.unparkLocked();
+    const result = blk: {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        break :blk self.unparkLocked();
+    };
+    // Replaying the parked tail can answer a query the child had in flight.
+    self.flushPtyWrites();
+    return result;
 }
 
 fn unparkLocked(self: *Terminal) !void {
@@ -1155,22 +1193,6 @@ fn unparkLocked(self: *Terminal) !void {
     switch (decoded.continuation) {
         .ground => {},
         .bytes => |bytes| self.stream.?.nextSlice(bytes),
-    }
-
-    // Sized while it was on disk? `resize` had no VT to reflow then: it moved
-    // the PTY, told every client, and left this for here. Without it the
-    // server would parse the child's repaint -- drawn for the new width,
-    // because the winsize already said so -- into a grid of the old one, and
-    // the clients, sized from the marker, would disagree with it for good.
-    if (self.vt.?.cols != self.cols or self.vt.?.rows != self.rows) {
-        self.stream.?.handler.resize(.{
-            .cols = self.cols,
-            .rows = self.rows,
-            .cell_size_px = .{ .width = self.cell.width, .height = self.cell.height },
-        }) catch |err| log.warn(
-            "terminal {d}: unparked at {d}x{d}, could not reach {d}x{d}: {t}",
-            .{ self.id, self.vt.?.cols, self.vt.?.rows, self.cols, self.rows, err },
-        );
     }
 
     self.residency = .rehydrating;
@@ -2434,7 +2456,7 @@ test "a resize tells every subscriber the new size, and a repeat tells nobody" {
     try testing.expectEqual(@as(u16, 480), ws.height_px);
 }
 
-test "a terminal resized while parked unparks at the new size" {
+test "a resize wakes a parked terminal, and every client hears the new size" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
@@ -2462,17 +2484,26 @@ test "a terminal resized while parked unparks at the new size" {
     try t.start();
     try awaitMarker(t, gpa, marker);
 
+    var seen = Resizes{};
+    try t.subscribe(seen.subscriber());
+
     try t.park();
     try testing.expect(t.vt == null);
 
-    // No VT to reflow: the PTY and the clients move, and the VT owes a size.
-    try t.resize(120, 40, .{});
-    try testing.expectEqual(@as(u16, 120), t.cols);
+    // The same size is not a reason to wake anything.
+    try t.resize(80, 24, .{});
+    try testing.expect(t.vt == null);
+    try testing.expectEqual(@as(usize, 0), seen.n);
 
-    try t.unpark();
+    // A new one is: there is a VT again, it is that size, and the marker
+    // went out from the point where the server's terminal changed.
+    try t.resize(120, 40, .{});
     const vt = &(t.vt orelse return error.StillParked);
     try testing.expectEqual(@as(u16, 120), vt.cols);
     try testing.expectEqual(@as(u16, 40), vt.rows);
+    try testing.expect(t.summary().residency != .parked);
+    try testing.expectEqual(@as(usize, 1), seen.n);
+    try testing.expectEqual(@as(u16, 120), seen.cols);
 }
 
 /// A subscriber that remembers the last size it was told and how often.

@@ -44,8 +44,9 @@ struct BodyTests {
     @Test("the geometry bodies spell the cell the way the server reads it")
     func geometryKeys() throws {
         // Snake case, and the same four keys on both: the Zig `Resize` and
-        // `Attach` structs' field names are the keys, and `cellWidth` on its
-        // own would be a frame the daemon rejects at parse time.
+        // `Attach` structs' field names are the keys. A `cellWidth` would not
+        // be refused -- version 2 reads past a key it does not know -- it
+        // would be read as no cell at all, which is quieter and worse.
         for json in [
             try keyedJSON(ResizeBody(cols: 100, rows: 30, cellWidth: 8, cellHeight: 16)),
             try keyedJSON(AttachBody(cols: 100, rows: 30, cellWidth: 8, cellHeight: 16)),

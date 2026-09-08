@@ -988,18 +988,25 @@ final class HangUpServer: @unchecked Sendable {
             _held.append(fd)
         }
 
+        /// The threads reading held sockets. `releaseHeld` waits for them
+        /// between shutting a socket down and closing it: a close while a
+        /// reader has yet to enter `read` frees the descriptor number for the
+        /// next test's socket, and the stray reader then eats that socket's
+        /// hello.
+        let readers = DispatchGroup()
+
         func releaseHeld() {
             lock.lock()
             let fds = _held
             _held = []
             lock.unlock()
-            for fd in fds {
-                // A reader may be blocked on it (`errorThenHold` keeps one);
-                // `close` alone does not reliably wake that thread, `shutdown`
-                // does.
-                Darwin.shutdown(fd, SHUT_RDWR)
-                Darwin.close(fd)
-            }
+            // Shut down first: that is what wakes a reader blocked on the
+            // socket, or makes one that has not started yet return at once.
+            // Close only once every reader has left, so the number cannot be
+            // reused under one.
+            for fd in fds { Darwin.shutdown(fd, SHUT_RDWR) }
+            readers.wait()
+            for fd in fds { Darwin.close(fd) }
         }
 
         var accepted: Int {
@@ -1100,7 +1107,11 @@ final class HangUpServer: @unchecked Sendable {
                     // reattach on it wants the attach it sends recorded, and
                     // the accept loop must not be the thread that waits for
                     // it: the same tests open a second connection meanwhile.
-                    Thread.detachNewThread { _ = Self.readFrames(client, state, count: .max) }
+                    state.readers.enter()
+                    Thread.detachNewThread {
+                        defer { state.readers.leave() }
+                        _ = Self.readFrames(client, state, count: .max)
+                    }
                 } else {
                     Darwin.close(client)
                 }

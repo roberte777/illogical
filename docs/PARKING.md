@@ -39,6 +39,12 @@ So a terminal that is attached, focused, and being typed into is **still parked*
 if the child is producing no output. Our `park.shouldPark` must key on
 `last_pty_read_ns`, never on a general "activity" timestamp.
 
+One thing does wake it besides a read: a resize. There is no VT on disk to
+reflow or to answer a mode 2048 size report from, and a program that asked for
+those reports ignores the SIGWINCH the new winsize raises — so it would never
+speak, never cause the read that unparks, and never learn its window changed.
+See [ARCHITECTURE.md](ARCHITECTURE.md#data-flow-resize).
+
 ### Lifecycle
 
 ```
