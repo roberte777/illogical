@@ -115,6 +115,14 @@ struct IllogicalApp: App {
                 // the app on something most windows, which have one machine in
                 // them, never reach for at all.
                 //
+                // And deliberately not the ⇧⌘K the line above has just freed,
+                // tempting as an empty slot beside its own menu item is. A
+                // submenu of per-host toggles has no single action for a chord
+                // to fire, and ⇧⌘K meant "open the session dropdown" for the
+                // whole life of that chord — giving it one release later to
+                // something that moves the window to another machine turns a
+                // habit into a teleport. It stays fallow.
+                //
                 // `Toggle` rather than `Button`, for the checkmark: it is the
                 // only thing in the menu that says which machine you are on,
                 // and macOS draws it for a toggle without being asked.

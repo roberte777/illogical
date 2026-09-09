@@ -92,14 +92,18 @@ own complaint with a Try Again that dials that machine alone.
 The window remembers the session last in front **on each host**, so coming back
 to a machine lands where you left it rather than on its first session. Across
 launches it remembers one thing: the machine, and the *name* of the session in
-front. The name and not the id, because `next_session_id` is a daemon's
+front on it. The name and not the id, because `next_session_id` is a daemon's
 in-memory counter and a machine that has rebooted renumbers everything it still
-has. It is written through as it changes, since there is no termination hook in
-this app and a write at exit is one a force-quit loses. The window opens on that
-machine immediately — showing the empty screen for the length of the handshake,
-rather than opening on the local daemon and yanking itself away a second later —
-and lands on the session when the machine answers. Anything you select first
-voids the restore.
+has. The name is simply absent when nothing was in front — end the day on a
+machine with no sessions and you reopen on that machine's empty screen, which is
+the same claim as the rest of this section, that an empty machine is a place the
+window can be. It is written through as it changes, since there is no
+termination hook in this app and a write at exit is one a force-quit loses. The
+window opens on that machine immediately — showing the empty screen for the
+length of the handshake, rather than opening on the local daemon and yanking
+itself away a second later — and lands on the session when the machine answers.
+Any explicit move you make first voids the restore, whether it lands on a tab or
+on an empty machine.
 
 Hosts are remembered in `UserDefaults`, and there is no credential among them:
 `ssh` reads the user's own config, so a `Host` alias out of it is a perfectly

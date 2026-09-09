@@ -30,17 +30,30 @@ final class SessionStore {
     /// perfectly good answer to a question nobody asked and sent ⌘T to a
     /// machine nothing on screen named.
     ///
-    /// Always one of `hosts`: set at init, moved by the selection funnel below,
-    /// and put back by `removeHost` when the machine it names is forgotten.
+    /// Always one of `hosts`: set at init, moved by the selection funnel below
+    /// and by `switchHost`, which is also what `removeHost` goes through when
+    /// the machine it names is forgotten. The one exception is a store built
+    /// with no hosts at all, where `init`'s last fallback names a local daemon
+    /// that is not in the list — see there for why that is unreachable in the
+    /// app and worth having anyway.
     private(set) var currentHost: ServerHost
 
     /// The session last in front on each machine, so that coming back to one
     /// lands where you left it rather than on its first tab.
     ///
-    /// Never pruned. An entry for a session that has since been deleted costs
-    /// a `SessionRef`, and `switchHost` validates it against the host's own
-    /// list before using it; pruning would mean walking this on every list from
+    /// Never pruned, and checked at use rather than trusted: an entry for a
+    /// session that has since been deleted costs a `SessionRef`, and both
+    /// readers — `switchHost` and `selectedSession` — first check the host
+    /// still lists the id. Pruning would mean walking this on every list from
     /// every host to save nothing anybody can measure.
+    ///
+    /// That check is existence, not identity. Ids come from an in-memory
+    /// counter (see `FrontSession`), so a daemon that restarted mid-run can
+    /// hand a remembered id to a different session, and coming back lands
+    /// there — a real session on the right machine, which is all an in-process
+    /// memory promises, and the entry is rewritten the moment a tab there is
+    /// selected. Across a *relaunch* an id is no use at all, which is why what
+    /// survives one is a name.
     private var lastSession: [ServerHost: SessionRef] = [:]
 
     /// Tabs, each a layout of panes. A tab is not a terminal: splitting adds
@@ -52,12 +65,14 @@ final class SessionStore {
     /// The tab in front, or nil when the machine you are on has nothing to
     /// show.
     ///
-    /// The `didSet` is the one funnel selecting a tab goes through, and it is a
-    /// `didSet` rather than a `select(_:)` method because this is written
-    /// directly from the tab strip, the dropdown, the menu bar, the split reply
-    /// and the tests — a call site that forgot the method would leave the
-    /// toolbar naming one machine while ⌘T made a terminal on another, which is
-    /// exactly the disagreement `currentHost` exists to end.
+    /// The `didSet` is the one funnel selecting a tab goes through, and the
+    /// reason it is a `didSet` rather than a `select(_:)` method is that most
+    /// of the writes are *this file's own*: `repairSelection`, the pendingTab
+    /// and restore blocks in `reconcileTabs`, the split reply, the tab chords.
+    /// Every one of them is a place the window genuinely can change machines,
+    /// and a method they each have to remember to call is a funnel with five
+    /// bypasses — the symptom of taking one being the toolbar naming one
+    /// machine while ⌘T makes a terminal on another.
     var selectedTabID: TabLayout.ID? {
         didSet { selectionChanged() }
     }
@@ -125,10 +140,11 @@ final class SessionStore {
     /// a re-list is not a way to observe it.
     private(set) var closing: Set<TerminalRef> = []
 
-    /// The session this window was on last time it ran, until the machine it
-    /// names has answered. `reconcileTabs` spends it on that machine's first
-    /// list; anything the user selects first voids it, because a restore that
-    /// overrode a person reaching for a tab would be selection theft.
+    /// Where this window was last time it ran, until the machine it names has
+    /// answered. `reconcileTabs` spends it on that machine's first list; any
+    /// explicit move the user makes first voids it — selecting a tab, or
+    /// switching to a machine that has nothing to select — because a restore
+    /// that overrode a person who has already chosen is selection theft.
     private var pendingRestore: FrontSession?
 
     /// What `FrontSessionStore` already holds, so that ⌘1/⌘2 inside one session
@@ -315,10 +331,18 @@ final class SessionStore {
         hosts.remove(at: index)
         RemoteHostStore.save(hostsToRemember, to: defaults)
         // The window cannot be left standing on a machine that is no longer
-        // here: `hosts[0]` is the local daemon, which is the one host that
-        // cannot be removed. Before the reconcile, because the repair it ends
-        // with reads `currentHost` to decide what may keep the selection.
-        if currentHost == host { currentHost = hosts[0].host }
+        // here, and leaving it is the same move as Switch Host: `hosts.first`
+        // is the local daemon, and going there should land on the session you
+        // were last in on it rather than on its first tab. Optional rather than
+        // `hosts[0]` because a store built with no local host — only the tests
+        // make one — has nowhere to go, and must not trap on its way to finding
+        // that out.
+        //
+        // Before the reconcile, because the repair that ends it reads
+        // `currentHost` to decide which tabs may keep the selection.
+        if currentHost == host, let fallback = hosts.first?.host { switchHost(fallback) }
+        // And the restore goes with the machine it names, which `switchHost`
+        // only covers when that machine is the one being left.
         if pendingRestore?.host == host { pendingRestore = nil }
         reconcileTabs()
     }
@@ -341,6 +365,14 @@ final class SessionStore {
         // row you can click, and without this it would drop you on the first
         // tab of the session you are already in.
         guard let connection = host(target), target != currentHost else { return }
+        // An explicit move ends the launch restore, whether or not it lands on
+        // anything. Landing on a tab already voided it through
+        // `selectionChanged`; landing on *nothing* — the case this whole
+        // feature exists for — did not. So a window whose remembered machine
+        // was still shaking hands, and whose owner had meanwhile gone to a
+        // local daemon with no sessions on it, was teleported away the moment
+        // that handshake finished.
+        pendingRestore = nil
         currentHost = target
         // Validated at use rather than pruned: the remembered session may have
         // been deleted from another window since we were last there.
@@ -352,6 +384,12 @@ final class SessionStore {
         // being left.
         selectedTabID = nil
         repairSelection(preferring: wanted)
+        // The machine is part of what is remembered even when there is no
+        // session to name — standing on an empty machine is a place the window
+        // can rest, so it is a place it should reopen. When the repair above
+        // landed on a tab this is the value `selectionChanged` has already
+        // written, and `rememberFront` makes it nothing at all.
+        rememberFront(FrontSession(host: target, name: selectedSessionSummary?.name))
     }
 
     private func adopt(_ connection: HostConnection) {
@@ -1253,6 +1291,10 @@ final class SessionStore {
             // way the restore is spent: a later list is a machine that has
             // changed since, not a launch.
             pendingRestore = nil
+            // A restore with no name is a window that was last standing on this
+            // machine rather than in a session on it. It needs no case of its
+            // own: nil matches no session, so it falls through to the first —
+            // which is where `repairSelection` would have put it anyway.
             let target =
                 connection.sessions.first { $0.name == restore.name }
                 ?? connection.sessions.first
@@ -1342,18 +1384,22 @@ final class SessionStore {
         rememberFrontSession(tab.session)
     }
 
-    /// Write the front session through, if it is not already what is on disk.
+    /// The tab in front, as the next launch will read it.
+    ///
+    /// A session the host has not listed yet is not written: there is no name
+    /// to write, and the id is no use across a restart.
+    private func rememberFrontSession(_ ref: SessionRef) {
+        guard let name = session(ref)?.name else { return }
+        rememberFront(FrontSession(host: ref.host, name: name))
+    }
+
+    /// Write the front state through, if it is not already what is on disk.
     ///
     /// Write-through rather than at exit: there is no termination hook in this
     /// app — no app delegate, no `willTerminate`, no `scenePhase` — and a write
     /// at exit is a write that a force-quit or a crash loses, which is exactly
     /// the run whose session you would most like back.
-    ///
-    /// A session the host has not listed yet is not written. There is no name
-    /// to write, and the id is no use across a restart.
-    private func rememberFrontSession(_ ref: SessionRef) {
-        guard let name = session(ref)?.name else { return }
-        let front = FrontSession(host: ref.host, name: name)
+    private func rememberFront(_ front: FrontSession) {
         guard front != writtenFront else { return }
         writtenFront = front
         FrontSessionStore.save(front, to: defaults)
@@ -1547,8 +1593,8 @@ enum RemoteHostStore {
     }
 }
 
-/// The session that was in front, as it survives a relaunch: the machine, and
-/// the session's *name*.
+/// What was in front, as it survives a relaunch: the machine, and the *name*
+/// of the session on it.
 ///
 /// Not its id. A daemon's `next_session_id` is an in-memory counter
 /// (src/daemon/Server.zig), so a machine that rebooted renumbers everything it
@@ -1556,9 +1602,14 @@ enum RemoteHostStore {
 /// to hold it. A name is what a session is called by the people using it, and
 /// docs/CLIENT.md's governing rule already says a session is addressed by name
 /// on the way in.
+///
+/// A nil name means the machine itself was the front state: Switch Host to a
+/// machine with nothing on it is somewhere the window can rest, so it is
+/// somewhere it has to be able to reopen. Restoring one needs no special case —
+/// see `reconcileTabs`.
 struct FrontSession: Codable, Equatable {
     var host: ServerHost
-    var name: String
+    var name: String?
 }
 
 /// Where that session is written. One key, one small blob, read once at init.

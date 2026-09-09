@@ -175,19 +175,52 @@ final class CurrentHostTests: XCTestCase {
         XCTAssertTrue(store.visibleTabs.isEmpty)
     }
 
-    /// Forgetting the machine you are on has to leave the window somewhere.
-    /// `hosts[0]` is the local daemon, which is the one host that cannot be
-    /// removed.
+    /// Forgetting the machine you are on has to leave the window somewhere, and
+    /// `hosts.first` — the local daemon, the one host that cannot be removed —
+    /// is the only somewhere there is.
+    ///
+    /// It goes there the way Switch Host does, so it lands in the session you
+    /// were last in on that machine rather than on its first tab. Two sessions
+    /// here for exactly that reason: with one, both behaviours look the same.
     func testRemovingTheCurrentHostFallsBackToLocal() throws {
         let store = emptyStore([Self.local, Self.remote])
-        list(store, [(1, "here", [1])])
+        list(store, [(1, "a", [1]), (2, "b", [2])])
         list(store, host: Self.remote, [(1, "there", [1])])
+        store.selectedTabID = try tab(store, 2).id
         store.switchHost(Self.remote)
 
         store.removeHost(Self.remote)
 
         XCTAssertEqual(store.currentHost, Self.local)
-        XCTAssertEqual(store.selectedTabID, try tab(store, 1).id)
+        XCTAssertEqual(store.selectedSession?.session, 2, "it landed on the machine's first tab")
+        XCTAssertEqual(store.selectedTabID, try tab(store, 2).id)
+    }
+
+    /// Closing the last tab on the machine you are on leaves you on that
+    /// machine, with nothing on screen — the flip side of the invariant above,
+    /// and the assertion the old `?? tabs.first?.id` fallback fails. It is the
+    /// pin against a future revert: with that fallback back in place, closing
+    /// your last local tab hands the window to whichever machine happens to
+    /// have one.
+    func testClosingTheCurrentHostsLastTabDoesNotJumpMachines() throws {
+        let store = emptyStore([Self.local, Self.remote])
+        list(store, [(1, "here", [1])])
+        list(store, host: Self.remote, [(9, "there", [9])])
+        let here = try tab(store, 1).id
+        store.selectedTabID = here
+
+        // `.closed` rather than `.closeWindow`: two tabs exist window-wide, and
+        // it is only the window's *last* tab that closes the window.
+        XCTAssertEqual(store.requestCloseTab(here), .closed)
+
+        XCTAssertNil(store.selectedTabID, "closing a tab moved the window to another machine")
+        XCTAssertEqual(store.currentHost, Self.local)
+        XCTAssertTrue(store.visibleTabs.isEmpty)
+
+        // And the other machine saying anything at all does not change that.
+        list(store, host: Self.remote, [(9, "there", [9])])
+        XCTAssertNil(store.selectedTabID)
+        XCTAssertEqual(store.currentHost, Self.local)
     }
 
     /// A machine that cannot be reached must say why. The empty screen's New
@@ -286,6 +319,55 @@ final class CurrentHostTests: XCTestCase {
 
         XCTAssertEqual(store.selectedTabID, here, "a late restore moved the window")
         XCTAssertEqual(store.currentHost, Self.local)
+    }
+
+    /// The sibling of the test above, and the one the funnel could not cover:
+    /// there the switch lands on a tab, so `selectionChanged` voids the restore
+    /// on its way past. Here the machine somebody switches to has nothing on
+    /// it — which is the case this whole feature exists for — so nothing is
+    /// selected, nothing runs, and the remembered machine finishing its
+    /// handshake five seconds later used to take the window with it.
+    func testSwitchingToAnEmptyMachineVoidsTheRestore() {
+        let defaults = InMemoryDefaults()
+        FrontSessionStore.save(FrontSession(host: Self.remote, name: "work"), to: defaults)
+        let store = emptyStore([Self.local, Self.remote], defaults: defaults)
+
+        // The local daemon answers first, with nothing on it: a machine that
+        // has just been restarted, which is the ordinary way to have none.
+        list(store, [])
+        store.switchHost(Self.local)
+        XCTAssertEqual(store.currentHost, Self.local)
+
+        // ...and now build-box answers, with the session that was remembered.
+        list(store, host: Self.remote, [(7, "work", [1])])
+
+        XCTAssertEqual(store.currentHost, Self.local, "a late restore moved the window")
+        XCTAssertNil(store.selectedTabID)
+        XCTAssertTrue(store.visibleTabs.isEmpty)
+    }
+
+    /// Standing on an empty machine is a place the window can rest, so it is a
+    /// place it has to be able to reopen: the blob keeps the machine and simply
+    /// has no name in it. Without this, ending the day on a machine you had
+    /// just added — before making anything on it — reopened you somewhere else.
+    func testStandingOnAnEmptyMachineIsRememberedAcrossLaunches() {
+        let defaults = InMemoryDefaults()
+        let store = emptyStore([Self.local, Self.remote], defaults: defaults)
+        list(store, [(1, "here", [1])])
+        list(store, host: Self.remote, [])
+        XCTAssertEqual(defaults.writes[FrontSessionStore.key], 1)
+
+        store.switchHost(Self.remote)
+
+        XCTAssertEqual(FrontSessionStore.load(defaults), FrontSession(host: Self.remote, name: nil))
+        XCTAssertEqual(
+            defaults.writes[FrontSessionStore.key], 2,
+            "the machine in front was written more than once, or not at all")
+
+        // Which is what the next launch reads.
+        let next = emptyStore([Self.local, Self.remote], defaults: defaults)
+        XCTAssertEqual(next.currentHost, Self.remote)
+        XCTAssertNil(next.selectedTabID)
     }
 
     /// Written through as it changes, because there is no termination hook in
