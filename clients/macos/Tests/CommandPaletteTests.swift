@@ -461,7 +461,7 @@ final class CommandPaletteTests: XCTestCase {
         XCTAssertNil(store.palette, "⌫ opened a panel that was not there")
     }
 
-    // MARK: - The one piece of geometry a test can hold
+    // MARK: - The geometry a test can hold
 
     /// The list is as tall as its rows, up to sixteen of them.
     ///
@@ -492,6 +492,43 @@ final class CommandPaletteTests: XCTestCase {
         // into `MenuMetrics.rowHeight` — the obvious tidy-up — fails here
         // instead of silently undoing the measurement.
         XCTAssertGreaterThan(PaletteMetrics.rowHeight, MenuMetrics.rowHeight)
+    }
+
+    /// And never taller than the window it is centred in.
+    ///
+    /// Sixteen rows is a count, and it stopped being a safe one when the row
+    /// grew: they are 576pt of list in a 628pt panel now, so a window shorter
+    /// than that got a palette running off the bottom edge with its last
+    /// commands unreachable — arrowing onto one scrolls it into a part of the
+    /// list that is outside the window too.
+    func testTheListNeverOutgrowsTheWindowItIsCentredIn() {
+        // Room for all sixteen: the count is what bites, exactly as before.
+        XCTAssertEqual(
+            PaletteMetrics.listHeight(rows: 16, in: 1200), PaletteMetrics.listMaxHeight,
+            "a window with room to spare clamped a list that fitted in it")
+
+        // Room for fewer. Whole rows, and the panel they make still fits under
+        // the inset it hangs at with the same margin left beneath it.
+        let short: CGFloat = 500
+        let list = PaletteMetrics.listHeight(rows: 16, in: short)
+        XCTAssertLessThan(list, PaletteMetrics.listMaxHeight)
+        XCTAssertEqual(
+            list.truncatingRemainder(dividingBy: PaletteMetrics.rowHeight), 0,
+            "the list ended in a sliver of a row")
+        XCTAssertLessThanOrEqual(
+            list + PaletteMetrics.listOverhead + 2 * PaletteMetrics.topInset, short,
+            "the panel hung off the bottom of the window")
+
+        // Less room than one row, which is not a window anybody has, and still
+        // not a list of nothing: the notice has to be somewhere.
+        XCTAssertEqual(PaletteMetrics.listHeight(rows: 8, in: 100), PaletteMetrics.rowHeight)
+
+        // Zero is a container SwiftUI has not laid out yet rather than a window
+        // with no room in it. Clamping against it would open every palette one
+        // row tall for the frame before the real height arrives.
+        XCTAssertEqual(
+            PaletteMetrics.listHeight(rows: 8, in: 0), PaletteMetrics.listHeight(rows: 8),
+            "an unmeasured container clamped the list to one row")
     }
 
     // MARK: - The two key rules

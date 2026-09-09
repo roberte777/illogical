@@ -308,20 +308,35 @@ struct ContentView: View {
             // hangs `PaletteMetrics.topInset` below, clear of the chrome
             // rather than touching it — see there for why this one floats and
             // the dropdown does not.
-            ZStack(alignment: .top) {
-                if store.palette != nil {
-                    // Dismiss on a click anywhere else, the way a menu does.
-                    Color.black.opacity(0.001)
-                        .contentShape(Rectangle())
-                        .onTapGesture { store.closePalette() }
+            //
+            // The `GeometryReader` is for one number the panel cannot ask for
+            // itself: how much room it has. Its list clamps against the height
+            // of this area — see `PaletteMetrics.listHeight(rows:in:)` — and
+            // the only way a view can measure the space around it is to fill
+            // it, which is exactly what a panel sized by its own contents must
+            // not do. The view doing the placing measures instead.
+            GeometryReader { window in
+                ZStack(alignment: .top) {
+                    if store.palette != nil {
+                        // Dismiss on a click anywhere else, the way a menu does.
+                        Color.black.opacity(0.001)
+                            .contentShape(Rectangle())
+                            .onTapGesture { store.closePalette() }
 
-                    CommandPalette()
-                        .environment(store)
-                        .offset(y: PaletteMetrics.topInset)
-                        .transition(Motion.menu.transition(reduceMotion: reduceMotion))
+                        CommandPalette(windowHeight: window.size.height)
+                            .environment(store)
+                            .offset(y: PaletteMetrics.topInset)
+                            .transition(Motion.menu.transition(reduceMotion: reduceMotion))
+                    }
                 }
+                // A reader offers its content the whole of itself and then puts
+                // it in the top-left corner; without this the stack would be
+                // the size of what is in it and centre the panel in that. The
+                // scrim above happens to fill today, and "happens to" is not a
+                // layout rule.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .animation(Motion.menu.animation(reduceMotion: reduceMotion), value: store.palette)
             }
-            .animation(Motion.menu.animation(reduceMotion: reduceMotion), value: store.palette)
         }
         // ⌃⇥ / ⌃⇧⇥, the one pair of tab chords the Window menu cannot also
         // carry: a menu item holds a single key equivalent, and those items

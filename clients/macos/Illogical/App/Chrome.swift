@@ -57,9 +57,43 @@ extension View {
 /// drawn on the boundary between two inactive tabs.
 enum Metrics {
     static let toolbarHeight: CGFloat = 39
+
     static let breadcrumbHeight: CGFloat = 27
-    static let tabHeight: CGFloat = 27
-    static let tabCornerRadius: CGFloat = 13
+
+    /// 29, up from 27, and the two points were measured rather than judged.
+    ///
+    /// The later reference is a photograph of a screen, so it carries no scale
+    /// of its own — but the traffic lights supply one, because their centres
+    /// are 20pt apart on every Mac. They measure 24.5px there, which fixes that
+    /// image at 1.225px/pt, confirmed by their diameters coming back at 12.2pt
+    /// against a known 12. At that scale the reference's pill is 35px tall —
+    /// 28.6pt — where this was drawing 27.
+    ///
+    /// Small, and still the thing you see, because the pill is concentric with
+    /// the lights in both: the whole difference lands on the edge that is
+    /// easiest to compare, how far the pill's underside drops past the bottom
+    /// of the green light. 7.75pt in the reference against 6.5 here.
+    ///
+    /// Two sources disagree here and it is worth saying which won and why. The
+    /// 27 came from the 2160p recording this file's header names, at 2.083px/pt
+    /// — four times the resolution and none of the lens. That is the better
+    /// instrument, and on any other question it should be believed over a
+    /// phone. But the recording is a pre-alpha and the photograph is of what
+    /// the app looks like now, and 1.6pt is more than either source's error
+    /// bar, so the likeliest reading is not that one of them is wrong: it is
+    /// that the pill grew. Parity is being judged against the newer one.
+    ///
+    /// The same pass is why `toolbarHeight` did *not* move. It is 39 from the
+    /// recording, the photograph puts its toolbar at 48px — 39.2 — and the two
+    /// agree to within a rounding, so a detour through 44 was measured wrong
+    /// and reverted. The chrome was never small. A window 64% wider than the
+    /// reference's makes all of it read that way, and `PaletteMetrics.width`
+    /// carries the same story and what was done about it there.
+    static let tabHeight: CGFloat = 29
+
+    /// Half the tab's height, so the pill's ends stay semicircular as they were
+    /// at 27/13. A radius left behind at 13 would have flattened them.
+    static let tabCornerRadius: CGFloat = 14.5
     /// One tab's slot. Content is left-aligned in it and truncates.
     static let tabWidth: CGFloat = 197
     static let tabLeadingPadding: CGFloat = 10

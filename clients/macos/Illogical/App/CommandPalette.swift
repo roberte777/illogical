@@ -2,9 +2,9 @@
 //  ⇧⌘P: everything the app can do, searchable, in one panel.
 //
 //      ┌────────────────────────────────────────────────┐
-//      │ ⌕  Search commands...                          │  field, 29pt
+//      │ ⌕  Search commands...                          │  field, 36pt
 //      │                                                │
-//      │    Change Session             drifting-cedar › │  29pt rows
+//      │    Change Session             drifting-cedar › │  36pt rows
 //      │    Rename Session…            drifting-cedar › │
 //      │ ⇄  Switch Host                       build-box │
 //      │ ⊕  Add Remote Host…                          › │
@@ -33,17 +33,33 @@
 //  which is the whole argument for it over a second panel: there is nowhere
 //  else to look and nothing else to dismiss.
 //
-//  Geometry: 340pt wide, rows 29pt at 14pt type, sixteen of them before it
-//  scrolls, hanging 32pt under the toolbar and centred in the window.
+//  Geometry: 440pt wide, rows 36pt at 15pt type, sixteen of them before it
+//  scrolls — fewer in a window too short to hold sixteen — hanging 36pt under
+//  the toolbar and centred in the window.
 //
 //  Those numbers were 352 and 22 first, out of `MenuMetrics`, on the reasoning
 //  that this panel and the dropdown are the same kind of surface — so it took
 //  the dropdown's row and a width guessed as a multiple of the dropdown's. The
 //  result was both too wide and too tight, and the tell was a ratio rather than
-//  a measurement: width over row height is about 11.7 in the reference and was
-//  16.0 here. Only the ratio was worth reading, because the reference is a
-//  photograph of a screen and carries no scale at all — the absolute sizes here
-//  were settled by looking, which is the only instrument that reference admits.
+//  a measurement: width over row height is about 11.7 in the reference, was
+//  16.0 here, and is 12.2 now. Only the ratio was worth reading, because the
+//  reference is a photograph of a screen and carries no scale of its own —
+//  until something in the frame supplies one. The traffic lights do: their
+//  centres are 20pt apart on every Mac, they measure about 24px there, and at
+//  the 1.2px/pt that gives, the reference's window is about 1042pt wide and its
+//  palette about 295.
+//
+//  Which is the second correction, and the one these numbers come from. 340 x
+//  29 held the ratio and landed within fifty points of the reference's own
+//  width, and it still read as too small — because a palette is judged as a
+//  fraction of the window it is centred in, and the two windows are not the
+//  same window. 295pt of 1042 is 28% of it; 340pt of the 1709pt window this was
+//  looked at in is 20% of that. Matching the fraction outright would mean 484,
+//  which is a third of the way across a wide window and starts to read as a
+//  dialog rather than as a palette, so the width stops at 440 — and the row and
+//  the type come up with it, because holding 12.2 is the whole of what the
+//  reference had to say and 440 over a 29pt row would be 15.2, the shape of the
+//  first wrong attempt again.
 //
 //  So the panel keeps `MenuMetrics`'s padding and corner radii — a person sees
 //  the two surfaces a second apart and they should be cut from the same cloth —
@@ -82,25 +98,33 @@ extension Palette {
 }
 
 enum PaletteMetrics {
-    /// Measured off the reference rather than derived from the dropdown, for
-    /// the reason the file header gives: a width picked as a multiple of
-    /// `MenuMetrics.width` came out half again too wide for its own rows.
-    /// Wider than the dropdown all the same, because these rows carry two
-    /// things — a title, and either the value it acts on or the chord that
-    /// reaches it.
-    static let width: CGFloat = 340
+    /// Proportioned off the reference rather than derived from the dropdown,
+    /// and then sized against the window rather than off the reference — the
+    /// file header sets out both corrections. 440 is 26% of the 1709pt window
+    /// it was looked at in, against the reference's 28%, and deliberately short
+    /// of the 484 that would match that exactly.
+    ///
+    /// Wider than the dropdown whatever the reference said, because these rows
+    /// carry two things — a title, and either the value it acts on or the chord
+    /// that reaches it.
+    static let width: CGFloat = 440
 
     /// Taller than `MenuMetrics.rowHeight`'s 22, and deliberately not it. The
     /// dropdown's row holds a session name; this one holds a sentence with a
     /// chord after it, and at 22 the two columns read as one crowded line.
-    static let rowHeight: CGFloat = 29
+    ///
+    /// 36 rather than 29 because the width moved and the row is tied to it:
+    /// width over row height is the one proportion a photograph of a screen can
+    /// be asked for, it is about 11.7 in the reference, and 440 over a 29pt row
+    /// would be 15.2 — within a point of the 16.0 that was wrong the first time.
+    static let rowHeight: CGFloat = 36
 
-    /// A point larger than `MenuMetrics.font`'s 13, and for the same reason
+    /// Two points larger than `MenuMetrics.font`'s 13, and for the same reason
     /// the row is taller: this panel is read, where the dropdown is scanned
     /// for a name you already know. Scaling the type with the panel is what
-    /// keeps 340 from being merely a wider 300 — the reference's panel is
-    /// bigger, not just roomier.
-    static let font: CGFloat = 14
+    /// keeps 440 from being merely a wider 340 — a panel drawn bigger at the
+    /// same type size is not bigger, it is emptier.
+    static let font: CGFloat = 15
 
     /// How far under the toolbar the panel hangs.
     ///
@@ -109,7 +133,12 @@ enum PaletteMetrics {
     /// window, and the reference floats it clear of the chrome — below the
     /// pane header rather than tucked behind it, so the top of the window
     /// still reads as the window's.
-    static let topInset: CGFloat = 32
+    ///
+    /// 36 rather than 32 for the reason the row moved: a gap is read against
+    /// the thing it holds off, so it grew with the panel to stay the same gap.
+    /// It is also the margin kept at the *bottom* of the window, where it is
+    /// what stops a clamped panel looking cut off — see `listHeight(rows:in:)`.
+    static let topInset: CGFloat = 36
 
     /// The field matches a row, so the panel has one vertical rhythm from the
     /// top down — the same rule `MenuMetrics.fieldHeight` follows, applied to
@@ -119,6 +148,12 @@ enum PaletteMetrics {
     /// How many rows fit before it scrolls. Sixteen is the reference's, and it
     /// is also about right for the table: the whole of it is twenty-two, so
     /// the panel is honest about there being more without becoming a window.
+    ///
+    /// A ceiling on the table, and not a promise about the panel. Sixteen 36pt
+    /// rows are 576pt of list in a 628pt panel that hangs 36pt below the
+    /// chrome, which is more room than a window half the height of a laptop
+    /// screen has — so the room actually there is the other limit, and
+    /// `listHeight(rows:in:)` takes whichever of the two bites first.
     static let maxRows = 16
     static let listMaxHeight = CGFloat(maxRows) * rowHeight
 
@@ -138,15 +173,30 @@ enum PaletteMetrics {
     /// in on the right and left it out on the left, and a selected row that is
     /// off-centre in its own panel looks like a mistake even when nobody can
     /// say why. The fill spans the row; only what it contains stops short.
-    static let scrollGutter: CGFloat = 10
+    ///
+    /// Twelve rather than ten now the row is 36pt, and the two extra points are
+    /// air rather than lane: the scroller in it is the system's and is the same
+    /// width whatever this panel does. They moved for the reason `rowLeading`
+    /// gained two — a taller row wearing the old insets reads as pinched at
+    /// both ends.
+    static let scrollGutter: CGFloat = 12
 
     /// The row's left inset, wider than `MenuMetrics.rowPadding`'s 7.
     ///
     /// The dropdown can be tight against its edge because its rows are short
     /// names; here a title starts a sentence, and at 7 it began hard against
     /// the highlight's own corner radius — the fill's curve and the first
-    /// letter fighting for the same few points.
-    static let rowLeading: CGFloat = 12
+    /// letter fighting for the same few points. Fourteen rather than twelve
+    /// since the row grew: the corner radius is unchanged, but there is more
+    /// fill above and below the text to be framed by, and the sides have to
+    /// keep up with it.
+    static let rowLeading: CGFloat = 14
+
+    /// Everything in the panel that is not the list: the padding above and
+    /// below it, the field, and the gap under the field. Written down because
+    /// the height clamp has to subtract it.
+    static let listOverhead: CGFloat =
+        2 * MenuMetrics.padding + fieldHeight + MenuMetrics.fieldToRows
 
     /// How tall the list is for a given number of rows.
     ///
@@ -159,21 +209,65 @@ enum PaletteMetrics {
         min(CGFloat(max(rows, 1)) * rowHeight, listMaxHeight)
     }
 
+    /// The same, in a window with `available` points of content under its
+    /// title bar — which is the area the panel is centred in, and the only
+    /// limit `maxRows` cannot express.
+    ///
+    /// Sixteen rows is a count, not a height, and it stopped being a safe one
+    /// when the row went to 36: the panel that makes is 628pt tall and hangs
+    /// 36pt down, so any window shorter than that got a palette running off the
+    /// bottom edge — with the last commands in the table unreachable, because
+    /// arrowing onto one scrolls it into a part of the list that is outside the
+    /// window too. So there are two ceilings now and the list takes whichever
+    /// bites first.
+    ///
+    /// Rounded down to whole rows, so the list is always an exact number of
+    /// them rather than ending in a sliver of one, and floored at a single row
+    /// for the reason the count is: a window too short even for that is better
+    /// served by a panel that overflows than by one with nothing in it.
+    ///
+    /// The margin left at the bottom is `topInset` again. The panel hangs that
+    /// far below the chrome, and stopping the same distance above the bottom
+    /// edge is what makes a clamped panel look placed rather than cropped.
+    ///
+    /// A height of zero is a container SwiftUI has not laid out yet, which it
+    /// reports for a frame or two; clamping against it would open every palette
+    /// one row tall and then snap it open.
+    static func listHeight(rows: Int, in available: CGFloat) -> CGFloat {
+        guard available > 0 else { return listHeight(rows: rows) }
+        let room = available - 2 * topInset - listOverhead
+        return min(listHeight(rows: rows), max((room / rowHeight).rounded(.down), 1) * rowHeight)
+    }
+
     /// The command-turned-token in the field. Rounded rather than a capsule
     /// because it sits flush against the field's left inset and a capsule's
     /// end-cap would leave a crescent of field colour inside the corner.
+    ///
+    /// Its type is a point under the row's, and stays a point under it now the
+    /// row's is 15: the chip says what the field has become, and set at `font`
+    /// it would carry the same weight as the answer being typed beside it.
     static let chipCorner: CGFloat = 5
-    static let chipFont: CGFloat = 12
+    static let chipFont: CGFloat = 13
     static let chipPadding: CGFloat = 6
 
     /// The one line a free-text stage two draws under its hairline. Smaller
     /// than a row: it is a label, not something to click — the same rule
-    /// `MenuMetrics.headerFont` follows.
-    static let hintFont: CGFloat = 12
+    /// `MenuMetrics.headerFont` follows, and the same size the chip is set at,
+    /// so the two things in the panel that are not rows agree with each other.
+    static let hintFont: CGFloat = 13
 }
 
 struct CommandPalette: View {
     @Environment(SessionStore.self) private var store
+
+    /// How much window there is to draw in: the height of the content area the
+    /// panel is centred in, which is what its list clamps against.
+    ///
+    /// Handed in rather than measured here, because the only instrument this
+    /// view has is a `GeometryReader` and a `GeometryReader` fills whatever it
+    /// is offered — measuring the window would make the panel the size of it.
+    /// `ContentView` is the one placing this and already holds the number.
+    let windowHeight: CGFloat
 
     /// What has been typed. View state, exactly as the dropdown's `filter` is:
     /// nothing outside this panel has an opinion about it, and it dies with
@@ -347,8 +441,11 @@ struct CommandPalette: View {
             if let prompt {
                 chip(prompt.chip)
             } else {
+                // 12 rather than the dropdown's 11: this glyph was sized to sit
+                // against 14pt text and the field's type is 15 now, and a
+                // magnifier that stays behind is not smaller, it is faint.
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundStyle(Palette.menuShortcut)
             }
 
@@ -436,12 +533,21 @@ struct CommandPalette: View {
                     }
 
                     if commands.isEmpty {
+                        // Given the palette's row rather than the dropdown's,
+                        // because the list reserves one for it — `listHeight`'s
+                        // floor — and a 22pt notice in a 36pt slot sat high
+                        // with fourteen points of nothing beneath it. Its type
+                        // stays the dropdown's 13: this is a label, on the same
+                        // rule that keeps `hintFont` under `font`.
                         MenuNotice(text: "No matching commands")
+                            .frame(height: PaletteMetrics.rowHeight)
                     }
                 }
             }
             .scrollIndicators(.visible)
-            .frame(height: PaletteMetrics.listHeight(rows: commands.count))
+            .frame(
+                height: PaletteMetrics.listHeight(rows: commands.count, in: windowHeight)
+            )
             .onChange(of: scrollTarget) { _, target in
                 guard let target else { return }
                 proxy.scrollTo(target)
@@ -504,12 +610,15 @@ struct CommandPalette: View {
                     }
 
                     if choices.isEmpty {
+                        // The palette's row, for the reason the command list's
+                        // notice takes it.
                         MenuNotice(text: "No matching hosts")
+                            .frame(height: PaletteMetrics.rowHeight)
                     }
                 }
             }
             .scrollIndicators(.visible)
-            .frame(height: PaletteMetrics.listHeight(rows: choices.count))
+            .frame(height: PaletteMetrics.listHeight(rows: choices.count, in: windowHeight))
             .onChange(of: scrollTarget) { _, target in
                 guard let target else { return }
                 proxy.scrollTo(target)
@@ -631,8 +740,15 @@ private struct PaletteRow: View {
     var body: some View {
         HStack(spacing: 0) {
             if let icon {
+                // 12 against 15pt titles, where the dropdown draws 11 against
+                // 13. The column it is centred in stays `MenuMetrics`'s 13 all
+                // the same, because what that frame does is line the titles up
+                // and it does that at any glyph size — a wide symbol at 12
+                // spills a fraction of a point into a 9pt gap that can spare
+                // it, where widening the column would push every title with an
+                // icon away from every title without one.
                 Image(systemName: icon)
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .frame(width: MenuMetrics.iconColumn, alignment: .center)
 
                 Spacer().frame(width: MenuMetrics.iconToTitle)
@@ -651,18 +767,24 @@ private struct PaletteRow: View {
                     .foregroundStyle(trailingColor)
             }
 
+            // Up a point with the title beside it, for the reason the leading
+            // icon is: a checkmark is read against the name it marks, and one
+            // sized for 14pt type reads as tentative next to 15.
             if let trailingIcon {
                 Image(systemName: trailingIcon)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(trailingColor)
             }
 
             // The reference's `>`: this command will ask you something rather
             // than doing it. Only ever on a row that has a prompt behind it, so
-            // it is a promise the panel keeps.
+            // it is a promise the panel keeps. Deliberately the smallest glyph
+            // in the row and still 10 rather than 9 — it is punctuation on a
+            // 15pt line, and punctuation set for a 14pt one goes from quiet to
+            // hard to see.
             if chevron {
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
+                    .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(trailingColor)
                     .padding(.leading, 6)
             }
