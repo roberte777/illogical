@@ -713,8 +713,8 @@ travels with its tab instead of staying behind at an index, and neither side of
 the gap draws one — and `slot(at:)` says which slot a pointer is in.
 
 **Hover is the strip's, not each slot's.** One pointer position read against
-the slots, from an `onContinuousHover` on the strip and from the drag gesture
-while a button is down, rather than an `onHover` flag per tab. The difference
+the slots, from a tracking area over the strip and from the drag gesture while
+a button is down, rather than an `onHover` flag per tab. The difference
 is the case a flag cannot answer: a drop rearranges the tabs under a pointer
 that never moved, so every flag then describes the arrangement before it — the
 tab you just dropped sat under the pointer believing it was not hovered, with
@@ -726,6 +726,16 @@ the reorder that caused the trouble: the region the pointer is in did not
 change, and which tab is drawn there is read off the new order. The position is
 written only when it crosses into another slot, so this costs no more redraws
 than the flags did.
+
+The position comes from an `NSTrackingArea` (`PointerTracker` in
+`WindowChrome.swift`), not from `onContinuousHover`, which has the second half
+of the same bug: it stops delivering once a drag that began inside it ends, and
+does not resume until the pointer leaves and returns. Every drop ends a drag
+under the pointer, so with SwiftUI hover the strip came out of a reorder
+frozen — the ✕ right for the drop and then stuck there however far the pointer
+moved. A tracking area is independent of hit testing and of gestures, which is
+what ghostty's own surface relies on, and `mouseMoved` resumes on the first
+movement after the button comes up.
 
 The ✕ on a slot appears on **hover**, on every tab including the active one. It
 sat on the active tab permanently until it did not: that parks a close button

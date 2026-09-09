@@ -544,12 +544,13 @@ struct Toolbar: View {
                 // just dropped with no ✕ until you took the pointer out to the
                 // terminal and brought it back — the enter event it was
                 // waiting for.
-                .onContinuousHover(coordinateSpace: .named(Self.stripSpace)) { phase in
-                    switch phase {
-                    case .active(let point): hover(at: point.x)
-                    case .ended: hoveredSlot = nil
-                    }
-                }
+                //
+                // A tracking area rather than `onContinuousHover`, which has
+                // the second half of the same bug: it stops delivering when a
+                // drag that started inside it ends, so the strip came out of a
+                // reorder frozen instead — the ✕ correct for the drop and then
+                // stuck there. See `PointerTracker`.
+                .tracksPointer(moved: { hover(at: $0.x) }, exited: { hoveredSlot = nil })
                 // Room for the lifted slot's shadow. A `ScrollView` clips to
                 // its content, and the content is exactly one tab tall, so
                 // without this the shadow was cut off square along the top and
