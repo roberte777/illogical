@@ -374,7 +374,14 @@ struct SessionMenu: View {
             // have said why, is only ever reached by *being* on that machine.
             // "Go to that machine, even with nothing on it" is exactly what
             // `switchHost` exists for, so this path goes through it too.
-            store.switchHost(host.host)
+            //
+            // Carrying the row's own session, which is what keeps the move
+            // honest: a machine whose *other* sessions still have tabs in this
+            // window would otherwise land you in one of them — silently, since
+            // a tab in front is exactly the state in which `currentHostError`
+            // says nothing — and rewrite that machine's remembered session to
+            // it, on a click that meant this one.
+            store.switchHost(host.host, preferring: ref)
             store.createTerminal(sessionName: session.name, on: host.host)
         }
         isPresented = false

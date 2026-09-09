@@ -165,6 +165,25 @@ final class SessionStore {
     /// from.
     private let launcher: DaemonLauncher
 
+    /// What this window's machines owe to the environment: the hosts
+    /// ILLOGICAL_HOSTS put in the list, and whether the local daemon in it is
+    /// the one ILLOGICAL_SOCK named. Both feed the provenance rule that decides
+    /// what may be written to `defaults` — see `hostsToRemember` and
+    /// `rememberFront`.
+    ///
+    /// **Read once, here, rather than at every write.** These are properties of
+    /// how the store was built, and reading them later makes a store that is
+    /// not hermetic: `rememberFront` is on the selection path, so a variable
+    /// merely exported in the shell that launched the process silently changed
+    /// what a store *already constructed from an explicit host list* would
+    /// remember. ILLOGICAL_SOCK is a documented knob (`src/cli/main.zig`
+    /// lists it) and `launchctl setenv` reaches GUI apps, so it is a variable
+    /// that really does sit in environments — and with it set, every test that
+    /// drives a front session through a socket path of its own failed, for a
+    /// reason nowhere in the test.
+    private let injectedHosts: [ServerHost]
+    private let socketInjected: Bool
+
     /// `hosts: nil` means "whatever was remembered", read through `defaults`.
     ///
     /// Not defaulted to `startingHosts()` directly: that reads
@@ -195,6 +214,20 @@ final class SessionStore {
         self.defaults = defaults
         self.launcher = launcher
         let starting = hosts ?? SessionStore.startingHosts(defaults)
+        // The remote half asks where the list came from, because an injected
+        // host is in it *because* the variable named it — there is nothing to
+        // compare against afterwards. `startingHosts` is the only door
+        // ILLOGICAL_HOSTS has, and it is only opened when no list was handed
+        // over, so a caller that hands one chose those machines itself.
+        injectedHosts = hosts == nil ? Self.environmentHosts() : []
+        // The local half can be exact, and is: the question is whether the
+        // daemon this window is on is the throwaway one the variable names, and
+        // a store built on some other socket is not on it whatever the
+        // environment says. In the app the two are the same thing —
+        // `defaultSocketPath` is where the override is honoured.
+        socketInjected =
+            ProcessInfo.processInfo.environment["ILLOGICAL_SOCK"]
+            .map { starting.contains(.local(socketPath: $0)) } ?? false
         let front = FrontSessionStore.load(defaults)
         writtenFront = front
         // A remembered machine that is no longer in the list — a host forgotten
@@ -276,8 +309,10 @@ final class SessionStore {
         }
     }
 
+    /// The same, for the app: what the environment contributed to *this* store,
+    /// decided when it was built. See `injectedHosts`.
     private var hostsToRemember: [ServerHost] {
-        hostsToRemember(injected: Self.environmentHosts())
+        hostsToRemember(injected: injectedHosts)
     }
 
     // MARK: - Hosts
@@ -373,7 +408,19 @@ final class SessionStore {
     /// on it is somewhere the window can be — you go there to make the first
     /// terminal on it — and until this there was no way to say so, because
     /// "which machine" was read off a tab.
-    func switchHost(_ target: ServerHost) {
+    ///
+    /// `preferring` is for a caller that already has a session in mind — the
+    /// dropdown's rows, each of which names one. It is the whole answer rather
+    /// than a first choice: a row for a session with no tabs must land on
+    /// *that* session's empty screen and not on whatever else the machine
+    /// happens to be showing. Without it, clicking such a row on a machine
+    /// whose control connection had dropped put the window in a **different**
+    /// session there — `lastSession[target] ?? sessions.first` is not the row
+    /// that was clicked — rewrote both the in-memory and on-disk memory of that
+    /// machine to it, and said nothing, because `currentHostError` is only
+    /// reachable with no tab in front. Landing on nothing is what lets that
+    /// screen explain itself.
+    func switchHost(_ target: ServerHost, preferring aimed: SessionRef? = nil) {
         // Already being there is not a move. The menu's checked row is still a
         // row you can click, and without this it would drop you on the first
         // tab of the session you are already in.
@@ -387,22 +434,37 @@ final class SessionStore {
         // that handshake finished.
         pendingRestore = nil
         currentHost = target
-        // Validated at use rather than pruned: the remembered session may have
-        // been deleted from another window since we were last there.
-        let wanted =
-            lastSession[target].flatMap { session($0) != nil ? $0 : nil }
-            ?? connection.sessions.first.map { SessionRef(host: target, session: $0.id) }
-        // Cleared first, so the repair below is a repair rather than a no-op:
-        // the tab in front is still perfectly valid, it is just on the machine
+        // Cleared first, so what follows is a landing rather than a no-op: the
+        // tab in front is still perfectly valid, it is just on the machine
         // being left.
         selectedTabID = nil
-        repairSelection(preferring: wanted)
+        if let aimed {
+            // No widening to another session of that machine, which is the one
+            // thing `repairSelection` would add — see the doc above.
+            selectedTabID = tabs.first { $0.session == aimed }?.id
+        } else {
+            // Validated at use rather than pruned: the remembered session may
+            // have been deleted from another window since we were last there.
+            let wanted =
+                lastSession[target].flatMap { session($0) != nil ? $0 : nil }
+                ?? connection.sessions.first.map { SessionRef(host: target, session: $0.id) }
+            repairSelection(preferring: wanted)
+        }
         // The machine is part of what is remembered even when there is no
         // session to name — standing on an empty machine is a place the window
-        // can rest, so it is a place it should reopen. When the repair above
+        // can rest, so it is a place it should reopen. When the move above
         // landed on a tab this is the value `selectionChanged` has already
         // written, and `rememberFront` makes it nothing at all.
-        rememberFront(FrontSession(host: target, name: selectedSessionSummary?.name))
+        //
+        // The name comes from the session that was aimed at rather than from
+        // what is in front, for the same reason the landing does: with no tab
+        // to name one, `selectedSession` answers with the machine's remembered
+        // or first session — so a click on a tab-less row would have written
+        // *another* session's name as this window's last position.
+        rememberFront(
+            FrontSession(
+                host: target, name: (aimed ?? selectedSession).flatMap { session($0)?.name })
+        )
     }
 
     private func adopt(_ connection: HostConnection) {
@@ -1395,6 +1457,10 @@ final class SessionStore {
     /// off a tab that was in front, and `switchHost` passes one keyed to the
     /// machine it has just moved to — so the second clause is a widening of the
     /// first rather than a second answer.
+    ///
+    /// Which is why `switchHost(_:preferring:)` does not come through here when
+    /// it was handed a session: a session somebody named is the whole answer,
+    /// and the widening would quietly substitute another one.
     private func repairSelection(preferring wanted: SessionRef?) {
         if let id = selectedTabID, tabs.contains(where: { $0.id == id }) { return }
         selectedTabID =
@@ -1483,10 +1549,13 @@ final class SessionStore {
         FrontSessionStore.save(front, to: defaults)
     }
 
+    /// The same, for the app: both signals as this store was built with them.
+    /// See `injectedHosts`, and note that this is the wrapper the whole
+    /// selection path goes through — which is what made reading them here, on
+    /// every write, a store whose behaviour depended on the shell it was
+    /// launched from.
     private func rememberFront(_ front: FrontSession) {
-        rememberFront(
-            front, injected: Self.environmentHosts(),
-            socketInjected: ProcessInfo.processInfo.environment["ILLOGICAL_SOCK"] != nil)
+        rememberFront(front, injected: injectedHosts, socketInjected: socketInjected)
     }
 
     // MARK: - Per-terminal connections

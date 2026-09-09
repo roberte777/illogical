@@ -700,6 +700,15 @@ With more than one machine connected it grows a header per host and the sessions
 under it are that machine's. One host is the common case, so the headers only
 appear when there is something to disambiguate.
 
+A row with no tabs — a session whose terminals have all gone — moves the window
+to that machine *and that session*, and makes a terminal there. The session the
+row names is carried into the move (`switchHost(_:preferring:)`) rather than
+left to the machine's own memory of where you were: on a machine whose other
+sessions still have tabs in this window, "the session you were last in, then its
+first" is not the row that was clicked, and landing there would be silent —
+`currentHostError`, the one screen that explains a machine that cannot make a
+terminal, is only reached with no tab in front.
+
 Switching to a parked terminal is **not** an unpark: the server streams its
 snapshot straight from disk and the terminal stays parked [MEM t=660]. From the
 client's side this is indistinguishable from attaching to a live one, which is

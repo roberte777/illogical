@@ -67,6 +67,15 @@ final class CurrentHostTests: XCTestCase {
     /// in session order — the two answers always agree, and an assertion meant
     /// to pin a lookup by session passes just as well under code that took the
     /// first tab it saw. Two of the tests below were exactly that.
+    ///
+    /// It reorders within one rule, and the rule is the wire's: `terminals` is
+    /// ascending by id, always. `Server.listInto` walks an insertion-ordered
+    /// map fed by a monotonic `next_terminal_id`, retirement is an
+    /// `orderedRemove`, and `HostConnection` takes the list wholesale — so a
+    /// descending fixture is a state no daemon can produce. The way to put a
+    /// later session's tab first is therefore to give the *earlier* session the
+    /// later terminal, which is what a session outliving its original terminal
+    /// looks like.
     private func list(
         _ store: SessionStore, host: ServerHost = local, _ sessions: [Listing],
         terminalOrder: [UInt64]? = nil
@@ -82,13 +91,21 @@ final class CurrentHostTests: XCTestCase {
             // Reordered, never re-invented: a fixture that named a terminal no
             // session holds would be driving a list the wire cannot produce,
             // and the reconcile would answer it perfectly reasonably.
+            //
+            // Compared as contents rather than as a count. `[2, 2]` names two
+            // terminals and the sessions hold two, so counting passed it — and
+            // handed the reconcile the same terminal twice, which is a listing
+            // no daemon can produce either.
             connection.terminals = terminalOrder.compactMap { id in listed.first { $0.id == id } }
             XCTAssertEqual(
-                connection.terminals.count, listed.count,
+                terminalOrder.sorted(), listed.map(\.id).sorted(),
                 "terminalOrder does not name exactly the terminals the sessions hold")
         } else {
             connection.terminals = listed
         }
+        XCTAssertEqual(
+            connection.terminals.map(\.id), connection.terminals.map(\.id).sorted(),
+            "a daemon lists terminals in ascending id order; this fixture does not")
         connection.setStatusForTesting(.connected)
         store.reconcileTabs()
     }
@@ -160,20 +177,21 @@ final class CurrentHostTests: XCTestCase {
     /// opens on the first session the machine lists.
     ///
     /// The first *session*, which is only a different answer from "the first
-    /// tab" when the host lists its terminals in some other order — so it does
-    /// here. Session `a` is the one to land in; the tab that happens to be
-    /// first belongs to `b`, which is where `switchHost` with its
-    /// `?? connection.sessions.first` deleted lands instead.
+    /// tab" when the machine's first session is not the one holding its first
+    /// terminal — so it is not here. `a` has outlived its original terminal and
+    /// holds a later one than `b` does, so the first tab belongs to `b`, which
+    /// is where `switchHost` with its `?? connection.sessions.first` deleted
+    /// lands instead.
     func testSwitchHostFallsBackToTheFirstSession() throws {
         let store = emptyStore([Self.local, Self.remote])
         list(store, [(1, "here", [1])])
-        list(store, host: Self.remote, [(1, "a", [1]), (2, "b", [2])], terminalOrder: [2, 1])
+        list(store, host: Self.remote, [(1, "a", [3]), (2, "b", [2])], terminalOrder: [2, 3])
         store.selectedTabID = try tab(store, 1).id
 
         store.switchHost(Self.remote)
 
         XCTAssertEqual(
-            store.selectedTabID, try tab(store, 1, on: Self.remote).id,
+            store.selectedTabID, try tab(store, 3, on: Self.remote).id,
             "it took the machine's first tab rather than its first session")
         XCTAssertEqual(store.selectedSession?.session, 1)
     }
@@ -279,6 +297,83 @@ final class CurrentHostTests: XCTestCase {
         XCTAssertNil(store.currentHostError)
     }
 
+    /// Picking a session with no tabs is a move to *that* session. Every row in
+    /// the dropdown names one, and `SessionMenu.select` hands it over — the
+    /// `preferring:` here — precisely so that this cannot become a move to a
+    /// different one.
+    ///
+    /// The shape that made it one: a machine whose control connection has
+    /// dropped keeps its lists, which `controlClosed` does on purpose, so a
+    /// session whose terminals are gone (issue #37) is still a row and the
+    /// machine's *other* sessions still have their tabs in this window. Without
+    /// the row's own session, `switchHost` fell back to
+    /// `lastSession[target] ?? sessions.first`, `repairSelection` widened that
+    /// to any tab on the machine, and the click landed in a session nobody had
+    /// asked for — rewriting that machine's remembered session and the blob on
+    /// disk to it, and saying nothing, because a tab in front is exactly the
+    /// state in which `currentHostError` is silent. Landing on nothing is what
+    /// puts the reason on screen.
+    func testPickingATabLessSessionDoesNotLandInAnotherSession() throws {
+        let defaults = InMemoryDefaults()
+        let store = emptyStore([Self.local, Self.remote], defaults: defaults)
+        // The local machine has a tab-less session of its own, and it is *not*
+        // the first one there. The two memories need opposite list orders to be
+        // visible at all, so they get a machine each: see the second half.
+        list(store, [(1, "here", [1]), (2, "gone", [])])
+        // `b` is listed first, and that is what makes the in-memory half
+        // observable: with no tab in front `selectedSession` reads
+        // `lastSession` and falls through to the machine's first session, so an
+        // entry rewritten to `a` surfaces there as `a` rather than as the row
+        // that was clicked.
+        list(store, host: Self.remote, [(1, "b", []), (2, "a", [2])])
+        store.selectedTabID = try tab(store, 1).id
+
+        // build-box's control connection drops. Both rows stay, `a`'s tab stays
+        // with them, and nothing sent can leave the process — the create below
+        // goes into `createTerminal`'s `try?`, which is the whole reason this
+        // click had nothing to show for itself before.
+        store.host(Self.remote)?.setStatusForTesting(
+            .reconnecting(attempt: 1, detail: "build-box: Connection reset by peer"))
+
+        // The row for `b`, as the dropdown performs it.
+        let b = SessionRef(host: Self.remote, session: 1)
+        store.switchHost(Self.remote, preferring: b)
+        store.createTerminal(sessionName: "b", on: Self.remote)
+
+        XCTAssertEqual(store.currentHost, Self.remote)
+        XCTAssertNil(store.selectedTabID, "the click landed on another session's tab")
+        XCTAssertEqual(store.selectedSession, b, "the machine's remembered session was rewritten")
+        XCTAssertEqual(
+            store.currentHostError, "build-box: Connection reset by peer",
+            "the one screen that says why a click did nothing was never reached")
+        XCTAssertEqual(
+            FrontSessionStore.load(defaults), FrontSession(host: Self.remote, name: "b"),
+            "the next launch was aimed at a session nobody clicked")
+
+        // ...and the same row on the machine you are already on is not a move
+        // at all. The create is the whole of what that click does there, and
+        // taking the selection off a live tab to say so would be worse than the
+        // nothing the `target != currentHost` guard does.
+        let there = try tab(store, 2, on: Self.remote).id
+        store.selectedTabID = there
+        store.switchHost(Self.remote, preferring: b)
+        XCTAssertEqual(store.selectedTabID, there, "a row on this machine moved the selection")
+
+        // The other half, and the other order: `gone` is neither the local
+        // machine's first session nor the one this window was last in there, so
+        // what is written for the next launch can only be right if the move
+        // carried the row's own session. `selectedSession` cannot show it —
+        // with no tab in front it answers with `here`, which is exactly what a
+        // blob naming the wrong session would say too.
+        let gone = SessionRef(host: Self.local, session: 2)
+        store.switchHost(Self.local, preferring: gone)
+
+        XCTAssertNil(store.selectedTabID, "the click landed on the session it was last in")
+        XCTAssertEqual(
+            FrontSessionStore.load(defaults), FrontSession(host: Self.local, name: "gone"),
+            "the next launch was aimed at a session nobody clicked")
+    }
+
     // MARK: - The session that comes back
 
     /// The machine, before anything has answered. The alternative — open on
@@ -325,20 +420,20 @@ final class CurrentHostTests: XCTestCase {
     /// and takes the first session, which is where a launch with no memory at
     /// all would have gone.
     ///
-    /// Two sessions, listed terminals-last-first, so that "the host's first
-    /// session" and "whatever tab the reconcile appended first" are different
-    /// tabs. With one session — or with the terminals in session order — this
-    /// passes with the whole restore block deleted, since `repairSelection`
-    /// reaches the same tab on its own.
+    /// Two sessions, the first of them holding the later terminal, so that "the
+    /// host's first session" and "whatever tab the reconcile appended first"
+    /// are different tabs. With one session — or with each session holding the
+    /// terminal its position suggests — this passes with the whole restore
+    /// block deleted, since `repairSelection` reaches the same tab on its own.
     func testARestoreNamingAGoneSessionFallsBackToTheHostsFirst() throws {
         let defaults = InMemoryDefaults()
         FrontSessionStore.save(FrontSession(host: Self.local, name: "work"), to: defaults)
         let store = emptyStore(defaults: defaults)
 
-        list(store, [(3, "scratch", [1]), (5, "spare", [2])], terminalOrder: [2, 1])
+        list(store, [(3, "scratch", [4]), (5, "spare", [2])], terminalOrder: [2, 4])
 
         XCTAssertEqual(
-            store.selectedTabID, try tab(store, 1).id,
+            store.selectedTabID, try tab(store, 4).id,
             "the restore took the first tab rather than the machine's first session")
         XCTAssertEqual(store.selectedSession?.session, 3)
     }
@@ -691,24 +786,25 @@ final class CurrentHostTests: XCTestCase {
     func testARememberedSessionThatWasDeletedIsNotComeBackTo() throws {
         let store = emptyStore([Self.local, Self.remote])
         list(store, [(1, "here", [1])])
-        // Listed newest-tab-first, so that "the machine's first session" and
-        // "the machine's first tab" are two different answers.
+        // Each session holding a terminal from later than its own position, so
+        // that "the machine's first session" and "the machine's first tab" are
+        // two different answers — `a` is first and its tab is last.
         list(
-            store, host: Self.remote, [(1, "a", [1]), (2, "b", [2]), (3, "c", [3])],
-            terminalOrder: [3, 2, 1])
+            store, host: Self.remote, [(1, "a", [5]), (2, "b", [4]), (3, "c", [3])],
+            terminalOrder: [3, 4, 5])
 
-        store.selectedTabID = try tab(store, 2, on: Self.remote).id
+        store.selectedTabID = try tab(store, 4, on: Self.remote).id
         store.switchHost(Self.local)
 
         // Another window deletes `b` while we are on the local machine.
-        list(store, host: Self.remote, [(1, "a", [1]), (3, "c", [3])], terminalOrder: [3, 1])
+        list(store, host: Self.remote, [(1, "a", [5]), (3, "c", [3])], terminalOrder: [3, 5])
 
         store.switchHost(Self.remote)
 
         XCTAssertEqual(
             store.selectedSession?.session, 1,
             "it came back to a deleted session, so the repair fell through to a tab")
-        XCTAssertEqual(store.selectedTabID, try tab(store, 1, on: Self.remote).id)
+        XCTAssertEqual(store.selectedTabID, try tab(store, 5, on: Self.remote).id)
 
         // ...and with the machine emptied entirely there is no session to name,
         // rather than the last one it remembers.
