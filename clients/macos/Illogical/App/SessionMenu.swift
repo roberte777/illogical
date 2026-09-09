@@ -247,17 +247,22 @@ struct SessionMenu: View {
 
             MenuSeparator()
 
-            // The chord out of the command table, formatted the way the
-            // palette's own rows format theirs. The title is not, and stays
-            // this dropdown's: plainly "New Session", on every machine count.
-            // It used to grow an "on <machine>" suffix once a second host was
-            // connected, which read as though this row were about that machine
-            // rather than about the one the window is on; the ＋ on each host
-            // header is where a named destination belongs, and it says so in
-            // its own tooltip.
+            // Title and chord both out of the command table, the way the
+            // "Add Remote Host…" row below already reads its own.
+            //
+            // The title used to be this dropdown's alone, because it grew an
+            // "on <machine>" suffix once a second host was connected and that
+            // was a thing only a row with a host list above it could say. The
+            // suffix is gone, so the exemption goes with it: a bare literal
+            // here would be a second copy of the table's wording, free to
+            // drift the moment the verb is reworded for the palette or the
+            // menu bar. Where the session lands is unchanged — `newSession()`
+            // still creates on `currentHost` — it is simply no longer spelled
+            // out in the row. The ＋ on each host header remains the affordance
+            // that names a destination, and still says so in its tooltip.
             MenuRow(
-                icon: "rectangle.stack.badge.plus", title: "New Session",
-                shortcut: Commands.command(.newSession).shortcut.map(ShortcutDisplay.string),
+                icon: "rectangle.stack.badge.plus", title: newSessionCommand.title(store),
+                shortcut: newSessionCommand.shortcut.map(ShortcutDisplay.string),
                 isHovered: hovered == "__new",
                 hover: { hovered = $0 ? "__new" : nil },
                 action: newSession)
@@ -325,8 +330,10 @@ struct SessionMenu: View {
         .onEscape { isPresented = false }
     }
 
-    /// The registry's entry for the last row, so its wording is the same
-    /// string the menu bar's item and the palette's row draw.
+    /// The registry's entries for the two rows below the session list, so
+    /// their wording is the same string the menu bar's items and the palette's
+    /// rows draw.
+    private var newSessionCommand: Command { Commands.command(.newSession) }
     private var addRemoteHost: Command { Commands.command(.addRemoteHost) }
 
     private func rowID(_ session: SessionSummary, on host: HostConnection) -> String {
