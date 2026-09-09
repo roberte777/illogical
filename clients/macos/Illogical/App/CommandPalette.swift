@@ -128,7 +128,21 @@ enum PaletteMetrics {
     ///
     /// Reserved from the rows rather than added to the panel, so the width
     /// above stays the measured number and the lane comes out of it.
+    ///
+    /// Taken out of the row's *text* rather than out of the row, which is the
+    /// distinction that matters: insetting the whole row pulled its highlight
+    /// in on the right and left it out on the left, and a selected row that is
+    /// off-centre in its own panel looks like a mistake even when nobody can
+    /// say why. The fill spans the row; only what it contains stops short.
     static let scrollGutter: CGFloat = 10
+
+    /// The row's left inset, wider than `MenuMetrics.rowPadding`'s 7.
+    ///
+    /// The dropdown can be tight against its edge because its rows are short
+    /// names; here a title starts a sentence, and at 7 it began hard against
+    /// the highlight's own corner radius — the fill's curve and the first
+    /// letter fighting for the same few points.
+    static let rowLeading: CGFloat = 12
 
     /// How tall the list is for a given number of rows.
     ///
@@ -409,9 +423,6 @@ struct CommandPalette: View {
                         MenuNotice(text: "No matching commands")
                     }
                 }
-                // The rows end before the scroller does. See `scrollGutter`:
-                // the alternative is a scrollbar sitting on top of the chords.
-                .padding(.trailing, PaletteMetrics.scrollGutter)
             }
             .scrollIndicators(.visible)
             .frame(height: PaletteMetrics.listHeight(rows: commands.count))
@@ -635,7 +646,17 @@ private struct PaletteRow: View {
             }
         }
         .foregroundStyle(titleColor)
-        .padding(.horizontal, MenuMetrics.rowPadding)
+        // Asymmetric, and the two sides are asymmetric for different reasons.
+        // The left is simply wider than the dropdown's — see `rowLeading`. The
+        // right carries the scroller's lane as well as its own padding, so the
+        // trailing column stops clear of a scrollbar that would otherwise sit
+        // on top of it.
+        //
+        // Both are inside the frame, so neither moves the highlight: the fill
+        // below spans the whole row and stays centred in the panel however far
+        // in the text has to start.
+        .padding(.leading, PaletteMetrics.rowLeading)
+        .padding(.trailing, MenuMetrics.rowPadding + PaletteMetrics.scrollGutter)
         .frame(height: PaletteMetrics.rowHeight)
         .background {
             if isSelected {
