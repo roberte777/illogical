@@ -32,7 +32,14 @@
 //  the window, and it uses the app's own palette. So it is an in-window overlay
 //  anchored to the session button's leading edge, just below the toolbar.
 //
-//  Geometry measured from the reference at 1.256 px/pt (toolbar = 39pt):
+//  Geometry measured from the reference at 1.256 px/pt, calibrated on the
+//  toolbar *in that image*: 49px for a band of 39pt, and 49/39 is where the
+//  1.256 comes from. Deliberately not `Metrics.toolbarHeight`, which is 40
+//  now — that 40 is a fact about the height AppKit gives a `.unifiedCompact`
+//  titlebar, and the photograph did not change when the constant did. Reading
+//  the same 49px as 40pt would give 1.225 and move every number below by half
+//  a percent for no reason at all.
+//
 //  panel ~125pt tall at x=80, corner radius 10, 4pt padding; icon column at 11pt
 //  from the panel edge, titles at 33pt; hover fill #5C9DF9 with dark text.
 //
@@ -111,8 +118,6 @@ struct SessionMenu: View {
     @State private var filter = ""
     @State private var hovered: String?
     @FocusState private var fieldFocused: Bool
-    @State private var addingHost = false
-    @State private var newHost = ""
 
     /// The session whose row is currently a text field, and what is in it.
     /// Set by the row's own context menu, or by File ▸ Rename Session… leaving
@@ -254,19 +259,36 @@ struct SessionMenu: View {
 
             MenuSeparator()
 
+            // The chord out of the command table, formatted the way the
+            // palette's own rows format theirs. The title is not, and stays
+            // this dropdown's: `newSessionTitle` names the machine when there
+            // is more than one to be wrong about, which is a thing only a row
+            // with a host list above it can say.
             MenuRow(
-                icon: "rectangle.stack.badge.plus", title: newSessionTitle, shortcut: "⇧⌘N",
+                icon: "rectangle.stack.badge.plus", title: newSessionTitle,
+                shortcut: Commands.command(.newSession).shortcut.map(ShortcutDisplay.string),
                 isHovered: hovered == "__new",
                 hover: { hovered = $0 ? "__new" : nil },
                 action: newSession)
 
             MenuSeparator()
 
+            // The title and the glyph come out of `Commands.all`, which now
+            // carries this verb for the palette and the menu bar as well —
+            // three copies of one row's wording is exactly what that table
+            // exists to prevent.
+            //
+            // It used to raise a sheet. A sheet and an in-place prompt are two
+            // answers to one question, and the prompt wins because the palette
+            // has to exist anyway: `beginAddRemoteHost` opens it already asking
+            // for a destination, and the store's overlay exclusion closes this
+            // dropdown on the way — so there is deliberately no
+            // `isPresented = false` here to be a second door.
             MenuRow(
-                icon: "globe", title: "Add Remote Host…",
+                icon: addRemoteHost.icon, title: addRemoteHost.title(store),
                 isHovered: hovered == "__remote",
                 hover: { hovered = $0 ? "__remote" : nil },
-                action: { addingHost = true })
+                action: { store.beginAddRemoteHost() })
         }
         .padding(MenuMetrics.padding)
         .frame(width: MenuMetrics.width)
@@ -310,13 +332,11 @@ struct SessionMenu: View {
         // be. Closing hands the
         // keyboard back to the terminal (SessionStore.focusTerminal).
         .onEscape { isPresented = false }
-        .sheet(isPresented: $addingHost) {
-            AddRemoteHost(destination: $newHost) { destination in
-                store.addHost(.ssh(destination: destination))
-                isPresented = false
-            }
-        }
     }
+
+    /// The registry's entry for the last row, so its wording is the same
+    /// string the menu bar's item and the palette's row draw.
+    private var addRemoteHost: Command { Commands.command(.addRemoteHost) }
 
     private func rowID(_ session: SessionSummary, on host: HostConnection) -> String {
         "s\(host.id)-\(session.id)"
@@ -663,62 +683,6 @@ struct HostHeader: View {
         .frame(height: MenuMetrics.headerHeight)
         .contentShape(Rectangle())
         .onHover(perform: hover)
-    }
-}
-
-/// Ask for an SSH destination. There is nothing else to ask for: no key, no
-/// port, no password. `ssh` reads the user's own config, so a `Host` alias out
-/// of it is a perfectly good answer.
-struct AddRemoteHost: View {
-    @Binding var destination: String
-    let add: (String) -> Void
-    @Environment(\.dismiss) private var dismiss
-
-    private var trimmed: String {
-        destination.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Add Remote Host")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Palette.textBright)
-
-            TextField("user@host, or a Host from ~/.ssh/config", text: $destination)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 320)
-                .onSubmit(commit)
-
-            Text(
-                "Runs `ssh <host> illogicald --stdio`. Your SSH config, keys, "
-                    + "jump hosts and agent forwarding apply — nothing is stored here "
-                    + "but the name."
-            )
-            .font(.system(size: 11))
-            .foregroundStyle(Palette.textDim)
-            .frame(width: 320, alignment: .leading)
-            .fixedSize(horizontal: false, vertical: true)
-
-            HStack {
-                Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }
-                Button("Add", action: commit)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(trimmed.isEmpty)
-            }
-        }
-        .padding(20)
-        // The panel colour, not the terminal's: this is a sheet over the
-        // window, and the only thing in the app that is the terminal's colour
-        // is a terminal.
-        .background(Palette.menuBottom)
-    }
-
-    private func commit() {
-        guard !trimmed.isEmpty else { return }
-        add(trimmed)
-        destination = ""
-        dismiss()
     }
 }
 

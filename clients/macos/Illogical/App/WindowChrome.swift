@@ -249,11 +249,63 @@ struct WindowChrome<Toolbar: View>: NSViewRepresentable {
         // where an event is delivered, not whether the window makes one.
         window.acceptsMouseMovedEvents = true
 
+        // A toolbar is a band the user can revoke, so this is the band being
+        // taken back. The toolbar below is attached for its height and nothing
+        // else, and hiding it takes `NSTitlebarView` back to a plain window's
+        // 32pt with the 40pt accessory clipped inside it — the exact fault
+        // that toolbar exists to fix, arriving with no UI left to explain it.
+        //
+        // This is the half that covers the doors that are actually open, and
+        // none of them is a menu item: `toggleToolbarShown:` reaches any
+        // window from anywhere in the responder chain, the title bar has a
+        // context menu of AppKit's own, and *state restoration* remembers
+        // toolbar visibility across launches — so without this, a window
+        // hidden once would reopen hidden for good. `IllogicalApp` empties the
+        // `.toolbar` command group as well, which is belt to this braces and
+        // is measured to delete nothing today; see the note there.
+        //
+        // On every update rather than only at creation, because a restored
+        // window arrives after both. Written only when it is wrong, so this is
+        // not a set on every pass of a SwiftUI body — including the ones in
+        // the middle of a live resize.
+        if window.toolbar?.isVisible == false { window.toolbar?.isVisible = true }
+
         if let existing = context.coordinator.accessory {
             // Keep the hosted SwiftUI view current across state changes.
             (existing.view as? NSHostingView<Toolbar>)?.rootView = toolbar()
             return
         }
+
+        // An empty toolbar, for its *height* and nothing else.
+        //
+        // A `.top` accessory is placed inside `NSTitlebarView`, and that view is
+        // a fixed 32pt on a plain window. AppKit hands the accessory to an
+        // `NSTitlebarAccessoryClipView` sized to the titlebar and resizes the
+        // hosted view down to fit, so `Metrics.toolbarHeight` was being asked
+        // for and quietly clipped: the strip drew 32pt of its 39 and the tab
+        // pill sat a point and a half under the top of the window with two
+        // points below it, where the reference gives it five and six. The
+        // SwiftUI side was never wrong — `NSHostingView.intrinsicContentSize`
+        // reported the full 39 throughout.
+        //
+        // Attaching a toolbar in `.unifiedCompact` makes that band 40pt, and
+        // the accessory then gets all of it. The reference is built the same
+        // way, which is checkable rather than assumed: a unified titlebar
+        // shifts the traffic lights right by 3pt, and the reference's first
+        // light sits 20.0pt from the window's left edge where a plain titlebar
+        // puts it at 16.0 and this puts it at 19.0.
+        //
+        // No items and no delegate, so it contributes nothing to draw. The
+        // accessory covers the full width and paints `Palette.toolbar` over it.
+        //
+        // What it does contribute is a way to *lose* the band, which is what
+        // the heal above is for: `allowsUserCustomization` covers the
+        // customize sheet, and nothing here covers `toggleToolbarShown:` or a
+        // window restored with the toolbar already off.
+        let spacer = NSToolbar(identifier: "illogical.titlebar-height")
+        spacer.allowsUserCustomization = false
+        window.toolbar = spacer
+        window.toolbarStyle = .unifiedCompact
 
         let hosting = NSHostingView(rootView: toolbar())
         hosting.frame = NSRect(x: 0, y: 0, width: window.frame.width, height: toolbarHeight)
@@ -262,6 +314,27 @@ struct WindowChrome<Toolbar: View>: NSViewRepresentable {
         let accessory = NSTitlebarAccessoryViewController()
         accessory.view = hosting
         accessory.layoutAttribute = .top
+        // What this asks for: that the strip stay on screen in full screen,
+        // where AppKit otherwise takes the whole title bar away until the
+        // pointer goes to the top of the display. At 0 — the default — an
+        // accessory goes with it; at a height it stays behind at that height.
+        //
+        // It was written for a window with no toolbar, and the toolbar above
+        // has since put the accessory in a title bar with a second reason to
+        // auto-hide, so it was worth measuring rather than reasoning about.
+        // **Measured**, on macOS 26: driven into full screen with the pointer
+        // parked well away from the top and read back ten seconds later, the
+        // accessory is un-hidden at alpha 1, its full 40pt tall, flush with
+        // the top of the window — and it is all of that with this line set to
+        // `0` as well. So the toolbar has not made the strip auto-hide, and
+        // this line is not what is holding it up: a `.hiddenTitleBar` window
+        // whose title bar is transparent appears to keep its accessory either
+        // way.
+        //
+        // Kept anyway. It is the documented way to ask for what the app wants
+        // and it costs a property set, where "it holds without asking" is a
+        // fact about one OS version — deleting it trades a line for something
+        // to rediscover.
         accessory.fullScreenMinHeight = toolbarHeight
         window.addTitlebarAccessoryViewController(accessory)
         context.coordinator.accessory = accessory

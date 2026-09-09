@@ -33,14 +33,52 @@ struct IllogicalApp: App {
                 }
         }
         .windowStyle(.hiddenTitleBar)
+        // Every item below whose verb is in `Commands.all` is a
+        // `CommandMenuItem`, which reads its title, its chord and its greying
+        // out of that table. What stays hand-written here is placement: which
+        // group an item is in, what it sits between, and the comments that
+        // explain both. SwiftUI wants that structure static anyway, and where
+        // a thing lives in the menu bar is a fact about the menu bar rather
+        // than about the verb.
         .commands {
+            // The app prints nothing, and SwiftUI's default File menu offers
+            // Page Setup… (⇧⌘P) and Print… (⌘P) regardless. ⇧⌘P is the
+            // palette's, and two items claiming one chord resolve by menu
+            // order — a coin flip that would be nobody's fault and everybody's
+            // bug. Removing both is cheaper than out-ranking one.
+            CommandGroup(replacing: .printItem) { EmptyView() }
+            // Whatever this placement would generate, which is where Show
+            // Toolbar and Customize Toolbar… live. `WindowChrome` attaches an
+            // `NSToolbar` for its *height* and nothing else — it is what makes
+            // `NSTitlebarView` 40pt where a plain window's is 32 — so a
+            // toolbar the user can hide is a band the user can revoke: hidden,
+            // that band drops back to 32, the 40pt accessory inside it is
+            // clipped to 32, and the window is showing the exact bug the
+            // toolbar was added to fix with nothing in the app to name or undo
+            // it.
+            //
+            // **Measured, twice**, by dumping `NSApp.mainMenu` two seconds
+            // into a real launch: this placement generates nothing in this app
+            // with the line and nothing without it. The View menu holds the
+            // eleven items the group below adds and no toolbar item at all. So
+            // it deletes nothing today, and it is here as the cheap half of a
+            // pair — an empty replacement costs one line and forecloses a
+            // SwiftUI release, or a `.toolbar` modifier added upstream of
+            // here, quietly growing a ⌥⌘T that undoes the chrome. The
+            // load-bearing half is in `WindowChrome`, which heals a toolbar it
+            // finds hidden: `toggleToolbarShown:` from the responder chain and
+            // window state restoration are the doors that are actually open,
+            // and neither is a menu item this could delete.
+            //
+            // `replacing:` alongside the `after:` below is not a conflict —
+            // they are different halves of one placement — and the dump is
+            // what confirms the eleven items after it survive.
+            CommandGroup(replacing: .toolbar) { EmptyView() }
             CommandGroup(replacing: .newItem) {
-                Button("New Terminal") { store.createTerminal() }
-                    .keyboardShortcut("t", modifiers: .command)
+                CommandMenuItem(.newTerminal, store: store)
                 // On the machine in front, which is where ⌘T would put a
                 // terminal too. What it is called is the store's to decide.
-                Button("New Session") { store.createSession() }
-                    .keyboardShortcut("n", modifiers: [.command, .shift])
+                CommandMenuItem(.newSession, store: store)
                 Divider()
                 // No key equivalents. Both are rare, one of them is
                 // destructive, and a chord for either would be spent for the
@@ -49,18 +87,12 @@ struct IllogicalApp: App {
                 // Rename opens the dropdown rather than a sheet: the field is
                 // the row itself, which is where the name is read, and this is
                 // the same gesture the row's own context menu performs.
-                Button("Rename Session…") {
-                    if let ref = store.selectedSession { store.requestRenameSession(ref) }
-                }
-                .disabled(store.selectedSession == nil)
+                CommandMenuItem(.renameSession, store: store)
                 // Also disabled while the machine is being reconnected to. The
                 // session is still listed — `controlClosed` keeps the lists on
                 // purpose — but nothing can be sent, and the dialog behind this
                 // says "This cannot be undone."
-                Button("Delete Session…") {
-                    if let ref = store.selectedSession { store.requestDeleteSession(ref) }
-                }
-                .disabled(store.selectedSession.map { !store.canDeleteSession($0) } ?? true)
+                CommandMenuItem(.deleteSession, store: store)
             }
             // Closing and splits. ⌘W itself is deliberately absent: it goes
             // through the responder chain as `performClose:`, so the focused
@@ -70,21 +102,15 @@ struct IllogicalApp: App {
             // `closeSurfacePane`.
             CommandGroup(after: .newItem) {
                 Divider()
-                Button("Close Tab") {
-                    if let id = store.selectedTabID { WindowClose.tab(id, in: store) }
-                }
-                .keyboardShortcut("w", modifiers: [.command, .shift])
-                .disabled(store.selectedTabID == nil)
+                CommandMenuItem(.closeTab, store: store)
                 Divider()
-                Button("Split Right") { store.split(.columns) }
-                    .keyboardShortcut("d", modifiers: .command)
-                Button("Split Down") { store.split(.rows) }
-                    .keyboardShortcut("d", modifiers: [.command, .shift])
-                Button(store.selectedTab?.zoomed == nil ? "Zoom Pane" : "Unzoom Pane") {
-                    store.toggleZoomOnFocusedPane()
-                }
-                .keyboardShortcut(.return, modifiers: [.command, .shift])
-                .disabled(store.selectedTab?.isSplit != true)
+                // Both splits now grey out with no tab in front. They were
+                // enabled and silently did nothing — `split` guards on
+                // `selectedTab` and returns — which is the one thing this app
+                // has decided a menu item must never do.
+                CommandMenuItem(.splitRight, store: store)
+                CommandMenuItem(.splitDown, store: store)
+                CommandMenuItem(.toggleZoom, store: store)
             }
             // Find, where macOS puts it: after the pasteboard items in Edit.
             // Menu items rather than a key monitor, for the reason the tab
@@ -92,60 +118,77 @@ struct IllogicalApp: App {
             // ⌘F cannot also be typed into the terminal.
             CommandGroup(after: .pasteboard) {
                 Divider()
-                Button("Find…") { store.beginFind() }
-                    .keyboardShortcut("f", modifiers: .command)
-                    .disabled(store.selectedController == nil)
-                Button("Find Next") { store.findNext() }
-                    .keyboardShortcut("g", modifiers: .command)
-                    .disabled(!store.canFindAgain)
-                Button("Find Previous") { store.findPrevious() }
-                    .keyboardShortcut("g", modifiers: [.command, .shift])
-                    .disabled(!store.canFindAgain)
+                CommandMenuItem(.find, store: store)
+                CommandMenuItem(.findNext, store: store)
+                CommandMenuItem(.findPrevious, store: store)
             }
             CommandGroup(after: .toolbar) {
+                // ⇧⌘P, beside the switcher it is a superset of. It toggles,
+                // exactly as ⌘K does: the chord that opened it closes it, and
+                // there is no second gesture to learn.
+                CommandMenuItem(.commandPalette, store: store)
                 // ⌘K rather than ⇧⌘K: switching sessions is the most reached-for
                 // thing in the chrome, and unshifted is where every other app
                 // puts its switcher. The cost is the iTerm/Ghostty "clear
                 // scrollback" convention — a chord this menu claims can never
                 // reach `keyDown`, so ⌘K is now unavailable to the terminal.
-                Button("Change Session") { store.toggleSessionMenu() }
-                    .keyboardShortcut("k", modifiers: .command)
+                CommandMenuItem(.changeSession, store: store)
                 // No key equivalent, on the same rule as Rename and Delete
                 // Session: a chord spent here would be spent for the life of
                 // the app on something most windows, which have one machine in
                 // them, never reach for at all.
                 //
-                // And deliberately not the ⇧⌘K the line above has just freed,
-                // tempting as an empty slot beside its own menu item is. A
-                // submenu of per-host toggles has no single action for a chord
-                // to fire, and ⇧⌘K meant "open the session dropdown" for the
-                // whole life of that chord — giving it one release later to
-                // something that moves the window to another machine turns a
-                // habit into a teleport. It stays fallow.
+                // And deliberately not the ⇧⌘K that ⌘K freed, tempting as an
+                // empty slot beside its own menu item is. A submenu of per-host
+                // toggles has no single action for a chord to fire, and ⇧⌘K
+                // meant "open the session dropdown" for the whole life of that
+                // chord — giving it one release later to something that moves
+                // the window to another machine turns a habit into a teleport.
+                // It stays fallow.
                 //
                 // `Toggle` rather than `Button`, for the checkmark: it is the
                 // only thing in the menu that says which machine you are on,
-                // and macOS draws it for a toggle without being asked.
-                Menu("Switch Host") {
-                    ForEach(store.hosts) { host in
-                        Toggle(
-                            host.displayName,
-                            isOn: Binding(
-                                get: { store.currentHost == host.host },
-                                set: { _ in store.switchHost(host.host) }))
-                    }
+                // and macOS draws it for a toggle without being asked. The
+                // machines themselves come from the same registry entry the
+                // palette's Switch Host prompt reads, so the two lists cannot
+                // drift.
+                //
+                // That machine's own row is checked *and* greyed, which is one
+                // sentence in menu-bar grammar: here, and nowhere to go from
+                // here. The greying is `CommandChoiceMenu`'s, off the same
+                // `PaletteChoice.isEnabled` the palette dims the row with,
+                // because `switchHost` returns for it. Dropping the row instead
+                // was tried and cost this checkmark — nothing left to be on
+                // meant `isOn` could never be true, and this had to become a
+                // `Button` with the menu no longer saying where the window was.
+                CommandChoiceMenu(.switchHost, store: store) { choice in
+                    Toggle(
+                        choice.title,
+                        isOn: Binding(
+                            get: { choice.isCurrent },
+                            set: { _ in store.chooseOption(choice) }))
                 }
-                Button("Refresh Sessions") { store.refresh() }
-                    .keyboardShortcut("r", modifiers: .command)
+                // These two used to exist only inside the session dropdown,
+                // which meant the palette carried verbs the menu bar did not —
+                // a gap in the other direction from the one `Commands.swift`
+                // exists to close. Both chord-less, on the rule Rename and
+                // Delete Session already state.
+                CommandMenuItem(.addRemoteHost, store: store)
+                // A `Button` where Switch Host is a `Toggle`: there is no state
+                // here to check, and an item that never shows a checkmark
+                // should not be drawn as one that could.
+                CommandChoiceMenu(.forgetHost, store: store) { choice in
+                    Button(choice.title) { store.chooseOption(choice) }
+                }
+                CommandMenuItem(.refreshSessions, store: store)
                 Divider()
-                Button("Focus Pane Left") { store.moveFocus(.left) }
-                    .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
-                Button("Focus Pane Right") { store.moveFocus(.right) }
-                    .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
-                Button("Focus Pane Above") { store.moveFocus(.up) }
-                    .keyboardShortcut(.upArrow, modifiers: [.command, .option])
-                Button("Focus Pane Below") { store.moveFocus(.down) }
-                    .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+                // Greyed with no split, where they used to be enabled and do
+                // nothing: `moveFocus` returns unless there is a pane to move
+                // to. Same unification as the two splits above.
+                CommandMenuItem(.focusPaneLeft, store: store)
+                CommandMenuItem(.focusPaneRight, store: store)
+                CommandMenuItem(.focusPaneAbove, store: store)
+                CommandMenuItem(.focusPaneBelow, store: store)
             }
             // Tab switching sits in the Window menu, where Terminal.app puts
             // it and where a user looks for it. ⌘1–⌘9 are menu items rather
@@ -153,13 +196,13 @@ struct IllogicalApp: App {
             // claims never reaches `keyDown`, so it cannot also be typed into
             // the terminal.
             CommandGroup(before: .windowList) {
-                Button("Show Next Tab") { store.selectNextTab() }
-                    .keyboardShortcut("]", modifiers: [.command, .shift])
-                    .disabled(store.visibleTabs.count < 2)
-                Button("Show Previous Tab") { store.selectPreviousTab() }
-                    .keyboardShortcut("[", modifiers: [.command, .shift])
-                    .disabled(store.visibleTabs.count < 2)
+                CommandMenuItem(.showNextTab, store: store)
+                CommandMenuItem(.showPreviousTab, store: store)
                 Divider()
+                // The one group that stays bespoke, and deliberately: the
+                // number *is* the argument, so nine registry entries would be
+                // nine palette rows of noise for a thing whose whole interface
+                // is the chord.
                 ForEach(1...SessionStore.lastTabIndex, id: \.self) { index in
                     Button(index == SessionStore.lastTabIndex ? "Last Tab" : "Tab \(index)") {
                         store.selectTab(at: index)
@@ -199,6 +242,21 @@ struct ContentView: View {
         if store.selectedTab != nil { return .terminals }
         if store.connectionError != nil || store.currentHostError != nil { return .unavailable }
         return .empty
+    }
+
+    /// Hand the keyboard back to the terminal, but only once *both* overlays
+    /// have gone.
+    ///
+    /// The guard on both is load-bearing and subtle. `beginAddRemoteHost`
+    /// closes the dropdown in the very act of opening the palette — that is
+    /// what `SessionStore.palette`'s `didSet` does — so a handler that only
+    /// asked whether the dropdown had closed would bump `focusGeneration` on
+    /// the way past, and the terminal surface would take first responder back
+    /// from the palette's field in the frame the panel appeared in. The person
+    /// would watch a field open and then type into the shell behind it.
+    private func returnFocusIfNothingIsOpen() {
+        guard !store.sessionMenuOpen, store.palette == nil else { return }
+        store.focusTerminal()
     }
 
     var body: some View {
@@ -276,6 +334,46 @@ struct ContentView: View {
             .animation(
                 Motion.menu.animation(reduceMotion: reduceMotion), value: store.sessionMenuOpen)
         }
+        .overlay {
+            // Its own overlay rather than a second child of the ZStack above,
+            // because the two are anchored differently: the dropdown hangs off
+            // the session button's leading edge, and this is centred in the
+            // window. `ZStack(alignment: .top)` is exactly that, and it is
+            // unconditional for the same reason the dropdown's is, so the
+            // removal transition has something to run inside. The panel then
+            // hangs `PaletteMetrics.topInset` below, clear of the chrome
+            // rather than touching it — see there for why this one floats and
+            // the dropdown does not.
+            //
+            // The `GeometryReader` is for one number the panel cannot ask for
+            // itself: how much room it has. Its list clamps against the height
+            // of this area — see `PaletteMetrics.listHeight(rows:in:)` — and
+            // the only way a view can measure the space around it is to fill
+            // it, which is exactly what a panel sized by its own contents must
+            // not do. The view doing the placing measures instead.
+            GeometryReader { window in
+                ZStack(alignment: .top) {
+                    if store.palette != nil {
+                        // Dismiss on a click anywhere else, the way a menu does.
+                        Color.black.opacity(0.001)
+                            .contentShape(Rectangle())
+                            .onTapGesture { store.closePalette() }
+
+                        CommandPalette(windowHeight: window.size.height)
+                            .environment(store)
+                            .offset(y: PaletteMetrics.topInset)
+                            .transition(Motion.menu.transition(reduceMotion: reduceMotion))
+                    }
+                }
+                // A reader offers its content the whole of itself and then puts
+                // it in the top-left corner; without this the stack would be
+                // the size of what is in it and centre the panel in that. The
+                // scrim above happens to fill today, and "happens to" is not a
+                // layout rule.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .animation(Motion.menu.animation(reduceMotion: reduceMotion), value: store.palette)
+            }
+        }
         // ⌃⇥ / ⌃⇧⇥, the one pair of tab chords the Window menu cannot also
         // carry: a menu item holds a single key equivalent, and those items
         // already spend theirs on ⇧⌘] and ⇧⌘[. TabCycleKey says why that
@@ -286,12 +384,11 @@ struct ContentView: View {
             case .previous: store.selectPreviousTab()
             }
         }
-        // The menu's filter field held the keyboard while it was open, and
+        // Either overlay's field held the keyboard while it was open, and
         // nothing in the split tree changed when the overlay went away — so
         // without this, typing after Esc went nowhere. W15.
-        .onChange(of: store.sessionMenuOpen) { _, isOpen in
-            if !isOpen { store.focusTerminal() }
-        }
+        .onChange(of: store.sessionMenuOpen) { _, _ in returnFocusIfNothingIsOpen() }
+        .onChange(of: store.palette) { _, _ in returnFocusIfNothingIsOpen() }
         // One dialog for every destructive action, driven off the store so the
         // wording and the policy are tested in one place. `presenting:` hands
         // the value back to the buttons rather than making them read the slot
@@ -638,8 +735,24 @@ struct Toolbar: View {
             // around it calls `claimsMouseDown()`.
             Spacer(minLength: 8)
 
+            // Through `runCommand` rather than straight to `createTerminal`,
+            // which is the same correction `EmptyState`'s New Terminal button
+            // took: the table decides what the verb does, and `runCommand`'s
+            // rule is that nothing is left drawing a panel over what it just
+            // did.
+            //
+            // It matters more here than anywhere else in the app, because this
+            // control is live *underneath* the palette. The panel's scrim is
+            // an overlay on `ContentView`'s `VStack`; this toolbar is an
+            // `NSTitlebarAccessoryViewController` inside `NSTitlebarView`,
+            // which is not in that view and is not covered by anything the
+            // content view draws. So ＋ with the panel up made a terminal
+            // behind a panel that stayed. The tab pills and their ✕ are live
+            // under it for exactly the same reason; they are left alone here
+            // because neither is a command in the table, and closing a tab
+            // already goes through `WindowClose`.
             Button {
-                store.createTerminal()
+                store.runCommand(.newTerminal)
             } label: {
                 Image(systemName: "plus")
                     .font(.system(size: 12, weight: .regular))
@@ -651,7 +764,9 @@ struct Toolbar: View {
             // Without this a drag begun on `+` moved the window and made a
             // terminal when it ended, which is two surprises for one gesture.
             .claimsMouseDown()
-            .help("New Terminal (⌘T)")
+            // The menu item's own title and chord, so the ＋ cannot go on
+            // advertising a chord that has moved.
+            .help(Commands.help(.newTerminal, store))
             .padding(.trailing, Metrics.plusTrailing)
         }
         .frame(height: Metrics.toolbarHeight)
@@ -683,8 +798,13 @@ struct EmptyState: View {
             Text("Sessions keep running after you close this window.")
                 .font(.system(size: 12))
                 .foregroundStyle(Palette.textDim)
-            Button("New Terminal") { store.createTerminal() }
-                .padding(.top, 4)
+            // Title and action both out of the table: this button is File ▸
+            // New Terminal drawn somewhere else, and the one thing it must not
+            // do is come to mean something different from the item it copies.
+            Button(Commands.command(.newTerminal).title(store)) {
+                store.runCommand(.newTerminal)
+            }
+            .padding(.top, 4)
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -89,8 +89,90 @@ final class SessionStore {
     ///
     /// ILLOGICAL_OPEN_SESSION_MENU opens it at launch, alongside
     /// ILLOGICAL_TRACE, so it can be screenshotted without driving the mouse.
-    var sessionMenuOpen =
-        ProcessInfo.processInfo.environment["ILLOGICAL_OPEN_SESSION_MENU"] != nil
+    /// Read in `init`'s default argument rather than here, so that a test can
+    /// hand over the same launch state the environment would — see there.
+    ///
+    /// The `didSet` is half of the mutual exclusion with `palette` — see
+    /// there. It is an observer rather than a rule the callers follow because
+    /// SwiftUI writes this property directly: the session button binds to
+    /// `$store.sessionMenuOpen`, so a `open()` method would be a funnel with a
+    /// bypass, which is the `selectedTabID` lesson repeated.
+    var sessionMenuOpen: Bool {
+        didSet {
+            if sessionMenuOpen { palette = nil }
+        }
+    }
+
+    /// The command palette: nil when it is closed, and otherwise which of its
+    /// two stages is on screen.
+    ///
+    /// ILLOGICAL_OPEN_PALETTE opens it at launch, on the same rule
+    /// ILLOGICAL_OPEN_SESSION_MENU is there for: the panel can be
+    /// screenshotted without driving the mouse. Set it to a `CommandID` —
+    /// `ILLOGICAL_OPEN_PALETTE=addRemoteHost` — and it opens on that command's
+    /// prompt rather than on the list, which is the only way to photograph
+    /// stage two at all: reaching it by hand means typing into the field, and
+    /// a keystroke has to come from a person. A value naming no command with a
+    /// prompt, `1` included, opens the list.
+    ///
+    /// Three invariants, held here rather than asked of the callers:
+    ///
+    /// 1. `.argument(id)` is only ever a command that *has* a prompt, and is
+    ///    only entered while that command is enabled. Two doors, and both
+    ///    check: `runCommand` for everything the app does, and `init` for the
+    ///    launch flag, which cannot check for itself because the check needs
+    ///    the store the flag is being read for. It is belt and braces rather
+    ///    than a load-bearing guarantee: every action re-checks for itself in
+    ///    the store (`switchHost`, `removeHost` and `addHost` all already do),
+    ///    so a prompt left standing while a reconcile takes its machine away
+    ///    can commit to nothing. That is the same property
+    ///    `confirmPendingDestruction` has.
+    /// 2. At most one overlay is on screen. The two `didSet`s hold it, not the
+    ///    callers, and there is no loop between them: the second write finds
+    ///    nothing left to change. `init` holds the one case a `didSet` cannot
+    ///    see — both launch flags set at once, where neither observer runs
+    ///    because neither property was ever assigned to.
+    /// 3. What has been typed resets on every stage change. That is view state
+    ///    (`CommandPalette`'s `query`, like the dropdown's `filter`), so the
+    ///    view watches this property for it.
+    var palette: PaletteStage? {
+        didSet {
+            if palette != nil { sessionMenuOpen = false }
+        }
+    }
+
+    /// Which stage ILLOGICAL_OPEN_PALETTE asks for, or nil when it is unset.
+    ///
+    /// The prompt check is the same one `runCommand` makes, so the flag cannot
+    /// put the panel into a stage the app has no way to reach: a command with
+    /// no prompt falls back to the list rather than opening an argument field
+    /// for something that takes no argument.
+    ///
+    /// The *enabled* check `runCommand` also makes cannot happen here — there
+    /// is no store yet to ask, this being what one of its properties starts
+    /// out as — so `init` makes it once there is one. Both halves are needed
+    /// for invariant 1 above to be true, and this function used to claim both
+    /// while making one: `ILLOGICAL_OPEN_PALETTE=switchHost` on a one-machine
+    /// window opened a prompt with nothing in it, off a row the panel itself
+    /// draws dimmed.
+    ///
+    /// Not `private`, and neither is `launchFlag`: they are `init`'s default
+    /// arguments, and a default argument cannot be less visible than the
+    /// initializer it belongs to.
+    static func launchStage() -> PaletteStage? {
+        guard let value = ProcessInfo.processInfo.environment["ILLOGICAL_OPEN_PALETTE"]
+        else { return nil }
+        guard let id = CommandID(rawValue: value), Commands.prompt(id) != nil else {
+            return .commands
+        }
+        return .argument(id)
+    }
+
+    /// One of the launch-time overlay switches. Named rather than repeated so
+    /// the two reads above look like the pair they are.
+    static func launchFlag(_ name: String) -> Bool {
+        ProcessInfo.processInfo.environment[name] != nil
+    }
 
     /// A session the menu bar has asked the dropdown to rename in place.
     ///
@@ -206,13 +288,28 @@ final class SessionStore {
     /// docs/GOALS.md G7's launch budget is untouched — the read is off the
     /// first-paint path's critical section entirely, beside the one
     /// `startingHosts` already does.
+    ///
+    /// The last two are the launch-time overlay switches, and they are
+    /// parameters for one reason: the two rules at the end of this method are
+    /// the only ones in the store that a `didSet` cannot hold, precisely
+    /// because they are about a property's *initial* value — so they are also
+    /// the only ones no assignment from a test could exercise. Read out of the
+    /// environment by default, which is what the app gets and what leaves
+    /// `ProcessInfo` in exactly one place; handed over directly by the tests
+    /// that hold those two rules. Assigned once each below, so the observers
+    /// stay out of it and the repairs are doing the work rather than being
+    /// covered for.
     init(
         hosts: [ServerHost]? = nil,
         defaults: HostDefaults = UserDefaults.standard,
-        launcher: DaemonLauncher = BundledDaemonLauncher()
+        launcher: DaemonLauncher = BundledDaemonLauncher(),
+        sessionMenuOpen: Bool = SessionStore.launchFlag("ILLOGICAL_OPEN_SESSION_MENU"),
+        palette: PaletteStage? = SessionStore.launchStage()
     ) {
         self.defaults = defaults
         self.launcher = launcher
+        self.sessionMenuOpen = sessionMenuOpen
+        self.palette = palette
         let starting = hosts ?? SessionStore.startingHosts(defaults)
         // The remote half asks where the list came from, because an injected
         // host is in it *because* the variable named it — there is nothing to
@@ -241,6 +338,34 @@ final class SessionStore {
         pendingRestore = remembered == nil ? nil : front
         for host in starting {
             adopt(HostConnection(host: host, launcher: launcher))
+        }
+        // The overlay exclusion's one blind spot, closed by hand. A `didSet`
+        // does not run for a property's initial value, so both launch flags set
+        // at once — ILLOGICAL_OPEN_SESSION_MENU and ILLOGICAL_OPEN_PALETTE
+        // together, which is one screenshot script away — produced two overlays
+        // with neither observer having fired. A hole in the holder is worse
+        // than no holder, because everything downstream is written as though
+        // the invariant is total.
+        //
+        // The palette wins, which is the rule the runtime already gives: the
+        // later-opened overlay closes the earlier one, and of the two the panel
+        // is the more specific ask.
+        if self.palette != nil { self.sessionMenuOpen = false }
+        // The other half of the same blind spot, and the other half of
+        // invariant 1. `launchStage` checks that a command has a prompt,
+        // because that much is a fact about the table; whether it is *enabled*
+        // is a fact about this store, which does not exist while its own
+        // properties are being computed. So the check `runCommand` makes for
+        // every other way into stage two is made here for the one way that
+        // skips it: ILLOGICAL_OPEN_PALETTE=switchHost on a one-machine window
+        // opened an argument field over a list of no machines, off a row the
+        // panel draws dimmed and refuses to run.
+        //
+        // Falling back to the list rather than to nothing, which is what the
+        // unreachable-stage case above already does: the flag asked for the
+        // panel, and the panel is a thing this window can show.
+        if case .argument(let id) = self.palette, !Commands.command(id).isEnabled(self) {
+            self.palette = .commands
         }
     }
 
@@ -409,9 +534,11 @@ final class SessionStore {
     /// terminal on it — and until this there was no way to say so, because
     /// "which machine" was read off a tab.
     func switchHost(_ target: ServerHost) {
-        // Already being there is not a move. The menu's checked row is still a
-        // row you can click, and without this it would drop you on the first
-        // tab of the session you are already in.
+        // Already being there is not a move. Both surfaces draw that machine —
+        // checked, and greyed because of this line — and both refuse it before
+        // they reach here, so this is the store's own re-guard behind them, on
+        // the rule every action in this file follows. Without it that row would
+        // drop you on the first tab of the session you are already in.
         guard let connection = host(target), target != currentHost else { return }
         // An explicit move ends the launch restore, whether or not it lands on
         // anything. Landing on a tab already voided it through
@@ -1249,6 +1376,171 @@ final class SessionStore {
         sessionMenuOpen.toggle()
     }
 
+    // MARK: - The command palette
+    //
+    // ⇧⌘P. Everything the menu bar can do, searchable, plus the two host verbs
+    // that used to live only in the dropdown. The panel is drawn by
+    // `CommandPalette`; every decision it makes is here, because a view cannot
+    // be asked which commands are reachable or what a filter means.
+
+    /// ⇧⌘P.
+    ///
+    /// Focus is not restored here, for the reason `toggleSessionMenu` does not
+    /// restore it either: `ContentView` watches both overlays and hands the
+    /// keyboard back when neither is up, so there is one owner of that rule.
+    func togglePalette() {
+        palette = palette == nil ? .commands : nil
+    }
+
+    /// Every dismissal funnels here — Escape, a click away, and the far side
+    /// of running anything.
+    func closePalette() {
+        palette = nil
+    }
+
+    /// Do a command, or ask for the argument it needs.
+    ///
+    /// The one door, and both surfaces go through it: a menu item is this with
+    /// nothing open, and a palette row is this with the panel up. That is why
+    /// it is not called `runPaletteCommand` — the menu bar would be lying
+    /// about where it was.
+    ///
+    /// **The palette closes before the action runs, not after**, so that
+    /// nothing is left drawing a panel over what it just did — Close Tab can
+    /// take the window with it, and Change Session and Rename Session… both
+    /// raise the dropdown. A close written behind the action is a tidying
+    /// write that arrives after the thing it was tidying up for.
+    ///
+    /// With one exception, and it is the command that owns the panel. ⇧⌘P's
+    /// action is a toggle, so dismissing first would have it find the palette
+    /// already shut and open it again — the chord that opens the palette could
+    /// then never close it. It is also the one command the palette never
+    /// lists, which is the same fact said the other way round: closing "the
+    /// panel a row was chosen from" cannot apply to a command that has no row.
+    ///
+    /// A disabled command does nothing at all, which is the whole reason the
+    /// palette dims rows rather than hiding them: the row is honest about
+    /// existing and honest about not being reachable, and clicking it cannot
+    /// produce the silent half-action a hidden-but-live command would.
+    func runCommand(_ id: CommandID) {
+        let command = Commands.command(id)
+        guard command.isEnabled(self) else { return }
+        switch command.action {
+        case .run(let act):
+            if id != .commandPalette { closePalette() }
+            act(self)
+        case .prompt:
+            palette = .argument(id)
+        }
+    }
+
+    /// Take one of a choice prompt's options.
+    ///
+    /// Both surfaces again: a palette row and one of the menu bar's per-host
+    /// items are this call, which is why it is not named after the palette.
+    /// It closes first on the same rule `runCommand` does — nothing is left
+    /// drawing a panel over what it did — and closing a panel that was never
+    /// up, which is the menu bar's case, is nothing at all.
+    ///
+    /// The guard is `runCommand`'s, line for line, and it is what makes the
+    /// close-first order safe: an option that cannot be taken is refused
+    /// *before* anything is closed. Switch Host has one — the machine the
+    /// window is already on, which it offers dimmed and checked rather than not
+    /// at all, because `switchHost` returns for it. Without this line that row
+    /// is a panel which closes and an action which declines, and it is no
+    /// answer that the row is drawn dimmed: the dimming warns, and this is what
+    /// makes the warning true. A choice prompt added later gets it for nothing.
+    func chooseOption(_ choice: PaletteChoice) {
+        guard choice.isEnabled else { return }
+        closePalette()
+        choice.choose(self)
+    }
+
+    /// ⌫ on an empty argument field: back to the list of commands.
+    ///
+    /// The chip is the command, so deleting backwards past the start of the
+    /// text deletes the chip — which is the gesture every token field on this
+    /// platform has. Nothing at all in stage one: there is no token there to
+    /// take back, and swallowing ⌫ would make the search field unable to
+    /// correct a typo.
+    func popPaletteArgument() {
+        guard case .argument = palette else { return }
+        palette = .commands
+    }
+
+    /// The rows stage one shows for what has been typed.
+    ///
+    /// The same rule the dropdown's filter follows — trimmed, case-insensitive,
+    /// substring — and in the store for the same reason `filterOffer` is: it is
+    /// what Return acts on as well as what is drawn, and two copies of it would
+    /// be a highlighted row and a keystroke that disagree about which command
+    /// is first. Registry order is preserved rather than ranked: ranking is a
+    /// second rule to keep, and the dropdown has done without one.
+    func paletteCommands(matching typed: String) -> [Command] {
+        let query = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return Commands.paletteVisible }
+        return Commands.paletteVisible.filter {
+            $0.title(self).localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    /// The same, for a choice prompt's options. Empty for a command with no
+    /// prompt, or one whose prompt is free text.
+    func paletteChoices(for id: CommandID, matching typed: String) -> [PaletteChoice] {
+        let choices = Commands.choices(id, in: self)
+        let query = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return choices }
+        return choices.filter { $0.title.localizedCaseInsensitiveContains(query) }
+    }
+
+    /// Add Remote Host…'s Return.
+    ///
+    /// The trim and the refusal of an empty destination came off the sheet this
+    /// replaced, where they were the Add button's `.disabled` and its
+    /// `commit`'s guard. Here rather than in the field for the reason every
+    /// other refusal in this file is here: the rule is one thing, and a view
+    /// that decided for itself is how the dropdown's rename ended up validating
+    /// the raw text and committing a trimmed one.
+    ///
+    /// Nothing is said on screen about an empty field, and nothing needs to be:
+    /// the panel stays open with the caret where it was, which is the whole of
+    /// the feedback a field with nothing in it can want.
+    func commitAddHost(_ typed: String) {
+        guard let destination = SessionStore.destination(typed) else { return }
+        addHost(.ssh(destination: destination))
+        closePalette()
+    }
+
+    /// What `commitAddHost` would commit for what has been typed: the trimmed
+    /// destination, or nil for a field holding nothing but whitespace.
+    ///
+    /// Named and pulled out of the method above so that it can be pinned
+    /// *without a store*, which is not tidiness — it is the difference between
+    /// a safe test and an unsafe one. Driving the trim through `commitAddHost`
+    /// means handing it a padded address, and a padded address only stays
+    /// harmless while the trim works: broken, it is a destination the store
+    /// does not hold, so `addHost` falls through to `connect: true` and a unit
+    /// test spawns a real `ssh`. That is the regression `CommandPaletteTests`'s
+    /// header says the suite guards against, reached on the failure path of
+    /// the test that guards it. The rule is testable here and the composition
+    /// over it is one line.
+    static func destination(_ typed: String) -> String? {
+        let trimmed = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// The dropdown's "Add Remote Host…" row, and the menu bar item beside
+    /// Switch Host.
+    ///
+    /// Through `runCommand` rather than writing `palette` directly, so the
+    /// prompt this arms is the registry's own and the enabled check is the one
+    /// every other caller passes. The dropdown closes on the way, by
+    /// `palette`'s `didSet` — the same shape `requestRenameSession` has, where
+    /// one gesture leaves the other surface armed.
+    func beginAddRemoteHost() {
+        runCommand(.addRemoteHost)
+    }
+
     // MARK: - Focus
 
     /// Bumped whenever the terminal should take the keyboard back.
@@ -1542,6 +1834,30 @@ final class SessionStore {
 
     func closeController(_ ref: TerminalRef) {
         host(ref.host)?.closeController(ref.terminal)
+    }
+}
+
+/// Which of the command palette's two stages is on screen.
+///
+/// Two cases and not a submenu, which is the whole design: pressing Return on
+/// a command that needs an argument leaves the panel exactly where it is, at
+/// the same width, and changes what the field you were already typing in
+/// means. The command becomes a chip in that field and the list below is
+/// replaced by either the choices for it or a line saying what to type. A
+/// second panel would have been somewhere else to look and something else to
+/// dismiss.
+enum PaletteStage: Equatable {
+    /// Searching every command.
+    case commands
+    /// Being asked for one command's argument. Always a command with a
+    /// `Command.Prompt` — see `SessionStore.palette`.
+    case argument(CommandID)
+
+    /// The command being asked about, or nil in stage one. For the view and
+    /// for the ⌫ rule, neither of which wants to write the `case` out.
+    var argument: CommandID? {
+        guard case .argument(let id) = self else { return nil }
+        return id
     }
 }
 

@@ -1,12 +1,20 @@
 //  Chrome.swift
 //  The window chrome, matched to the Superlogical Mac app.
 //
-//  Every value below was measured off Mitchell's pre-alpha demo recording at
-//  2160p, where the traffic lights give a known scale: 25 frame pixels for a
-//  12pt light, so 2.083 px/pt. Colours are sampled pixels, not guesses.
+//  Almost every value below was measured off Mitchell's pre-alpha demo
+//  recording at 2160p, where the traffic lights give a known scale: 25 frame
+//  pixels for a 12pt light, so 2.083 px/pt. Colours are sampled pixels, not
+//  guesses.
+//
+//  Two exceptions. `tabHeight`, and its corner radius with it, come from a
+//  later photograph of the app running, which is a far worse instrument and a
+//  far better subject — the recording is a pre-alpha and the two disagree by
+//  more than either can explain away. And `toolbarHeight` comes from neither:
+//  both sources put that band at about 39, and the constant is 40 for a reason
+//  that is AppKit's rather than the reference's. See the note on each.
 //
 //      ┌──────────────────────────────────────────────────────────────┐
-//      │ ● ● ●  ▤ Demo │ ▣ ~> btop │ ▣ ~> htop │(▣ ~/…> nvim)      +  │ 39pt
+//      │ ● ● ●  ▤ Demo │ ▣ ~> btop │ ▣ ~> htop │(▣ ~/…> nvim)      +  │ 40pt
 //      ├──────────────────────────────────────────────────────────────┤ 1px
 //      │ ▢ ~/Documents/ghostty> nvim                                  │ 27pt
 //      │                                                              │
@@ -56,10 +64,58 @@ extension View {
 /// So: tab slots are a fixed ~197pt, laid out edge to edge, with a 1pt hairline
 /// drawn on the boundary between two inactive tabs.
 enum Metrics {
-    static let toolbarHeight: CGFloat = 39
+    /// 40, and the band really is 40 now.
+    ///
+    /// It was 39 and drew 32. A `.top` titlebar accessory lives inside
+    /// `NSTitlebarView`, which is a fixed 32pt on a plain window, so seven
+    /// points were being clipped off every frame — see `WindowChrome`, which
+    /// now attaches a `.unifiedCompact` toolbar to make that band 40 and says
+    /// how the reference was shown to be built the same way. 40 rather than 39
+    /// because the band is 40 exactly and a 39pt strip inside it would leave a
+    /// half-point of window background top and bottom.
+    static let toolbarHeight: CGFloat = 40
+
     static let breadcrumbHeight: CGFloat = 27
-    static let tabHeight: CGFloat = 27
-    static let tabCornerRadius: CGFloat = 13
+
+    /// 29, up from 27, and the two points were measured rather than judged.
+    ///
+    /// The later reference is a photograph of a screen, so it carries no scale
+    /// of its own — but the traffic lights supply one, because their centres
+    /// are 20pt apart on every Mac. They measure 24.5px there, which fixes that
+    /// image at 1.225px/pt, confirmed by their diameters coming back at 12.2pt
+    /// against a known 12. At that scale the reference's pill is 35px tall —
+    /// 28.6pt — where this was drawing 27.
+    ///
+    /// Small, and still the thing you see. The pill is concentric with the
+    /// lights in both, so half the difference lands on the edge that is easiest
+    /// to compare against a fixed round object: how far the pill's underside
+    /// drops past the bottom of the green light. Measured rather than derived,
+    /// because a photograph's light has a soft edge and its apparent diameter
+    /// is a point wider than the 12 it really is — the reference drops 9px past
+    /// it, which is 7.35pt, where this dropped 6.5 and now drops 7.5.
+    ///
+    /// Two sources disagree here and it is worth saying which won and why. The
+    /// 27 came from the 2160p recording this file's header names, at 2.083px/pt
+    /// — four times the resolution and none of the lens. That is the better
+    /// instrument, and on any other question it should be believed over a
+    /// phone. But the recording is a pre-alpha and the photograph is of what
+    /// the app looks like now, and 1.6pt is more than either source's error
+    /// bar, so the likeliest reading is not that one of them is wrong: it is
+    /// that the pill grew. Parity is being judged against the newer one.
+    ///
+    /// The same pass settled `toolbarHeight` too, though not the way it looked
+    /// at the time. Both sources agree the band is about 39 — the recording
+    /// said so and the photograph puts it at 48px, or 39.2 — so a detour
+    /// through 44 was reverted as unfounded. What neither source could show is
+    /// that the band was *drawing* 32: see `toolbarHeight`, where the seven
+    /// points were going, and why the constant is 40 now.
+    static let tabHeight: CGFloat = 29
+
+    /// Half the tab's height, so the pill's ends are true semicircles. 13 was a
+    /// half-point under that at 27 and would be a point and a half under it at
+    /// 29 — the flattening compounds rather than staying put, which is why this
+    /// moves whenever `tabHeight` does.
+    static let tabCornerRadius: CGFloat = 14.5
     /// One tab's slot. Content is left-aligned in it and truncates.
     static let tabWidth: CGFloat = 197
     static let tabLeadingPadding: CGFloat = 10
@@ -70,7 +126,12 @@ enum Metrics {
     /// coordinate space from `contentInset`: AppKit already offsets the
     /// accessory past the traffic lights, so this only adds the remainder
     /// needed to land the session icon at 90.7pt in the window.
-    static let toolbarLeading: CGFloat = 3
+    ///
+    /// That remainder is now zero. A unified titlebar moves the lights right by
+    /// 3pt and the accessory's own inset with them — measured at 78 before and
+    /// 81 after, and 81 is already `contentInset`. Left at 3 this would be 3pt
+    /// of drift rather than 3pt of padding.
+    static let toolbarLeading: CGFloat = 0
     static let sessionPadding: CGFloat = 8
     /// Gap between the session button and the first tab slot.
     static let sessionToTabs: CGFloat = 6
@@ -242,11 +303,13 @@ struct SessionButton: View {
         // the button moved the window and *then* opened the menu on the
         // mouse-up. See `WindowChrome`.
         .claimsMouseDown()
-        // Written the way the menu item draws it, which is the order macOS
-        // orders modifiers in — the reason this said ⌘⇧K, in the wrong order
-        // and bound to nothing at all, until the View menu's "Change Session"
-        // landed. One modifier now, so there is no order left to get wrong.
-        .help("Change Session (⌘K)")
+        // Out of the command table rather than written here, which is what
+        // finally settles this line: it said ⌘⇧K — in the wrong modifier order
+        // and bound to nothing at all — until the View menu's "Change Session"
+        // landed and the two could be held against each other. Derived now from
+        // the same `KeyboardShortcut` that menu item applies, so there is
+        // nothing left to get out of order or out of date.
+        .help(Commands.help(.changeSession, store))
     }
 }
 
@@ -280,6 +343,11 @@ struct TerminalTab: View {
     let close: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Only for the ✕'s tooltip, which names a command and so reads its
+    /// wording out of `Commands`. A slot draws nothing else off the store —
+    /// what it shows is handed to it, so that a strip of them is one `ForEach`
+    /// over values rather than twenty views each observing the world.
+    @Environment(SessionStore.self) private var store
 
     private let closeWidth: CGFloat = 16
     /// One id for the whole strip, not one per tab: the pill is a single view
@@ -340,8 +408,13 @@ struct TerminalTab: View {
                 //
                 // The chord is named only on the *active* tab, because that is
                 // the only tab ⇧⌘W acts on. This ✕ also appears on hover over
-                // an inactive one, where advertising it would be a lie.
-                .help(isActive ? "Close Tab (⇧⌘W)" : "Close Tab")
+                // an inactive one, where advertising it would be a lie. Both
+                // halves come out of the command table, so the title and the
+                // chord are the menu item's own.
+                .help(
+                    isActive
+                        ? Commands.help(.closeTab, store)
+                        : Commands.command(.closeTab).title(store))
             }
         }
         .padding(.horizontal, Metrics.tabLeadingPadding)

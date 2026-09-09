@@ -179,6 +179,22 @@ targets:
       - path: Illogical/App/Chrome.swift
       - path: Illogical/App/SessionMenu.swift
       - path: Illogical/App/WindowClose.swift
+      # The command table. Not here for the view it feeds but for the table
+      # itself: it is the one definition of every verb's title, chord and
+      # enabled-predicate, `SessionStore` no longer compiles without it, and
+      # the drift it exists to prevent is only checkable by holding
+      # `Commands.all` against `CommandID.allCases` in a test.
+      - path: Illogical/App/Commands.swift
+      # The palette's panel. Same position as SessionMenu: the view cannot be
+      # driven without a window, but it declares `PaletteMetrics`, and the
+      # geometry a test can hold is arithmetic over `MenuMetrics`.
+      - path: Illogical/App/CommandPalette.swift
+      # ↑ ↓ ⌫ while the palette is open. The monitor is in the same position as
+      # `EscapeKey`'s -- no unit test can drive one -- but the two decisions it
+      # makes are pure functions and are the parts that have to be right: every
+      # key wrongly claimed is a keystroke the search field stops receiving,
+      # and an arrow that lands on a dimmed row is a Return that does nothing.
+      - path: Illogical/App/PaletteKeys.swift
       # The two bits of AppKit event plumbing the chrome needs, and the only
       # part of either a test can hold without a window: `ClaimsMouseDown`'s
       # backing view answers `mouseDownCanMoveWindow` with `false`, which is the

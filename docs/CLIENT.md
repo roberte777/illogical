@@ -595,6 +595,7 @@ never be typed into a terminal.
 | ⌘D / ⇧⌘D | Split Right / Split Down | File |
 | ⇧⌘↩ | Zoom / Unzoom pane | File |
 | ⌥⌘← → ↑ ↓ | Focus pane left/right/above/below | View |
+| ⇧⌘P | Command Palette — toggles the panel. Everything in this table that is a menu item, searchable, plus Add Remote Host and Forget Host | View. The slot is free because `CommandGroup(replacing: .printItem)` removes SwiftUI's default Page Setup… (⇧⌘P) and Print… (⌘P): the app prints nothing, and two items claiming one chord resolve by menu order |
 | ⌘K | Change Session — toggles the dropdown. Unshifted, so the terminal cannot be sent ⌘K | View |
 | ⌘R | Refresh Sessions | View |
 | ⇧⌘] / ⇧⌘[ | Show Next / Previous Tab, wrapping | Window |
@@ -603,7 +604,8 @@ never be typed into a terminal.
 | ⌘9 | Last tab (the iTerm/Ghostty/browser convention, not the ninth) | Window |
 | ⌘F | Find — opens the find bar over the focused pane, keeping the last query | Edit |
 | ⌘G / ⇧⌘G | Next / Previous match, wrapping; greyed out with no bar open and nothing found | Edit |
-| Esc | Dismiss the session menu, or the find bar | each one's `onEscape` — a local `NSEvent` monitor, alive only while that overlay is |
+| Esc | Dismiss the session menu, the command palette, or the find bar | each one's `onEscape` — a local `NSEvent` monitor, alive only while that overlay is |
+| ↑ ↓ / ⌫ | Move the palette's highlight, skipping rows that cannot be run; ⌫ on an empty argument field takes the command's chip back to the list | `CommandPalette.onPaletteKey` — a local `NSEvent` monitor, alive only while the palette is. Bare keys only: a modified arrow is a chord, so ⌥⌘↑ passes through to Focus Pane Above rather than moving the highlight |
 | ⌘Home / ⌘End | Scroll to the top / bottom of the scrollback | `TerminalSurfaceView.keyDown` |
 | ⌘PgUp / ⌘PgDn | Scroll one page (a screen less a row of overlap) | `TerminalSurfaceView.keyDown` |
 | ⌘C / ⌘V / ⌘A | Copy / Paste / Select All | system Edit menu → responder chain |
@@ -1422,7 +1424,7 @@ known 12pt, which fixes the scale at 4:3, and then:
 
 | | reference | ours |
 |---|---|---|
-| toolbar height | 52px | 39pt |
+| toolbar height | 52px | 40pt |
 | bezel, left / right / bottom | 8px | 6pt |
 | bezel, top | 0 | 0 |
 | card corner radius | 13px | 10pt |

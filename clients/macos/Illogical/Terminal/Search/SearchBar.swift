@@ -149,8 +149,19 @@ struct SearchBar: View {
                 .fill(Palette.searchBarDivider)
                 .frame(width: 1, height: (home.height * 0.44).rounded())
 
-            step(icon: "chevron.up", help: "Previous Match (⇧⌘G)", action: session.selectPrevious)
-            step(icon: "chevron.down", help: "Next Match (⌘G)", action: session.selectNext)
+            // The chords are the Edit menu's, out of the command table. The
+            // words are this bar's: "Next Match" rather than the menu's "Find
+            // Next", because a bar with the query still in it is past the point
+            // of saying "find".
+            step(
+                icon: "chevron.up",
+                help: Commands.help(.findPrevious, titled: "Previous Match"),
+                action: session.selectPrevious)
+            step(
+                icon: "chevron.down", help: Commands.help(.findNext, titled: "Next Match"),
+                action: session.selectNext)
+            // Not out of the table: Esc is not a chord any menu item claims —
+            // it is `onEscape`'s local monitor, alive only while this bar is.
             step(icon: "xmark", help: "Close (esc)", action: dismiss)
         }
         .padding(.leading, (home.height * 0.34).rounded())
