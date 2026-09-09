@@ -37,13 +37,10 @@ struct IllogicalApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("New Terminal") { store.createTerminal() }
                     .keyboardShortcut("t", modifiers: .command)
-                Button("New Session") {
-                    // On the machine in front, which is where ⌘T would put a
-                    // terminal too.
-                    let count = store.selectedHost?.sessions.count ?? 0
-                    store.createTerminal(sessionName: "session-\(count + 1)")
-                }
-                .keyboardShortcut("n", modifiers: [.command, .shift])
+                // On the machine in front, which is where ⌘T would put a
+                // terminal too. What it is called is the store's to decide.
+                Button("New Session") { store.createSession() }
+                    .keyboardShortcut("n", modifiers: [.command, .shift])
                 Divider()
                 // No key equivalents. Both are rare, one of them is
                 // destructive, and a chord for either would be spent for the
@@ -113,6 +110,31 @@ struct IllogicalApp: App {
                 // reach `keyDown`, so ⌘K is now unavailable to the terminal.
                 Button("Change Session") { store.toggleSessionMenu() }
                     .keyboardShortcut("k", modifiers: .command)
+                // No key equivalent, on the same rule as Rename and Delete
+                // Session: a chord spent here would be spent for the life of
+                // the app on something most windows, which have one machine in
+                // them, never reach for at all.
+                //
+                // And deliberately not the ⇧⌘K the line above has just freed,
+                // tempting as an empty slot beside its own menu item is. A
+                // submenu of per-host toggles has no single action for a chord
+                // to fire, and ⇧⌘K meant "open the session dropdown" for the
+                // whole life of that chord — giving it one release later to
+                // something that moves the window to another machine turns a
+                // habit into a teleport. It stays fallow.
+                //
+                // `Toggle` rather than `Button`, for the checkmark: it is the
+                // only thing in the menu that says which machine you are on,
+                // and macOS draws it for a toggle without being asked.
+                Menu("Switch Host") {
+                    ForEach(store.hosts) { host in
+                        Toggle(
+                            host.displayName,
+                            isOn: Binding(
+                                get: { store.currentHost == host.host },
+                                set: { _ in store.switchHost(host.host) }))
+                    }
+                }
                 Button("Refresh Sessions") { store.refresh() }
                     .keyboardShortcut("r", modifiers: .command)
                 Divider()
@@ -170,9 +192,12 @@ struct ContentView: View {
         case empty
     }
 
+    /// Three cases, not four: `.unavailable` covers both "nothing is
+    /// reachable" and "this machine is not", because the crossfade must not
+    /// run between two screens that differ only in their sentence.
     private var screen: Screen {
         if store.selectedTab != nil { return .terminals }
-        if store.connectionError != nil { return .unavailable }
+        if store.connectionError != nil || store.currentHostError != nil { return .unavailable }
         return .empty
     }
 
@@ -200,7 +225,14 @@ struct ContentView: View {
                         .environment(store)
                         .id(tab.id)
                 } else if let error = store.connectionError {
-                    ServerUnavailable(message: error)
+                    // Every machine is down, so Try Again means all of them.
+                    ServerUnavailable(message: error) { store.connect() }
+                        .transition(Motion.screen.transition(reduceMotion: reduceMotion))
+                } else if let error = store.currentHostError {
+                    // Only the machine you are on. Retrying every host here
+                    // would dial machines the person is not looking at and
+                    // restart handshakes that were going perfectly well.
+                    ServerUnavailable(message: error) { store.reconnect(store.currentHost) }
                         .transition(Motion.screen.transition(reduceMotion: reduceMotion))
                 } else {
                     EmptyState()
@@ -499,7 +531,12 @@ struct EmptyState: View {
 
 struct ServerUnavailable: View {
     let message: String
-    @Environment(SessionStore.self) private var store
+    /// What Try Again asks for, which is not the same question on both screens
+    /// this draws: every host when nothing at all is reachable, and one host
+    /// when the window is parked on a machine that is not. Handed in rather
+    /// than decided here — the caller is the one that knows which screen this
+    /// is, and a view cannot be asked.
+    let retry: () -> Void
 
     var body: some View {
         VStack(spacing: 10) {
@@ -515,7 +552,7 @@ struct ServerUnavailable: View {
                 .foregroundStyle(Palette.textDim)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 420)
-            Button("Try Again") { store.connect() }
+            Button("Try Again", action: retry)
                 .padding(.top, 4)
             Spacer()
         }

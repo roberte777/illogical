@@ -20,12 +20,63 @@ final class SessionStore {
     /// daemon; the rest were added by the user and are remembered.
     private(set) var hosts: [HostConnection] = []
 
+    /// The machine the window is on: where ⌘T makes a terminal, whose sessions
+    /// the strip draws, and what the session button names.
+    ///
+    /// Stored, not derived from the front tab. Derived, "which machine" could
+    /// only ever be a machine with a terminal on it — so Switch Host had
+    /// nowhere to put you on an empty one, and a window with no tabs at all had
+    /// to guess. It guessed "the first host that is connected", which is a
+    /// perfectly good answer to a question nobody asked and sent ⌘T to a
+    /// machine nothing on screen named.
+    ///
+    /// Always one of `hosts`: set at init, moved by the selection funnel below
+    /// and by `switchHost`, which is also what `removeHost` goes through when
+    /// the machine it names is forgotten. The one exception is a store built
+    /// with no hosts at all, where `init`'s last fallback names a local daemon
+    /// that is not in the list — see there for why that is unreachable in the
+    /// app and worth having anyway. That store's `current` is nil for its whole
+    /// life, which is the one shape `current`'s own doc has to allow for.
+    private(set) var currentHost: ServerHost
+
+    /// The session last in front on each machine, so that coming back to one
+    /// lands where you left it rather than on its first tab.
+    ///
+    /// Never pruned, and checked at use rather than trusted: an entry for a
+    /// session that has since been deleted costs a `SessionRef`, and both
+    /// readers — `switchHost` and `selectedSession` — first check the host
+    /// still lists the id. Pruning would mean walking this on every list from
+    /// every host to save nothing anybody can measure.
+    ///
+    /// That check is existence, not identity. Ids come from an in-memory
+    /// counter (see `FrontSession`), so a daemon that restarted mid-run can
+    /// hand a remembered id to a different session, and coming back lands
+    /// there — a real session on the right machine, which is all an in-process
+    /// memory promises, and the entry is rewritten the moment a tab there is
+    /// selected. Across a *relaunch* an id is no use at all, which is why what
+    /// survives one is a name.
+    private var lastSession: [ServerHost: SessionRef] = [:]
+
     /// Tabs, each a layout of panes. A tab is not a terminal: splitting adds
     /// a pane and a connection without adding a tab. A tab belongs to one
     /// session on one host — panes from two machines never share a tab,
     /// because a session is a thing that lives on a machine.
     var tabs: [TabLayout] = []
-    var selectedTabID: TabLayout.ID?
+
+    /// The tab in front, or nil when the machine you are on has nothing to
+    /// show.
+    ///
+    /// The `didSet` is the one funnel selecting a tab goes through, and the
+    /// reason it is a `didSet` rather than a `select(_:)` method is that most
+    /// of the writes are *this file's own*: `repairSelection`, the pendingTab
+    /// and restore blocks in `reconcileTabs`, the split reply, the tab chords.
+    /// Every one of them is a place the window genuinely can change machines,
+    /// and a method they each have to remember to call is a funnel with five
+    /// bypasses — the symptom of taking one being the toolbar naming one
+    /// machine while ⌘T makes a terminal on another.
+    var selectedTabID: TabLayout.ID? {
+        didSet { selectionChanged() }
+    }
 
     /// The destructive thing a dialog is currently asking about, or nil.
     ///
@@ -90,6 +141,17 @@ final class SessionStore {
     /// a re-list is not a way to observe it.
     private(set) var closing: Set<TerminalRef> = []
 
+    /// Where this window was last time it ran, until the machine it names has
+    /// answered. `reconcileTabs` spends it on that machine's first list; any
+    /// explicit move the user makes first voids it — selecting a tab, or
+    /// switching to a machine that has nothing to select — because a restore
+    /// that overrode a person who has already chosen is selection theft.
+    private var pendingRestore: FrontSession?
+
+    /// What `FrontSessionStore` already holds, so that ⌘1/⌘2 inside one session
+    /// does not rewrite a value that has not changed.
+    private var writtenFront: FrontSession?
+
     /// Where remembered hosts are written.
     ///
     /// Injectable so tests do not scribble on the developer's real defaults --
@@ -102,6 +164,25 @@ final class SessionStore {
     /// local host ever calls it; a remote one has no bundle to start anything
     /// from.
     private let launcher: DaemonLauncher
+
+    /// What this window's machines owe to the environment: the hosts
+    /// ILLOGICAL_HOSTS put in the list, and whether the local daemon in it is
+    /// the one ILLOGICAL_SOCK named. Both feed the provenance rule that decides
+    /// what may be written to `defaults` — see `hostsToRemember` and
+    /// `rememberFront`.
+    ///
+    /// **Read once, here, rather than at every write.** These are properties of
+    /// how the store was built, and reading them later makes a store that is
+    /// not hermetic: `rememberFront` is on the selection path, so a variable
+    /// merely exported in the shell that launched the process silently changed
+    /// what a store *already constructed from an explicit host list* would
+    /// remember. ILLOGICAL_SOCK is a documented knob (`src/cli/main.zig`
+    /// lists it) and `launchctl setenv` reaches GUI apps, so it is a variable
+    /// that really does sit in environments — and with it set, every test that
+    /// drives a front session through a socket path of its own failed, for a
+    /// reason nowhere in the test.
+    private let injectedHosts: [ServerHost]
+    private let socketInjected: Bool
 
     /// `hosts: nil` means "whatever was remembered", read through `defaults`.
     ///
@@ -117,6 +198,14 @@ final class SessionStore {
     /// threaded through every `HostConnection` this store makes, `addHost`
     /// included -- a store with a recording launcher and a host that quietly
     /// had the real one is a seam that reads as isolated and is not.
+    ///
+    /// The front session is read here too, from the same `defaults` and in the
+    /// same breath: it is one `data(forKey:)`, nothing waits on the network,
+    /// and the window therefore opens on the machine it was left on rather than
+    /// opening on the local daemon and being yanked elsewhere a second later.
+    /// docs/GOALS.md G7's launch budget is untouched — the read is off the
+    /// first-paint path's critical section entirely, beside the one
+    /// `startingHosts` already does.
     init(
         hosts: [ServerHost]? = nil,
         defaults: HostDefaults = UserDefaults.standard,
@@ -124,7 +213,33 @@ final class SessionStore {
     ) {
         self.defaults = defaults
         self.launcher = launcher
-        for host in hosts ?? SessionStore.startingHosts(defaults) {
+        let starting = hosts ?? SessionStore.startingHosts(defaults)
+        // The remote half asks where the list came from, because an injected
+        // host is in it *because* the variable named it — there is nothing to
+        // compare against afterwards. `startingHosts` is the only door
+        // ILLOGICAL_HOSTS has, and it is only opened when no list was handed
+        // over, so a caller that hands one chose those machines itself.
+        injectedHosts = hosts == nil ? Self.environmentHosts() : []
+        // The local half can be exact, and is: the question is whether the
+        // daemon this window is on is the throwaway one the variable names, and
+        // a store built on some other socket is not on it whatever the
+        // environment says. In the app the two are the same thing —
+        // `defaultSocketPath` is where the override is honoured.
+        socketInjected =
+            ProcessInfo.processInfo.environment["ILLOGICAL_SOCK"]
+            .map { starting.contains(.local(socketPath: $0)) } ?? false
+        let front = FrontSessionStore.load(defaults)
+        writtenFront = front
+        // A remembered machine that is no longer in the list — a host forgotten
+        // since, or an ILLOGICAL_HOSTS window — is not somewhere to open on,
+        // and neither is its session. `starting.first` is the local daemon
+        // (`startingHosts` puts it there and nothing removes it); the last
+        // fallback is unreachable in the app and keeps this non-optional rather
+        // than making every reader unwrap a thing that is always there.
+        let remembered = front.map(\.host).flatMap { starting.contains($0) ? $0 : nil }
+        currentHost = remembered ?? starting.first ?? .local(socketPath: Self.defaultSocketPath)
+        pendingRestore = remembered == nil ? nil : front
+        for host in starting {
             adopt(HostConnection(host: host, launcher: launcher))
         }
     }
@@ -194,8 +309,10 @@ final class SessionStore {
         }
     }
 
+    /// The same, for the app: what the environment contributed to *this* store,
+    /// decided when it was built. See `injectedHosts`.
     private var hostsToRemember: [ServerHost] {
-        hostsToRemember(injected: Self.environmentHosts())
+        hostsToRemember(injected: injectedHosts)
     }
 
     // MARK: - Hosts
@@ -204,23 +321,23 @@ final class SessionStore {
         hosts.first { $0.host == id }
     }
 
-    /// The host the next new terminal belongs on: whichever one the front tab
-    /// is looking at.
+    /// The connection to the machine the window is on.
     ///
-    /// The fallback prefers a host that is actually connected. `hosts.first` is
-    /// always the local daemon, and `createTerminal` sends through `try?`, so
-    /// with no local `illogicald` running and a working remote, every ⌘T, every
-    /// "+" and every New Session went to the dead host and did nothing at all --
-    /// silently, with no tab, no error, and nothing on screen saying why.
-    /// A host still connecting is preferred over one that has failed, for the
-    /// same reason: during an ssh handshake nothing is connected yet, and
-    /// falling through to a dead local daemon put ⌘T back to doing nothing.
-    var selectedHost: HostConnection? {
-        if let ref = selectedTab?.session.host, let host = host(ref) { return host }
-        return hosts.first { $0.status.isConnected }
-            ?? hosts.first { $0.status.isConnecting }
-            ?? hosts.first
-    }
+    /// In the app, nil only in the moment between a host being forgotten and
+    /// `removeHost` moving the window off it. Permanently nil in one shape the
+    /// app cannot build and the tests can: a store with no hosts at all, where
+    /// `currentHost` is `init`'s last-resort local daemon and there is no
+    /// connection to it — see `currentHost`.
+    ///
+    /// This replaced a `selectedHost` that read the front tab's host and, with
+    /// no front tab, fell back to "the first host that is connected". The
+    /// fallback was there because `createTerminal` sends through `try?`, so a
+    /// ⌘T aimed at a dead local daemon did nothing at all, silently — but it
+    /// answered that by quietly routing the terminal to some other machine.
+    /// `currentHost` is now always a machine somebody chose, and a machine that
+    /// cannot make a terminal says so on screen (`currentHostError`) instead of
+    /// having its work done elsewhere.
+    var current: HostConnection? { host(currentHost) }
 
     /// Add a machine and connect to it. A destination already in the list is
     /// selected rather than duplicated.
@@ -255,12 +372,72 @@ final class SessionStore {
         hosts[index].disconnect()
         hosts.remove(at: index)
         RemoteHostStore.save(hostsToRemember, to: defaults)
+        // The window cannot be left standing on a machine that is no longer
+        // here, and leaving it is the same move as Switch Host: `hosts.first`
+        // is the local daemon, and going there should land on the session you
+        // were last in on it rather than on its first tab. Optional rather than
+        // `hosts[0]` because a store built with no local host — only the tests
+        // make one — has nowhere to go, and must not trap on its way to finding
+        // that out.
+        //
+        // Before the reconcile, because the repair that ends it reads
+        // `currentHost` to decide which tabs may keep the selection.
+        if currentHost == host, let fallback = hosts.first?.host { switchHost(fallback) }
+        // Belt and braces, and only that: `pendingRestore` is set in `init` and
+        // every write to `currentHost` since either sets or clears it, so a
+        // pending restore always names the machine the window is on and the
+        // line above has already cleared it. What it covers is the one shape
+        // that skips that line — a store whose last host has just been removed,
+        // so there is no `hosts.first` to switch to. Only the tests can build
+        // one, but the alternative is a store holding a restore for a machine
+        // somebody explicitly forgot, ready to fire if it were ever re-added.
+        if pendingRestore?.host == host { pendingRestore = nil }
         reconcileTabs()
     }
 
     /// Try a host again after a failure.
     func reconnect(_ host: ServerHost) {
         self.host(host)?.connect()
+    }
+
+    /// Go to a machine: the session you were last on there, its first session
+    /// when there is no memory of one, and the empty screen when it has none at
+    /// all.
+    ///
+    /// The last case is the point of the whole feature. A machine with nothing
+    /// on it is somewhere the window can be — you go there to make the first
+    /// terminal on it — and until this there was no way to say so, because
+    /// "which machine" was read off a tab.
+    func switchHost(_ target: ServerHost) {
+        // Already being there is not a move. The menu's checked row is still a
+        // row you can click, and without this it would drop you on the first
+        // tab of the session you are already in.
+        guard let connection = host(target), target != currentHost else { return }
+        // An explicit move ends the launch restore, whether or not it lands on
+        // anything. Landing on a tab already voided it through
+        // `selectionChanged`; landing on *nothing* — the case this whole
+        // feature exists for — did not. So a window whose remembered machine
+        // was still shaking hands, and whose owner had meanwhile gone to a
+        // local daemon with no sessions on it, was teleported away the moment
+        // that handshake finished.
+        pendingRestore = nil
+        currentHost = target
+        // Validated at use rather than pruned: the remembered session may have
+        // been deleted from another window since we were last there.
+        let wanted =
+            lastSession[target].flatMap { session($0) != nil ? $0 : nil }
+            ?? connection.sessions.first.map { SessionRef(host: target, session: $0.id) }
+        // Cleared first, so the repair below is a repair rather than a no-op:
+        // the tab in front is still perfectly valid, it is just on the machine
+        // being left.
+        selectedTabID = nil
+        repairSelection(preferring: wanted)
+        // The machine is part of what is remembered even when there is no
+        // session to name — standing on an empty machine is a place the window
+        // can rest, so it is a place it should reopen. When the repair above
+        // landed on a tab this is the value `selectionChanged` has already
+        // written, and `rememberFront` makes it nothing at all.
+        rememberFront(FrontSession(host: target, name: selectedSessionSummary?.name))
     }
 
     private func adopt(_ connection: HostConnection) {
@@ -315,6 +492,23 @@ final class SessionStore {
         return hosts.compactMap(\.status.message).first
     }
 
+    /// Why the machine in front cannot show anything, or nil when it can.
+    ///
+    /// Switch Host and the launch restore can both park the window on a machine
+    /// that is unreachable, and the empty screen is the wrong thing to say
+    /// there: its New Terminal button sends through `try?` on a connection that
+    /// is not open, so it is a button that does nothing and gives no reason.
+    ///
+    /// Nil while a host is merely connecting — the first moments of a launch
+    /// are not a failure — and nil whenever a tab is up, for the reason
+    /// `ContentView` puts the tab first: a reconnect must not blank a live
+    /// window over a dropped packet. The wording is `ssh`'s own complaint, by
+    /// way of `Status.message`, so nothing new is invented here.
+    var currentHostError: String? {
+        guard selectedTab == nil else { return nil }
+        return current?.status.message
+    }
+
     // MARK: - The window's view of what exists
 
     var selectedTab: TabLayout? {
@@ -355,10 +549,20 @@ final class SessionStore {
     /// Whether stepping between matches would do anything, so the menu says so.
     var canFindAgain: Bool { selectedController?.search.canStep ?? false }
 
+    /// The session in front: the tab's, or — with no tab — the one the machine
+    /// you are on was last showing, then its first.
+    ///
+    /// Never another machine's. This used to end at `hosts.first`, which is the
+    /// local daemon, so a window sitting on a remote host with no tabs named a
+    /// local session on the session button and offered Rename and Delete for
+    /// it.
     var selectedSession: SessionRef? {
         if let tab = selectedTab { return tab.session }
-        guard let host = hosts.first, let session = host.sessions.first else { return nil }
-        return SessionRef(host: host.host, session: session.id)
+        if let remembered = lastSession[currentHost], session(remembered) != nil {
+            return remembered
+        }
+        guard let session = current?.sessions.first else { return nil }
+        return SessionRef(host: currentHost, session: session.id)
     }
 
     var selectedSessionSummary: SessionSummary? {
@@ -376,8 +580,15 @@ final class SessionStore {
 
     /// Tabs in the session that is currently in front. A session lives on one
     /// host, so this is also "tabs on the machine you are looking at".
+    ///
+    /// With no session in front — a machine with nothing on it — that is an
+    /// empty strip, not every host's tabs. It used to be `return tabs`, which
+    /// on an empty remote host drew the local machine's tab strip under a
+    /// session button naming the remote one.
     var visibleTabs: [TabLayout] {
-        guard let session = selectedSession else { return tabs }
+        guard let session = selectedSession else {
+            return tabs.filter { $0.session.host == currentHost }
+        }
         return tabs.filter { $0.session == session }
     }
 
@@ -407,13 +618,62 @@ final class SessionStore {
         for host in hosts { host.refresh() }
     }
 
-    /// Make a terminal on a host. Defaults to the machine the front tab is on,
-    /// in the session it is in.
+    /// Make a terminal on a host. Defaults to the machine the window is on, in
+    /// the session in front there.
+    ///
+    /// An `on:` naming a machine that is not in the list is refused, not
+    /// rerouted. `createSession` has always guarded that way; this is the same
+    /// guard on the path it delegates to, and the asymmetry was reachable —
+    /// the dropdown's rows and ＋ buttons carry a host, and a host can be
+    /// forgotten between the panel being drawn and a row being clicked. A
+    /// no-op is a button that did nothing; a reroute is a terminal running on
+    /// a machine nobody named, which is the failure this whole `currentHost`
+    /// change exists to stop.
     func createTerminal(sessionName: String? = nil, on host: ServerHost? = nil) {
-        let target = host.flatMap { self.host($0) } ?? selectedHost
+        // `map`, not `flatMap`: an `on:` that resolves to no connection stays
+        // `.some(nil)` and falls out of the guard below, where `flatMap` would
+        // have flattened it to nil and let `?? current` answer for it.
+        let target = host.map { self.host($0) } ?? current
         guard let target, let name = createName(typed: sessionName, joining: nil, on: target)
         else { return }
         target.createTerminal(sessionName: name)
+    }
+
+    /// A fresh session on `host` — the machine in front by default — named
+    /// `session-N` for the lowest N no session there already uses.
+    ///
+    /// The one place that name is made. Three call sites in two files had their
+    /// own `session-\(count + 1)` — the File ▸ New Session command in
+    /// `IllogicalApp`, and both of `SessionMenu`'s (the panel's button and a
+    /// host header's ＋) — and all three were wrong in the same way: a `create`
+    /// is addressed by name, and the daemon *joins* a session whose name
+    /// already exists rather than refusing it. Delete `session-1` of two and
+    /// `count + 1` says `session-2`, which is the session still on screen — so
+    /// "New Session" opened a second tab in the session you already had.
+    ///
+    /// That is the *deleted lower number* case, and it is all this closes. The
+    /// join is still reachable by racing: two ⇧⌘Ns inside one ssh round trip
+    /// both read `host.sessions` before either `created` lands, both propose
+    /// `session-1`, and `Server.sessionByNameLocked` joins by name rather than
+    /// refusing — so the second terminal opens in the session the first has
+    /// just made. Closing that needs the server to be able to say "this name,
+    /// only if it is new"; the protocol has no such flag today, so the race is
+    /// left standing rather than papered over with a client-side counter that
+    /// would be wrong across two windows anyway.
+    func createSession(on host: ServerHost? = nil) {
+        let target = host ?? currentHost
+        guard let connection = self.host(target) else { return }
+        createTerminal(sessionName: nextSessionName(on: connection), on: target)
+    }
+
+    private func nextSessionName(on host: HostConnection) -> String {
+        // Exact comparison, mirroring the server's `mem.eql` — the same
+        // reasoning `renameRefusal` sets out. Being case-insensitive here would
+        // skip a name the daemon would have given us.
+        let taken = Set(host.sessions.map(\.name))
+        var index = 1
+        while taken.contains("session-\(index)") { index += 1 }
+        return "session-\(index)"
     }
 
     /// The session name a `create` should carry, or nil when it must not be
@@ -464,7 +724,7 @@ final class SessionStore {
         let name = SessionName.normalized(typed)
         guard !name.isEmpty else { return .nothing }
         if let refusal = SessionNameRefusal.of(name) { return .refused(refusal) }
-        guard selectedHost != nil else { return .nothing }
+        guard current != nil else { return .nothing }
         // Checked against *every* host's sessions, not just the one in front.
         // The rows below list them all, so a name that matches a session on
         // another machine is one you can switch to — offering "Create" for it
@@ -836,9 +1096,15 @@ final class SessionStore {
     /// caller lets `performClose` fall through to `NSWindow`.
     ///
     /// `tabs.count`, not `visibleTabs.count`. A window whose front session has
-    /// one tab may still be holding tabs on another session, and closing the
-    /// window would take those with it; `repairSelection` moves to them
-    /// instead, which is exactly the behaviour its own doc comment describes.
+    /// one tab may still be holding tabs elsewhere, and closing the window
+    /// would take those with it — so the window stays, and what happens next
+    /// depends on where they are. Another session *on `currentHost`*:
+    /// `repairSelection` moves to one of them. Another *machine*: it does not,
+    /// deliberately — see its trailing comment, and
+    /// `testClosingTheCurrentHostsLastTabDoesNotJumpMachines`. The window is
+    /// left standing on the machine it was on with an empty strip, which is a
+    /// resting state now that "which machine" is stored rather than read off a
+    /// tab.
     func closeSurfacePane(_ paneID: UUID, in tabID: TabLayout.ID) -> Bool {
         guard let tab = tabs.first(where: { $0.id == tabID }) else { return false }
         guard tabs.count > 1 || tab.isSplit else { return false }
@@ -1094,6 +1360,31 @@ final class SessionStore {
             pendingTab = nil
         }
 
+        if let restore = pendingRestore, let connection = host(restore.host),
+            connection.status.isConnected
+        {
+            // The machine has answered — `.connected` is set on the
+            // `session_list` immediately before this runs — so its list is
+            // authoritative and this is the moment to land or give up. Either
+            // way the restore is spent: a later list is a machine that has
+            // changed since, not a launch.
+            pendingRestore = nil
+            // A restore with no name is a window that was last standing on this
+            // machine rather than in a session on it. It needs no case of its
+            // own: nil matches no session, so it falls through to the first —
+            // which is where `repairSelection` would have put it anyway.
+            let target =
+                connection.sessions.first { $0.name == restore.name }
+                ?? connection.sessions.first
+            if let target,
+                let tab = tabs.first(where: {
+                    $0.session == SessionRef(host: restore.host, session: target.id)
+                })
+            {
+                selectedTabID = tab.id
+            }
+        }
+
         repairSelection(preferring: wasInFront)
         dismissStaleDestruction()
 
@@ -1132,14 +1423,108 @@ final class SessionStore {
     /// used to do their own `tabs.first?.id`, which is how closing the last tab
     /// of a remote session teleported the window to the local machine: the
     /// session button changed host and the strip's contents changed with it.
-    /// Prefer the session that was in front, then any tab on that machine,
-    /// then anything at all.
+    /// Prefer the session that was in front, then any tab on the machine you
+    /// are on.
+    ///
+    /// `wanted` is always a session on `currentHost` — every caller reads it
+    /// off a tab that was in front, and `switchHost` passes one keyed to the
+    /// machine it has just moved to — so the second clause is a widening of the
+    /// first rather than a second answer.
     private func repairSelection(preferring wanted: SessionRef?) {
         if let id = selectedTabID, tabs.contains(where: { $0.id == id }) { return }
         selectedTabID =
             tabs.first { $0.session == wanted }?.id
-            ?? tabs.first { $0.session.host == wanted?.host }?.id
-            ?? tabs.first?.id
+            ?? tabs.first { $0.session.host == currentHost }?.id
+        // No `?? tabs.first?.id`. A machine with nothing on it is a place the
+        // window can be now — Switch Host puts you there — and stealing another
+        // machine's tab would move the toolbar, the strip and the next ⌘T
+        // somewhere nobody asked to go, on the strength of an unrelated host's
+        // list having changed.
+    }
+
+    // MARK: - Where the window is
+    //
+    // Selecting a tab is also how the window moves between machines, so every
+    // write to `selectedTabID` lands here. Which makes this the one place that
+    // decides what "you are on this machine, in this session" means — a view
+    // cannot be asked either half.
+
+    private func selectionChanged() {
+        // A nil selection changes nothing. It is the resting state of a machine
+        // with nothing on it, and it arrives on the way through `switchHost`
+        // and every repair, neither of which is a person leaving a host.
+        guard let tab = selectedTab else { return }
+        currentHost = tab.session.host
+        lastSession[currentHost] = tab.session
+        // Somebody has chosen a tab, so whatever the last launch was on is no
+        // longer what this window is about.
+        pendingRestore = nil
+        rememberFrontSession(tab.session)
+    }
+
+    /// The tab in front, as the next launch will read it.
+    ///
+    /// A session the host has not listed yet is not written: there is no name
+    /// to write, and the id is no use across a restart.
+    private func rememberFrontSession(_ ref: SessionRef) {
+        guard let name = session(ref)?.name else { return }
+        rememberFront(FrontSession(host: ref.host, name: name))
+    }
+
+    /// Write the front state through, if it is not already what is on disk and
+    /// this window is entitled to remember it at all.
+    ///
+    /// Write-through rather than at exit: there is no termination hook in this
+    /// app — no app delegate, no `willTerminate`, no `scenePhase` — and a write
+    /// at exit is a write that a force-quit or a crash loses, which is exactly
+    /// the run whose session you would most like back.
+    ///
+    /// Which makes provenance this blob's problem as much as the host list's.
+    /// `RemoteHostStore.save` is fed by `hostsToRemember` precisely so a window
+    /// handed its hosts by the environment does not make them permanent, and
+    /// docs/CLIENT.md promises that in as many words; this had no equivalent,
+    /// and it is the same `UserDefaults`. Both injection points are reachable
+    /// from this repo's own scripts, which launch the *shipped bundle* and so
+    /// write to the developer's real defaults — only the tests get a
+    /// `HostDefaults` of their own. `scripts/bench-remote.sh` launches it with
+    /// `ILLOGICAL_HOSTS=bench-host`, and it, `bench-launch.sh` and
+    /// `bench-attach.sh` all launch it with `ILLOGICAL_SOCK` naming a throwaway
+    /// daemon. Either way the blob written names a machine that will not be in
+    /// the list next launch, so `init` drops it — and the session the person
+    /// was really last in is gone with it. A benchmark must not cost somebody
+    /// their window.
+    ///
+    /// The remote half is `hostsToRemember` exactly, union clause included. The
+    /// local half cannot be: the local daemon is never on disk — it is wherever
+    /// this machine puts its socket — so "is it saved" has no answer for it,
+    /// and "did the environment name it" is the same question `environmentHosts`
+    /// asks of the other kind.
+    ///
+    /// `injected` and `socketInjected` are parameters for the reason
+    /// `hostsToRemember`'s is: both come from `ProcessInfo`, which cannot be
+    /// changed underneath a running process, so hardcoding the reads would make
+    /// the whole of this untestable — which is how its twin landed untested.
+    func rememberFront(_ front: FrontSession, injected: [ServerHost], socketInjected: Bool) {
+        // Cheapest first, and it is also the common case: ⌘1/⌘2 inside one
+        // session must not be a write, and must not be a `RemoteHostStore`
+        // decode either.
+        guard front != writtenFront else { return }
+        let remembered =
+            front.host.isRemote
+            ? hostsToRemember(injected: injected).contains(front.host)
+            : !socketInjected
+        guard remembered else { return }
+        writtenFront = front
+        FrontSessionStore.save(front, to: defaults)
+    }
+
+    /// The same, for the app: both signals as this store was built with them.
+    /// See `injectedHosts`, and note that this is the wrapper the whole
+    /// selection path goes through — which is what made reading them here, on
+    /// every write, a store whose behaviour depended on the shell it was
+    /// launched from.
+    private func rememberFront(_ front: FrontSession) {
+        rememberFront(front, injected: injectedHosts, socketInjected: socketInjected)
     }
 
     // MARK: - Per-terminal connections
@@ -1326,6 +1711,40 @@ enum RemoteHostStore {
 
     static func save(_ hosts: [ServerHost], to defaults: HostDefaults = UserDefaults.standard) {
         guard let data = try? JSONEncoder().encode(hosts.filter(\.isRemote)) else { return }
+        defaults.set(data, forKey: key)
+    }
+}
+
+/// What was in front, as it survives a relaunch: the machine, and the *name*
+/// of the session on it.
+///
+/// Not its id. A daemon's `next_session_id` is an in-memory counter
+/// (src/daemon/Server.zig), so a machine that rebooted renumbers everything it
+/// still has and an id restored across launches points at whatever now happens
+/// to hold it. A name is what a session is called by the people using it, and
+/// docs/CLIENT.md's governing rule already says a session is addressed by name
+/// on the way in.
+///
+/// A nil name means the machine itself was the front state: Switch Host to a
+/// machine with nothing on it is somewhere the window can rest, so it is
+/// somewhere it has to be able to reopen. Restoring one needs no special case —
+/// see `reconcileTabs`.
+struct FrontSession: Codable, Equatable {
+    var host: ServerHost
+    var name: String?
+}
+
+/// Where that session is written. One key, one small blob, read once at init.
+enum FrontSessionStore {
+    static let key = "frontSession"
+
+    static func load(_ defaults: HostDefaults = UserDefaults.standard) -> FrontSession? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(FrontSession.self, from: data)
+    }
+
+    static func save(_ front: FrontSession, to defaults: HostDefaults = UserDefaults.standard) {
+        guard let data = try? JSONEncoder().encode(front) else { return }
         defaults.set(data, forKey: key)
     }
 }

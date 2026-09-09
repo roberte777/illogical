@@ -20,6 +20,18 @@ import XCTest
 @MainActor
 final class ReconnectTests: XCTestCase {
 
+    /// Nothing here writes the developer's real preferences. The stores below
+    /// end up with tabs and a selection, and a store writes the session in
+    /// front through as it changes — there is no termination hook to save it
+    /// at, so it is saved when it happens.
+    private final class InMemoryDefaults: HostDefaults {
+        private var values: [String: Data] = [:]
+        func data(forKey defaultName: String) -> Data? { values[defaultName] }
+        func set(_ value: Any?, forKey defaultName: String) {
+            values[defaultName] = value as? Data
+        }
+    }
+
     // MARK: - The schedule
 
     func testBackoffGrowsAndThenStops() {
@@ -169,7 +181,8 @@ final class ReconnectTests: XCTestCase {
         let server = try HangUpServer()
         defer { server.stop() }
 
-        let store = SessionStore(hosts: [.local(socketPath: server.path)])
+        let store = SessionStore(
+            hosts: [.local(socketPath: server.path)], defaults: InMemoryDefaults())
         guard let host = store.host(.local(socketPath: server.path)) else {
             return XCTFail("no host")
         }
@@ -250,7 +263,8 @@ final class ReconnectTests: XCTestCase {
         let server = try HangUpServer()
         defer { server.stop() }
 
-        let store = SessionStore(hosts: [.local(socketPath: server.path)])
+        let store = SessionStore(
+            hosts: [.local(socketPath: server.path)], defaults: InMemoryDefaults())
         guard let host = store.host(.local(socketPath: server.path)) else {
             return XCTFail("no host")
         }
@@ -295,7 +309,8 @@ final class ReconnectTests: XCTestCase {
         let server = try HangUpServer()
         defer { server.stop() }
 
-        let store = SessionStore(hosts: [.local(socketPath: server.path)])
+        let store = SessionStore(
+            hosts: [.local(socketPath: server.path)], defaults: InMemoryDefaults())
         guard let host = store.host(.local(socketPath: server.path)) else {
             return XCTFail("no host")
         }
@@ -334,7 +349,8 @@ final class ReconnectTests: XCTestCase {
         let server = try HangUpServer()
         defer { server.stop() }
 
-        let store = SessionStore(hosts: [.local(socketPath: server.path)])
+        let store = SessionStore(
+            hosts: [.local(socketPath: server.path)], defaults: InMemoryDefaults())
         guard let host = store.host(.local(socketPath: server.path)) else {
             return XCTFail("no host")
         }
@@ -406,7 +422,8 @@ final class ReconnectTests: XCTestCase {
     /// assigned `.failed`, so it showed an amber "reconnecting…" indefinitely
     /// and rescanned PATH on a timer.
     func testAnUnrecoverableFailureIsTerminal() async throws {
-        let store = SessionStore(hosts: [.ssh(destination: "nowhere")])
+        let store = SessionStore(
+            hosts: [.ssh(destination: "nowhere")], defaults: InMemoryDefaults())
         guard let host = store.host(.ssh(destination: "nowhere")) else {
             return XCTFail("no host")
         }
@@ -435,7 +452,8 @@ final class ReconnectTests: XCTestCase {
     /// that `HostConnection` acts on that verdict — and that the string it
     /// puts in front of a person is a sentence rather than an `NSError` dump.
     func testAnUnrunnableSshIsTerminal() async throws {
-        let store = SessionStore(hosts: [.ssh(destination: "nowhere")])
+        let store = SessionStore(
+            hosts: [.ssh(destination: "nowhere")], defaults: InMemoryDefaults())
         guard let host = store.host(.ssh(destination: "nowhere")) else {
             return XCTFail("no host")
         }
@@ -485,7 +503,9 @@ final class ReconnectTests: XCTestCase {
     private func localStore(
         _ path: String, _ launcher: RecordingLauncher
     ) throws -> HostConnection {
-        let store = SessionStore(hosts: [.local(socketPath: path)], launcher: launcher)
+        let store = SessionStore(
+            hosts: [.local(socketPath: path)], defaults: InMemoryDefaults(),
+            launcher: launcher)
         return try XCTUnwrap(store.host(.local(socketPath: path)), "no host")
     }
 
@@ -542,7 +562,9 @@ final class ReconnectTests: XCTestCase {
     /// starts a server over there, and it already does.
     func testARemoteHostNeverStartsALocalServer() async throws {
         let launcher = RecordingLauncher(.succeedSilently)
-        let store = SessionStore(hosts: [.ssh(destination: "nowhere")], launcher: launcher)
+        let store = SessionStore(
+            hosts: [.ssh(destination: "nowhere")], defaults: InMemoryDefaults(),
+            launcher: launcher)
         let host = try XCTUnwrap(store.host(.ssh(destination: "nowhere")), "no host")
         defer { host.disconnect() }
         setenv("ILLOGICAL_SSH", "illogical-no-such-ssh-binary", 1)

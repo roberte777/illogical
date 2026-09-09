@@ -382,16 +382,11 @@ final class TabReconcileTests: XCTestCase {
         XCTAssertEqual(store.connectionError, "No illogicald")
     }
 
-    /// A new terminal must go to a machine that can actually make one.
-    /// `hosts.first` is always the local daemon, and `createTerminal` sends
-    /// through `try?`, so with no local daemon every ⌘T silently did nothing.
-    func testNewTerminalsAvoidAHostThatIsNotConnected() {
-        let store = emptyStore([Self.local, Self.remote])
-        store.host(Self.local)?.setStatusForTesting(.failed("No illogicald"))
-        store.host(Self.remote)?.setStatusForTesting(.connected)
-
-        XCTAssertEqual(store.selectedHost?.host, Self.remote)
-    }
+    // ⌘T's routing used to be asserted here, as `current?.host` and
+    // `currentHostError` on a store that never made a terminal — so putting the
+    // reroute back inside `createTerminal` left it green. It has moved to
+    // `CurrentHostTests`, where the socket-backed harness that can see which
+    // machine a `create` actually left by already lives.
 
     /// Persistence round-trips, and `ILLOGICAL_HOSTS` entries are not written.
     func testOnlyUserAddedHostsAreRemembered() throws {
@@ -532,9 +527,11 @@ final class TabReconcileTests: XCTestCase {
         store.host(Self.local)?.setStatusForTesting(.failed("No illogicald"))
         // The remote is still `.connecting` — where a HostConnection starts.
         XCTAssertNil(store.connectionError, "a handshake was reported as an outage")
-        XCTAssertEqual(
-            store.selectedHost?.host, Self.remote,
-            "⌘T was routed to the failed host over the one still connecting")
+        // The window is on the local daemon and the local daemon is dead, so
+        // that is a screen with a reason on it — for this machine, and with a
+        // Try Again that dials only this machine. The window-wide screen would
+        // reconnect the remote mid-handshake, which is the bug above.
+        XCTAssertEqual(store.currentHostError, "No illogicald")
 
         // Once it has really failed, the screen is right to appear.
         store.host(Self.remote)?.setStatusForTesting(.failed("could not resolve hostname"))
