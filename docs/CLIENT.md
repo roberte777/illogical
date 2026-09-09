@@ -712,9 +712,9 @@ position less its stored index) and the hairlines come from, so a separator
 travels with its tab instead of staying behind at an index, and neither side of
 the gap draws one — and `slot(at:)` says which slot a pointer is in.
 
-**Hover is the strip's, not each slot's.** One pointer position read against
-the slots, from a tracking area over the strip and from the drag gesture while
-a button is down, rather than an `onHover` flag per tab. The difference
+**Hover is the strip's, not each slot's.** One hovered slot held by the strip,
+set by each slot's own `onHover` *arrival* and by the drag while a button is
+down, and cleared only by the pointer leaving the strip. The difference
 is the case a flag cannot answer: a drop rearranges the tabs under a pointer
 that never moved, so every flag then describes the arrangement before it — the
 tab you just dropped sat under the pointer believing it was not hovered, with
@@ -727,15 +727,22 @@ change, and which tab is drawn there is read off the new order. The position is
 written only when it crosses into another slot, so this costs no more redraws
 than the flags did.
 
-The position comes from an `NSTrackingArea` (`PointerTracker` in
-`WindowChrome.swift`), not from `onContinuousHover`, which has the second half
-of the same bug: it stops delivering once a drag that began inside it ends, and
-does not resume until the pointer leaves and returns. Every drop ends a drag
-under the pointer, so with SwiftUI hover the strip came out of a reorder
-frozen — the ✕ right for the drop and then stuck there however far the pointer
-moved. A tracking area is independent of hit testing and of gestures, which is
-what ghostty's own surface relies on, and `mouseMoved` resumes on the first
-movement after the button comes up.
+Two things about it are load-bearing, and both were found by tracing rather
+than by reasoning — three fixes built on the reasoning were wrong.
+
+**Arrivals only.** A slot's *departure* never speaks for the strip. The
+reorder moves a slot out from under a stationary pointer, so it reports an
+exit one frame after the drop has already recorded the right answer; honouring
+that exit cleared the hover with the pointer still on a tab, and no enter ever
+follows a pointer that did not move. Leaving the strip is what clears it, and
+the strip reports that for itself — it is the one view a reorder does not move.
+
+**Mouse-moved stops once a drag ends**, in this accessory. Traced at hundreds
+of move events before a drag and two after it, while enters and exits kept
+arriving throughout — so SwiftUI's `onContinuousHover` over the strip and an
+`NSTrackingArea` asking for `.mouseMoved` both come out of a reorder frozen,
+and neither is usable here. A slot boundary is the only crossing that changes
+the answer anyway, and an arrival is exactly that crossing.
 
 The ✕ on a slot appears on **hover**, on every tab including the active one. It
 sat on the active tab permanently until it did not: that parks a close button

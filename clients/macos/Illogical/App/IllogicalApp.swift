@@ -332,9 +332,15 @@ struct Toolbar: View {
     }
     @State private var drag: TabDrag?
 
-    /// The drawn position the pointer is in, or nil when it is not over the
-    /// strip. A *position*, not a tab: see `TabStrip.slot(at:)` for why the
-    /// per-slot `onHover` this replaced could not survive a reorder.
+    /// The slot the pointer is in, or nil when it is not over one.
+    ///
+    /// One flag for the strip rather than one inside each slot, and that is the
+    /// whole fix: a drop rearranges the tabs under a pointer that never moved,
+    /// so a per-slot flag is left describing the arrangement before it, with no
+    /// event coming to correct it — the tab you had just dropped had no ✕ until
+    /// you took the pointer out to the terminal and brought it back, because
+    /// that was the next enter it would see. Held here, it can simply be
+    /// rewritten at the drop, from the drag's own last position.
     @State private var hoveredSlot: Int?
 
     /// Far enough that a click with a shaky hand is still a click.
@@ -411,10 +417,43 @@ struct Toolbar: View {
         drag == nil && hoveredSlot == index
     }
 
-    /// Take the pointer's position along the strip. Written only when it
-    /// crosses into another slot, so a mouse moved across the toolbar redraws
-    /// the strip as often as an enter/exit flag did — which is to say rarely.
-    private func hover(at x: CGFloat) {
+    /// A slot says the pointer has arrived on it.
+    ///
+    /// **Arrivals only.** A slot's *departure* is never allowed to speak for
+    /// the strip, and that is not tidiness — it is the bug this went through
+    /// three wrong fixes to find. A drop rearranges the slots under a pointer
+    /// that is holding still, so the slot that moved out from under it reports
+    /// an exit one frame after the drop has already recorded the right answer.
+    /// Honouring that exit cleared the hover while the pointer was still
+    /// sitting on a tab, and since no *enter* ever follows a pointer that did
+    /// not move, the ✕ stayed gone until you took the pointer out to the
+    /// terminal and brought it back. Leaving the strip is what says nothing is
+    /// hovered, and the strip reports that for itself.
+    ///
+    /// Arrivals rather than the pointer's position, because an arrival is what
+    /// still gets delivered: **mouse-moved stops once a drag ends** in this
+    /// accessory, for SwiftUI's `onContinuousHover` and for an `NSTrackingArea`
+    /// asking for `.mouseMoved` alike — traced at hundreds of move events
+    /// before a drag and two after it, while enters and exits kept arriving
+    /// throughout. Every fix built on move events came out of a reorder frozen.
+    /// A slot boundary is the only crossing that changes the answer anyway, and
+    /// an arrival is exactly that crossing.
+    ///
+    /// Ignored for the length of a drag: the slots are moving then, so an
+    /// arrival is a claim about an arrangement that is still settling, and
+    /// `pointer(at:)` speaks for the pointer until the drop.
+    private func hover(enteredSlot index: Int) {
+        guard drag == nil else { return }
+        hoveredSlot = index
+    }
+
+    /// Take the pointer's position along the strip, for the length of a drag.
+    ///
+    /// This is what makes the drop land somewhere true: no enter or exit
+    /// arrives for the slot that ends up under a pointer that never moved, so
+    /// the strip would otherwise come out of the reorder still believing
+    /// whatever it believed going in.
+    private func pointer(at x: CGFloat) {
         let slot = TabStrip.slot(
             at: x, slotWidth: Metrics.tabWidth, count: store.visibleTabs.count)
         if hoveredSlot != slot { hoveredSlot = slot }
@@ -493,6 +532,11 @@ struct Toolbar: View {
                         // opens around all three of these changes at once.
                         .offset(x: carry(index))
                         .zIndex(drag?.id == tab.id ? 1 : 0)
+                        // Arrivals only. See `hover(enteredSlot:)` for why a
+                        // slot's departure is not allowed to clear the strip —
+                        // a reorder fires one, and honouring it is what took
+                        // the ✕ away the instant you dropped a tab.
+                        .onHover { if $0 { hover(enteredSlot: index) } }
                         // Drag to reorder — issue #38. Order is client state
                         // and never leaves the window. `simultaneousGesture`
                         // rather than `gesture`: the slot is mostly taken up by
@@ -514,19 +558,16 @@ struct Toolbar: View {
                             )
                             .onChanged { value in
                                 drag = TabDrag(id: tab.id, translation: value.translation.width)
-                                // `onContinuousHover` does not fire while the
-                                // button is down, so the pointer is tracked
-                                // from the drag for as long as there is one.
-                                // Without this the strip comes out of a drag
-                                // believing the pointer is wherever it was
-                                // when the drag began.
-                                hover(at: value.location.x)
+                                // No enter or exit arrives while a button is
+                                // down, so the drag speaks for the pointer for
+                                // as long as there is one.
+                                pointer(at: value.location.x)
                             }
                             // `drop` clears the drag itself, inside the same
                             // animation as the reorder. Clearing it here first
                             // put the tab back in its old slot for one frame.
                             .onEnded { value in
-                                hover(at: value.location.x)
+                                pointer(at: value.location.x)
                                 drop(tab.id, translation: value.translation.width)
                             }
                         )
@@ -535,22 +576,16 @@ struct Toolbar: View {
                         .transition(Motion.tabs.transition(reduceMotion: reduceMotion))
                     }
                 }
+                // Only so the drag can report a location the slot arithmetic
+                // can use. The slots move inside this space rather than with
+                // it, so it is a fixed ruler.
                 .coordinateSpace(.named(Self.stripSpace))
-                // Hover, for the whole strip at once. One pointer position
-                // read against the slots beats a flag per slot, because the
-                // flags cannot be re-read: a drop rearranges the tabs under a
-                // pointer that never moved, and every flag then describes the
-                // arrangement before it. That is what left the tab you had
-                // just dropped with no ✕ until you took the pointer out to the
-                // terminal and brought it back — the enter event it was
-                // waiting for.
-                //
-                // A tracking area rather than `onContinuousHover`, which has
-                // the second half of the same bug: it stops delivering when a
-                // drag that started inside it ends, so the strip came out of a
-                // reorder frozen instead — the ✕ correct for the drop and then
-                // stuck there. See `PointerTracker`.
-                .tracksPointer(moved: { hover(at: $0.x) }, exited: { hoveredSlot = nil })
+                // And leaving the strip is what says nothing is hovered. On
+                // the strip rather than on a slot because the strip is the
+                // thing that holds still: a reorder moves every slot inside
+                // it, so an exit from a slot that has just been moved is about
+                // the move rather than about the pointer.
+                .onHover { if !$0 { hoveredSlot = nil } }
                 // Room for the lifted slot's shadow. A `ScrollView` clips to
                 // its content, and the content is exactly one tab tall, so
                 // without this the shadow was cut off square along the top and
