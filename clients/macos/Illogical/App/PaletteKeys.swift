@@ -32,11 +32,17 @@
 //  the panel down on its way out through `runCommand`'s dismissal — which is
 //  what ⌥⌘← was doing all along.
 //
-//  The decision is a pure value, exactly as `TabCycle.Matcher` is, and for the
-//  same reason: a `ViewModifier`'s monitor closure is not something a unit test
-//  can build, and both of the rules below — which keys are claimed, and where
-//  an arrow lands among rows that are not all selectable — are rules worth
-//  pinning.
+//  The decisions are pure values, exactly as `TabCycle.Matcher` is, and for the
+//  same reason: neither a `ViewModifier`'s monitor closure nor a hover callback
+//  is something a unit test can build, and every rule below is worth pinning —
+//  which keys are claimed, where an arrow lands among rows that are not all
+//  selectable, where the highlight goes when the row under it dims, and when a
+//  hover is the mouse moving rather than the list moving under it.
+//
+//  The last two are not keys and are here anyway, because they are the same
+//  question: which row does Return act on. Splitting them across files would
+//  put three of the four answers in one place and the fourth somewhere a
+//  reader has no reason to look.
 
 import AppKit
 import SwiftUI
@@ -145,6 +151,73 @@ enum PaletteKeys {
             next += delta
         }
         return index
+    }
+
+    /// Where the highlight goes when the row *under* it dims.
+    ///
+    /// Nothing moved and nothing was typed: the app changed. Delete Session…
+    /// greys out when its machine drops, and Close Tab greys out when the last
+    /// tab goes — which can happen with the panel up, because the titlebar's
+    /// own ✕ stays live underneath it. The highlight stayed where it was and
+    /// Return then did nothing at all, with nothing on screen saying why; that
+    /// is the same silent no-op the dimming rule and `step` above exist to
+    /// prevent, arriving from the one direction neither of them watched.
+    ///
+    /// Forward first, because that is the direction an arrow was last going
+    /// and it keeps the highlight ahead of where the person was reading. Then
+    /// back, for a row that dimmed at the end of the list, where there is
+    /// nothing ahead of it. Then nothing at all, which is honest: a list with
+    /// nothing runnable in it should not be pointing at a row.
+    ///
+    /// An index outside the list is the list having shrunk rather than a row
+    /// having dimmed — a filter and a predicate changing in the same pass —
+    /// and starts again from the top, exactly as `resetSelection` does.
+    /// `step` cannot walk in from outside: it stops the moment it is off the
+    /// end, so from beyond the last row it never enters the list at all.
+    static func restep(from index: Int, enabled: [Bool]) -> Int {
+        guard enabled.indices.contains(index) else {
+            return step(from: -1, by: 1, enabled: enabled)
+        }
+        if enabled[index] { return index }
+        for delta in [1, -1] {
+            // In range, because `step` returns where it started when it finds
+            // nothing and where it started is in range.
+            let next = step(from: index, by: delta, enabled: enabled)
+            if enabled[next] { return next }
+        }
+        return -1
+    }
+
+    /// Whether a hover is the pointer moving onto a row, or a row arriving
+    /// under a pointer that has not moved at all.
+    ///
+    /// Hover callbacks fire whenever the view under the pointer changes, and
+    /// it does not have to be the pointer that changed it. The palette moves
+    /// rows under a stationary mouse twice, and both were bugs. The panel is
+    /// centred and hangs 30pt down — where a pointer very often already rests
+    /// — so opening it put a row under the mouse, whose hover overwrote the
+    /// first-row highlight `onAppear` had just set: ⇧⌘P then Return ran
+    /// whatever the pointer happened to be over. And an arrow past the visible
+    /// fold scrolls the list, which puts a *new* row under that same
+    /// stationary pointer, whose hover snapped the highlight back and cleared
+    /// the pending scroll with it — so with the mouse anywhere over the panel
+    /// the last commands in the table could not be reached by arrow at all.
+    ///
+    /// So a hover only counts once the pointer has been seen somewhere else.
+    /// `nil` is "not seen yet", which is the panel's first frame: it records
+    /// where the pointer is and changes nothing. This is what `NSMenu` and
+    /// Spotlight both do — a menu opened under the mouse highlights its own
+    /// first item, and starts following the mouse when the mouse moves.
+    ///
+    /// Comparing positions rather than timing a runloop turn after each
+    /// `scrollTo`, which was the other way to do it: a deadline says "ignore
+    /// hovers for a moment and hope", where a position answers the question
+    /// actually being asked. The points must be in a space the *panel* does
+    /// not move in — window coordinates, not the row's own — or a row sliding
+    /// under a still pointer reports a new position and reads as a move.
+    static func hoverMoved(from previous: CGPoint?, to point: CGPoint) -> Bool {
+        guard let previous else { return false }
+        return previous != point
     }
 }
 

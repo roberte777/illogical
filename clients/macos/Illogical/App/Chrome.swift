@@ -6,10 +6,12 @@
 //  pixels for a 12pt light, so 2.083 px/pt. Colours are sampled pixels, not
 //  guesses.
 //
-//  The exception is `tabHeight`, and its corner radius with it. Those come from
-//  a later photograph of the app running, which is a far worse instrument and a
+//  Two exceptions. `tabHeight`, and its corner radius with it, come from a
+//  later photograph of the app running, which is a far worse instrument and a
 //  far better subject — the recording is a pre-alpha and the two disagree by
-//  more than either can explain away. See the note on the constant.
+//  more than either can explain away. And `toolbarHeight` comes from neither:
+//  both sources put that band at about 39, and the constant is 40 for a reason
+//  that is AppKit's rather than the reference's. See the note on each.
 //
 //      ┌──────────────────────────────────────────────────────────────┐
 //      │ ● ● ●  ▤ Demo │ ▣ ~> btop │ ▣ ~> htop │(▣ ~/…> nvim)      +  │ 40pt

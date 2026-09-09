@@ -47,6 +47,33 @@ struct IllogicalApp: App {
             // order — a coin flip that would be nobody's fault and everybody's
             // bug. Removing both is cheaper than out-ranking one.
             CommandGroup(replacing: .printItem) { EmptyView() }
+            // Whatever this placement would generate, which is where Show
+            // Toolbar and Customize Toolbar… live. `WindowChrome` attaches an
+            // `NSToolbar` for its *height* and nothing else — it is what makes
+            // `NSTitlebarView` 40pt where a plain window's is 32 — so a
+            // toolbar the user can hide is a band the user can revoke: hidden,
+            // that band drops back to 32, the 40pt accessory inside it is
+            // clipped to 32, and the window is showing the exact bug the
+            // toolbar was added to fix with nothing in the app to name or undo
+            // it.
+            //
+            // **Measured, twice**, by dumping `NSApp.mainMenu` two seconds
+            // into a real launch: this placement generates nothing in this app
+            // with the line and nothing without it. The View menu holds the
+            // eleven items the group below adds and no toolbar item at all. So
+            // it deletes nothing today, and it is here as the cheap half of a
+            // pair — an empty replacement costs one line and forecloses a
+            // SwiftUI release, or a `.toolbar` modifier added upstream of
+            // here, quietly growing a ⌥⌘T that undoes the chrome. The
+            // load-bearing half is in `WindowChrome`, which heals a toolbar it
+            // finds hidden: `toggleToolbarShown:` from the responder chain and
+            // window state restoration are the doors that are actually open,
+            // and neither is a menu item this could delete.
+            //
+            // `replacing:` alongside the `after:` below is not a conflict —
+            // they are different halves of one placement — and the dump is
+            // what confirms the eleven items after it survive.
+            CommandGroup(replacing: .toolbar) { EmptyView() }
             CommandGroup(replacing: .newItem) {
                 CommandMenuItem(.newTerminal, store: store)
                 // On the machine in front, which is where ⌘T would put a
@@ -119,18 +146,23 @@ struct IllogicalApp: App {
                 // the window to another machine turns a habit into a teleport.
                 // It stays fallow.
                 //
-                // `Toggle` rather than `Button`, for the checkmark: it is the
-                // only thing in the menu that says which machine you are on,
-                // and macOS draws it for a toggle without being asked. The
-                // machines themselves come from the same registry entry the
-                // palette's Switch Host prompt reads, so the two lists cannot
-                // drift.
+                // A `Button` per machine, and the machines come from the same
+                // registry entry the palette's Switch Host prompt reads, so
+                // the two lists cannot drift.
+                //
+                // This was a `Toggle`, for the checkmark on the machine you
+                // are on. That machine is no longer in the list: `switchHost`
+                // guards on `target != currentHost` and returns, so its row's
+                // Return did nothing, and it is left out now for the same
+                // reason Forget Host leaves out the local daemon. With it gone
+                // the toggle could never be on, and a toggle that never
+                // toggles on is a lie about one — the rule Forget Host below
+                // already states. What was lost with it is only this menu's
+                // copy of the answer: the session button in the toolbar names
+                // the machine whenever it is not the local one, and Switch
+                // Host's own palette row carries it as the row's value.
                 CommandChoiceMenu(.switchHost, store: store) { choice in
-                    Toggle(
-                        choice.title,
-                        isOn: Binding(
-                            get: { choice.isCurrent },
-                            set: { _ in store.chooseOption(choice) }))
+                    Button(choice.title) { store.chooseOption(choice) }
                 }
                 // These two used to exist only inside the session dropdown,
                 // which meant the palette carried verbs the menu bar did not —
@@ -536,8 +568,24 @@ struct Toolbar: View {
             // around it calls `claimsMouseDown()`.
             Spacer(minLength: 8)
 
+            // Through `runCommand` rather than straight to `createTerminal`,
+            // which is the same correction `EmptyState`'s New Terminal button
+            // took: the table decides what the verb does, and `runCommand`'s
+            // rule is that nothing is left drawing a panel over what it just
+            // did.
+            //
+            // It matters more here than anywhere else in the app, because this
+            // control is live *underneath* the palette. The panel's scrim is
+            // an overlay on `ContentView`'s `VStack`; this toolbar is an
+            // `NSTitlebarAccessoryViewController` inside `NSTitlebarView`,
+            // which is not in that view and is not covered by anything the
+            // content view draws. So ＋ with the panel up made a terminal
+            // behind a panel that stayed. The tab pills and their ✕ are live
+            // under it for exactly the same reason; they are left alone here
+            // because neither is a command in the table, and closing a tab
+            // already goes through `WindowClose`.
             Button {
-                store.createTerminal()
+                store.runCommand(.newTerminal)
             } label: {
                 Image(systemName: "plus")
                     .font(.system(size: 12, weight: .regular))

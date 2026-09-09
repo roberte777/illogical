@@ -88,13 +88,15 @@ final class SessionStore {
     ///
     /// ILLOGICAL_OPEN_SESSION_MENU opens it at launch, alongside
     /// ILLOGICAL_TRACE, so it can be screenshotted without driving the mouse.
+    /// Read in `init`'s default argument rather than here, so that a test can
+    /// hand over the same launch state the environment would — see there.
     ///
     /// The `didSet` is half of the mutual exclusion with `palette` — see
     /// there. It is an observer rather than a rule the callers follow because
     /// SwiftUI writes this property directly: the session button binds to
     /// `$store.sessionMenuOpen`, so a `open()` method would be a funnel with a
     /// bypass, which is the `selectedTabID` lesson repeated.
-    var sessionMenuOpen = SessionStore.launchFlag("ILLOGICAL_OPEN_SESSION_MENU") {
+    var sessionMenuOpen: Bool {
         didSet {
             if sessionMenuOpen { palette = nil }
         }
@@ -115,12 +117,15 @@ final class SessionStore {
     /// Three invariants, held here rather than asked of the callers:
     ///
     /// 1. `.argument(id)` is only ever a command that *has* a prompt, and is
-    ///    only entered while that command is enabled — `runCommand` is the one
-    ///    door. It is belt and braces rather than a load-bearing guarantee:
-    ///    every action re-checks for itself in the store (`switchHost`,
-    ///    `removeHost` and `addHost` all already do), so a prompt left standing
-    ///    while a reconcile takes its machine away can commit to nothing. That
-    ///    is the same property `confirmPendingDestruction` has.
+    ///    only entered while that command is enabled. Two doors, and both
+    ///    check: `runCommand` for everything the app does, and `init` for the
+    ///    launch flag, which cannot check for itself because the check needs
+    ///    the store the flag is being read for. It is belt and braces rather
+    ///    than a load-bearing guarantee: every action re-checks for itself in
+    ///    the store (`switchHost`, `removeHost` and `addHost` all already do),
+    ///    so a prompt left standing while a reconcile takes its machine away
+    ///    can commit to nothing. That is the same property
+    ///    `confirmPendingDestruction` has.
     /// 2. At most one overlay is on screen. The two `didSet`s hold it, not the
     ///    callers, and there is no loop between them: the second write finds
     ///    nothing left to change. `init` holds the one case a `didSet` cannot
@@ -129,8 +134,7 @@ final class SessionStore {
     /// 3. What has been typed resets on every stage change. That is view state
     ///    (`CommandPalette`'s `query`, like the dropdown's `filter`), so the
     ///    view watches this property for it.
-    var palette: PaletteStage? = SessionStore.launchStage()
-    {
+    var palette: PaletteStage? {
         didSet {
             if palette != nil { sessionMenuOpen = false }
         }
@@ -142,7 +146,19 @@ final class SessionStore {
     /// put the panel into a stage the app has no way to reach: a command with
     /// no prompt falls back to the list rather than opening an argument field
     /// for something that takes no argument.
-    private static func launchStage() -> PaletteStage? {
+    ///
+    /// The *enabled* check `runCommand` also makes cannot happen here — there
+    /// is no store yet to ask, this being what one of its properties starts
+    /// out as — so `init` makes it once there is one. Both halves are needed
+    /// for invariant 1 above to be true, and this function used to claim both
+    /// while making one: `ILLOGICAL_OPEN_PALETTE=switchHost` on a one-machine
+    /// window opened a prompt with nothing in it, off a row the panel itself
+    /// draws dimmed.
+    ///
+    /// Not `private`, and neither is `launchFlag`: they are `init`'s default
+    /// arguments, and a default argument cannot be less visible than the
+    /// initializer it belongs to.
+    static func launchStage() -> PaletteStage? {
         guard let value = ProcessInfo.processInfo.environment["ILLOGICAL_OPEN_PALETTE"]
         else { return nil }
         guard let id = CommandID(rawValue: value), Commands.prompt(id) != nil else {
@@ -153,7 +169,7 @@ final class SessionStore {
 
     /// One of the launch-time overlay switches. Named rather than repeated so
     /// the two reads above look like the pair they are.
-    private static func launchFlag(_ name: String) -> Bool {
+    static func launchFlag(_ name: String) -> Bool {
         ProcessInfo.processInfo.environment[name] != nil
     }
 
@@ -252,13 +268,28 @@ final class SessionStore {
     /// docs/GOALS.md G7's launch budget is untouched — the read is off the
     /// first-paint path's critical section entirely, beside the one
     /// `startingHosts` already does.
+    ///
+    /// The last two are the launch-time overlay switches, and they are
+    /// parameters for one reason: the two rules at the end of this method are
+    /// the only ones in the store that a `didSet` cannot hold, precisely
+    /// because they are about a property's *initial* value — so they are also
+    /// the only ones no assignment from a test could exercise. Read out of the
+    /// environment by default, which is what the app gets and what leaves
+    /// `ProcessInfo` in exactly one place; handed over directly by the tests
+    /// that hold those two rules. Assigned once each below, so the observers
+    /// stay out of it and the repairs are doing the work rather than being
+    /// covered for.
     init(
         hosts: [ServerHost]? = nil,
         defaults: HostDefaults = UserDefaults.standard,
-        launcher: DaemonLauncher = BundledDaemonLauncher()
+        launcher: DaemonLauncher = BundledDaemonLauncher(),
+        sessionMenuOpen: Bool = SessionStore.launchFlag("ILLOGICAL_OPEN_SESSION_MENU"),
+        palette: PaletteStage? = SessionStore.launchStage()
     ) {
         self.defaults = defaults
         self.launcher = launcher
+        self.sessionMenuOpen = sessionMenuOpen
+        self.palette = palette
         let starting = hosts ?? SessionStore.startingHosts(defaults)
         let front = FrontSessionStore.load(defaults)
         writtenFront = front
@@ -284,7 +315,23 @@ final class SessionStore {
         // The palette wins, which is the rule the runtime already gives: the
         // later-opened overlay closes the earlier one, and of the two the panel
         // is the more specific ask.
-        if palette != nil { sessionMenuOpen = false }
+        if self.palette != nil { self.sessionMenuOpen = false }
+        // The other half of the same blind spot, and the other half of
+        // invariant 1. `launchStage` checks that a command has a prompt,
+        // because that much is a fact about the table; whether it is *enabled*
+        // is a fact about this store, which does not exist while its own
+        // properties are being computed. So the check `runCommand` makes for
+        // every other way into stage two is made here for the one way that
+        // skips it: ILLOGICAL_OPEN_PALETTE=switchHost on a one-machine window
+        // opened an argument field over a list of no machines, off a row the
+        // panel draws dimmed and refuses to run.
+        //
+        // Falling back to the list rather than to nothing, which is what the
+        // unreachable-stage case above already does: the flag asked for the
+        // panel, and the panel is a thing this window can show.
+        if case .argument(let id) = self.palette, !Commands.command(id).isEnabled(self) {
+            self.palette = .commands
+        }
     }
 
     /// The local daemon, plus whichever remote hosts were added last time.
@@ -1314,6 +1361,14 @@ final class SessionStore {
     /// It closes first on the same rule `runCommand` does — nothing is left
     /// drawing a panel over what it did — and closing a panel that was never
     /// up, which is the menu bar's case, is nothing at all.
+    ///
+    /// Closing first is only safe because every prompt vets its own options,
+    /// and both of them do it the same way: Switch Host leaves out the machine
+    /// the window is on and Forget Host leaves out the local daemon, because
+    /// `switchHost` and `removeHost` refuse exactly those. Without that this
+    /// method is a panel that closes and an action that declines — which is
+    /// worse than a dimmed row, because there was no dimming to warn anybody.
+    /// A choice prompt added later carries the same obligation.
     func chooseOption(_ choice: PaletteChoice) {
         closePalette()
         choice.choose(self)
@@ -1369,10 +1424,27 @@ final class SessionStore {
     /// the panel stays open with the caret where it was, which is the whole of
     /// the feedback a field with nothing in it can want.
     func commitAddHost(_ typed: String) {
-        let destination = typed.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !destination.isEmpty else { return }
+        guard let destination = SessionStore.destination(typed) else { return }
         addHost(.ssh(destination: destination))
         closePalette()
+    }
+
+    /// What `commitAddHost` would commit for what has been typed: the trimmed
+    /// destination, or nil for a field holding nothing but whitespace.
+    ///
+    /// Named and pulled out of the method above so that it can be pinned
+    /// *without a store*, which is not tidiness — it is the difference between
+    /// a safe test and an unsafe one. Driving the trim through `commitAddHost`
+    /// means handing it a padded address, and a padded address only stays
+    /// harmless while the trim works: broken, it is a destination the store
+    /// does not hold, so `addHost` falls through to `connect: true` and a unit
+    /// test spawns a real `ssh`. That is the regression `CommandPaletteTests`'s
+    /// header says the suite guards against, reached on the failure path of
+    /// the test that guards it. The rule is testable here and the composition
+    /// over it is one line.
+    static func destination(_ typed: String) -> String? {
+        let trimmed = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// The dropdown's "Add Remote Host…" row, and the menu bar item beside

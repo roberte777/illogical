@@ -8,23 +8,32 @@
 //  `CommandID.allCases`, and they read the chords a person sees out of the very
 //  `KeyboardShortcut` the menu item applies rather than out of a second string.
 //
-//  The **state machine** is a pair of `didSet`s and four methods on the store.
-//  It decides which overlay is up, whether a command runs or asks for an
-//  argument first, and what a filter means — every one of which used to be the
-//  kind of thing a view was trusted to remember.
+//  The **state machine** is a pair of `didSet`s, four methods on the store and
+//  two repairs `init` makes by hand. It decides which overlay is up, whether a
+//  command runs or asks for an argument first, and what a filter means — every
+//  one of which used to be the kind of thing a view was trusted to remember.
+//  The two in `init` are there because a `didSet` does not run for a property's
+//  initial value, which is exactly why they also needed a seam to be tested
+//  through: the launch overlay state is an argument, and an assignment from a
+//  test would run the observers these stand in for.
 //
-//  The **key rules** are two pure functions. The monitor around them cannot be
+//  The **row rules** are the four pure functions in `PaletteKeys`. Neither the
+//  monitor around two of them nor the hover callback behind the fourth can be
 //  driven from a unit test, exactly as `EscapeKey`'s and `TabCycleKey`'s
 //  cannot, but the decisions can: every key wrongly claimed is a keystroke the
-//  search field stops receiving, and an arrow that lands on a dimmed row is a
-//  Return that does nothing.
+//  search field stops receiving, an arrow that lands on a dimmed row is a
+//  Return that does nothing, and a hover that counts when the mouse has not
+//  moved is a highlight the keyboard cannot keep.
 //
 //  Driven without a socket throughout, and deliberately without dialling one
 //  either. `CurrentHostTests` records the regression this is guarding against
 //  in as many words — two suites once spawned a real `ssh build-box` per run —
-//  so the one test that reaches `addHost` arranges for the destination to be a
-//  machine the store already holds and marks it connected first, which is the
-//  branch that returns without connecting anything.
+//  so the one test that reaches `addHost` arranges for every destination it
+//  could commit to be a machine the store already holds, marked connected,
+//  which is the branch that returns without connecting anything. *Every* one:
+//  arranging only the destination the correct code path commits leaves the
+//  suite dialling the moment the code under test regresses, which is the one
+//  run where nobody is watching.
 
 import Foundation
 import IllogicalProtocol
@@ -34,6 +43,10 @@ import XCTest
 final class CommandPaletteTests: XCTestCase {
     private static let local = ServerHost.local(socketPath: "/tmp/illogical-palette.sock")
     private static let remote = ServerHost.ssh(destination: "build-box")
+    /// A third machine, for the lists that leave one out: Switch Host does not
+    /// offer the machine the window is already on, so two hosts make a list of
+    /// one and there is nothing left to filter or to arrow through.
+    private static let otherRemote = ServerHost.ssh(destination: "web-01")
 
     /// Somewhere in memory to read and write. The same shape
     /// `CurrentHostTests` uses, and here for the same reason: a suite that
@@ -203,8 +216,16 @@ final class CommandPaletteTests: XCTestCase {
         let store = emptyStore()
 
         let everything = store.paletteCommands(matching: "")
-        XCTAssertEqual(everything.map(\.id), Commands.paletteVisible.map(\.id))
         XCTAssertEqual(everything.count, CommandID.allCases.count - 1)
+        // The table's order, written out rather than compared against
+        // `Commands.paletteVisible`: the empty-query branch *returns* that
+        // array, so holding one against the other asserts that a value equals
+        // itself and passes with any ranking at all bolted on underneath.
+        // These four are the top of the table as `Commands.all` writes it.
+        XCTAssertEqual(
+            Array(everything.prefix(4).map(\.id)),
+            [.changeSession, .renameSession, .deleteSession, .switchHost],
+            "the panel opened on something other than the top of the table")
 
         // The panel never offers to open the panel you are looking at, even
         // when what has been typed is its own name.
@@ -223,17 +244,41 @@ final class CommandPaletteTests: XCTestCase {
 
     /// A choice prompt's options narrow on the same rule, and a command with no
     /// prompt — or a free-text one — has none to narrow.
+    ///
+    /// Three machines, because Switch Host leaves out the one the window is on
+    /// and two would leave a list of one with nothing to narrow.
     func testChoicesNarrowOnTheSameRuleAsCommands() {
-        let store = emptyStore([Self.local, Self.remote])
+        let store = emptyStore([Self.local, Self.remote, Self.otherRemote])
 
         XCTAssertEqual(
             store.paletteChoices(for: .switchHost, matching: "").map(\.title),
-            ["Local", "build-box"])
+            ["build-box", "web-01"])
         XCTAssertEqual(
             store.paletteChoices(for: .switchHost, matching: " BUILD ").map(\.title),
             ["build-box"])
         XCTAssertTrue(store.paletteChoices(for: .addRemoteHost, matching: "").isEmpty)
         XCTAssertTrue(store.paletteChoices(for: .newTerminal, matching: "").isEmpty)
+    }
+
+    /// Two machines can be called the same thing — `Local` is the local
+    /// daemon's display name and is also a perfectly legal SSH destination —
+    /// and a `PaletteChoice`'s id has to tell them apart anyway: `ForEach`
+    /// keys on it, so a collision is two rows SwiftUI believes are one, and
+    /// `scrollTo` keys on it, so an arrow onto the second scrolls to the
+    /// first. `Commands.choiceID` is what stops it, and nothing pinned that.
+    func testTwoMachinesWithOneNameStillHaveDistinctChoiceIds() {
+        let namesake = ServerHost.ssh(destination: "Local")
+        let store = emptyStore([Self.local, namesake, Self.remote])
+        // Onto the third machine, so that the two namesakes are both offered:
+        // the list leaves out the machine the window is on, and the window
+        // starts on the local daemon.
+        store.switchHost(Self.remote)
+
+        let options = store.paletteChoices(for: .switchHost, matching: "")
+        XCTAssertEqual(options.map(\.title), ["Local", "Local"], "the fixture stopped colliding")
+        XCTAssertEqual(
+            Set(options.map(\.id)).count, 2,
+            "an SSH destination called Local took the local daemon's row id")
     }
 
     // MARK: - Running things
@@ -326,19 +371,36 @@ final class CommandPaletteTests: XCTestCase {
 
     // MARK: - The host verbs
 
-    func testChoosingAHostSwitchesAndCloses() throws {
+    /// Taking an option moves the window and takes the panel down — and the
+    /// machine the window is already on is not one of the options.
+    ///
+    /// `switchHost` guards on `target != currentHost` and returns, so that row
+    /// closed the panel and did nothing, which is the same defect the Forget
+    /// Host list avoids by leaving out the local daemon. It is also what makes
+    /// `chooseOption` safe to write as a close followed by an action.
+    func testChoosingAHostSwitchesAndClosesAndTheMachineYouAreOnIsNotOffered() throws {
         let store = emptyStore([Self.local, Self.remote])
         list(store, [(1, "here", [1])])
         list(store, host: Self.remote, [(1, "there", [1])])
 
         store.runCommand(.switchHost)
         let options = store.paletteChoices(for: .switchHost, matching: "")
-        XCTAssertEqual(options.filter(\.isCurrent).map(\.title), ["Local"])
+        XCTAssertEqual(
+            options.map(\.title), ["build-box"],
+            "the machine the window was already on was offered as somewhere to go")
+        XCTAssertTrue(
+            options.allSatisfy { !$0.isCurrent },
+            "a checkmark was drawn on a machine this list does not contain")
 
         store.chooseOption(try XCTUnwrap(options.last))
 
         XCTAssertEqual(store.currentHost, Self.remote)
         XCTAssertNil(store.palette, "the panel stayed up on the machine it had just left")
+
+        // And it moves with the window: what was left out a moment ago is what
+        // is offered now.
+        XCTAssertEqual(
+            store.paletteChoices(for: .switchHost, matching: "").map(\.title), ["Local"])
     }
 
     /// The local daemon is not something the user added, and `removeHost`
@@ -370,27 +432,46 @@ final class CommandPaletteTests: XCTestCase {
     /// store's now, so the field cannot validate one string and send another —
     /// which is exactly how the dropdown's rename once went wrong.
     ///
-    /// `build-box` is already in the store and already marked connected, so
-    /// `addHost` takes its "already here, and it is working" branch and dials
-    /// nothing. A destination that arrived with its spaces still on it would
-    /// be a *different* host, which is what the count catches.
+    /// The rule is asserted on its own, and that is the point rather than
+    /// tidiness. This test used to drive the trim by committing a padded
+    /// address against a store that held the unpadded one, which was safe
+    /// *only while the trim worked*: broken, the padded string is a
+    /// destination the store does not hold, `addHost` falls through to
+    /// `connect: true`, and the suite spawns a real `ssh` — the regression
+    /// this file's header says it guards against, reintroduced on the one path
+    /// nobody watches. Every string handed to `commitAddHost` below resolves
+    /// to a host the store already holds and has marked connected, whichever
+    /// way the trim goes, so no branch of any regression dials anything.
     func testCommittingAnAddressIsTrimmedAndCommittingNothingIsRefused() {
+        XCTAssertEqual(SessionStore.destination("  build-box  "), "build-box")
+        XCTAssertNil(SessionStore.destination("   "))
+        XCTAssertNil(SessionStore.destination(""))
+
         let store = emptyStore()
-        store.addHost(Self.remote, connect: false)
-        store.host(Self.remote)?.setStatusForTesting(.connected)
+        // `build-box` is what a working trim commits; the other two are what a
+        // broken one commits, and they are here so that it cannot dial.
+        let held: [ServerHost] = [
+            Self.remote, .ssh(destination: "  build-box  "), .ssh(destination: "   "),
+        ]
+        for host in held {
+            store.addHost(host, connect: false)
+            store.host(host)?.setStatusForTesting(.connected)
+        }
         store.runCommand(.addRemoteHost)
 
         // Whitespace is not an address. The panel stays where it is with the
         // caret where it was, which is the whole of the feedback a field with
-        // nothing in it can want.
+        // nothing in it can want — and a commit that got as far as `addHost`
+        // would have closed it.
         store.commitAddHost("   ")
-        XCTAssertEqual(store.palette, .argument(.addRemoteHost))
-        XCTAssertEqual(store.hosts.count, 2)
+        XCTAssertEqual(
+            store.palette, .argument(.addRemoteHost),
+            "a field with nothing in it was committed as an address")
 
         store.commitAddHost("  build-box  ")
         XCTAssertEqual(
-            store.hosts.map(\.host), [Self.local, Self.remote],
-            "a destination was added with its whitespace still on it")
+            store.hosts.map(\.host), [Self.local] + held,
+            "a machine already in the list was added to it a second time")
         XCTAssertNil(store.palette)
     }
 
@@ -473,7 +554,11 @@ final class CommandPaletteTests: XCTestCase {
         XCTAssertEqual(
             PaletteMetrics.listHeight(rows: 2), 2 * PaletteMetrics.rowHeight,
             "a two-row filter drew a full-height panel")
-        XCTAssertEqual(PaletteMetrics.listHeight(rows: 16), PaletteMetrics.listMaxHeight)
+        // No assertion that sixteen rows are `listMaxHeight`: that constant
+        // *is* sixteen rows and `listHeight` is a `min` against it, so the two
+        // cannot come out different however the function is written. The
+        // clamp's work is the twenty-two below.
+        //
         // The unfiltered table is longer than sixteen, so the panel opens
         // clamped and scrolling — which is the state the reference measures,
         // scroll indicator and all.
@@ -497,11 +582,23 @@ final class CommandPaletteTests: XCTestCase {
     /// And never taller than the window it is centred in.
     ///
     /// Sixteen rows is a count, and it stopped being a safe one when the row
-    /// grew: they are 576pt of list in a 628pt panel now, so a window shorter
-    /// than that got a palette running off the bottom edge with its last
-    /// commands unreachable — arrowing onto one scrolls it into a part of the
-    /// list that is outside the window too.
+    /// grew: they are 400pt of list in a 441pt panel, which wants 501pt of
+    /// content area once the inset it hangs at and the margin under it are
+    /// counted — against a window this app lets you make 460pt tall. Without
+    /// the clamp such a window got a palette running off the bottom edge with
+    /// its last commands unreachable, since arrowing onto one scrolls it into
+    /// a part of the list that is outside the window too.
     func testTheListNeverOutgrowsTheWindowItIsCentredIn() {
+        // The two figures the paragraph above and `PaletteMetrics.maxRows`
+        // both quote. Pinned because this panel's constants have moved four
+        // times and the arithmetic in the comments around them did not move
+        // once: whatever changes these, the sentences naming 400 and 441 have
+        // to change in the same commit.
+        XCTAssertEqual(PaletteMetrics.listMaxHeight, 400, "sixteen rows are no longer 400pt")
+        XCTAssertEqual(
+            PaletteMetrics.listMaxHeight + PaletteMetrics.listOverhead, 441,
+            "the full-height panel is no longer 441pt")
+
         // Room for all sixteen: the count is what bites, exactly as before.
         XCTAssertEqual(
             PaletteMetrics.listHeight(rows: 16, in: 1200), PaletteMetrics.listMaxHeight,
@@ -636,5 +733,109 @@ final class CommandPaletteTests: XCTestCase {
             PaletteKeys.step(from: -1, by: 1, enabled: [false, false]), -1,
             "a list with nothing runnable in it still highlighted something")
         XCTAssertEqual(PaletteKeys.step(from: -1, by: 1, enabled: []), -1)
+    }
+
+    /// And where it goes when the row *under* it dims — nothing typed, nothing
+    /// moved, the app changed. Delete Session… greys out when its machine
+    /// drops; Close Tab greys out when the last tab is closed by the
+    /// titlebar's ✕, which stays live under the panel. The highlight used to
+    /// stay put and Return then did nothing at all, which is the silent no-op
+    /// the dimming rule exists to prevent, arriving from the one direction
+    /// `resetSelection` does not watch.
+    func testTheHighlightLeavesARowThatDimsUnderIt() {
+        // Still runnable: nothing moves. A re-step that always stepped would
+        // walk the highlight down the list on every reconcile.
+        XCTAssertEqual(PaletteKeys.restep(from: 1, enabled: [true, true, true]), 1)
+
+        // Forward first, the way an arrow was going.
+        XCTAssertEqual(PaletteKeys.restep(from: 1, enabled: [true, false, true]), 2)
+
+        // Then back, for a row that dimmed with nothing runnable after it —
+        // Show Previous Tab is the last row in the table and greys out the
+        // moment a window is down to one tab.
+        XCTAssertEqual(
+            PaletteKeys.restep(from: 2, enabled: [true, false, false]), 0,
+            "the highlight stayed on a dimmed row because the list ended after it")
+
+        // Then nothing, which is honest: a list with nothing runnable in it
+        // should not be pointing at a row.
+        XCTAssertEqual(PaletteKeys.restep(from: 1, enabled: [false, false]), -1)
+        XCTAssertEqual(PaletteKeys.restep(from: 0, enabled: []), -1)
+
+        // An index off the end is the list having *shrunk* rather than a row
+        // having dimmed, and starts again from the top. `step` cannot walk in
+        // from outside — it stops the moment it is off the end — so this is
+        // the case that needs saying separately.
+        XCTAssertEqual(
+            PaletteKeys.restep(from: 9, enabled: [false, true]), 1,
+            "a list that shrank under the highlight left it pointing past the end")
+    }
+
+    /// A hover only counts once the pointer has moved.
+    ///
+    /// Hover callbacks fire whenever the view under the pointer changes, and
+    /// the pointer does not have to be what changed it. The panel is centred
+    /// and hangs 30pt down, so opening it lands a row under a mouse that is
+    /// very often already resting there — ⇧⌘P then Return ran whatever the
+    /// pointer happened to be over rather than the first row. And an arrow
+    /// past the visible fold scrolls the list, which puts a new row under that
+    /// same still pointer, whose hover snapped the highlight back: with the
+    /// mouse anywhere over the panel, the end of the table could not be
+    /// reached by arrow at all.
+    func testAHoverCountsOnlyOnceThePointerHasMoved() {
+        let resting = CGPoint(x: 400, y: 300)
+
+        XCTAssertFalse(
+            PaletteKeys.hoverMoved(from: nil, to: resting),
+            "the panel opened under the pointer and handed it the highlight")
+        XCTAssertFalse(
+            PaletteKeys.hoverMoved(from: resting, to: resting),
+            "a row scrolled under a still pointer and took the highlight off the arrows")
+        XCTAssertTrue(
+            PaletteKeys.hoverMoved(from: resting, to: CGPoint(x: resting.x, y: resting.y + 1)),
+            "the mouse moved and the highlight did not follow it")
+    }
+
+    // MARK: - What a launch flag can open
+
+    /// The two rules `init` holds by hand, because they are about a property's
+    /// *initial* value and a `didSet` does not run for one.
+    ///
+    /// Both are reachable from a screenshot script and neither was reachable
+    /// from a test until the launch state became an argument: an assignment
+    /// from a test runs the observers, which is precisely what these two
+    /// repairs exist to stand in for. Passing them in is the whole seam.
+    func testBothLaunchFlagsAtOnceStillLeaveOneOverlay() {
+        let store = SessionStore(
+            hosts: [Self.local], defaults: InMemoryDefaults(),
+            launcher: RecordingLauncher(.succeedSilently),
+            sessionMenuOpen: true, palette: .commands)
+
+        XCTAssertEqual(store.palette, .commands)
+        XCTAssertFalse(
+            store.sessionMenuOpen,
+            "a screenshot script asking for both got two overlays on screen at once")
+    }
+
+    /// And a launch flag cannot arm a prompt the panel itself would refuse to
+    /// open. `launchStage` checks that the command *has* a prompt, which is a
+    /// fact about the table; whether it is enabled is a fact about the store,
+    /// and there is no store yet while its own properties are being computed —
+    /// so `init` makes the check `runCommand` makes for every other door.
+    func testALaunchFlagCannotOpenAPromptTheCommandIsTooDisabledToOffer() {
+        func store(_ hosts: [ServerHost]) -> SessionStore {
+            SessionStore(
+                hosts: hosts, defaults: InMemoryDefaults(),
+                launcher: RecordingLauncher(.succeedSilently), palette: .argument(.switchHost))
+        }
+
+        // One machine is nowhere to switch to, and the panel draws that row
+        // dimmed. Opening on the list instead is the same fallback a value
+        // naming no prompt at all gets.
+        XCTAssertEqual(
+            store([Self.local]).palette, .commands,
+            "a launch flag armed a prompt off a row the panel refuses to run")
+        // Two, and the command is enabled, so the flag gets what it asked for.
+        XCTAssertEqual(store([Self.local, Self.remote]).palette, .argument(.switchHost))
     }
 }

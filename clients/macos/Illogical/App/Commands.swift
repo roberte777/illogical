@@ -160,9 +160,19 @@ struct PaletteChoice: Identifiable {
     /// key on this.
     let id: String
     let title: String
-    /// Drawn as a checkmark. The one state-dependent glyph in the palette, and
-    /// the reason the choice list reserves an icon column where the command
-    /// list does not.
+    /// Drawn as a checkmark *after* the title, which is the whole of why the
+    /// choice list reserves no icon column: a trailing glyph cannot move
+    /// anything, so a choice row begins exactly where a command row does. The
+    /// leading column that would have held it was built first and rejected —
+    /// `PaletteRow.trailingIcon` carries that argument, and the file header of
+    /// `CommandPalette` carries the measurement behind it.
+    ///
+    /// **No prompt sets it today**, and that is not an oversight to be tidied
+    /// away. Switch Host cannot: the machine you are on is the one machine it
+    /// leaves out, because `switchHost` refuses it and the row's Return would
+    /// do nothing. Forget Host has no current machine to mark. It stays a
+    /// field because "which of these are you already on" is a question the
+    /// next choice prompt may well answer, and the answer has somewhere to go.
     let isCurrent: Bool
     let choose: @MainActor (SessionStore) -> Void
 }
@@ -221,8 +231,9 @@ enum Commands {
                 store.requestDeleteSession(ref)
             }),
 
-        // Enabled only with somewhere to go. One machine means one choice,
-        // and a prompt whose single option puts you where you already are is a
+        // Enabled only with somewhere to go, which with the machine you are on
+        // left out of the list below means: with anything in that list at all.
+        // One machine is not a choice, and a prompt with nothing in it is a
         // lie about what the app can do.
         Command(
             .switchHost, title: "Switch Host", icon: "arrow.left.arrow.right",
@@ -231,12 +242,20 @@ enum Commands {
             action: .prompt(
                 Command.Prompt(
                     chip: "Switch Host", placeholder: "Search hosts...", hint: nil,
+                    // Everywhere but here. `switchHost` guards on `target !=
+                    // currentHost` and returns — being somewhere is not a move
+                    // — so the machine the window is already on would be a row
+                    // whose Return does nothing, which is the same rule Forget
+                    // Host states one entry below about the local daemon.
+                    //
+                    // It is also why nothing in this list is ever `isCurrent`:
+                    // the only machine that could be is the one not offered.
                     kind: .choice { store in
-                        store.hosts.map { connection in
+                        store.hosts.filter { $0.host != store.currentHost }.map { connection in
                             PaletteChoice(
                                 id: Commands.choiceID(connection.host),
                                 title: connection.displayName,
-                                isCurrent: connection.host == store.currentHost,
+                                isCurrent: false,
                                 choose: { $0.switchHost(connection.host) })
                         }
                     }))),
@@ -521,10 +540,11 @@ struct CommandMenuItem: View {
 /// come out of the same table entry the palette's prompt reads, so the two
 /// lists of machines cannot disagree.
 ///
-/// The row itself is the caller's to build. Switch Host draws a `Toggle`,
-/// because the checkmark is the only thing in the menu bar that says which
-/// machine you are on; Forget Host draws a `Button`, because there is no state
-/// there to check and a toggle that never toggles on is a lie about one.
+/// The row itself is the caller's to build, and both callers now draw a
+/// `Button`. Switch Host drew a `Toggle` while the machine you are on was in
+/// its list and could carry a checkmark; that machine is left out now — its
+/// Return did nothing — so there is no state left in either list to check, and
+/// a toggle that never toggles on is a lie about one.
 struct CommandChoiceMenu<Row: View>: View {
     let id: CommandID
     let store: SessionStore

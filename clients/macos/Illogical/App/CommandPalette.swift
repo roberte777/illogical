@@ -26,8 +26,11 @@
 //
 //  A command with a *list* of answers — Switch Host, Forget Host — is the same
 //  chip and the same field, now filtering, with the choices where the hint
-//  would have gone and a checkmark on the one you are already on. Free text is
-//  the degenerate case of that, where a sentence takes the list's place. This
+//  would have gone. Every row in that list is somewhere Return can actually
+//  take you: Switch Host leaves out the machine you are already on and Forget
+//  Host leaves out the local daemon, because the store refuses both and a row
+//  whose Return does nothing is the thing this panel keeps killing. Free text
+//  is the degenerate case of it, where a sentence takes the list's place. This
 //  reuses the grammar stage one already taught — the field narrows a list, the
 //  arrows move through it, Return takes it — and adds no new mechanics at all,
 //  which is the whole argument for it over a second panel: there is nowhere
@@ -74,14 +77,19 @@
 //  text inset, and a row with one is pushed right. No glyph in either list ever
 //  appears or disappears in place, so nothing reflows under the pointer.
 //
-//  Holding that for the **choice** list took moving the current-machine
-//  checkmark to the trailing side. It was a reserved leading column first —
-//  the dropdown's answer, and defensible, because a checkmark that comes and
-//  goes on the left would shift every title beside it. But reserving indents a
-//  whole list to make room for one glyph, and the reference's choice rows begin
-//  exactly where its command rows do. Trailing satisfies both: nothing on the
-//  left can move because nothing is on the left, and the column it lands in is
-//  empty in a choice row anyway.
+//  Holding that for the **choice** list took moving its one state-dependent
+//  glyph — a checkmark on the machine you are on — to the trailing side. It
+//  was a reserved leading column first, which is the dropdown's answer and a
+//  defensible one, because a checkmark that comes and goes on the left would
+//  shift every title beside it. But reserving indents a whole list to make room
+//  for one glyph, and the reference's choice rows begin exactly where its
+//  command rows do. Trailing satisfies both: nothing on the left can move
+//  because nothing is on the left, and the column it lands in is empty in a
+//  choice row anyway.
+//
+//  No list draws that checkmark today — the one machine it could mark is the
+//  one Switch Host leaves out, a paragraph above — and the argument is kept
+//  because the glyph and its column are: see `PaletteChoice.isCurrent`.
 
 import SwiftUI
 
@@ -148,11 +156,12 @@ enum PaletteMetrics {
     /// is also about right for the table: the whole of it is twenty-two, so
     /// the panel is honest about there being more without becoming a window.
     ///
-    /// A ceiling on the table, and not a promise about the panel. Sixteen 36pt
-    /// rows are 576pt of list in a 628pt panel that hangs 36pt below the
-    /// chrome, which is more room than a window half the height of a laptop
-    /// screen has — so the room actually there is the other limit, and
-    /// `listHeight(rows:in:)` takes whichever of the two bites first.
+    /// A ceiling on the table, and not a promise about the panel. Sixteen 25pt
+    /// rows are 400pt of list in a 441pt panel, and a panel that hangs 30pt
+    /// down and leaves the same margin beneath it needs 501pt of content area
+    /// — where `ContentView` lets a window be 460pt tall. So the room actually
+    /// there is the other limit, and `listHeight(rows:in:)` takes whichever of
+    /// the two bites first.
     static let maxRows = 16
     static let listMaxHeight = CGFloat(maxRows) * rowHeight
 
@@ -286,9 +295,25 @@ struct CommandPalette: View {
     ///
     /// Separate from `selected` because hovering also moves the highlight and
     /// must not scroll: the pointer is already on the row, and scrolling under
-    /// it would fight the wheel that put it there. Hovering clears this, so
-    /// that arrowing back onto the same row afterwards still scrolls to it.
+    /// it would fight the wheel that put it there. A hover clears this, so that
+    /// arrowing back onto the same row afterwards still scrolls to it.
+    ///
+    /// That was considered in one direction only, and the other one was a bug.
+    /// A `scrollTo` moves the list under a pointer that has not moved, which
+    /// fires the hover of whichever row lands beneath it — so an arrow past the
+    /// visible fold set this, scrolled, and had its own selection snapped back
+    /// and this cleared by the row that arrived. `PaletteKeys.hoverMoved` is
+    /// what stops a hover the mouse did not cause from counting; both writes
+    /// below are behind it.
     @State private var scrollTarget: String?
+
+    /// Where the pointer was when this panel last heard from it, in window
+    /// coordinates. Nil until it is heard from at all.
+    ///
+    /// The whole of the hover rule's memory — see `PaletteKeys.hoverMoved` for
+    /// what it is for and why the space it is measured in has to be one the
+    /// panel does not move in.
+    @State private var pointer: CGPoint?
 
     @FocusState private var fieldFocused: Bool
 
@@ -412,6 +437,21 @@ struct CommandPalette: View {
             fieldFocused = true
         }
         .onChange(of: query) { _, _ in resetSelection() }
+        // And a row can dim while the highlight is *on* it, with nothing typed
+        // and nothing moved: Delete Session… when its machine drops mid-panel,
+        // or Close Tab when the last tab is closed by the titlebar's own ✕,
+        // which stays live under the panel because the scrim is on the content
+        // view and the toolbar is not. Return then did nothing at all — the
+        // case `resetSelection` says it exists to prevent, arriving from the
+        // one direction it does not watch, since the filter has not changed.
+        //
+        // Unconditional because `restep` is: a highlight still on something
+        // runnable is handed straight back, and `scrollTarget` reassigned to
+        // the id it already held wakes nothing up.
+        .onChange(of: enabled) { _, enabled in
+            selected = PaletteKeys.restep(from: selected, enabled: enabled)
+            scrollTarget = selectedID
+        }
         // Escape closes it, the way it closes an NSMenu. Not `.onExitCommand`,
         // for the reason `EscapeKey` sets out at length: that fires only for
         // the *focused* view, and with an overlay up the app's focused element
@@ -443,9 +483,12 @@ struct CommandPalette: View {
             if let prompt {
                 chip(prompt.chip)
             } else {
-                // 12 rather than the dropdown's 11: this glyph was sized to sit
-                // against 14pt text and the field's type is 15 now, and a
-                // magnifier that stays behind is not smaller, it is faint.
+                // The same 11 the dropdown sets its filter glyph at, against
+                // the same 13pt field type — `MenuMetrics.font` and
+                // `PaletteMetrics.font` are one number. It was 12 for the
+                // rounds when this field's type was 15, where a glyph left at
+                // 11 read as faint rather than as small; the type came back to
+                // the dropdown's and this came back with it.
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 11))
                     .foregroundStyle(Palette.menuShortcut)
@@ -524,8 +567,11 @@ struct CommandPalette: View {
                             // A dimmed row does not take the highlight either.
                             // One highlight, and it is always on something
                             // Return would actually do.
-                            hover: { inside in
-                                guard inside, isEnabled else { return }
+                            //
+                            // And only a hover the *mouse* caused — see
+                            // `pointerMoved(to:)`.
+                            hover: { point in
+                                guard isEnabled, pointerMoved(to: point) else { return }
                                 selected = index
                                 scrollTarget = nil
                             },
@@ -537,10 +583,13 @@ struct CommandPalette: View {
                     if commands.isEmpty {
                         // Given the palette's row rather than the dropdown's,
                         // because the list reserves one for it — `listHeight`'s
-                        // floor — and a 22pt notice in a 36pt slot sat high
-                        // with fourteen points of nothing beneath it. Its type
-                        // stays the dropdown's 13: this is a label, on the same
-                        // rule that keeps `hintFont` under `font`.
+                        // floor — and `MenuNotice`'s own 22 in that 25pt slot
+                        // sat high, with all three of the leftover points
+                        // underneath it. Only the height: its type is
+                        // `MenuMetrics.font`, which is the same 13 this panel
+                        // sets, so the two surfaces already agree about the
+                        // notice's text and differed only about the row it
+                        // sits in.
                         MenuNotice(text: "No matching commands")
                             .frame(height: PaletteMetrics.rowHeight)
                     }
@@ -601,8 +650,8 @@ struct CommandPalette: View {
                             trailingIcon: choice.isCurrent ? "checkmark" : nil,
                             isSelected: selected == index,
                             isEnabled: true,
-                            hover: { inside in
-                                guard inside else { return }
+                            hover: { point in
+                                guard pointerMoved(to: point) else { return }
                                 selected = index
                                 scrollTarget = nil
                             },
@@ -648,6 +697,11 @@ struct CommandPalette: View {
         // From before the list, stepping forward: the first row that can
         // actually be run. A filter whose first match is dimmed used to leave
         // the highlight on it, and Return then did nothing at all.
+        //
+        // The rows changing is only half of that. A row can also dim where it
+        // stands, with the filter untouched, and this never runs for it — see
+        // the `.onChange(of: enabled)` above, which is the same rule for the
+        // other half.
         selected = PaletteKeys.step(from: -1, by: 1, enabled: enabled)
         scrollTarget = selectedID
     }
@@ -655,6 +709,18 @@ struct CommandPalette: View {
     private func move(by delta: Int) {
         selected = PaletteKeys.step(from: selected, by: delta, enabled: enabled)
         scrollTarget = selectedID
+    }
+
+    /// Whether a hover reported at `point` is the mouse having moved, noting
+    /// where it now is either way.
+    ///
+    /// The note happens on every hover, including the ones that do not count:
+    /// a row arriving under a still pointer is exactly how this view learns
+    /// where that pointer is, and refusing to remember it would leave the
+    /// first *real* move with nothing to be different from.
+    private func pointerMoved(to point: CGPoint) -> Bool {
+        defer { pointer = point }
+        return PaletteKeys.hoverMoved(from: pointer, to: point)
     }
 
     private var selectedID: String? {
@@ -707,8 +773,10 @@ private struct PaletteRow: View {
     var icon: String?
     let title: String
     var trailing: String?
-    /// A glyph after the title rather than before it — the checkmark on the
-    /// machine you are already on.
+    /// A glyph after the title rather than before it — the checkmark a choice
+    /// row would carry on the option you are already on, which today is a
+    /// checkmark no list draws: see `PaletteChoice.isCurrent` for why the one
+    /// machine that could take it is the one Switch Host does not offer.
     ///
     /// It was a reserved *leading* column first, on the reasoning that a
     /// checkmark which comes and goes would otherwise shift every title beside
@@ -722,7 +790,12 @@ private struct PaletteRow: View {
     var chevron = false
     let isSelected: Bool
     let isEnabled: Bool
-    let hover: (Bool) -> Void
+    /// The pointer is over this row, and here is where the pointer is.
+    ///
+    /// A position rather than the `Bool` `.onHover` would hand over, because
+    /// whether this hover means anything is not a question the row can answer
+    /// — see `PaletteKeys.hoverMoved`. The row reports; the panel decides.
+    let hover: (CGPoint) -> Void
     let action: () -> Void
 
     /// Dimmed rather than hidden, and the difference matters: the menu bar
@@ -742,13 +815,16 @@ private struct PaletteRow: View {
     var body: some View {
         HStack(spacing: 0) {
             if let icon {
-                // 12 against 15pt titles, where the dropdown draws 11 against
-                // 13. The column it is centred in stays `MenuMetrics`'s 13 all
-                // the same, because what that frame does is line the titles up
-                // and it does that at any glyph size — a wide symbol at 12
-                // spills a fraction of a point into a 9pt gap that can spare
-                // it, where widening the column would push every title with an
-                // icon away from every title without one.
+                // The dropdown's pair exactly: an 11pt glyph against 13pt
+                // titles, centred in `MenuMetrics`'s own 13pt column. Nothing
+                // in the row's *type* is this panel's — only the row is taller
+                // — and a glyph scaled to the row rather than to the text
+                // would be a glyph that disagreed with the title beside it.
+                //
+                // The column is the dropdown's for a reason of its own: what
+                // it does is line the titles up, and it does that at any glyph
+                // size, so widening it would push every title with an icon
+                // away from every title without one to no purpose.
                 Image(systemName: icon)
                     .font(.system(size: 11))
                     .frame(width: MenuMetrics.iconColumn, alignment: .center)
@@ -769,9 +845,11 @@ private struct PaletteRow: View {
                     .foregroundStyle(trailingColor)
             }
 
-            // Up a point with the title beside it, for the reason the leading
-            // icon is: a checkmark is read against the name it marks, and one
-            // sized for 14pt type reads as tentative next to 15.
+            // The leading icon's 11, and semibold where that one is regular: a
+            // checkmark is read against the name it marks rather than as a
+            // symbol of its own, and at the same weight as the icons on the
+            // other side of the row it reads as tentative — which is the one
+            // thing a mark saying "you are here" must not be.
             if let trailingIcon {
                 Image(systemName: trailingIcon)
                     .font(.system(size: 11, weight: .semibold))
@@ -781,9 +859,11 @@ private struct PaletteRow: View {
             // The reference's `>`: this command will ask you something rather
             // than doing it. Only ever on a row that has a prompt behind it, so
             // it is a promise the panel keeps. Deliberately the smallest glyph
-            // in the row and still 10 rather than 9 — it is punctuation on a
-            // 15pt line, and punctuation set for a 14pt one goes from quiet to
-            // hard to see.
+            // in the row, two points under the icons either side of it: it is
+            // punctuation on a 13pt line rather than a symbol anybody reads,
+            // and it is the one thing in the row that should be noticed only
+            // when it is looked for. Semibold so that two points down is quiet
+            // rather than faint.
             if chevron {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 9, weight: .semibold))
@@ -811,7 +891,18 @@ private struct PaletteRow: View {
             }
         }
         .contentShape(Rectangle())
-        .onHover(perform: hover)
+        // `.onContinuousHover` rather than `.onHover`, for the location: the
+        // panel needs to know whether the mouse moved, and "the pointer is
+        // inside me" cannot say. `.global` because the row itself slides when
+        // the list scrolls, so a position measured inside the row changes
+        // while the pointer is still — which is the one case this exists to
+        // recognise. `.ended` is dropped: a row the pointer has left has
+        // nothing to say about the highlight, exactly as `inside == false`
+        // had nothing to say before.
+        .onContinuousHover(coordinateSpace: .global) { phase in
+            guard case .active(let point) = phase else { return }
+            hover(point)
+        }
         // A dimmed row takes no click. The store re-guards anyway; this is so
         // that clicking one is visibly nothing rather than a panel that closes
         // and does not act.

@@ -32,7 +32,14 @@
 //  the window, and it uses the app's own palette. So it is an in-window overlay
 //  anchored to the session button's leading edge, just below the toolbar.
 //
-//  Geometry measured from the reference at 1.256 px/pt (toolbar = 40pt):
+//  Geometry measured from the reference at 1.256 px/pt, calibrated on the
+//  toolbar *in that image*: 49px for a band of 39pt, and 49/39 is where the
+//  1.256 comes from. Deliberately not `Metrics.toolbarHeight`, which is 40
+//  now — that 40 is a fact about the height AppKit gives a `.unifiedCompact`
+//  titlebar, and the photograph did not change when the constant did. Reading
+//  the same 49px as 40pt would give 1.225 and move every number below by half
+//  a percent for no reason at all.
+//
 //  panel ~125pt tall at x=80, corner radius 10, 4pt padding; icon column at 11pt
 //  from the panel edge, titles at 33pt; hover fill #5C9DF9 with dark text.
 //
