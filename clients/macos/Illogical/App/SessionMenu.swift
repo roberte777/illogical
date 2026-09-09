@@ -147,18 +147,6 @@ struct SessionMenu: View {
 
     private var anyMatches: Bool { store.hosts.contains { !matches($0).isEmpty } }
 
-    /// "New Session", and on which machine once there is more than one to be
-    /// wrong about. This row carries no host of its own — it takes whichever
-    /// one the front tab is on — so with two connected the title was the only
-    /// thing that could say where the session was about to land, and it said
-    /// nothing. Named only when `showsHosts`, on the same rule the headers use:
-    /// with one machine there is nothing to disambiguate and the suffix would
-    /// be noise on every window that never adds a host.
-    private var newSessionTitle: String {
-        guard showsHosts, let host = store.current else { return "New Session" }
-        return "New Session on \(host.displayName)"
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             filterField
@@ -261,11 +249,14 @@ struct SessionMenu: View {
 
             // The chord out of the command table, formatted the way the
             // palette's own rows format theirs. The title is not, and stays
-            // this dropdown's: `newSessionTitle` names the machine when there
-            // is more than one to be wrong about, which is a thing only a row
-            // with a host list above it can say.
+            // this dropdown's: plainly "New Session", on every machine count.
+            // It used to grow an "on <machine>" suffix once a second host was
+            // connected, which read as though this row were about that machine
+            // rather than about the one the window is on; the ＋ on each host
+            // header is where a named destination belongs, and it says so in
+            // its own tooltip.
             MenuRow(
-                icon: "rectangle.stack.badge.plus", title: newSessionTitle,
+                icon: "rectangle.stack.badge.plus", title: "New Session",
                 shortcut: Commands.command(.newSession).shortcut.map(ShortcutDisplay.string),
                 isHovered: hovered == "__new",
                 hover: { hovered = $0 ? "__new" : nil },
