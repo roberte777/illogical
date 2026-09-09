@@ -343,6 +343,19 @@ struct Toolbar: View {
     /// rewritten at the drop, from the drag's own last position.
     @State private var hoveredSlot: Int?
 
+    /// A drag has happened, and the mouse-up that ended it is still to come.
+    ///
+    /// The select button and the drag gesture run side by side — that is what
+    /// `simultaneousGesture` is for — so the mouse-up that finishes a reorder
+    /// also fires the button under it, and dragging a tab opened it. Reordering
+    /// and selecting are different intentions and only one of them was asked
+    /// for, so the button stands down for the gesture that was.
+    ///
+    /// Cleared a runloop turn later rather than in `onEnded`, because the
+    /// button's action is dispatched from the same mouse-up and has not run
+    /// yet at that point.
+    @State private var didDrag = false
+
     /// Far enough that a click with a shaky hand is still a click.
     private static let dragThreshold: CGFloat = 8
 
@@ -417,46 +430,20 @@ struct Toolbar: View {
         drag == nil && hoveredSlot == index
     }
 
-    /// A slot says the pointer has arrived on it.
+    /// Take the pointer's position along the strip.
     ///
-    /// **Arrivals only.** A slot's *departure* is never allowed to speak for
-    /// the strip, and that is not tidiness — it is the bug this went through
-    /// three wrong fixes to find. A drop rearranges the slots under a pointer
-    /// that is holding still, so the slot that moved out from under it reports
-    /// an exit one frame after the drop has already recorded the right answer.
-    /// Honouring that exit cleared the hover while the pointer was still
-    /// sitting on a tab, and since no *enter* ever follows a pointer that did
-    /// not move, the ✕ stayed gone until you took the pointer out to the
-    /// terminal and brought it back. Leaving the strip is what says nothing is
-    /// hovered, and the strip reports that for itself.
-    ///
-    /// Arrivals rather than the pointer's position, because an arrival is what
-    /// still gets delivered: **mouse-moved stops once a drag ends** in this
-    /// accessory, for SwiftUI's `onContinuousHover` and for an `NSTrackingArea`
-    /// asking for `.mouseMoved` alike — traced at hundreds of move events
-    /// before a drag and two after it, while enters and exits kept arriving
-    /// throughout. Every fix built on move events came out of a reorder frozen.
-    /// A slot boundary is the only crossing that changes the answer anyway, and
-    /// an arrival is exactly that crossing.
-    ///
-    /// Ignored for the length of a drag: the slots are moving then, so an
-    /// arrival is a claim about an arrangement that is still settling, and
-    /// `pointer(at:)` speaks for the pointer until the drop.
-    private func hover(enteredSlot index: Int) {
-        guard drag == nil else { return }
-        hoveredSlot = index
-    }
-
-    /// Take the pointer's position along the strip, for the length of a drag.
-    ///
-    /// This is what makes the drop land somewhere true: no enter or exit
-    /// arrives for the slot that ends up under a pointer that never moved, so
-    /// the strip would otherwise come out of the reorder still believing
-    /// whatever it believed going in.
+    /// The strip's tracking area reports this as the pointer moves, and the
+    /// drag gesture reports it while a button is down, when no tracking area
+    /// does. A *position* is what makes a drop land somewhere true: no arrival
+    /// is delivered for the slot that ends up under a pointer that never moved,
+    /// so anything read from arrivals alone comes out of a reorder still
+    /// believing whatever it believed going in.
     private func pointer(at x: CGFloat) {
         let slot = TabStrip.slot(
             at: x, slotWidth: Metrics.tabWidth, count: store.visibleTabs.count)
-        if hoveredSlot != slot { hoveredSlot = slot }
+        if hoveredSlot != slot {
+            hoveredSlot = slot
+        }
     }
 
     private func drop(_ id: TabLayout.ID, translation: CGFloat) {
@@ -507,7 +494,11 @@ struct Toolbar: View {
                             isDragging: drag?.id == tab.id,
                             isHovered: isHovered(index),
                             pill: pill,
-                            select: { store.selectedTabID = tab.id },
+                            // Not after a drag: see `didDrag`.
+                            select: {
+                                guard !didDrag else { return }
+                                store.selectedTabID = tab.id
+                            },
                             // Through the same policy ⇧⌘W uses, so pointer and
                             // keyboard cannot disagree about when closing a tab
                             // asks first — or about the window's last tab
@@ -532,11 +523,6 @@ struct Toolbar: View {
                         // opens around all three of these changes at once.
                         .offset(x: carry(index))
                         .zIndex(drag?.id == tab.id ? 1 : 0)
-                        // Arrivals only. See `hover(enteredSlot:)` for why a
-                        // slot's departure is not allowed to clear the strip —
-                        // a reorder fires one, and honouring it is what took
-                        // the ✕ away the instant you dropped a tab.
-                        .onHover { if $0 { hover(enteredSlot: index) } }
                         // Drag to reorder — issue #38. Order is client state
                         // and never leaves the window. `simultaneousGesture`
                         // rather than `gesture`: the slot is mostly taken up by
@@ -557,6 +543,7 @@ struct Toolbar: View {
                                 coordinateSpace: .named(Self.stripSpace)
                             )
                             .onChanged { value in
+                                didDrag = true
                                 drag = TabDrag(id: tab.id, translation: value.translation.width)
                                 // No enter or exit arrives while a button is
                                 // down, so the drag speaks for the pointer for
@@ -569,6 +556,9 @@ struct Toolbar: View {
                             .onEnded { value in
                                 pointer(at: value.location.x)
                                 drop(tab.id, translation: value.translation.width)
+                                // After the button's action has had its turn
+                                // and declined to take it.
+                                DispatchQueue.main.async { didDrag = false }
                             }
                         )
                         // Outermost, so what fades is the whole slot rather
@@ -580,12 +570,12 @@ struct Toolbar: View {
                 // can use. The slots move inside this space rather than with
                 // it, so it is a fixed ruler.
                 .coordinateSpace(.named(Self.stripSpace))
-                // And leaving the strip is what says nothing is hovered. On
-                // the strip rather than on a slot because the strip is the
-                // thing that holds still: a reorder moves every slot inside
-                // it, so an exit from a slot that has just been moved is about
-                // the move rather than about the pointer.
-                .onHover { if !$0 { hoveredSlot = nil } }
+                // The pointer itself, from a tracking area on the strip —
+                // the one view a reorder does not move, so unlike the slots it
+                // has no stale state to recover from. This is what answers
+                // after a drop, and what clears the hover when the pointer
+                // leaves the strip.
+                .tracksPointer(moved: { pointer(at: $0.x) }, exited: { hoveredSlot = nil })
                 // Room for the lifted slot's shadow. A `ScrollView` clips to
                 // its content, and the content is exactly one tab tall, so
                 // without this the shadow was cut off square along the top and

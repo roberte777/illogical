@@ -713,8 +713,8 @@ travels with its tab instead of staying behind at an index, and neither side of
 the gap draws one — and `slot(at:)` says which slot a pointer is in.
 
 **Hover is the strip's, not each slot's.** One hovered slot held by the strip,
-set by each slot's own `onHover` *arrival* and by the drag while a button is
-down, and cleared only by the pointer leaving the strip. The difference
+set from the pointer's position — by a local event monitor as it moves, and by
+the drag gesture while a button is down. The difference
 is the case a flag cannot answer: a drop rearranges the tabs under a pointer
 that never moved, so every flag then describes the arrangement before it — the
 tab you just dropped sat under the pointer believing it was not hovered, with
@@ -727,22 +727,31 @@ change, and which tab is drawn there is read off the new order. The position is
 written only when it crosses into another slot, so this costs no more redraws
 than the flags did.
 
-Two things about it are load-bearing, and both were found by tracing rather
-than by reasoning — three fixes built on the reasoning were wrong.
+The event source is a **local `NSEvent` monitor** (`PointerTracker` in
+`WindowChrome.swift`), which is a strange answer to "is the pointer over this
+view" and the only one that works here. Every ordinary way of asking stops
+reporting to a view once a drag ends on it — SwiftUI's `onHover` and
+`onContinuousHover`, and an `NSTrackingArea` on the same view — and stays
+silent until the pointer leaves the window and returns. Every drop ends a drag
+under the pointer, so that is precisely when the strip needs an answer and
+precisely when it stops getting one.
 
-**Arrivals only.** A slot's *departure* never speaks for the strip. The
-reorder moves a slot out from under a stationary pointer, so it reports an
-exit one frame after the drop has already recorded the right answer; honouring
-that exit cleared the hover with the pointer still on a tab, and no enter ever
-follows a pointer that did not move. Leaving the strip is what clears it, and
-the strip reports that for itself — it is the one view a reorder does not move.
+This was measured, not reasoned; three fixes reasoned their way to the wrong
+mechanism first. In one traced reproduction, after the drop: **0** events from
+the tracking area, **0** from SwiftUI's hover, **390** from the monitor. The
+window never stops *generating* the events — delivery to the view is what
+breaks — so a monitor, which watches what the app dispatches rather than what a
+view is offered, sees all of them. It needs
+`window.acceptsMouseMovedEvents = true`, which `WindowChrome.configure` sets:
+without it the window makes no mouse-moved events for anyone at all, monitor or
+tracking area, and SwiftUI turning it on for its own hover tracking is not
+something to depend on.
 
-**Mouse-moved stops once a drag ends**, in this accessory. Traced at hundreds
-of move events before a drag and two after it, while enters and exits kept
-arriving throughout — so SwiftUI's `onContinuousHover` over the strip and an
-`NSTrackingArea` asking for `.mouseMoved` both come out of a reorder frozen,
-and neither is usable here. A slot boundary is the only crossing that changes
-the answer anyway, and an arrival is exactly that crossing.
+A **drag does not select.** The select button and the drag run side by side, so
+the mouse-up that finishes a reorder also fired the button under it and opening
+a tab was the price of moving it. The button stands down once the drag
+threshold has been passed — reordering and selecting are different intentions,
+and a click that never became a drag still selects.
 
 The ✕ on a slot appears on **hover**, on every tab including the active one. It
 sat on the active tab permanently until it did not: that parks a close button

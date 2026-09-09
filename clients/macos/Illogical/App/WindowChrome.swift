@@ -58,6 +58,106 @@ extension View {
     }
 }
 
+/// Reports where the pointer is over this view, in the view's own coordinates,
+/// and when it leaves it.
+///
+/// A local `NSEvent` monitor, which is a strange way to ask "is the pointer
+/// over this view" and is the only way that answers on the tab strip. Both
+/// ordinary ways stop reporting to a slot the moment a drag ends on it —
+/// SwiftUI's `onHover` and `onContinuousHover`, and an `NSTrackingArea` on the
+/// same view, all of them — and they stay silent until the pointer leaves the
+/// window and comes back. Every drop ends a drag under the pointer, so that is
+/// exactly when the strip needs an answer and exactly when it stops getting
+/// one: the ✕ froze on the tab you had just dropped.
+///
+/// Measured rather than reasoned, after three fixes that reasoned their way to
+/// the wrong mechanism. In one reproduction, after the drop: 0 events from the
+/// tracking area, 0 from SwiftUI's hover, 390 from the monitor. The window
+/// never stopped *generating* the events — delivery to the view is what breaks
+/// — so a monitor, which watches the events the app dispatches rather than the
+/// ones a view is offered, sees all of them.
+///
+/// The `NSView` is only a ruler: it converts a window point into the strip's
+/// own coordinates and contributes nothing else, which is why it answers
+/// `hitTest` with nil and takes no part in where a click lands.
+///
+/// Needs `window.acceptsMouseMovedEvents`, which `configure` sets — without it
+/// the window makes no mouse-moved events for anyone to monitor.
+struct PointerTracker: NSViewRepresentable {
+    /// Where the pointer is, in the tracked view's own coordinates.
+    let moved: (CGPoint) -> Void
+    /// The pointer is somewhere else.
+    let exited: () -> Void
+
+    func makeNSView(context: Context) -> TrackingView {
+        TrackingView(moved: moved, exited: exited)
+    }
+
+    func updateNSView(_ nsView: TrackingView, context: Context) {
+        nsView.moved = moved
+        nsView.exited = exited
+    }
+
+    final class TrackingView: NSView {
+        var moved: (CGPoint) -> Void
+        var exited: () -> Void
+        private var monitor: Any?
+
+        init(moved: @escaping (CGPoint) -> Void, exited: @escaping () -> Void) {
+            self.moved = moved
+            self.exited = exited
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("PointerTracker is not built from a nib") }
+
+        /// Never the view a click lands on. It goes in as a `.background` under
+        /// live controls and only wants the geometry, so it stays out of hit
+        /// testing entirely.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        /// The monitor lives exactly as long as the view is in a window, which
+        /// is the only span in which it has coordinates to report.
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil else {
+                if let monitor { NSEvent.removeMonitor(monitor) }
+                monitor = nil
+                return
+            }
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) {
+                [weak self] event in
+                self?.observe(event)
+                return event
+            }
+        }
+
+        /// Watched, never intercepted: `observe` is called from a monitor that
+        /// returns the event unchanged, so nothing downstream of it sees a
+        /// difference.
+        private func observe(_ event: NSEvent) {
+            guard let window, event.window === window else { return exited() }
+            let point = convert(event.locationInWindow, from: nil)
+            // Horizontally the strip's own arithmetic would catch a point past
+            // either end, but nothing else would catch one above or below it.
+            guard bounds.contains(point) else { return exited() }
+            moved(point)
+        }
+    }
+}
+
+extension View {
+    /// Follow the pointer across this view. See `PointerTracker` for why this
+    /// is not `onHover`.
+    func tracksPointer(
+        moved: @escaping (CGPoint) -> Void, exited: @escaping () -> Void
+    ) -> some View {
+        background(PointerTracker(moved: moved, exited: exited))
+    }
+}
+
 @MainActor
 struct WindowChrome<Toolbar: View>: NSViewRepresentable {
     let toolbarHeight: CGFloat
@@ -139,6 +239,15 @@ struct WindowChrome<Toolbar: View>: NSViewRepresentable {
         // why `claimsMouseDown()` exists. With this already `false` the terminal
         // body correctly ignored a drag while the tab strip above it did not.
         window.isMovableByWindowBackground = false
+
+        // Without this the window generates no mouse-moved events, and every
+        // consumer of them in the title bar accessory is left with enters and
+        // exits only. Traced: the tab strip saw hundreds of moves before a
+        // drag and two after one, because SwiftUI turns this on for its own
+        // hover tracking and does not leave it on. `NSTrackingArea` asking for
+        // `.mouseMoved` does not turn it on either -- a tracking area says
+        // where an event is delivered, not whether the window makes one.
+        window.acceptsMouseMovedEvents = true
 
         if let existing = context.coordinator.accessory {
             // Keep the hosted SwiftUI view current across state changes.
