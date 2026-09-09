@@ -57,13 +57,18 @@ struct PaneHeader: View {
             Spacer(minLength: 8)
 
             HStack(spacing: Metrics.paneButtonSpacing) {
+                // Every chord in this row comes out of the command table, so a
+                // chord that moves in the menu bar moves here too. These
+                // tooltips are further from the menu bar than any other in the
+                // app, which is exactly why they were the ones most able to go
+                // quietly stale.
                 PaneButton(
-                    systemImage: "square.split.2x1", help: "Split Right (⌘D)"
+                    systemImage: "square.split.2x1", help: Commands.help(.splitRight, store)
                 ) {
                     store.split(pane: pane.id, in: tab, direction: .columns)
                 }
                 PaneButton(
-                    systemImage: "square.split.1x2", help: "Split Down (⇧⌘D)"
+                    systemImage: "square.split.1x2", help: Commands.help(.splitDown, store)
                 ) {
                     store.split(pane: pane.id, in: tab, direction: .rows)
                 }
@@ -71,7 +76,14 @@ struct PaneHeader: View {
                     systemImage: isZoomed
                         ? "arrow.down.right.and.arrow.up.left"
                         : "arrow.up.left.and.arrow.down.right",
-                    help: isZoomed ? "Unzoom (⇧⌘↩)" : "Zoom (⇧⌘↩)",
+                    // The chord is the table's; the word is this header's, and
+                    // deliberately so on both counts. "Zoom" rather than the
+                    // menu's "Zoom Pane" because this button is already sitting
+                    // on the pane it would zoom — and `isZoomed` is *this*
+                    // pane, where the menu item can only ask whether anything
+                    // in the front tab is zoomed. Different word, different
+                    // question.
+                    help: Commands.help(.toggleZoom, titled: isZoomed ? "Unzoom" : "Zoom"),
                     // Nothing to zoom out of in a tab with one pane, which is
                     // why the reference draws this one dimmed.
                     isEnabled: isSplit
@@ -90,6 +102,15 @@ struct PaneHeader: View {
                 // own ✕ is the one that closes a tab, and it asks first when
                 // that means more than one terminal. ⌘W still works — the
                 // chord is allowed to mean both; a button is not.
+                //
+                // The one hand-written chord left in the client, and it has to
+                // be: ⌘W is deliberately not in the command table, because it
+                // is not a menu item at all — it travels the responder chain as
+                // `performClose:` so the focused surface gets first refusal
+                // (docs/CLIENT.md's keybinding table records this). There is no
+                // `KeyboardShortcut` anywhere to derive it from. Said out loud
+                // so the next sweep for stale chords stops here rather than
+                // treating it as one that was missed.
                 PaneButton(
                     systemImage: "xmark", help: "Close Pane (⌘W)",
                     isEnabled: isSplit

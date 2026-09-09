@@ -242,11 +242,13 @@ struct SessionButton: View {
         // the button moved the window and *then* opened the menu on the
         // mouse-up. See `WindowChrome`.
         .claimsMouseDown()
-        // Written the way the menu item draws it, which is the order macOS
-        // orders modifiers in — the reason this said ⌘⇧K, in the wrong order
-        // and bound to nothing at all, until the View menu's "Change Session"
-        // landed. One modifier now, so there is no order left to get wrong.
-        .help("Change Session (⌘K)")
+        // Out of the command table rather than written here, which is what
+        // finally settles this line: it said ⌘⇧K — in the wrong modifier order
+        // and bound to nothing at all — until the View menu's "Change Session"
+        // landed and the two could be held against each other. Derived now from
+        // the same `KeyboardShortcut` that menu item applies, so there is
+        // nothing left to get out of order or out of date.
+        .help(Commands.help(.changeSession, store))
     }
 }
 
@@ -272,6 +274,11 @@ struct TerminalTab: View {
     let close: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Only for the ✕'s tooltip, which names a command and so reads its
+    /// wording out of `Commands`. A slot draws nothing else off the store —
+    /// what it shows is handed to it, so that a strip of them is one `ForEach`
+    /// over values rather than twenty views each observing the world.
+    @Environment(SessionStore.self) private var store
     @State private var isHovering = false
 
     private let closeWidth: CGFloat = 16
@@ -325,8 +332,13 @@ struct TerminalTab: View {
                 //
                 // The chord is named only on the *active* tab, because that is
                 // the only tab ⇧⌘W acts on. This ✕ also appears on hover over
-                // an inactive one, where advertising it would be a lie.
-                .help(isActive ? "Close Tab (⇧⌘W)" : "Close Tab")
+                // an inactive one, where advertising it would be a lie. Both
+                // halves come out of the command table, so the title and the
+                // chord are the menu item's own.
+                .help(
+                    isActive
+                        ? Commands.help(.closeTab, store)
+                        : Commands.command(.closeTab).title(store))
             }
         }
         .padding(.horizontal, Metrics.tabLeadingPadding)
