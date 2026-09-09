@@ -302,10 +302,12 @@ struct ContentView: View {
             // Its own overlay rather than a second child of the ZStack above,
             // because the two are anchored differently: the dropdown hangs off
             // the session button's leading edge, and this is centred in the
-            // window. `ZStack(alignment: .top)` is exactly that — horizontally
-            // centred, top edge just under the toolbar — and it is
+            // window. `ZStack(alignment: .top)` is exactly that, and it is
             // unconditional for the same reason the dropdown's is, so the
-            // removal transition has something to run inside.
+            // removal transition has something to run inside. The panel then
+            // hangs `PaletteMetrics.topInset` below, clear of the chrome
+            // rather than touching it — see there for why this one floats and
+            // the dropdown does not.
             ZStack(alignment: .top) {
                 if store.palette != nil {
                     // Dismiss on a click anywhere else, the way a menu does.
@@ -315,7 +317,7 @@ struct ContentView: View {
 
                     CommandPalette()
                         .environment(store)
-                        .offset(y: 1)
+                        .offset(y: PaletteMetrics.topInset)
                         .transition(Motion.menu.transition(reduceMotion: reduceMotion))
                 }
             }
