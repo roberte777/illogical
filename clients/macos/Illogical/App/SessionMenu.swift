@@ -366,22 +366,27 @@ struct SessionMenu: View {
             // A session with no tabs is one whose terminals have all gone.
             // Making one is what "switch to it" means.
             //
-            // The move comes first, and it is not redundant with the create.
-            // `createTerminal` sends through `try?`, so on a machine whose
-            // control connection has dropped this whole branch was: no tab, no
-            // host change, no error — the toolbar went on naming the machine
-            // you had left, and `currentHostError`, the one screen that would
-            // have said why, is only ever reached by *being* on that machine.
-            // "Go to that machine, even with nothing on it" is exactly what
-            // `switchHost` exists for, so this path goes through it too.
+            // A known no-op on a machine whose control connection has dropped,
+            // and deliberately left as one — issue #100. `createTerminal` sends
+            // through `try?`, so that click leaves no tab, no host change and
+            // no error, and `currentHostError`, the one screen that would say
+            // why, is only ever reached by *being* on that machine. Two
+            // attempts to fix it by moving the window first, through
+            // `switchHost`, each broke something that used to work. Unaimed, it
+            // landed in whichever *other* session of that machine still had
+            // tabs here and rewrote the machine's remembered session — in
+            // memory and on disk — to it, silently, since a tab in front is
+            // exactly the state in which `currentHostError` says nothing. Aimed
+            // at the row's own session, it landed on nothing correctly, and
+            // then the next `reconcileTabs` — a `session_list` from any host,
+            // the dropped machine's own reconnect included — read that nil
+            // selection as one to repair and moved the window into the other
+            // session anyway, taking the click's every effect with it.
             //
-            // Carrying the row's own session, which is what keeps the move
-            // honest: a machine whose *other* sessions still have tabs in this
-            // window would otherwise land you in one of them — silently, since
-            // a tab in front is exactly the state in which `currentHostError`
-            // says nothing — and rewrite that machine's remembered session to
-            // it, on a click that meant this one.
-            store.switchHost(host.host, preferring: ref)
+            // Landing on nothing and *staying* there needs `repairSelection`
+            // and `reconcileTabs` to tell a deliberately empty selection from
+            // one awaiting repair, which is a change to the selection model
+            // rather than to this click, and its own piece of work.
             store.createTerminal(sessionName: session.name, on: host.host)
         }
         isPresented = false
