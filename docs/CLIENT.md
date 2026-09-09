@@ -703,22 +703,38 @@ the tab pointed at, on the grounds that fixed-width slots laid edge to edge
 would have to shove their neighbours to open a gap. They do, and that shove is
 the whole effect — what made it read as broken was doing it once, at the drop.
 
-Three pure functions in `TabStrip` carry it, and they are the part that is
+Four pure functions in `TabStrip` carry it, and they are the part that is
 unit-tested; the gesture plumbing around them cannot be simulated.
 `dropIndex` turns a translation into a slot, `clampedTranslation` holds the
-carried tab inside the strip, and `displayOrder` gives the order the strip is
+carried tab inside the strip, `displayOrder` gives the order the strip is
 *drawn* in on this frame — which is where both the slide (a slot's drawn
 position less its stored index) and the hairlines come from, so a separator
 travels with its tab instead of staying behind at an index, and neither side of
-the gap draws one.
+the gap draws one — and `slot(at:)` says which slot a pointer is in.
+
+**Hover is the strip's, not each slot's.** One pointer position read against
+the slots, from an `onContinuousHover` on the strip and from the drag gesture
+while a button is down, rather than an `onHover` flag per tab. The difference
+is the case a flag cannot answer: a drop rearranges the tabs under a pointer
+that never moved, so every flag then describes the arrangement before it — the
+tab you just dropped sat under the pointer believing it was not hovered, with
+no ✕, until you took the pointer out to the terminal and brought it back,
+because that was the next enter event it would see. `Cursor.swift` documents
+the same bug from the other direction, where a view leaves under a stationary
+pointer and its `onHover(false)` never arrives. A stored *position* survives
+the reorder that caused the trouble: the region the pointer is in did not
+change, and which tab is drawn there is read off the new order. The position is
+written only when it crosses into another slot, so this costs no more redraws
+than the flags did.
 
 The ✕ on a slot appears on **hover**, on every tab including the active one. It
 sat on the active tab permanently until it did not: that parks a close button
 under the pointer's usual resting place on the tab you are most likely to be
 clicking, and gives the active slot a different shape from every other one.
-File ▸ Close Tab and the ⇧⌘W beside it are the discoverable path. The ✕ also
-goes away for the length of a drag, because the dragged slot rides under the
-pointer and the mouse-up that ends the drag would otherwise land inside it —
+File ▸ Close Tab and the ⇧⌘W beside it are the discoverable path. The strip
+holds hover false on *every* slot for the length of a drag, which is also what
+keeps the ✕ off a tab in flight: the dragged slot rides under the pointer, so
+the mouse-up that ends the drag would otherwise land inside its close button —
 dragging a tab by its ✕ closed it, measured.
 
 ### Renaming and deleting a session

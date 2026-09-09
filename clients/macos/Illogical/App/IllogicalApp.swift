@@ -332,8 +332,17 @@ struct Toolbar: View {
     }
     @State private var drag: TabDrag?
 
+    /// The drawn position the pointer is in, or nil when it is not over the
+    /// strip. A *position*, not a tab: see `TabStrip.slot(at:)` for why the
+    /// per-slot `onHover` this replaced could not survive a reorder.
+    @State private var hoveredSlot: Int?
+
     /// Far enough that a click with a shaky hand is still a click.
     private static let dragThreshold: CGFloat = 8
+
+    /// The strip's own space, which the slots move inside rather than with —
+    /// so it is a fixed ruler for both the pointer and a drag.
+    private static let stripSpace = "tab-strip"
 
     private func isActive(_ index: Int) -> Bool {
         let tabs = store.visibleTabs
@@ -392,6 +401,25 @@ struct Toolbar: View {
         return !isActive(index) && !isActive(before)
     }
 
+    /// Whether the pointer is over slot `index`.
+    ///
+    /// False on every slot for the length of a drag: the slots are moving,
+    /// so "the pointer is over this one" is a claim about an arrangement that
+    /// is still settling, and the one thing it would draw — the ✕ — must not
+    /// be under the pointer when the mouse-up arrives.
+    private func isHovered(_ index: Int) -> Bool {
+        drag == nil && hoveredSlot == index
+    }
+
+    /// Take the pointer's position along the strip. Written only when it
+    /// crosses into another slot, so a mouse moved across the toolbar redraws
+    /// the strip as often as an enter/exit flag did — which is to say rarely.
+    private func hover(at x: CGFloat) {
+        let slot = TabStrip.slot(
+            at: x, slotWidth: Metrics.tabWidth, count: store.visibleTabs.count)
+        if hoveredSlot != slot { hoveredSlot = slot }
+    }
+
     private func drop(_ id: TabLayout.ID, translation: CGFloat) {
         let tabs = store.visibleTabs
         guard let from = tabs.firstIndex(where: { $0.id == id }) else {
@@ -438,6 +466,7 @@ struct Toolbar: View {
                             isActive: isActive(index),
                             showsLeadingSeparator: showsSeparator(index),
                             isDragging: drag?.id == tab.id,
+                            isHovered: isHovered(index),
                             pill: pill,
                             select: { store.selectedTabID = tab.id },
                             // Through the same policy ⇧⌘W uses, so pointer and
@@ -470,27 +499,55 @@ struct Toolbar: View {
                         // the select button, and a plain gesture would have to
                         // win against it rather than run alongside it.
                         .simultaneousGesture(
-                            // `.global`, not the slot's own space. The slot is
-                            // offset by the very translation this reports, so
-                            // measuring in local coordinates would feed the
-                            // offset back into the next event and the tab would
-                            // either run away from the pointer or stick to it.
+                            // The strip's space, not the slot's own. The slot
+                            // is offset by the very translation this reports,
+                            // so measuring locally would feed the offset back
+                            // into the next event and the tab would either run
+                            // away from the pointer or stick to it. The strip
+                            // holds still while its slots move inside it, so
+                            // it is a fixed ruler the way `.global` is — and
+                            // unlike `.global` it reads a location the slot
+                            // arithmetic can use directly.
                             DragGesture(
-                                minimumDistance: Self.dragThreshold, coordinateSpace: .global
+                                minimumDistance: Self.dragThreshold,
+                                coordinateSpace: .named(Self.stripSpace)
                             )
                             .onChanged { value in
                                 drag = TabDrag(id: tab.id, translation: value.translation.width)
+                                // `onContinuousHover` does not fire while the
+                                // button is down, so the pointer is tracked
+                                // from the drag for as long as there is one.
+                                // Without this the strip comes out of a drag
+                                // believing the pointer is wherever it was
+                                // when the drag began.
+                                hover(at: value.location.x)
                             }
                             // `drop` clears the drag itself, inside the same
                             // animation as the reorder. Clearing it here first
                             // put the tab back in its old slot for one frame.
                             .onEnded { value in
+                                hover(at: value.location.x)
                                 drop(tab.id, translation: value.translation.width)
                             }
                         )
                         // Outermost, so what fades is the whole slot rather
                         // than the content inside a wrapper that stays.
                         .transition(Motion.tabs.transition(reduceMotion: reduceMotion))
+                    }
+                }
+                .coordinateSpace(.named(Self.stripSpace))
+                // Hover, for the whole strip at once. One pointer position
+                // read against the slots beats a flag per slot, because the
+                // flags cannot be re-read: a drop rearranges the tabs under a
+                // pointer that never moved, and every flag then describes the
+                // arrangement before it. That is what left the tab you had
+                // just dropped with no ✕ until you took the pointer out to the
+                // terminal and brought it back — the enter event it was
+                // waiting for.
+                .onContinuousHover(coordinateSpace: .named(Self.stripSpace)) { phase in
+                    switch phase {
+                    case .active(let point): hover(at: point.x)
+                    case .ended: hoveredSlot = nil
                     }
                 }
                 // Room for the lifted slot's shadow. A `ScrollView` clips to

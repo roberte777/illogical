@@ -260,6 +260,14 @@ struct TerminalTab: View {
     /// rides under the pointer. Where it would land is said by the gap its
     /// neighbours have opened, not by anything drawn on this slot.
     var isDragging: Bool = false
+    /// The pointer is over this slot.
+    ///
+    /// Passed in rather than read from an `onHover` of this slot's own, which
+    /// is a flag that goes stale the moment the strip rearranges under a
+    /// pointer that is holding still — see `TabStrip.slot(at:)`, which is what
+    /// answers this now. It is also false for the whole of a drag, on every
+    /// slot, which is what keeps the ✕ off a tab in flight.
+    var isHovered: Bool = false
     /// The strip's namespace for the active pill. One pill moves between slots
     /// rather than one per slot fading in and out, which is what makes
     /// selecting a tab slide rather than blink.
@@ -268,7 +276,6 @@ struct TerminalTab: View {
     let close: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var isHovering = false
 
     private let closeWidth: CGFloat = 16
     /// One id for the whole strip, not one per tab: the pill is a single view
@@ -285,13 +292,14 @@ struct TerminalTab: View {
     /// this; File ▸ Close Tab and the ⇧⌘W beside it are the discoverable
     /// path, and they are the ones that ask before closing a split tab.
     ///
-    /// Never on the slot being dragged. The dragged slot rides under the
-    /// pointer, so the ✕ rides with it and the mouse-up that ends the drag
-    /// lands *inside* the close button — dragging a tab by its ✕ closed it,
-    /// measured. Taking the ✕ away for the length of the drag leaves the
-    /// mouse-up on the select button instead, which is the behaviour the strip
-    /// already wants: a dragged tab comes to the front.
-    private var showsClose: Bool { isHovering && !isDragging }
+    /// Never during a drag, which the strip guarantees by holding `isHovered`
+    /// false for the length of one. The dragged slot rides under the pointer,
+    /// so a ✕ on it rides with it and the mouse-up that ends the drag lands
+    /// *inside* the close button — dragging a tab by its ✕ closed it,
+    /// measured. Taking the ✕ away leaves the mouse-up on the select button
+    /// instead, which is the behaviour the strip already wants: a dragged tab
+    /// comes to the front.
+    private var showsClose: Bool { isHovered }
 
     private var name: String { terminal?.name ?? "terminal" }
     private var residency: Residency { terminal?.residency ?? .live }
@@ -355,7 +363,7 @@ struct TerminalTab: View {
                     // source and a destination and slides the pill between
                     // them instead of fading one out and another in.
                     .matchedGeometryEffect(id: Self.pillID, in: pill)
-            } else if isHovering {
+            } else if isHovered {
                 RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
                     .fill(Palette.tabHoverFill)
             }
@@ -391,7 +399,6 @@ struct TerminalTab: View {
         // slot's *travel* is animated a level up, by the strip, because it is
         // the strip that knows where the gap is.
         .animation(Motion.tabs.animation(reduceMotion: reduceMotion), value: isDragging)
-        .onHover { isHovering = $0 }
         .traceFrame("tab-\(traceID)")
     }
 

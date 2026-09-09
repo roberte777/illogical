@@ -73,6 +73,29 @@ enum TabStrip {
         order.insert(order.remove(at: from), at: to)
         return order
     }
+
+    /// The drawn position `x` falls in, measured along the strip, or nil when
+    /// it is past either end.
+    ///
+    /// What the strip hovers *with*, in place of a per-slot enter/exit flag.
+    /// The difference matters exactly once, and it is the case a flag cannot
+    /// answer: a reorder moves the tabs while the pointer holds still, so the
+    /// flags describe an arrangement that no longer exists — the tab you
+    /// dropped is under the pointer and believes it is not hovered, and stays
+    /// that way until you take the pointer out of the strip and bring it back,
+    /// because that is the next enter event it will see. `Cursor.swift` has
+    /// the same bug from the other direction, where a view leaves under a
+    /// stationary pointer and its `onHover(false)` never arrives.
+    ///
+    /// A *position* rather than a slot's identity, so it survives the
+    /// reorder that caused the trouble: the pointer did not move, so the
+    /// region it is in did not either, and the answer to "which tab is that"
+    /// is read off the new order.
+    static func slot(at x: CGFloat, slotWidth: CGFloat, count: Int) -> Int? {
+        guard count > 0, slotWidth > 0, x.isFinite, x >= 0 else { return nil }
+        let slot = Int(x / slotWidth)
+        return slot < count ? slot : nil
+    }
 }
 
 struct TabLayout: Identifiable, Equatable {
