@@ -24,6 +24,16 @@ import XCTest
 @MainActor
 final class VersionSkewTests: XCTestCase {
 
+    /// Somewhere in memory for the store to read its remembered host and write
+    /// its front session, rather than the developer's own preferences.
+    private final class InMemoryDefaults: HostDefaults {
+        private var values: [String: Data] = [:]
+        func data(forKey defaultName: String) -> Data? { values[defaultName] }
+        func set(_ value: Any?, forKey defaultName: String) {
+            values[defaultName] = value as? Data
+        }
+    }
+
     /// A launcher that starts nothing and reports a fixed bundled version.
     private final class StubLauncher: DaemonLauncher, @unchecked Sendable {
         let version: String?
@@ -74,7 +84,9 @@ final class VersionSkewTests: XCTestCase {
 
     private func host(_ launcher: StubLauncher) throws -> HostConnection {
         let path = "/tmp/illogical-skew-\(getpid())-\(UInt32.random(in: 0..<1_000_000)).sock"
-        let store = SessionStore(hosts: [.local(socketPath: path)], launcher: launcher)
+        let store = SessionStore(
+            hosts: [.local(socketPath: path)], defaults: InMemoryDefaults(),
+            launcher: launcher)
         return try XCTUnwrap(store.host(.local(socketPath: path)), "no host")
     }
 
@@ -140,7 +152,7 @@ final class VersionSkewTests: XCTestCase {
     /// every one of them would make the marker mean nothing.
     func testARemoteHostIsNeverCompared() async throws {
         let store = SessionStore(
-            hosts: [.ssh(destination: "build-box")],
+            hosts: [.ssh(destination: "build-box")], defaults: InMemoryDefaults(),
             launcher: StubLauncher(version: "0.0.0-dev+gabc123456789"))
         let host = try XCTUnwrap(store.host(.ssh(destination: "build-box")), "no host")
         defer { host.disconnect() }

@@ -24,9 +24,9 @@
 //      └────────────────────────────────┘
 //
 //  The ＋ makes a session on the machine whose header it sits on, which is the
-//  whole of why it is there: "New Session" below the list takes whichever host
-//  the front tab is on, and with two machines connected nothing on screen said
-//  which one that was.
+//  whole of why it is there: "New Session" below the list takes the machine the
+//  window is on, and with two machines connected nothing on screen said which
+//  one that was.
 //
 //  It is not an NSMenu or a system popover: there is no arrow, it is clipped by
 //  the window, and it uses the app's own palette. So it is an in-window overlay
@@ -150,7 +150,7 @@ struct SessionMenu: View {
     /// with one machine there is nothing to disambiguate and the suffix would
     /// be noise on every window that never adds a host.
     private var newSessionTitle: String {
-        guard showsHosts, let host = store.selectedHost else { return "New Session" }
+        guard showsHosts, let host = store.current else { return "New Session" }
         return "New Session on \(host.displayName)"
     }
 
@@ -379,20 +379,19 @@ struct SessionMenu: View {
         isPresented = false
     }
 
-    /// "session-N" is digits and a dash, so it is always a name the server
-    /// accepts; no gate is needed here beyond the one in the store.
+    /// A session on the machine in front. The name is the store's to choose —
+    /// this view used to count that machine's sessions and add one, which
+    /// silently joined an existing session whenever a lower-numbered one had
+    /// been deleted.
     private func newSession() {
-        let count = store.selectedHost?.sessions.count ?? 0
-        store.createTerminal(sessionName: "session-\(count + 1)")
+        store.createSession()
         isPresented = false
     }
 
     /// The same, on a machine named rather than inferred — what a host header's
-    /// ＋ does. `N` counts that machine's own sessions, so the name the new row
-    /// gets matches the list it joins rather than the front tab's.
+    /// ＋ does.
     private func newSession(on host: HostConnection) {
-        store.createTerminal(
-            sessionName: "session-\(host.sessions.count + 1)", on: host.host)
+        store.createSession(on: host.host)
         isPresented = false
     }
 
@@ -594,10 +593,10 @@ struct HostHeader: View {
             Spacer(minLength: 4)
 
             // A session on the machine this header names, rather than on
-            // whichever one the front tab happens to be looking at. That is the
-            // whole point of it being here: "New Session" below the list goes
-            // to `selectedHost`, and with two machines connected nothing on
-            // screen said which that was.
+            // whichever one the window is currently on. That is the whole point
+            // of it being here: "New Session" below the list goes to
+            // `currentHost`, and with two machines connected nothing on screen
+            // said which that was.
             //
             // Hover-gated, unlike the ✕ beside it. Deliberately inconsistent,
             // and worth naming: `Chrome.swift`'s lesson is that hover-only made

@@ -337,8 +337,9 @@ final class HostConnection: Identifiable {
             // only *spawned* the process at this point -- nothing about
             // authentication or reachability is known, and the write above
             // lands in a pipe. The `session_list` below is the first thing
-            // that proves the far end is really there, and `selectedHost`
-            // routes new terminals on this.
+            // that proves the far end is really there, which is why both
+            // "no server" screens wait on it and why the store spends a
+            // remembered session on it.
 
             pump = Task { [weak self] in
                 for await frame in connection.frames {

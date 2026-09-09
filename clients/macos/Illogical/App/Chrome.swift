@@ -204,11 +204,15 @@ struct SessionButton: View {
     @Environment(SessionStore.self) private var store
     @Binding var isPresented: Bool
 
-    /// The machine the front session is on, when it is not this one. A window
-    /// can be looking at several at once, so which one is not a detail.
+    /// The machine the window is on, when it is not this one. A window can be
+    /// looking at several at once, so which one is not a detail.
+    ///
+    /// Read off `currentHost` rather than off the front session, so that a
+    /// machine with nothing on it still says whose empty screen you are
+    /// looking at: "build-box no session".
     private var remote: String? {
-        guard let host = store.selectedSession?.host, host.isRemote else { return nil }
-        return host.displayName
+        guard store.currentHost.isRemote else { return nil }
+        return store.currentHost.displayName
     }
 
     private var name: String { store.selectedSessionSummary?.name ?? "no session" }

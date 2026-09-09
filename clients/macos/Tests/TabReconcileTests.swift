@@ -382,15 +382,29 @@ final class TabReconcileTests: XCTestCase {
         XCTAssertEqual(store.connectionError, "No illogicald")
     }
 
-    /// A new terminal must go to a machine that can actually make one.
-    /// `hosts.first` is always the local daemon, and `createTerminal` sends
-    /// through `try?`, so with no local daemon every ⌘T silently did nothing.
-    func testNewTerminalsAvoidAHostThatIsNotConnected() {
+    /// A new terminal goes to the machine the window is on, and a machine that
+    /// cannot make one says so.
+    ///
+    /// This used to assert the opposite: ⌘T went to "the first host that is
+    /// connected", because `createTerminal` sends through `try?` and a ⌘T at a
+    /// dead local daemon did nothing at all, silently. That answered a real
+    /// problem in the one way nobody can follow — the terminal appeared on a
+    /// machine nothing on screen named. The reason is on screen now instead.
+    func testANewTerminalFollowsTheCurrentHostRatherThanWhoIsConnected() {
         let store = emptyStore([Self.local, Self.remote])
         store.host(Self.local)?.setStatusForTesting(.failed("No illogicald"))
         store.host(Self.remote)?.setStatusForTesting(.connected)
 
-        XCTAssertEqual(store.selectedHost?.host, Self.remote)
+        XCTAssertEqual(store.current?.host, Self.local, "⌘T was quietly rerouted")
+        XCTAssertEqual(
+            store.currentHostError, "No illogicald",
+            "a machine that cannot make a terminal said nothing about why")
+
+        // And going to the working one is a thing the user does, not a thing
+        // the store does behind them.
+        store.switchHost(Self.remote)
+        XCTAssertEqual(store.current?.host, Self.remote)
+        XCTAssertNil(store.currentHostError)
     }
 
     /// Persistence round-trips, and `ILLOGICAL_HOSTS` entries are not written.
@@ -532,9 +546,11 @@ final class TabReconcileTests: XCTestCase {
         store.host(Self.local)?.setStatusForTesting(.failed("No illogicald"))
         // The remote is still `.connecting` — where a HostConnection starts.
         XCTAssertNil(store.connectionError, "a handshake was reported as an outage")
-        XCTAssertEqual(
-            store.selectedHost?.host, Self.remote,
-            "⌘T was routed to the failed host over the one still connecting")
+        // The window is on the local daemon and the local daemon is dead, so
+        // that is a screen with a reason on it — for this machine, and with a
+        // Try Again that dials only this machine. The window-wide screen would
+        // reconnect the remote mid-handshake, which is the bug above.
+        XCTAssertEqual(store.currentHostError, "No illogicald")
 
         // Once it has really failed, the screen is right to appear.
         store.host(Self.remote)?.setStatusForTesting(.failed("could not resolve hostname"))

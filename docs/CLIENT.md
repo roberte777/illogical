@@ -74,9 +74,32 @@ pane rather than merely losing a tab. The same goes for a `SessionRef`.
 
 A tab belongs to one session, and a session lives on one machine, so a tab never
 spans two hosts. Splitting inside it creates a terminal on that same machine.
-Which machine you are looking at is on the session button; which machine a
-*pane* is on is in its own header, because a tab has one strip entry and a split
-tab could otherwise say nothing about it.
+Which machine a *pane* is on is in its own header, because a tab has one strip
+entry and a split tab could otherwise say nothing about it.
+
+**Which machine you are looking at is stored, not derived.**
+`SessionStore.currentHost` is what ⌘T makes a terminal on, whose sessions the
+tab strip draws, and what the session button names. Selecting a tab moves it —
+one funnel, so the toolbar and the next ⌘T cannot disagree — and View ▸ Switch
+Host sets it directly. Read off the front tab instead, "which machine" could
+only ever be a machine with a terminal on it: an empty one was somewhere the
+window could not be, and a window with no tabs at all fell back to "the first
+host that is connected", which quietly sent ⌘T to a machine nothing on screen
+named. A machine with nothing on it now shows the empty screen rather than
+borrowing another machine's tabs, and one that cannot be reached shows `ssh`'s
+own complaint with a Try Again that dials that machine alone.
+
+The window remembers the session last in front **on each host**, so coming back
+to a machine lands where you left it rather than on its first session. Across
+launches it remembers one thing: the machine, and the *name* of the session in
+front. The name and not the id, because `next_session_id` is a daemon's
+in-memory counter and a machine that has rebooted renumbers everything it still
+has. It is written through as it changes, since there is no termination hook in
+this app and a write at exit is one a force-quit loses. The window opens on that
+machine immediately — showing the empty screen for the length of the handshake,
+rather than opening on the local daemon and yanking itself away a second later —
+and lands on the session when the machine answers. Anything you select first
+voids the restore.
 
 Hosts are remembered in `UserDefaults`, and there is no credential among them:
 `ssh` reads the user's own config, so a `Host` alias out of it is a perfectly
