@@ -163,10 +163,12 @@ final class CurrentHostTests: XCTestCase {
         XCTAssertEqual(store.selectedSession?.session, 2, "it went back to that machine's first")
         XCTAssertEqual(store.selectedTabID, try tab(store, 2, on: Self.remote).id)
 
-        // ...and asking for the machine you are already on is not a move. The
-        // menu's checked row is still a row somebody can click, and the memory
-        // is of a session rather than a tab — so without that guard this would
-        // drop you on the first tab of the session you are already in.
+        // ...and asking for the machine you are already on is not a move. Both
+        // surfaces draw that machine — checked, and greyed because of this very
+        // guard — and refuse it before they get here, so this is the store's
+        // own re-guard behind them. The memory is of a session rather than a
+        // tab, so without it this would drop you on the first tab of the
+        // session you are already in.
         let third = try tab(store, 3, on: Self.remote).id
         store.selectedTabID = third
         store.switchHost(Self.remote)

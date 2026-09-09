@@ -534,9 +534,11 @@ final class SessionStore {
     /// terminal on it — and until this there was no way to say so, because
     /// "which machine" was read off a tab.
     func switchHost(_ target: ServerHost) {
-        // Already being there is not a move. The menu's checked row is still a
-        // row you can click, and without this it would drop you on the first
-        // tab of the session you are already in.
+        // Already being there is not a move. Both surfaces draw that machine —
+        // checked, and greyed because of this line — and both refuse it before
+        // they reach here, so this is the store's own re-guard behind them, on
+        // the rule every action in this file follows. Without it that row would
+        // drop you on the first tab of the session you are already in.
         guard let connection = host(target), target != currentHost else { return }
         // An explicit move ends the launch restore, whether or not it lands on
         // anything. Landing on a tab already voided it through
@@ -1440,14 +1442,16 @@ final class SessionStore {
     /// drawing a panel over what it did — and closing a panel that was never
     /// up, which is the menu bar's case, is nothing at all.
     ///
-    /// Closing first is only safe because every prompt vets its own options,
-    /// and both of them do it the same way: Switch Host leaves out the machine
-    /// the window is on and Forget Host leaves out the local daemon, because
-    /// `switchHost` and `removeHost` refuse exactly those. Without that this
-    /// method is a panel that closes and an action that declines — which is
-    /// worse than a dimmed row, because there was no dimming to warn anybody.
-    /// A choice prompt added later carries the same obligation.
+    /// The guard is `runCommand`'s, line for line, and it is what makes the
+    /// close-first order safe: an option that cannot be taken is refused
+    /// *before* anything is closed. Switch Host has one — the machine the
+    /// window is already on, which it offers dimmed and checked rather than not
+    /// at all, because `switchHost` returns for it. Without this line that row
+    /// is a panel which closes and an action which declines, and it is no
+    /// answer that the row is drawn dimmed: the dimming warns, and this is what
+    /// makes the warning true. A choice prompt added later gets it for nothing.
     func chooseOption(_ choice: PaletteChoice) {
+        guard choice.isEnabled else { return }
         closePalette()
         choice.choose(self)
     }

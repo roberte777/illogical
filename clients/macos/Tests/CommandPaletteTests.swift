@@ -43,9 +43,10 @@ import XCTest
 final class CommandPaletteTests: XCTestCase {
     private static let local = ServerHost.local(socketPath: "/tmp/illogical-palette.sock")
     private static let remote = ServerHost.ssh(destination: "build-box")
-    /// A third machine, for the lists that leave one out: Switch Host does not
-    /// offer the machine the window is already on, so two hosts make a list of
-    /// one and there is nothing left to filter or to arrow through.
+    /// A third machine, so that a filter has more than one row to discard and
+    /// the row it keeps is not the one Switch Host draws dimmed — the machine
+    /// the window is on is in that list, and a two-host fixture makes it half
+    /// of everything the filter is being asked about.
     private static let otherRemote = ServerHost.ssh(destination: "web-01")
 
     /// Somewhere in memory to read and write. The same shape
@@ -245,14 +246,16 @@ final class CommandPaletteTests: XCTestCase {
     /// A choice prompt's options narrow on the same rule, and a command with no
     /// prompt — or a free-text one — has none to narrow.
     ///
-    /// Three machines, because Switch Host leaves out the one the window is on
-    /// and two would leave a list of one with nothing to narrow.
+    /// Three machines, so that the filter has more than one row to discard and
+    /// the one it keeps is not the one Switch Host draws dimmed. Every machine
+    /// is offered, the window's own included — that row is the checkmark, and
+    /// it narrows away like any other when what is typed does not match it.
     func testChoicesNarrowOnTheSameRuleAsCommands() {
         let store = emptyStore([Self.local, Self.remote, Self.otherRemote])
 
         XCTAssertEqual(
             store.paletteChoices(for: .switchHost, matching: "").map(\.title),
-            ["build-box", "web-01"])
+            ["Local", "build-box", "web-01"])
         XCTAssertEqual(
             store.paletteChoices(for: .switchHost, matching: " BUILD ").map(\.title),
             ["build-box"])
@@ -269,15 +272,13 @@ final class CommandPaletteTests: XCTestCase {
     func testTwoMachinesWithOneNameStillHaveDistinctChoiceIds() {
         let namesake = ServerHost.ssh(destination: "Local")
         let store = emptyStore([Self.local, namesake, Self.remote])
-        // Onto the third machine, so that the two namesakes are both offered:
-        // the list leaves out the machine the window is on, and the window
-        // starts on the local daemon.
-        store.switchHost(Self.remote)
 
         let options = store.paletteChoices(for: .switchHost, matching: "")
-        XCTAssertEqual(options.map(\.title), ["Local", "Local"], "the fixture stopped colliding")
         XCTAssertEqual(
-            Set(options.map(\.id)).count, 2,
+            options.map(\.title), ["Local", "Local", "build-box"],
+            "the fixture stopped colliding")
+        XCTAssertEqual(
+            Set(options.map(\.id)).count, 3,
             "an SSH destination called Local took the local daemon's row id")
     }
 
@@ -362,8 +363,10 @@ final class CommandPaletteTests: XCTestCase {
         XCTAssertNil(store.pendingDestruction, "a dimmed row put a destructive dialog up")
         XCTAssertEqual(store.palette, .commands, "a dimmed row dismissed the panel")
 
-        // One machine is not a choice: a prompt whose single option puts you
-        // where you already are is a lie about what the app can do.
+        // One machine is not a choice: the list would hold a single row, for
+        // the machine you are on, and that is the one row in it Return cannot
+        // take — a prompt with nothing to press Return on is a lie about what
+        // the app can do.
         XCTAssertFalse(command(.switchHost).isEnabled(store))
         store.runCommand(.switchHost)
         XCTAssertEqual(store.palette, .commands, "a dimmed row opened a prompt")
@@ -371,41 +374,83 @@ final class CommandPaletteTests: XCTestCase {
 
     // MARK: - The host verbs
 
-    /// Taking an option moves the window and takes the panel down — and the
-    /// machine the window is already on is not one of the options.
-    ///
-    /// `switchHost` guards on `target != currentHost` and returns, so that row
-    /// closed the panel and did nothing, which is the same defect the Forget
-    /// Host list avoids by leaving out the local daemon. It is also what makes
-    /// `chooseOption` safe to write as a close followed by an action.
-    func testChoosingAHostSwitchesAndClosesAndTheMachineYouAreOnIsNotOffered() throws {
+    /// Taking an option moves the window and takes the panel down.
+    func testChoosingAHostSwitchesAndCloses() throws {
         let store = emptyStore([Self.local, Self.remote])
         list(store, [(1, "here", [1])])
         list(store, host: Self.remote, [(1, "there", [1])])
 
         store.runCommand(.switchHost)
         let options = store.paletteChoices(for: .switchHost, matching: "")
-        XCTAssertEqual(
-            options.map(\.title), ["build-box"],
-            "the machine the window was already on was offered as somewhere to go")
-        XCTAssertTrue(
-            options.allSatisfy { !$0.isCurrent },
-            "a checkmark was drawn on a machine this list does not contain")
+        XCTAssertEqual(options.map(\.title), ["Local", "build-box"])
 
         store.chooseOption(try XCTUnwrap(options.last))
 
         XCTAssertEqual(store.currentHost, Self.remote)
         XCTAssertNil(store.palette, "the panel stayed up on the machine it had just left")
 
-        // And it moves with the window: what was left out a moment ago is what
-        // is offered now.
+        // And both marks move with the window: the row that was checked and
+        // refused a moment ago is the one Return can take now.
+        let after = store.paletteChoices(for: .switchHost, matching: "")
+        XCTAssertEqual(after.filter(\.isCurrent).map(\.title), ["build-box"])
+        XCTAssertEqual(after.filter(\.isEnabled).map(\.title), ["Local"])
+    }
+
+    /// The machine you are already on is offered, and offered as somewhere you
+    /// cannot go: checked, because that mark is the only thing either surface
+    /// says about where the window is, and not actionable, because `switchHost`
+    /// guards on `target != currentHost` and returns.
+    ///
+    /// Leaving the row out was the other way to kill that dead Return, and it
+    /// took the checkmark with it: the menu bar's `Toggle` binds `isOn` to
+    /// `isCurrent`, so a flag nothing can set is the toggle that never toggles
+    /// on. Dimming is the same refusal with the row still on screen, through
+    /// the mechanism the command list has always dimmed with — which is why
+    /// `PaletteKeys.step` is asserted here against the real list rather than
+    /// only against the arrays in the row-rule tests below: the claim being
+    /// made is that a choice row is dimmed by the *same* thing, so the arrow
+    /// must walk past this one exactly as it walks past a greyed command.
+    ///
+    /// And `chooseOption` is the door both surfaces go through, so its refusal
+    /// is where a click and a keystroke are held to the same answer. The panel
+    /// staying up is the load-bearing half: `switchHost` would decline this
+    /// move whatever happened, so the failure being pinned is not a window that
+    /// moves — it is a panel that closes over an action that quietly declined.
+    func testTheMachineYouAreOnIsOfferedCheckedAndCannotBeChosen() throws {
+        let store = emptyStore([Self.local, Self.remote])
+        list(store, [(1, "here", [1])])
+        list(store, host: Self.remote, [(1, "there", [1])])
+        let here = store.selectedTabID
+
+        store.runCommand(.switchHost)
+        let options = store.paletteChoices(for: .switchHost, matching: "")
+        let current = try XCTUnwrap(options.first { $0.title == "Local" })
+        XCTAssertTrue(current.isCurrent, "nothing in the list said which machine the window was on")
+        XCTAssertFalse(
+            current.isEnabled, "the machine the window was already on was offered as a move")
         XCTAssertEqual(
-            store.paletteChoices(for: .switchHost, matching: "").map(\.title), ["Local"])
+            PaletteKeys.step(from: -1, by: 1, enabled: options.map(\.isEnabled)), 1,
+            "the panel opened with its highlight on a row Return would refuse")
+
+        store.chooseOption(current)
+
+        XCTAssertEqual(store.currentHost, Self.local)
+        XCTAssertEqual(store.selectedTabID, here, "a row that cannot be chosen moved the window")
+        XCTAssertEqual(
+            store.palette, .argument(.switchHost),
+            "a row that cannot be chosen closed the panel over an action that declined")
     }
 
     /// The local daemon is not something the user added, and `removeHost`
-    /// refuses it — so offering it here would be a row whose Return does
-    /// nothing, which is the thing the dimming rule exists to prevent.
+    /// refuses it — so a live row for it would be a Return that does nothing,
+    /// which is the defect this whole panel keeps killing.
+    ///
+    /// Left out rather than dimmed, which is where this list and Switch Host's
+    /// part company on purpose. A dimmed row is worth drawing when it says
+    /// something — Switch Host's says which machine you are on, and stops
+    /// saying it the moment you go elsewhere. There is nothing for a row here
+    /// to say about the local daemon: it is not forgettable and never will be,
+    /// so the honest list is one it is not in.
     func testForgetHostOffersOnlyTheMachinesYouAdded() throws {
         let store = emptyStore([Self.local, Self.remote])
 

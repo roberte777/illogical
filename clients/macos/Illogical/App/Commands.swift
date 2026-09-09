@@ -167,13 +167,31 @@ struct PaletteChoice: Identifiable {
     /// `PaletteRow.trailingIcon` carries that argument, and the file header of
     /// `CommandPalette` carries the measurement behind it.
     ///
-    /// **No prompt sets it today**, and that is not an oversight to be tidied
-    /// away. Switch Host cannot: the machine you are on is the one machine it
-    /// leaves out, because `switchHost` refuses it and the row's Return would
-    /// do nothing. Forget Host has no current machine to mark. It stays a
-    /// field because "which of these are you already on" is a question the
-    /// next choice prompt may well answer, and the answer has somewhere to go.
+    /// Switch Host sets it on the machine the window is on, which is the same
+    /// row `isEnabled` is false for: "you are here" and "there is nowhere to
+    /// go from here" are one fact said twice, once to the eye and once to
+    /// Return. Forget Host has no current machine to mark.
     let isCurrent: Bool
+    /// Whether Return can take this row, and deliberately `Command.isEnabled`'s
+    /// word, because it is that mechanism rather than a second one: the palette
+    /// dims the row (`PaletteRow.isEnabled`), the arrows step over it
+    /// (`PaletteKeys.step`), a click on it does nothing, `CommandChoiceMenu`
+    /// greys it in the menu bar, and `SessionStore.chooseOption` refuses it
+    /// exactly as `runCommand` refuses a dimmed command.
+    ///
+    /// A `Bool` where a command's is a function of the store, and that is not
+    /// an inconsistency: a choice list is *already* a function of the store,
+    /// rebuilt from it on every keystroke, so the answer is known by the time
+    /// there is a row to answer for.
+    ///
+    /// One row carries `false` today: Switch Host's machine you are already on,
+    /// which `switchHost` returns for. Leaving that row out instead was tried
+    /// and is what this replaced — it kills the same dead Return and takes the
+    /// checkmark with it, because with no row to be on `isCurrent` can never be
+    /// true and the menu bar's `Toggle` becomes the toggle that never toggles
+    /// on. Forget Host's local daemon is a different rule and stays a filter:
+    /// see there.
+    let isEnabled: Bool
     let choose: @MainActor (SessionStore) -> Void
 }
 
@@ -231,10 +249,10 @@ enum Commands {
                 store.requestDeleteSession(ref)
             }),
 
-        // Enabled only with somewhere to go, which with the machine you are on
-        // left out of the list below means: with anything in that list at all.
-        // One machine is not a choice, and a prompt with nothing in it is a
-        // lie about what the app can do.
+        // Enabled only with somewhere to go. One machine is a list holding
+        // nothing but the row for the machine you are on, which is the one row
+        // in it Return cannot take — and a prompt with nothing to press Return
+        // on is a lie about what the app can do.
         Command(
             .switchHost, title: "Switch Host", icon: "arrow.left.arrow.right",
             detail: { $0.current?.displayName },
@@ -242,20 +260,28 @@ enum Commands {
             action: .prompt(
                 Command.Prompt(
                     chip: "Switch Host", placeholder: "Search hosts...", hint: nil,
-                    // Everywhere but here. `switchHost` guards on `target !=
-                    // currentHost` and returns — being somewhere is not a move
-                    // — so the machine the window is already on would be a row
-                    // whose Return does nothing, which is the same rule Forget
-                    // Host states one entry below about the local daemon.
+                    // Every machine, the one the window is on included. That
+                    // row is the only thing on either surface that says which
+                    // machine that is — the checkmark in the palette, the
+                    // checked item in the menu bar's `Toggle` — so it is drawn.
                     //
-                    // It is also why nothing in this list is ever `isCurrent`:
-                    // the only machine that could be is the one not offered.
+                    // And drawn *dimmed*. `switchHost` guards on `target !=
+                    // currentHost` and returns — being somewhere is not a move
+                    // — so a live row there is a Return that does nothing,
+                    // which is the defect Forget Host names one entry below
+                    // about the local daemon. Leaving it out answers that and
+                    // costs the checkmark with it; `isEnabled: false` is the
+                    // same refusal with the row still on screen, through the
+                    // mechanism the command list has dimmed rows with all
+                    // along. See `PaletteChoice.isEnabled`.
                     kind: .choice { store in
-                        store.hosts.filter { $0.host != store.currentHost }.map { connection in
-                            PaletteChoice(
+                        store.hosts.map { connection in
+                            let isCurrent = connection.host == store.currentHost
+                            return PaletteChoice(
                                 id: Commands.choiceID(connection.host),
                                 title: connection.displayName,
-                                isCurrent: false,
+                                isCurrent: isCurrent,
+                                isEnabled: !isCurrent,
                                 choose: { $0.switchHost(connection.host) })
                         }
                     }))),
@@ -279,16 +305,22 @@ enum Commands {
             action: .prompt(
                 Command.Prompt(
                     chip: "Forget Host", placeholder: "Search hosts...", hint: nil,
-                    // Remote only. The local daemon is not something the user
-                    // added, and forgetting it would leave nowhere to make a
-                    // terminal — `removeHost` refuses it, so offering it here
-                    // would be a row whose Return does nothing.
+                    // Remote only, and a filter rather than the dimmed row
+                    // Switch Host draws above. The two rules look alike and are
+                    // not the same one: the local daemon is not something the
+                    // user added, forgetting it would leave nowhere to make a
+                    // terminal, and `removeHost` refuses it *always* — where
+                    // "you are already on this machine" is a state that changes
+                    // the moment you go somewhere else, and is worth a row to
+                    // say so. There is nothing for a Forget Host row to say
+                    // about the local daemon, so it has none.
                     kind: .choice { store in
                         store.hosts.filter { $0.host.isRemote }.map { connection in
                             PaletteChoice(
                                 id: Commands.choiceID(connection.host),
                                 title: connection.displayName,
                                 isCurrent: false,
+                                isEnabled: true,
                                 choose: { $0.removeHost(connection.host) })
                         }
                     }))),
@@ -540,11 +572,18 @@ struct CommandMenuItem: View {
 /// come out of the same table entry the palette's prompt reads, so the two
 /// lists of machines cannot disagree.
 ///
-/// The row itself is the caller's to build, and both callers now draw a
-/// `Button`. Switch Host drew a `Toggle` while the machine you are on was in
-/// its list and could carry a checkmark; that machine is left out now — its
-/// Return did nothing — so there is no state left in either list to check, and
-/// a toggle that never toggles on is a lie about one.
+/// Two levels of greying, and both are held here rather than asked of the
+/// callers: the menu itself for `Command.isEnabled`, and every row in it for
+/// `PaletteChoice.isEnabled` — the same flag the palette dims a row with, so
+/// an option the store would refuse cannot be clicked to no effect on either
+/// surface, and a choice prompt added later gets that for nothing.
+///
+/// The row itself is the caller's to build, because the two differ in kind.
+/// Switch Host draws a `Toggle`: the checkmark on the machine you are on is
+/// the only thing in the menu bar that says which one that is, and macOS draws
+/// it for a toggle without being asked. Forget Host draws a `Button`, because
+/// there is no state there to check and a toggle that never toggles on is a
+/// lie about one.
 struct CommandChoiceMenu<Row: View>: View {
     let id: CommandID
     let store: SessionStore
@@ -559,7 +598,13 @@ struct CommandChoiceMenu<Row: View>: View {
     var body: some View {
         let command = Commands.command(id)
         Menu(command.title(store)) {
-            ForEach(Commands.choices(id, in: store), content: row)
+            ForEach(Commands.choices(id, in: store)) { choice in
+                // On the built row rather than inside it, so the flag reaches
+                // whatever control the caller chose — `.disabled` propagates
+                // down — and a `Toggle` disabled this way keeps its checkmark,
+                // which is the whole point of the row it lands on.
+                row(choice).disabled(!choice.isEnabled)
+            }
         }
         .disabled(!command.isEnabled(store))
     }

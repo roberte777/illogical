@@ -146,23 +146,27 @@ struct IllogicalApp: App {
                 // the window to another machine turns a habit into a teleport.
                 // It stays fallow.
                 //
-                // A `Button` per machine, and the machines come from the same
-                // registry entry the palette's Switch Host prompt reads, so
-                // the two lists cannot drift.
+                // `Toggle` rather than `Button`, for the checkmark: it is the
+                // only thing in the menu that says which machine you are on,
+                // and macOS draws it for a toggle without being asked. The
+                // machines themselves come from the same registry entry the
+                // palette's Switch Host prompt reads, so the two lists cannot
+                // drift.
                 //
-                // This was a `Toggle`, for the checkmark on the machine you
-                // are on. That machine is no longer in the list: `switchHost`
-                // guards on `target != currentHost` and returns, so its row's
-                // Return did nothing, and it is left out now for the same
-                // reason Forget Host leaves out the local daemon. With it gone
-                // the toggle could never be on, and a toggle that never
-                // toggles on is a lie about one — the rule Forget Host below
-                // already states. What was lost with it is only this menu's
-                // copy of the answer: the session button in the toolbar names
-                // the machine whenever it is not the local one, and Switch
-                // Host's own palette row carries it as the row's value.
+                // That machine's own row is checked *and* greyed, which is one
+                // sentence in menu-bar grammar: here, and nowhere to go from
+                // here. The greying is `CommandChoiceMenu`'s, off the same
+                // `PaletteChoice.isEnabled` the palette dims the row with,
+                // because `switchHost` returns for it. Dropping the row instead
+                // was tried and cost this checkmark — nothing left to be on
+                // meant `isOn` could never be true, and this had to become a
+                // `Button` with the menu no longer saying where the window was.
                 CommandChoiceMenu(.switchHost, store: store) { choice in
-                    Button(choice.title) { store.chooseOption(choice) }
+                    Toggle(
+                        choice.title,
+                        isOn: Binding(
+                            get: { choice.isCurrent },
+                            set: { _ in store.chooseOption(choice) }))
                 }
                 // These two used to exist only inside the session dropdown,
                 // which meant the palette carried verbs the menu bar did not —

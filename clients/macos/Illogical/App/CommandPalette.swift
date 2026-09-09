@@ -26,15 +26,16 @@
 //
 //  A command with a *list* of answers — Switch Host, Forget Host — is the same
 //  chip and the same field, now filtering, with the choices where the hint
-//  would have gone. Every row in that list is somewhere Return can actually
-//  take you: Switch Host leaves out the machine you are already on and Forget
-//  Host leaves out the local daemon, because the store refuses both and a row
-//  whose Return does nothing is the thing this panel keeps killing. Free text
-//  is the degenerate case of it, where a sentence takes the list's place. This
-//  reuses the grammar stage one already taught — the field narrows a list, the
-//  arrows move through it, Return takes it — and adds no new mechanics at all,
-//  which is the whole argument for it over a second panel: there is nowhere
-//  else to look and nothing else to dismiss.
+//  would have gone and a checkmark on the one you are already on. That row is
+//  drawn dimmed, on the command list's own rule and through the same flag: the
+//  arrows step over it and Return refuses it, because `switchHost` will not
+//  move you to where you are. A row whose Return does nothing is the thing
+//  this panel keeps killing, and dimming is how it kills one without hiding
+//  it. Free text is the degenerate case of the list, where a sentence takes
+//  its place. All of this reuses the grammar stage one already taught — the
+//  field narrows a list, the arrows move through it, Return takes it — and
+//  adds no new mechanics at all, which is the whole argument for it over a
+//  second panel: there is nowhere else to look and nothing else to dismiss.
 //
 //  Geometry: 290pt wide, rows 25pt at 13pt type, hanging 30pt under the toolbar
 //  and centred in the window. Every one of those is the reference's own number,
@@ -87,9 +88,9 @@
 //  because nothing is on the left, and the column it lands in is empty in a
 //  choice row anyway.
 //
-//  No list draws that checkmark today — the one machine it could mark is the
-//  one Switch Host leaves out, a paragraph above — and the argument is kept
-//  because the glyph and its column are: see `PaletteChoice.isCurrent`.
+//  Switch Host is the list that draws it, on the row it also draws dimmed: the
+//  machine you are on is something to be told and nowhere to go, and one row
+//  says both — see `PaletteChoice.isCurrent`.
 
 import SwiftUI
 
@@ -347,10 +348,13 @@ struct CommandPalette: View {
         isChoosing ? choices.map(\.id) : commands.map(\.id.rawValue)
     }
 
-    /// Which of those rows can actually be run. Every choice can: the options
-    /// a prompt offers are already only the machines the command applies to.
+    /// Which of those rows can actually be run: a command's predicate against
+    /// the store, or a choice's own flag. One array for both lists, so the
+    /// dimming, the arrows and the highlight are one rule rather than a pair —
+    /// Switch Host's row for the machine you are on is dimmed by exactly what
+    /// dims Close Tab with no tab in front.
     private var enabled: [Bool] {
-        isChoosing ? choices.map { _ in true } : commands.map { $0.isEnabled(store) }
+        isChoosing ? choices.map(\.isEnabled) : commands.map { $0.isEnabled(store) }
     }
 
     var body: some View {
@@ -649,9 +653,13 @@ struct CommandPalette: View {
                             // rows do — see `PaletteRow.trailingIcon`.
                             trailingIcon: choice.isCurrent ? "checkmark" : nil,
                             isSelected: selected == index,
-                            isEnabled: true,
+                            isEnabled: choice.isEnabled,
+                            // The command list's rule word for word, because
+                            // it is the same rule: a dimmed row takes neither
+                            // the highlight nor a click, and only a hover the
+                            // mouse caused counts at all.
                             hover: { point in
-                                guard pointerMoved(to: point) else { return }
+                                guard choice.isEnabled, pointerMoved(to: point) else { return }
                                 selected = index
                                 scrollTarget = nil
                             },
@@ -731,13 +739,14 @@ struct CommandPalette: View {
     ///
     /// Into the store in every case, which is what keeps a keystroke and a
     /// click doing the same thing. Where the *guard* sits differs by branch,
-    /// and it is worth being exact about, because only the first one goes
-    /// through `runCommand`:
+    /// and it is worth being exact about, because no two of the three are the
+    /// same door:
     ///
     /// Stage one is `runCommand`, so the enabled check is that method's and a
-    /// dimmed row's Return does nothing. The choice branch has no check to
-    /// make — every option a prompt offers can be taken, because the options
-    /// are already only the machines the command applies to.
+    /// dimmed row's Return does nothing. The choice branch is `chooseOption`,
+    /// which makes the same check against `PaletteChoice.isEnabled` — one row
+    /// carries it today, Switch Host's machine you are already on, and its
+    /// Return does nothing for exactly the reason a dimmed command's does.
     ///
     /// The text branch calls the prompt's own commit directly, and its guard is
     /// therefore the *action's*: `commitAddHost` owns the trim and the refusal
@@ -774,9 +783,9 @@ private struct PaletteRow: View {
     let title: String
     var trailing: String?
     /// A glyph after the title rather than before it — the checkmark a choice
-    /// row would carry on the option you are already on, which today is a
-    /// checkmark no list draws: see `PaletteChoice.isCurrent` for why the one
-    /// machine that could take it is the one Switch Host does not offer.
+    /// row carries on the option you are already on, which today is Switch
+    /// Host's row for the machine the window is on: see
+    /// `PaletteChoice.isCurrent`.
     ///
     /// It was a reserved *leading* column first, on the reasoning that a
     /// checkmark which comes and goes would otherwise shift every title beside
