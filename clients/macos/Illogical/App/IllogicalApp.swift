@@ -348,14 +348,52 @@ struct Toolbar: View {
     /// competing with it. It also drops the two bugs the system path came with:
     /// a text selection dragged in from another app no longer lights the strip
     /// up, and a refused move no longer plays the accept animation.
+    ///
+    /// What the strip *does* with this is the native tab bar's answer rather
+    /// than the one #64 shipped: the dragged slot is lifted and carried, and
+    /// every other slot slides to where it would be if you let go — so the
+    /// reorder is shown by the strip rearranging itself under the pointer.
+    /// The first draft held the strip still and outlined the slot the tab
+    /// pointed at, on the grounds that fixed-width slots laid edge to edge
+    /// would have to shove their neighbours to open a gap. They do, and that
+    /// is the whole effect; what made it read as broken was doing it only
+    /// once, at the drop.
     private struct TabDrag: Equatable {
         var id: TabLayout.ID
         var translation: CGFloat
     }
     @State private var drag: TabDrag?
 
+    /// The slot the pointer is in, or nil when it is not over one.
+    ///
+    /// One flag for the strip rather than one inside each slot, and that is the
+    /// whole fix: a drop rearranges the tabs under a pointer that never moved,
+    /// so a per-slot flag is left describing the arrangement before it, with no
+    /// event coming to correct it — the tab you had just dropped had no ✕ until
+    /// you took the pointer out to the terminal and brought it back, because
+    /// that was the next enter it would see. Held here, it can simply be
+    /// rewritten at the drop, from the drag's own last position.
+    @State private var hoveredSlot: Int?
+
+    /// A drag has happened, and the mouse-up that ended it is still to come.
+    ///
+    /// The select button and the drag gesture run side by side — that is what
+    /// `simultaneousGesture` is for — so the mouse-up that finishes a reorder
+    /// also fires the button under it, and dragging a tab opened it. Reordering
+    /// and selecting are different intentions and only one of them was asked
+    /// for, so the button stands down for the gesture that was.
+    ///
+    /// Cleared a runloop turn later rather than in `onEnded`, because the
+    /// button's action is dispatched from the same mouse-up and has not run
+    /// yet at that point.
+    @State private var didDrag = false
+
     /// Far enough that a click with a shaky hand is still a click.
     private static let dragThreshold: CGFloat = 8
+
+    /// The strip's own space, which the slots move inside rather than with —
+    /// so it is a fixed ruler for both the pointer and a drag.
+    private static let stripSpace = "tab-strip"
 
     private func isActive(_ index: Int) -> Bool {
         let tabs = store.visibleTabs
@@ -363,25 +401,102 @@ struct Toolbar: View {
         return tabs[index].id == store.selectedTabID
     }
 
-    /// The slot the drag currently points at, if there is one.
-    private var dragTarget: Int? {
-        guard let drag,
-            let from = store.visibleTabs.firstIndex(where: { $0.id == drag.id })
-        else { return nil }
-        let to = TabStrip.dropIndex(
+    /// The slot the dragged tab started in.
+    private var dragFrom: Int? {
+        guard let drag else { return nil }
+        return store.visibleTabs.firstIndex(where: { $0.id == drag.id })
+    }
+
+    /// The slot the drag currently points at.
+    private var dragTo: Int? {
+        guard let drag, let from = dragFrom else { return nil }
+        return TabStrip.dropIndex(
             from: from, translation: drag.translation, slotWidth: Metrics.tabWidth,
             count: store.visibleTabs.count)
-        return to == from ? nil : to
+    }
+
+    /// The order the strip is drawn in on this frame — the order it would be
+    /// in if the drag ended now. Identity when nothing is in flight.
+    private var displayOrder: [Int] {
+        TabStrip.displayOrder(count: store.visibleTabs.count, from: dragFrom, to: dragTo)
+    }
+
+    /// How far slot `index` has slid to open the gap the dragged tab will drop
+    /// into. Zero for the dragged slot itself, which follows the pointer
+    /// instead.
+    private func slide(_ index: Int) -> CGFloat {
+        guard index != dragFrom, let drawn = displayOrder.firstIndex(of: index) else { return 0 }
+        return CGFloat(drawn - index) * Metrics.tabWidth
+    }
+
+    /// How far the dragged slot has come, held inside the strip.
+    private func carry(_ index: Int) -> CGFloat {
+        guard let drag, index == dragFrom else { return 0 }
+        return TabStrip.clampedTranslation(
+            from: index, translation: drag.translation, slotWidth: Metrics.tabWidth,
+            count: store.visibleTabs.count)
+    }
+
+    /// The hairline on a slot's leading edge, decided in the order the strip is
+    /// *drawn* rather than the order it is stored in — so a hairline slides
+    /// with the tab it belongs to instead of staying behind at an index.
+    ///
+    /// Never against the gap the dragged tab left, on either side of it: a
+    /// separator divides two tabs, and one side of that boundary is currently
+    /// empty.
+    private func showsSeparator(_ index: Int) -> Bool {
+        let order = displayOrder
+        guard let drawn = order.firstIndex(of: index), drawn > 0 else { return false }
+        let before = order[drawn - 1]
+        guard index != dragFrom, before != dragFrom else { return false }
+        return !isActive(index) && !isActive(before)
+    }
+
+    /// Whether the pointer is over slot `index`.
+    ///
+    /// False on every slot for the length of a drag: the slots are moving,
+    /// so "the pointer is over this one" is a claim about an arrangement that
+    /// is still settling, and the one thing it would draw — the ✕ — must not
+    /// be under the pointer when the mouse-up arrives.
+    private func isHovered(_ index: Int) -> Bool {
+        drag == nil && hoveredSlot == index
+    }
+
+    /// Take the pointer's position along the strip.
+    ///
+    /// The strip's tracking area reports this as the pointer moves, and the
+    /// drag gesture reports it while a button is down, when no tracking area
+    /// does. A *position* is what makes a drop land somewhere true: no arrival
+    /// is delivered for the slot that ends up under a pointer that never moved,
+    /// so anything read from arrivals alone comes out of a reorder still
+    /// believing whatever it believed going in.
+    private func pointer(at x: CGFloat) {
+        let slot = TabStrip.slot(
+            at: x, slotWidth: Metrics.tabWidth, count: store.visibleTabs.count)
+        if hoveredSlot != slot {
+            hoveredSlot = slot
+        }
     }
 
     private func drop(_ id: TabLayout.ID, translation: CGFloat) {
         let tabs = store.visibleTabs
-        guard let from = tabs.firstIndex(where: { $0.id == id }) else { return }
+        guard let from = tabs.firstIndex(where: { $0.id == id }) else {
+            drag = nil
+            return
+        }
         let to = TabStrip.dropIndex(
             from: from, translation: translation, slotWidth: Metrics.tabWidth,
             count: tabs.count)
-        guard to != from else { return }
-        Motion.tabs.run { store.moveTab(id, onto: tabs[to].id) }
+        // One transaction for the whole landing. The strip reorders, the
+        // neighbours' slide unwinds and the carried slot's offset falls to
+        // zero *together*, and because those three add up the tab travels
+        // continuously from under the pointer into its slot. Clearing the drag
+        // first and moving afterwards is the same two changes in the same
+        // frame with nothing tying them, which is a jump.
+        Motion.tabs.run {
+            drag = nil
+            if to != from { store.moveTab(id, onto: tabs[to].id) }
+        }
     }
 
     var body: some View {
@@ -407,12 +522,15 @@ struct Toolbar: View {
                             // than what it started as.
                             terminal: store.label(for: tab),
                             isActive: isActive(index),
-                            showsLeadingSeparator: index > 0 && !isActive(index)
-                                && !isActive(index - 1),
-                            isDropTarget: dragTarget == index,
+                            showsLeadingSeparator: showsSeparator(index),
                             isDragging: drag?.id == tab.id,
+                            isHovered: isHovered(index),
                             pill: pill,
-                            select: { store.selectedTabID = tab.id },
+                            // Not after a drag: see `didDrag`.
+                            select: {
+                                guard !didDrag else { return }
+                                store.selectedTabID = tab.id
+                            },
                             // Through the same policy ⇧⌘W uses, so pointer and
                             // keyboard cannot disagree about when closing a tab
                             // asks first — or about the window's last tab
@@ -420,10 +538,22 @@ struct Toolbar: View {
                             // it.
                             close: { WindowClose.tab(tab.id, in: store) }
                         )
-                        // The dragged slot follows the pointer and rides over
-                        // its neighbours; everything else stays put until the
-                        // drop, when the strip's own animation closes the gap.
-                        .offset(x: drag?.id == tab.id ? drag?.translation ?? 0 : 0)
+                        // The neighbours step aside as the drag passes them, so
+                        // the gap under the pointer is always the slot the tab
+                        // will land in. Animated and keyed on the slide itself:
+                        // a tab that has been passed moves once, rather than
+                        // tracking the pointer the way the carried one does.
+                        .offset(x: slide(index))
+                        .animation(
+                            Motion.tabs.animation(reduceMotion: reduceMotion),
+                            value: slide(index)
+                        )
+                        // Outside that animation, deliberately: the carried
+                        // slot has to sit under the pointer, and a carried
+                        // thing that eases is a thing that lags. It does
+                        // animate at the drop, under the transaction `drop`
+                        // opens around all three of these changes at once.
+                        .offset(x: carry(index))
                         .zIndex(drag?.id == tab.id ? 1 : 0)
                         // Drag to reorder — issue #38. Order is client state
                         // and never leaves the window. `simultaneousGesture`
@@ -431,20 +561,36 @@ struct Toolbar: View {
                         // the select button, and a plain gesture would have to
                         // win against it rather than run alongside it.
                         .simultaneousGesture(
-                            // `.global`, not the slot's own space. The slot is
-                            // offset by the very translation this reports, so
-                            // measuring in local coordinates would feed the
-                            // offset back into the next event and the tab would
-                            // either run away from the pointer or stick to it.
+                            // The strip's space, not the slot's own. The slot
+                            // is offset by the very translation this reports,
+                            // so measuring locally would feed the offset back
+                            // into the next event and the tab would either run
+                            // away from the pointer or stick to it. The strip
+                            // holds still while its slots move inside it, so
+                            // it is a fixed ruler the way `.global` is — and
+                            // unlike `.global` it reads a location the slot
+                            // arithmetic can use directly.
                             DragGesture(
-                                minimumDistance: Self.dragThreshold, coordinateSpace: .global
+                                minimumDistance: Self.dragThreshold,
+                                coordinateSpace: .named(Self.stripSpace)
                             )
                             .onChanged { value in
+                                didDrag = true
                                 drag = TabDrag(id: tab.id, translation: value.translation.width)
+                                // No enter or exit arrives while a button is
+                                // down, so the drag speaks for the pointer for
+                                // as long as there is one.
+                                pointer(at: value.location.x)
                             }
+                            // `drop` clears the drag itself, inside the same
+                            // animation as the reorder. Clearing it here first
+                            // put the tab back in its old slot for one frame.
                             .onEnded { value in
-                                drag = nil
+                                pointer(at: value.location.x)
                                 drop(tab.id, translation: value.translation.width)
+                                // After the button's action has had its turn
+                                // and declined to take it.
+                                DispatchQueue.main.async { didDrag = false }
                             }
                         )
                         // Outermost, so what fades is the whole slot rather
@@ -452,6 +598,23 @@ struct Toolbar: View {
                         .transition(Motion.tabs.transition(reduceMotion: reduceMotion))
                     }
                 }
+                // Only so the drag can report a location the slot arithmetic
+                // can use. The slots move inside this space rather than with
+                // it, so it is a fixed ruler.
+                .coordinateSpace(.named(Self.stripSpace))
+                // The pointer itself, from a tracking area on the strip —
+                // the one view a reorder does not move, so unlike the slots it
+                // has no stale state to recover from. This is what answers
+                // after a drop, and what clears the hover when the pointer
+                // leaves the strip.
+                .tracksPointer(moved: { pointer(at: $0.x) }, exited: { hoveredSlot = nil })
+                // Room for the lifted slot's shadow. A `ScrollView` clips to
+                // its content, and the content is exactly one tab tall, so
+                // without this the shadow was cut off square along the top and
+                // bottom edges — which reads as a seam rather than as depth.
+                // The tabs do not move: this is the gap the 39pt toolbar was
+                // already centring the 27pt strip in.
+                .padding(.vertical, (Metrics.toolbarHeight - Metrics.tabHeight) / 2)
             }
             // Cap the strip at its content width so the leftover toolbar is
             // genuinely empty and can drag the window. When the tabs outgrow

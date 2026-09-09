@@ -227,6 +227,153 @@ final class TabOrderTests: XCTestCase {
         XCTAssertEqual(TabStrip.dropIndex(from: 2, translation: .nan, slotWidth: 200, count: 4), 2)
     }
 
+    private func carry(from: Int, _ translation: CGFloat, count: Int = 4) -> CGFloat {
+        TabStrip.clampedTranslation(
+            from: from, translation: translation, slotWidth: 200, count: count)
+    }
+
+    /// Inside the strip, a drag is reported as it happened.
+    func testATranslationInsideTheStripIsUntouched() {
+        XCTAssertEqual(carry(from: 1, 0), 0)
+        XCTAssertEqual(carry(from: 1, 150), 150)
+        XCTAssertEqual(carry(from: 1, -150), -150)
+    }
+
+    /// And outside it, the tab stops against the end rather than following the
+    /// pointer out over `+` and off the window — which is what put the tab and
+    /// the slot it would land in in two different places.
+    func testATranslationOffTheEndStopsAtIt() {
+        XCTAssertEqual(carry(from: 0, 5000), 600)
+        XCTAssertEqual(carry(from: 0, -5000), 0)
+        XCTAssertEqual(carry(from: 3, 5000), 0)
+        XCTAssertEqual(carry(from: 3, -5000), -600)
+        XCTAssertEqual(carry(from: 1, 5000), 400)
+    }
+
+    /// The clamp and the slot arithmetic agree about where the ends are: a
+    /// translation held at the edge names the slot at that edge.
+    func testTheClampAndTheDropIndexAgree() {
+        for from in 0..<4 {
+            for translation in [-5000, -250, -100, 0, 100, 250, 5000] as [CGFloat] {
+                let held = carry(from: from, translation)
+                XCTAssertEqual(
+                    dropIndex(from: from, held), dropIndex(from: from, translation),
+                    "from \(from) by \(translation)")
+            }
+        }
+    }
+
+    func testDegenerateStripsCarryNothing() {
+        XCTAssertEqual(
+            TabStrip.clampedTranslation(from: 0, translation: 50, slotWidth: 200, count: 0), 0)
+        XCTAssertEqual(
+            TabStrip.clampedTranslation(from: 2, translation: 50, slotWidth: 0, count: 4), 0)
+        XCTAssertEqual(
+            TabStrip.clampedTranslation(from: 2, translation: .nan, slotWidth: 200, count: 4), 0)
+        XCTAssertEqual(
+            TabStrip.clampedTranslation(from: 9, translation: 50, slotWidth: 200, count: 4), 0)
+    }
+
+    // MARK: - The order the strip is drawn in
+
+    /// With nothing in flight the strip draws itself in its own order, which is
+    /// what makes every slot's slide zero when no one is dragging.
+    func testWithoutADragTheStripDrawsItself() {
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: nil, to: nil), [0, 1, 2, 3])
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: 1, to: nil), [0, 1, 2, 3])
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: nil, to: 2), [0, 1, 2, 3])
+        XCTAssertEqual(TabStrip.displayOrder(count: 0, from: nil, to: nil), [])
+    }
+
+    /// Dragging right: everything the tab has passed slides one slot left, and
+    /// the gap it will drop into is the position it now points at.
+    func testDraggingRightSlidesThePassedSlotsLeft() {
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: 0, to: 2), [1, 2, 0, 3])
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: 0, to: 3), [1, 2, 3, 0])
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: 1, to: 2), [0, 2, 1, 3])
+    }
+
+    /// And left, the same the other way.
+    func testDraggingLeftSlidesThePassedSlotsRight() {
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: 3, to: 1), [0, 3, 1, 2])
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: 2, to: 0), [2, 0, 1, 3])
+    }
+
+    /// A tab dragged less than half a slot points at the slot it is already in,
+    /// so nothing slides and the strip looks exactly as it did.
+    func testADragThatHasPassedNobodyMovesNobody() {
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: 2, to: 2), [0, 1, 2, 3])
+    }
+
+    func testAnOutOfRangeDragDrawsTheStripAsItIs() {
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: 9, to: 1), [0, 1, 2, 3])
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: 1, to: 9), [0, 1, 2, 3])
+        XCTAssertEqual(TabStrip.displayOrder(count: 4, from: -1, to: 1), [0, 1, 2, 3])
+    }
+
+    /// The drawn order is a permutation of the strip, never a strip with a slot
+    /// dropped or repeated — the invariant behind reading a slide off it as
+    /// `drawn position - stored index`.
+    func testTheDrawnOrderIsAPermutation() {
+        for from in 0..<5 {
+            for to in 0..<5 {
+                XCTAssertEqual(
+                    TabStrip.displayOrder(count: 5, from: from, to: to).sorted(), [0, 1, 2, 3, 4],
+                    "from \(from) to \(to)")
+            }
+        }
+    }
+
+    // MARK: - The slot under the pointer
+
+    private func slot(_ x: CGFloat, count: Int = 4) -> Int? {
+        TabStrip.slot(at: x, slotWidth: 200, count: count)
+    }
+
+    /// Slots are half-open and laid edge to edge, so a boundary belongs to the
+    /// slot it opens rather than to the one it closes — no gap between two
+    /// tabs where the pointer is over neither.
+    func testAPointerLandsInTheSlotItIsOver() {
+        XCTAssertEqual(slot(0), 0)
+        XCTAssertEqual(slot(199.9), 0)
+        XCTAssertEqual(slot(200), 1)
+        XCTAssertEqual(slot(399.9), 1)
+        XCTAssertEqual(slot(400), 2)
+        XCTAssertEqual(slot(799.9), 3)
+    }
+
+    /// Past either end there is no slot, which is what takes the hover off the
+    /// strip rather than leaving it stuck on the last tab.
+    func testAPointerPastTheStripIsOverNothing() {
+        XCTAssertNil(slot(-0.1))
+        XCTAssertNil(slot(-500))
+        XCTAssertNil(slot(800))
+        XCTAssertNil(slot(5000))
+    }
+
+    func testDegenerateStripsHaveNoSlotUnderThePointer() {
+        XCTAssertNil(TabStrip.slot(at: 50, slotWidth: 200, count: 0))
+        XCTAssertNil(TabStrip.slot(at: 50, slotWidth: 0, count: 4))
+        XCTAssertNil(TabStrip.slot(at: .nan, slotWidth: 200, count: 4))
+        XCTAssertNil(TabStrip.slot(at: .infinity, slotWidth: 200, count: 4))
+    }
+
+    /// The property the ✕ actually depends on: a drop rearranges the tabs
+    /// under a pointer that never moved, and the slot it is in is unchanged —
+    /// so the tab now drawn there is hovered, without waiting for an enter
+    /// event that is not coming.
+    func testTheHoveredSlotSurvivesAReorder() {
+        let x: CGFloat = 250
+        XCTAssertEqual(slot(x), 1)
+        // Tab 0 dragged onto slot 2. The pointer is still in slot 1, which is
+        // now drawn by the tab that was stored at index 2.
+        let order = TabStrip.displayOrder(count: 4, from: 0, to: 2)
+        XCTAssertEqual(order[slot(x)!], 2)
+        // And after the drop, with the strip stored in that order, the pointer
+        // is over the same drawn position it was over during the drag.
+        XCTAssertEqual(slot(x), TabStrip.displayOrder(count: 4, from: nil, to: nil)[slot(x)!])
+    }
+
     // MARK: - Drag plumbing
 
     /// The one line of the drag *plumbing* a test can hold, and it is worth
