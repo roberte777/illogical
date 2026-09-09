@@ -22,6 +22,10 @@ import XCTest
 @MainActor
 final class SessionLifecycleTests: XCTestCase {
     private static let local = ServerHost.local(socketPath: "/tmp/illogical-lifecycle.sock")
+    /// A second machine, for the one thing that needs two: the dropdown lists
+    /// sessions host by host, so which rows an arrow reaches and in what order
+    /// is only a question once there is more than one host to order.
+    private static let remote = ServerHost.ssh(destination: "build-box")
 
     /// Nothing here reaches the developer's real preferences: `SessionStore`
     /// persists remote hosts, and a unit test has no business writing them.
@@ -726,6 +730,134 @@ final class SessionLifecycleTests: XCTestCase {
                 width, MenuMetrics.titleWidth,
                 "“\(refusal.message)” is \(width)pt in a \(MenuMetrics.titleWidth)pt row")
         }
+    }
+
+    // MARK: - What the arrows can reach
+
+    /// `SessionMenuRows.targets` is the dropdown's list as a list: which rows
+    /// an arrow can land on and Return can act on, in the order the panel
+    /// draws them. It exists as a value because the alternative is a view
+    /// deciding it twice — once when it draws a row and once when a keystroke
+    /// looks for one — and two decisions that can disagree about which rows
+    /// are there is a highlight sitting on a row nobody can see.
+    ///
+    /// The order is the contract. The first row is what a freshly opened
+    /// panel's Return takes, and it has to stay the answer the dropdown's
+    /// Enter has always given: create it, or switch to the first match.
+    func testTheArrowsReachEveryRowThePanelDrawsAndNothingElse() {
+        let store = emptyStore()
+        list(store, [(1, "work", [1]), (2, "agent", [2])])
+
+        // Nothing typed: the sessions, then the two rows at the foot.
+        XCTAssertEqual(
+            SessionMenuRows.targets(
+                offer: store.filterOffer(""), hosts: store.hosts, filter: "", renaming: nil),
+            [.session(ref(1)), .session(ref(2)), .newSession, .addRemoteHost])
+
+        // A name the server would take and no session has: Create leads, and
+        // it is what Return takes — which is what Enter did here before there
+        // was a highlight to see it on.
+        XCTAssertEqual(
+            SessionMenuRows.targets(
+                offer: store.filterOffer("fresh"), hosts: store.hosts, filter: "fresh",
+                renaming: nil
+            ).first,
+            .create)
+
+        // A name it would refuse draws a sentence rather than a row. There is
+        // nothing there to press Return on, so there is nothing there for an
+        // arrow to stop on either.
+        XCTAssertEqual(
+            SessionMenuRows.targets(
+                offer: store.filterOffer("my project"), hosts: store.hosts, filter: "my project",
+                renaming: nil),
+            [.newSession, .addRemoteHost])
+    }
+
+    /// The filter narrows the rows an arrow can reach by exactly what it
+    /// narrows on screen, because both go through `SessionMenuRows.matches`.
+    /// Normalized, so ` wo` finds `work`: the ends of what is typed are never
+    /// part of what is meant, and `filterOffer` already reads it that way.
+    func testTheFilterNarrowsTheArrowsByExactlyWhatItNarrowsOnScreen() throws {
+        let store = emptyStore([Self.local, Self.remote])
+        list(store, [(1, "work", [1]), (2, "agent", [2])])
+        list(store, host: Self.remote, [(1, "worker", [1])])
+
+        let local = try XCTUnwrap(store.host(Self.local))
+        XCTAssertEqual(
+            SessionMenuRows.matches(local.sessions, filter: " wo").map(\.name), ["work"])
+
+        // Host order, and every machine's matches under it — the two headers
+        // the panel draws between them are labels, not rows.
+        //
+        // Create leads even here, with two matches under it: `wor` is a name
+        // no session has and the server would take, and the offer does not
+        // stop being an offer because something else starts with it. Which is
+        // the panel on screen, and now also where Return goes.
+        XCTAssertEqual(
+            SessionMenuRows.targets(
+                offer: store.filterOffer("wor"), hosts: store.hosts, filter: "wor", renaming: nil),
+            [
+                .create, .session(ref(1)), .session(ref(1, on: Self.remote)), .newSession,
+                .addRemoteHost,
+            ])
+    }
+
+    /// A session under rename is a text field with its own Return, so it is
+    /// not a row an arrow can land on for as long as that field is open.
+    func testARowMidRenameIsNotSomethingAnArrowCanLandOn() {
+        let store = emptyStore()
+        list(store, [(1, "work", [1]), (2, "agent", [2])])
+
+        XCTAssertEqual(
+            SessionMenuRows.targets(
+                offer: store.filterOffer(""), hosts: store.hosts, filter: "", renaming: ref(1)),
+            [.session(ref(2)), .newSession, .addRemoteHost])
+    }
+
+    /// New Session and Add Remote Host are always in the list, and neither is
+    /// ever filtered out: neither is a session, so there is nothing for the
+    /// field to exclude them by — and a panel filtered down to nothing must
+    /// still have a row for the highlight to be on, or the keyboard would be
+    /// pointing at nothing at all.
+    func testTheFootOfThePanelIsAlwaysReachable() {
+        let store = emptyStore()
+
+        XCTAssertEqual(
+            SessionMenuRows.targets(
+                offer: store.filterOffer(""), hosts: store.hosts, filter: "", renaming: nil),
+            [.newSession, .addRemoteHost])
+        XCTAssertEqual(
+            SessionMenuRows.targets(
+                offer: store.filterOffer("nothing-matches-this"), hosts: store.hosts,
+                filter: "nothing-matches-this", renaming: nil
+            ).suffix(2),
+            [.newSession, .addRemoteHost])
+    }
+
+    /// Where an arrow lands is `PaletteKeys.step`'s, against a mask that is
+    /// all true because this panel draws no row it will not run — see
+    /// `SessionMenu.move(by:)`. Asserted here on a real target list, because
+    /// what the two panels share is the *decision* — clamp at the ends rather
+    /// than wrap — and a dropdown that wrapped while the palette clamped would
+    /// be two arrows with one glyph. `CommandPaletteTests` pins the rule
+    /// itself, including what it does with the dimmed rows this list has none
+    /// of.
+    func testAnArrowClampsAtBothEndsOfTheDropdown() {
+        let store = emptyStore()
+        list(store, [(1, "work", [1])])
+        let targets = SessionMenuRows.targets(
+            offer: store.filterOffer(""), hosts: store.hosts, filter: "", renaming: nil)
+        let reachable = Array(repeating: true, count: targets.count)
+
+        XCTAssertEqual(PaletteKeys.step(from: -1, by: 1, enabled: reachable), 0)
+        XCTAssertEqual(PaletteKeys.step(from: 0, by: 1, enabled: reachable), 1)
+        XCTAssertEqual(
+            PaletteKeys.step(from: targets.count - 1, by: 1, enabled: reachable),
+            targets.count - 1, "the last row wrapped to the first")
+        XCTAssertEqual(
+            PaletteKeys.step(from: 0, by: -1, enabled: reachable), 0,
+            "the first row wrapped to the last")
     }
 
     // MARK: - What actually goes on the wire
