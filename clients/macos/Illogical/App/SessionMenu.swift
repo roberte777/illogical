@@ -18,24 +18,36 @@
 //      │ ⊜  Filter or create...         │
 //      │ LOCAL                          │  host header, 10pt, dim
 //      │ ✓   Demo                       │
-//      │ BUILD-BOX                  ✕   │  remote: removable
+//      │ BUILD-BOX               ＋ ✕   │  remote: new session, removable
 //      │     api                        │
 //      │     agent                      │
 //      └────────────────────────────────┘
+//
+//  The ＋ makes a session on the machine whose header it sits on, which is the
+//  whole of why it is there: "New Session" below the list takes whichever host
+//  the front tab is on, and with two machines connected nothing on screen said
+//  which one that was.
 //
 //  It is not an NSMenu or a system popover: there is no arrow, it is clipped by
 //  the window, and it uses the app's own palette. So it is an in-window overlay
 //  anchored to the session button's leading edge, just below the toolbar.
 //
 //  Geometry measured from the reference at 1.256 px/pt (toolbar = 39pt):
-//  panel 172×~125pt at x=80, corner radius 10, 4pt padding; icon column at 11pt
+//  panel ~125pt tall at x=80, corner radius 10, 4pt padding; icon column at 11pt
 //  from the panel edge, titles at 33pt; hover fill #5C9DF9 with dark text.
+//
+//  The width is the one measurement deliberately off the reference. At the
+//  measured 172pt a host header had to hold a machine's name, a status icon and
+//  two buttons in the same 18pt strip, and the name was the part that gave way.
 
 import IllogicalProtocol
 import SwiftUI
 
 enum MenuMetrics {
-    static let width: CGFloat = 172
+    /// Wider than the reference's 172. See the note at the top of the file:
+    /// `titleWidth` below is derived from this, so a session name gains every
+    /// point of it.
+    static let width: CGFloat = 220
     static let padding: CGFloat = 4
     static let rowHeight: CGFloat = 22
     static let rowPadding: CGFloat = 7
@@ -130,6 +142,18 @@ struct SessionMenu: View {
 
     private var anyMatches: Bool { store.hosts.contains { !matches($0).isEmpty } }
 
+    /// "New Session", and on which machine once there is more than one to be
+    /// wrong about. This row carries no host of its own — it takes whichever
+    /// one the front tab is on — so with two connected the title was the only
+    /// thing that could say where the session was about to land, and it said
+    /// nothing. Named only when `showsHosts`, on the same rule the headers use:
+    /// with one machine there is nothing to disambiguate and the suffix would
+    /// be noise on every window that never adds a host.
+    private var newSessionTitle: String {
+        guard showsHosts, let host = store.selectedHost else { return "New Session" }
+        return "New Session on \(host.displayName)"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             filterField
@@ -175,7 +199,8 @@ struct SessionMenu: View {
                         isHovered: hovered == "h\(host.id)",
                         hover: { hovered = $0 ? "h\(host.id)" : nil },
                         remove: { store.removeHost(host.host) },
-                        retry: { store.reconnect(host.host) })
+                        retry: { store.reconnect(host.host) },
+                        newSession: { newSession(on: host) })
                 }
                 ForEach(matches(host)) { session in
                     let ref = SessionRef(host: host.host, session: session.id)
@@ -230,7 +255,7 @@ struct SessionMenu: View {
             MenuSeparator()
 
             MenuRow(
-                icon: "rectangle.stack.badge.plus", title: "New Session", shortcut: "⇧⌘N",
+                icon: "rectangle.stack.badge.plus", title: newSessionTitle, shortcut: "⇧⌘N",
                 isHovered: hovered == "__new",
                 hover: { hovered = $0 ? "__new" : nil },
                 action: newSession)
@@ -359,6 +384,15 @@ struct SessionMenu: View {
     private func newSession() {
         let count = store.selectedHost?.sessions.count ?? 0
         store.createTerminal(sessionName: "session-\(count + 1)")
+        isPresented = false
+    }
+
+    /// The same, on a machine named rather than inferred — what a host header's
+    /// ＋ does. `N` counts that machine's own sessions, so the name the new row
+    /// gets matches the list it joins rather than the front tab's.
+    private func newSession(on host: HostConnection) {
+        store.createTerminal(
+            sessionName: "session-\(host.sessions.count + 1)", on: host.host)
         isPresented = false
     }
 
@@ -494,6 +528,7 @@ struct HostHeader: View {
     let hover: (Bool) -> Void
     let remove: () -> Void
     let retry: () -> Void
+    let newSession: () -> Void
 
     private var status: (icon: String, color: Color, help: String)? {
         switch host.status {
@@ -557,6 +592,33 @@ struct HostHeader: View {
             }
 
             Spacer(minLength: 4)
+
+            // A session on the machine this header names, rather than on
+            // whichever one the front tab happens to be looking at. That is the
+            // whole point of it being here: "New Session" below the list goes
+            // to `selectedHost`, and with two machines connected nothing on
+            // screen said which that was.
+            //
+            // Hover-gated, unlike the ✕ beside it. Deliberately inconsistent,
+            // and worth naming: `Chrome.swift`'s lesson is that hover-only made
+            // the tab close button undiscoverable, which is why the ✕ here is
+            // drawn unconditionally. This is the other side of that trade — two
+            // permanent buttons in an 18pt strip crowd out the name they belong
+            // to, and unlike closing a tab this has a discoverable twin in the
+            // "New Session" row below.
+            //
+            // Zero opacity rather than absence, so the header does not reflow
+            // under the pointer; hit-testing follows the opacity, because an
+            // invisible button that still takes clicks is a trap.
+            Button(action: newSession) {
+                Image(systemName: "plus")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Palette.menuShortcut)
+            }
+            .buttonStyle(.plain)
+            .opacity(isHovered ? 1 : 0)
+            .allowsHitTesting(isHovered)
+            .help("New session on \(host.displayName)")
 
             // Only what the user added can be removed; the local daemon is not
             // a host they chose, and removing it would leave nowhere to make a
