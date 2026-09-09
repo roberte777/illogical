@@ -388,7 +388,10 @@ about it.
 
 - Session sharing — multiple people, one session. Needs identity and permissions,
   neither of which the protocol addresses yet.
-- Rename, reorder, per-terminal cwd in the UI.
+- Rename and reorder in the UI. Showing the cwd is done — the daemon probes it
+  and the command beside it on the maintenance tick, see ARCHITECTURE.md — and
+  *using* it is not: a new terminal still starts wherever the daemon is rather
+  than where the focused one is.
 - Config file.
 - Daemon restart survival for live children (fd handoff).
 - An automation surface. [boo](https://github.com/coder/boo) has the shape right:

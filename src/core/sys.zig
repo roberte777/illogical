@@ -358,6 +358,7 @@ pub fn openDevNull() Error!fd_t {
     return fd;
 }
 
+const O_RDONLY: c_int = 0;
 const O_WRONLY: c_int = 1;
 const O_CREAT: c_int = if (builtin.os.tag == .linux) 0o100 else 0x0200;
 const O_APPEND: c_int = if (builtin.os.tag == .linux) 0o2000 else 0x0008;
@@ -393,6 +394,183 @@ pub fn selfExePath(buf: []u8) Error![]const u8 {
     // failing -- a path that exactly filled the buffer may have been cut.
     if (len >= buf.len) return error.NoSelfExe;
     return buf[0..len];
+}
+
+// -- what a child is doing -------------------------------------------------
+//
+// Two questions the breadcrumb asks of a live terminal: which process is in
+// the foreground of it, and where that process is. Neither is answerable from
+// the byte stream. OSC 7 would give the directory, and only from a shell set
+// up to emit it -- shell integration this project does not ship and cannot
+// require -- while nothing in the VT protocol names the running command at
+// all. So both are asked of the kernel, which is where tmux's
+// `pane_current_path` and `pane_current_command` come from too.
+
+extern "c" fn tcgetpgrp(fd: fd_t) pid_t;
+
+/// The process group in the foreground of a terminal, or null when it has
+/// none. A group id is the pid of its leader, so this is also the pid to ask
+/// the two questions below about.
+///
+/// This -- not the child we forked -- is what a person is looking at. An
+/// interactive shell puts each job it starts in a group of its own and hands
+/// that group the terminal, so `nvim` started from `zsh` is the foreground
+/// group and the shell is not. A shell with no job control (`sh -c ...`)
+/// never moves it and the answer stays the child, which is right for the same
+/// reason: nothing else ever held the terminal.
+pub fn foregroundPgrp(fd: fd_t) ?pid_t {
+    const pgrp = tcgetpgrp(fd);
+    // -1 for a descriptor that is not a terminal or is no longer open, and 0
+    // is not a group anything can be in.
+    return if (pgrp <= 0) null else pgrp;
+}
+
+/// `MAXPATHLEN`, as macOS's process-info structures embed it. Deliberately not
+/// `std.fs.max_path_bytes`, which is 4096 on Linux: this number is part of a
+/// kernel struct's layout rather than a bound of our own choosing.
+const darwin_max_path = 1024;
+
+/// `PROC_PIDVNODEPATHINFO`.
+const proc_pidvnodepathinfo: c_int = 9;
+
+extern "c" fn proc_pidinfo(
+    pid: pid_t,
+    flavor: c_int,
+    arg: u64,
+    buffer: ?*anyopaque,
+    size: c_int,
+) c_int;
+extern "c" fn proc_name(pid: pid_t, buffer: [*]u8, size: u32) c_int;
+
+/// `struct proc_vnodepathinfo` from macOS's `<sys/proc_info.h>`.
+///
+/// Written out rather than `@cImport`ed, which is this module's whole rule:
+/// one place, explicit, no header to depend on. What that risks is a field in
+/// the wrong place -- which would not fail to compile. It would move
+/// `cdir.path` and hand back a path-shaped slice of unrelated bytes. Two
+/// things catch it: the `@sizeOf` assertion below, which is the number
+/// `proc_pidinfo` checks the buffer against before it fills anything in, and
+/// the test at the bottom of this file that asks about *this* process and
+/// compares the answer with `getcwd`.
+const VnodePathInfo = extern struct {
+    /// `struct vinfo_stat`.
+    const Stat = extern struct {
+        dev: u32,
+        mode: u16,
+        nlink: u16,
+        ino: u64,
+        uid: u32,
+        gid: u32,
+        atime: i64,
+        atimensec: i64,
+        mtime: i64,
+        mtimensec: i64,
+        ctime: i64,
+        ctimensec: i64,
+        birthtime: i64,
+        birthtimensec: i64,
+        size: i64,
+        blocks: i64,
+        blksize: i32,
+        flags: u32,
+        gen: u32,
+        rdev: u32,
+        qspare: [2]i64,
+    };
+
+    /// `struct vnode_info`.
+    const Node = extern struct {
+        stat: Stat,
+        vtype: i32,
+        pad: i32,
+        /// `fsid_t`, which is two ints.
+        fsid: [2]i32,
+    };
+
+    /// `struct vnode_info_path`: a node, and the tail end of its path.
+    const NodePath = extern struct {
+        node: Node,
+        path: [darwin_max_path]u8,
+    };
+
+    /// The one we came for.
+    cdir: NodePath,
+    /// The process's root directory. Never read, but the kernel sizes the
+    /// call against the whole struct and will not fill in a buffer that is a
+    /// byte short of it.
+    rdir: NodePath,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(VnodePathInfo) == 2352);
+}
+
+/// The working directory of a live process, written into `buf`.
+///
+/// Null when the process is gone, or is not ours to ask about: both platforms
+/// answer for our own children and refuse a stranger's. That is all this needs
+/// -- every pid it is given is one this daemon forked, or a descendant of one.
+pub fn processCwd(pid: pid_t, buf: []u8) ?[]const u8 {
+    if (builtin.os.tag.isDarwin()) {
+        var info: VnodePathInfo = undefined;
+        const n = proc_pidinfo(pid, proc_pidvnodepathinfo, 0, &info, @sizeOf(VnodePathInfo));
+        // Anything short of the whole struct is a failure: the call returns
+        // the bytes it wrote, and a partial write has no path in it.
+        if (n != @sizeOf(VnodePathInfo)) return null;
+        const path = std.mem.sliceTo(&info.cdir.path, 0);
+        if (path.len == 0 or path.len > buf.len) return null;
+        @memcpy(buf[0..path.len], path);
+        return buf[0..path.len];
+    }
+    var link_buf: [64]u8 = undefined;
+    const link = std.fmt.bufPrintZ(&link_buf, "/proc/{d}/cwd", .{pid}) catch return null;
+    const n = readlink(link.ptr, buf.ptr, buf.len);
+    if (n <= 0) return null;
+    const len: usize = @intCast(n);
+    // `readlink` truncates silently rather than failing, so a path that
+    // exactly filled the buffer may have been cut -- and half a path is worse
+    // than no path.
+    if (len >= buf.len) return null;
+    return buf[0..len];
+}
+
+/// Linux only, and only for `/proc`: a descriptor open across a `fork` on
+/// another thread is a descriptor the child inherits.
+const O_CLOEXEC: c_int = 0o2000000;
+
+/// What a live process is called: the name the kernel holds for it, which is
+/// the executable's, not its `argv[0]`.
+///
+/// Short by construction on both platforms -- 16 bytes on Linux, 33 on macOS
+/// -- and that is the right length for a breadcrumb. A person reads `nvim`
+/// off it, not the path it was resolved from.
+///
+/// The executable's name and not `argv[0]` is a real difference for one kind
+/// of program: a multi-call binary answers to what it *is*, so `sleep` from a
+/// single-binary coreutils reads as `coreutils`. tmux says the same thing for
+/// the same reason. Reading the argv instead means `KERN_PROCARGS2` on macOS,
+/// which is a page of copying and a sysctl per probe, and this runs on a tick.
+pub fn processName(pid: pid_t, buf: []u8) ?[]const u8 {
+    if (builtin.os.tag.isDarwin()) {
+        const n = proc_name(pid, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(u32))));
+        if (n <= 0) return null;
+        return sliceToZ(buf[0..@intCast(n)]);
+    }
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/comm", .{pid}) catch return null;
+    const fd = open(path.ptr, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return null;
+    defer closeFd(fd);
+    const n = readFdOnce(fd, buf) catch return null;
+    // `comm` is the name and a trailing newline.
+    const line = std.mem.sliceTo(buf[0..n], '\n');
+    return if (line.len == 0) null else line;
+}
+
+/// `mem.sliceTo` over a slice that may or may not carry its NUL.
+fn sliceToZ(bytes: []const u8) ?[]const u8 {
+    const trimmed = std.mem.sliceTo(bytes, 0);
+    return if (trimmed.len == 0) null else trimmed;
 }
 
 // -- unix sockets ----------------------------------------------------------
@@ -725,6 +903,51 @@ test "this process can say where its own executable is" {
     // path that resolves without a `PATH` search, and it has to be there.
     try testing.expectEqual(@as(u8, '/'), path[0]);
     try std.Io.Dir.cwd().access(threaded.io(), path, .{});
+}
+
+test "the kernel says where this process is, and what it is called" {
+    const testing = std.testing;
+    const me = std.c.getpid();
+
+    // The point of asking about ourselves: `getcwd` is the answer, so a
+    // `VnodePathInfo` with a field in the wrong place fails here rather than
+    // shipping a garbled breadcrumb. Both calls resolve symlinks, so on macOS
+    // both say `/private/tmp` and neither says `/tmp`.
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_z = std.c.getcwd(&real_buf, real_buf.len) orelse return error.NoCwd;
+    const real = std.mem.span(@as([*:0]const u8, @ptrCast(real_z)));
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = processCwd(me, &buf) orelse return error.NoProcessCwd;
+    try testing.expectEqualStrings(real, cwd);
+
+    var name_buf: [64]u8 = undefined;
+    const name = processName(me, &name_buf) orelse return error.NoProcessName;
+    // Whatever the test runner's binary is called, it is a bare name: no
+    // directory, and no newline left on it by `/proc/<pid>/comm`.
+    try testing.expect(name.len > 0);
+    try testing.expect(std.mem.indexOfScalar(u8, name, '/') == null);
+    try testing.expect(std.mem.indexOfScalar(u8, name, '\n') == null);
+}
+
+test "a process that is gone has no directory and no name" {
+    const testing = std.testing;
+    // Nothing this daemon forked, and nothing anyone can be: pid 0 is the
+    // kernel's own on both platforms and `/proc/0` does not exist.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try testing.expect(processCwd(0, &buf) == null);
+    var name_buf: [64]u8 = undefined;
+    try testing.expect(processName(0, &name_buf) == null);
+}
+
+test "a pipe has no foreground process group" {
+    const testing = std.testing;
+    const fds = try pipeFds();
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    // ENOTTY. The terminal case is `Terminal.probeForeground`'s to prove,
+    // since it needs a PTY with a child on the far end of it.
+    try testing.expect(foregroundPgrp(fds[0]) == null);
 }
 
 test "unix address rejects an over-long path" {
