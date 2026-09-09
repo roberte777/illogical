@@ -686,8 +686,40 @@ all; a reorder that silently does nothing would be worse than none. The gesture
 is attached with `simultaneousGesture` so it runs beside the button rather than
 against it, which also means the button still fires on the mouse-up that ends a
 drag — a dragged tab comes to the front, the way it does in every tabbed app.
-`TabStrip.dropIndex` turns the translation into a slot and is the one part of
-this that is unit-tested; the gesture plumbing around it cannot be simulated.
+
+What the strip *does* with the drag is the native tab bar's answer, and it is
+three things at once. The dragged slot is **lifted** — an opaque ground, an
+edge and a shadow, so a tab with no fill of its own does not read through the
+one it is passing over — and **carried** under the pointer, held inside the
+strip so it stops at the first slot and the last rather than sailing out over
+`+`. Every other slot **slides** to where it would be if you let go, so the gap
+under the pointer is the answer and there is nothing left to annotate. At the
+mouse-up all three unwind inside one `withAnimation` alongside `moveTab`, and
+because they add up the tab travels continuously from under the pointer into
+its slot instead of snapping.
+
+The first version drew none of that: the strip held still and outlined the slot
+the tab pointed at, on the grounds that fixed-width slots laid edge to edge
+would have to shove their neighbours to open a gap. They do, and that shove is
+the whole effect — what made it read as broken was doing it once, at the drop.
+
+Three pure functions in `TabStrip` carry it, and they are the part that is
+unit-tested; the gesture plumbing around them cannot be simulated.
+`dropIndex` turns a translation into a slot, `clampedTranslation` holds the
+carried tab inside the strip, and `displayOrder` gives the order the strip is
+*drawn* in on this frame — which is where both the slide (a slot's drawn
+position less its stored index) and the hairlines come from, so a separator
+travels with its tab instead of staying behind at an index, and neither side of
+the gap draws one.
+
+The ✕ on a slot appears on **hover**, on every tab including the active one. It
+sat on the active tab permanently until it did not: that parks a close button
+under the pointer's usual resting place on the tab you are most likely to be
+clicking, and gives the active slot a different shape from every other one.
+File ▸ Close Tab and the ⇧⌘W beside it are the discoverable path. The ✕ also
+goes away for the length of a drag, because the dragged slot rides under the
+pointer and the mouse-up that ends the drag would otherwise land inside it —
+dragging a tab by its ✕ closed it, measured.
 
 ### Renaming and deleting a session
 

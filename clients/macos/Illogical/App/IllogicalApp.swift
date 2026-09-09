@@ -316,6 +316,16 @@ struct Toolbar: View {
     /// competing with it. It also drops the two bugs the system path came with:
     /// a text selection dragged in from another app no longer lights the strip
     /// up, and a refused move no longer plays the accept animation.
+    ///
+    /// What the strip *does* with this is the native tab bar's answer rather
+    /// than the one #64 shipped: the dragged slot is lifted and carried, and
+    /// every other slot slides to where it would be if you let go — so the
+    /// reorder is shown by the strip rearranging itself under the pointer.
+    /// The first draft held the strip still and outlined the slot the tab
+    /// pointed at, on the grounds that fixed-width slots laid edge to edge
+    /// would have to shove their neighbours to open a gap. They do, and that
+    /// is the whole effect; what made it read as broken was doing it only
+    /// once, at the drop.
     private struct TabDrag: Equatable {
         var id: TabLayout.ID
         var translation: CGFloat
@@ -331,25 +341,76 @@ struct Toolbar: View {
         return tabs[index].id == store.selectedTabID
     }
 
-    /// The slot the drag currently points at, if there is one.
-    private var dragTarget: Int? {
-        guard let drag,
-            let from = store.visibleTabs.firstIndex(where: { $0.id == drag.id })
-        else { return nil }
-        let to = TabStrip.dropIndex(
+    /// The slot the dragged tab started in.
+    private var dragFrom: Int? {
+        guard let drag else { return nil }
+        return store.visibleTabs.firstIndex(where: { $0.id == drag.id })
+    }
+
+    /// The slot the drag currently points at.
+    private var dragTo: Int? {
+        guard let drag, let from = dragFrom else { return nil }
+        return TabStrip.dropIndex(
             from: from, translation: drag.translation, slotWidth: Metrics.tabWidth,
             count: store.visibleTabs.count)
-        return to == from ? nil : to
+    }
+
+    /// The order the strip is drawn in on this frame — the order it would be
+    /// in if the drag ended now. Identity when nothing is in flight.
+    private var displayOrder: [Int] {
+        TabStrip.displayOrder(count: store.visibleTabs.count, from: dragFrom, to: dragTo)
+    }
+
+    /// How far slot `index` has slid to open the gap the dragged tab will drop
+    /// into. Zero for the dragged slot itself, which follows the pointer
+    /// instead.
+    private func slide(_ index: Int) -> CGFloat {
+        guard index != dragFrom, let drawn = displayOrder.firstIndex(of: index) else { return 0 }
+        return CGFloat(drawn - index) * Metrics.tabWidth
+    }
+
+    /// How far the dragged slot has come, held inside the strip.
+    private func carry(_ index: Int) -> CGFloat {
+        guard let drag, index == dragFrom else { return 0 }
+        return TabStrip.clampedTranslation(
+            from: index, translation: drag.translation, slotWidth: Metrics.tabWidth,
+            count: store.visibleTabs.count)
+    }
+
+    /// The hairline on a slot's leading edge, decided in the order the strip is
+    /// *drawn* rather than the order it is stored in — so a hairline slides
+    /// with the tab it belongs to instead of staying behind at an index.
+    ///
+    /// Never against the gap the dragged tab left, on either side of it: a
+    /// separator divides two tabs, and one side of that boundary is currently
+    /// empty.
+    private func showsSeparator(_ index: Int) -> Bool {
+        let order = displayOrder
+        guard let drawn = order.firstIndex(of: index), drawn > 0 else { return false }
+        let before = order[drawn - 1]
+        guard index != dragFrom, before != dragFrom else { return false }
+        return !isActive(index) && !isActive(before)
     }
 
     private func drop(_ id: TabLayout.ID, translation: CGFloat) {
         let tabs = store.visibleTabs
-        guard let from = tabs.firstIndex(where: { $0.id == id }) else { return }
+        guard let from = tabs.firstIndex(where: { $0.id == id }) else {
+            drag = nil
+            return
+        }
         let to = TabStrip.dropIndex(
             from: from, translation: translation, slotWidth: Metrics.tabWidth,
             count: tabs.count)
-        guard to != from else { return }
-        Motion.tabs.run { store.moveTab(id, onto: tabs[to].id) }
+        // One transaction for the whole landing. The strip reorders, the
+        // neighbours' slide unwinds and the carried slot's offset falls to
+        // zero *together*, and because those three add up the tab travels
+        // continuously from under the pointer into its slot. Clearing the drag
+        // first and moving afterwards is the same two changes in the same
+        // frame with nothing tying them, which is a jump.
+        Motion.tabs.run {
+            drag = nil
+            if to != from { store.moveTab(id, onto: tabs[to].id) }
+        }
     }
 
     var body: some View {
@@ -375,9 +436,7 @@ struct Toolbar: View {
                             // than what it started as.
                             terminal: store.label(for: tab),
                             isActive: isActive(index),
-                            showsLeadingSeparator: index > 0 && !isActive(index)
-                                && !isActive(index - 1),
-                            isDropTarget: dragTarget == index,
+                            showsLeadingSeparator: showsSeparator(index),
                             isDragging: drag?.id == tab.id,
                             pill: pill,
                             select: { store.selectedTabID = tab.id },
@@ -388,10 +447,22 @@ struct Toolbar: View {
                             // it.
                             close: { WindowClose.tab(tab.id, in: store) }
                         )
-                        // The dragged slot follows the pointer and rides over
-                        // its neighbours; everything else stays put until the
-                        // drop, when the strip's own animation closes the gap.
-                        .offset(x: drag?.id == tab.id ? drag?.translation ?? 0 : 0)
+                        // The neighbours step aside as the drag passes them, so
+                        // the gap under the pointer is always the slot the tab
+                        // will land in. Animated and keyed on the slide itself:
+                        // a tab that has been passed moves once, rather than
+                        // tracking the pointer the way the carried one does.
+                        .offset(x: slide(index))
+                        .animation(
+                            Motion.tabs.animation(reduceMotion: reduceMotion),
+                            value: slide(index)
+                        )
+                        // Outside that animation, deliberately: the carried
+                        // slot has to sit under the pointer, and a carried
+                        // thing that eases is a thing that lags. It does
+                        // animate at the drop, under the transaction `drop`
+                        // opens around all three of these changes at once.
+                        .offset(x: carry(index))
                         .zIndex(drag?.id == tab.id ? 1 : 0)
                         // Drag to reorder — issue #38. Order is client state
                         // and never leaves the window. `simultaneousGesture`
@@ -410,8 +481,10 @@ struct Toolbar: View {
                             .onChanged { value in
                                 drag = TabDrag(id: tab.id, translation: value.translation.width)
                             }
+                            // `drop` clears the drag itself, inside the same
+                            // animation as the reorder. Clearing it here first
+                            // put the tab back in its old slot for one frame.
                             .onEnded { value in
-                                drag = nil
                                 drop(tab.id, translation: value.translation.width)
                             }
                         )
@@ -420,6 +493,13 @@ struct Toolbar: View {
                         .transition(Motion.tabs.transition(reduceMotion: reduceMotion))
                     }
                 }
+                // Room for the lifted slot's shadow. A `ScrollView` clips to
+                // its content, and the content is exactly one tab tall, so
+                // without this the shadow was cut off square along the top and
+                // bottom edges — which reads as a seam rather than as depth.
+                // The tabs do not move: this is the gap the 39pt toolbar was
+                // already centring the 27pt strip in.
+                .padding(.vertical, (Metrics.toolbarHeight - Metrics.tabHeight) / 2)
             }
             // Cap the strip at its content width so the leftover toolbar is
             // genuinely empty and can drag the window. When the tabs outgrow
