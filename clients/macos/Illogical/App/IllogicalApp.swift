@@ -106,8 +106,13 @@ struct IllogicalApp: App {
                     .disabled(!store.canFindAgain)
             }
             CommandGroup(after: .toolbar) {
+                // ⌘K rather than ⇧⌘K: switching sessions is the most reached-for
+                // thing in the chrome, and unshifted is where every other app
+                // puts its switcher. The cost is the iTerm/Ghostty "clear
+                // scrollback" convention — a chord this menu claims can never
+                // reach `keyDown`, so ⌘K is now unavailable to the terminal.
                 Button("Change Session") { store.toggleSessionMenu() }
-                    .keyboardShortcut("k", modifiers: [.command, .shift])
+                    .keyboardShortcut("k", modifiers: .command)
                 Button("Refresh Sessions") { store.refresh() }
                     .keyboardShortcut("r", modifiers: .command)
                 Divider()

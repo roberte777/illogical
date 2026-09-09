@@ -973,7 +973,7 @@ final class SessionStore {
         return index >= 1 && index <= tabs.count
     }
 
-    /// ⇧⌘K. The tooltip on the session button has promised this since the
+    /// ⌘K. The tooltip on the session button has promised this since the
     /// chrome landed.
     ///
     /// Focus is not restored here: ContentView watches `sessionMenuOpen` and

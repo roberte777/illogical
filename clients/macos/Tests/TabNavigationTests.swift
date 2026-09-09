@@ -216,7 +216,7 @@ final class TabNavigationTests: XCTestCase {
         XCTAssertFalse(store.canSelectTab(at: 2), "⌘2 was offered for another session's tab")
     }
 
-    // MARK: - ⇧⌘K
+    // MARK: - ⌘K
 
     func testTogglingTheSessionMenu() {
         let store = store([1])
