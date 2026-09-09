@@ -110,7 +110,12 @@ Hosts are remembered in `UserDefaults`, and there is no credential among them:
 good answer. Only what the *user* added is written — hosts injected by
 `ILLOGICAL_HOSTS` are deliberately not, so a session started with that variable
 does not quietly make them permanent the first time you add or forget anything
-else.
+else. The front session above obeys the same rule, for a sharper reason: a
+window standing on an injected host — or on the throwaway daemon
+`ILLOGICAL_SOCK` names, which is how `scripts/bench-launch.sh`,
+`bench-attach.sh` and `bench-remote.sh` launch the shipped app — would write a
+machine that is not in the list next launch, so the restore is dropped and the
+session you were *really* last in is gone with it.
 
 **One unreachable machine is not a broken window.** A failed host is a marker in
 the dropdown with `ssh`'s own complaint behind it and a button to try again; the
@@ -159,9 +164,13 @@ through the responder chain, so the terminal gets first refusal without
 fighting the standard Close Window item for the chord. The window closes only
 when that terminal was the last one in it — the condition is
 `tabs.count > 1 || tab.isSplit`, and it counts *every* tab the window holds,
-not the strip's. A window whose front session shows one tab may be holding
-tabs on another session, and closing it would take those with it; the selection
-moves to them instead (issue #41).
+not the strip's. A window whose front session shows one tab may be holding tabs
+elsewhere, and closing it would take those with it (issue #41) — so the window
+stays, and where the selection goes depends on where they are. On another
+session of the machine you are on, it moves to them. On another *machine*, it
+does not: you are left standing on the machine you were on with an empty strip,
+because stealing a tab would move the toolbar, the strip and the next ⌘T
+somewhere nobody asked to go.
 
 The policy is `SessionStore.closeSurfacePane` and not the delegate method over
 it, so "does ⌘W close the window" is a question a test can ask without a window.
