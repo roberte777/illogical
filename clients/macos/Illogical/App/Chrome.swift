@@ -238,9 +238,10 @@ struct SessionButton: View {
         // the button moved the window and *then* opened the menu on the
         // mouse-up. See `WindowChrome`.
         .claimsMouseDown()
-        // Written the way the menu item draws it. It was ⌘⇧K here and bound to
-        // nothing at all until the View menu's "Change Session" landed, then
-        // ⇧⌘K until that item moved to the unshifted chord.
+        // Written the way the menu item draws it, which is the order macOS
+        // orders modifiers in — the reason this said ⌘⇧K, in the wrong order
+        // and bound to nothing at all, until the View menu's "Change Session"
+        // landed. One modifier now, so there is no order left to get wrong.
         .help("Change Session (⌘K)")
     }
 }
