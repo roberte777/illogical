@@ -1341,7 +1341,7 @@ known 12pt, which fixes the scale at 4:3, and then:
 
 | | reference | ours |
 |---|---|---|
-| toolbar height | 52px | 39pt |
+| toolbar height | 52px | 40pt |
 | bezel, left / right / bottom | 8px | 6pt |
 | bezel, top | 0 | 0 |
 | card corner radius | 13px | 10pt |

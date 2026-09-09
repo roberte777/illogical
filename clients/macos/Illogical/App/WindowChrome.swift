@@ -146,6 +146,32 @@ struct WindowChrome<Toolbar: View>: NSViewRepresentable {
             return
         }
 
+        // An empty toolbar, for its *height* and nothing else.
+        //
+        // A `.top` accessory is placed inside `NSTitlebarView`, and that view is
+        // a fixed 32pt on a plain window. AppKit hands the accessory to an
+        // `NSTitlebarAccessoryClipView` sized to the titlebar and resizes the
+        // hosted view down to fit, so `Metrics.toolbarHeight` was being asked
+        // for and quietly clipped: the strip drew 32pt of its 39 and the tab
+        // pill sat a point and a half under the top of the window with two
+        // points below it, where the reference gives it five and six. The
+        // SwiftUI side was never wrong — `NSHostingView.intrinsicContentSize`
+        // reported the full 39 throughout.
+        //
+        // Attaching a toolbar in `.unifiedCompact` makes that band 40pt, and
+        // the accessory then gets all of it. The reference is built the same
+        // way, which is checkable rather than assumed: a unified titlebar
+        // shifts the traffic lights right by 3pt, and the reference's first
+        // light sits 20.0pt from the window's left edge where a plain titlebar
+        // puts it at 16.0 and this puts it at 19.0.
+        //
+        // No items and no delegate, so it contributes nothing to draw. The
+        // accessory covers the full width and paints `Palette.toolbar` over it.
+        let spacer = NSToolbar(identifier: "illogical.titlebar-height")
+        spacer.allowsUserCustomization = false
+        window.toolbar = spacer
+        window.toolbarStyle = .unifiedCompact
+
         let hosting = NSHostingView(rootView: toolbar())
         hosting.frame = NSRect(x: 0, y: 0, width: window.frame.width, height: toolbarHeight)
         hosting.autoresizingMask = [.width]

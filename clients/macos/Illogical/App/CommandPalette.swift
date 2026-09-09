@@ -2,9 +2,9 @@
 //  ⇧⌘P: everything the app can do, searchable, in one panel.
 //
 //      ┌────────────────────────────────────────────────┐
-//      │ ⌕  Search commands...                          │  field, 36pt
+//      │ ⌕  Search commands...                          │  field, 25pt
 //      │                                                │
-//      │    Change Session             drifting-cedar › │  36pt rows
+//      │    Change Session             drifting-cedar › │  25pt rows
 //      │    Rename Session…            drifting-cedar › │
 //      │ ⇄  Switch Host                       build-box │
 //      │ ⊕  Add Remote Host…                          › │
@@ -33,39 +33,42 @@
 //  which is the whole argument for it over a second panel: there is nowhere
 //  else to look and nothing else to dismiss.
 //
-//  Geometry: 440pt wide, rows 36pt at 15pt type, sixteen of them before it
-//  scrolls — fewer in a window too short to hold sixteen — hanging 36pt under
-//  the toolbar and centred in the window.
+//  Geometry: 290pt wide, rows 25pt at 13pt type, hanging 30pt under the toolbar
+//  and centred in the window. Every one of those is the reference's own number,
+//  not a proportion of it — see below for why that distinction cost four
+//  rounds.
 //
-//  Those numbers were 352 and 22 first, out of `MenuMetrics`, on the reasoning
-//  that this panel and the dropdown are the same kind of surface — so it took
-//  the dropdown's row and a width guessed as a multiple of the dropdown's. The
-//  result was both too wide and too tight, and the tell was a ratio rather than
-//  a measurement: width over row height is about 11.7 in the reference, was
-//  16.0 here, and is 12.2 now. Only the ratio was worth reading, because the
-//  reference is a photograph of a screen and carries no scale of its own —
-//  until something in the frame supplies one. The traffic lights do: their
-//  centres are 20pt apart on every Mac, they measure about 24px there, and at
-//  the 1.2px/pt that gives, the reference's window is about 1042pt wide and its
-//  palette about 295.
+//  The reference is a photograph of a screen, so it carries no scale of its
+//  own until something in the frame supplies one. The traffic lights do: their
+//  centres are 20pt apart on every Mac and measure 24.5px there, giving
+//  **1.225 px/pt**, confirmed by their diameters coming back at ~12pt as they
+//  must. The photograph is also verifiably rectilinear — the window's top edge
+//  holds y=24 from x=200 to x=1200, flat to under a pixel, which no rotation,
+//  keystone or lens distortion could leave alone. So the frame can be measured
+//  across, not just locally, and these came out of it: highlight 342px, row
+//  pitch 30.0px, cap height 11.5px, panel ~357px counting its padding.
 //
-//  Which is the second correction, and the one these numbers come from. 340 x
-//  29 held the ratio and landed within fifty points of the reference's own
-//  width, and it still read as too small — because a palette is judged as a
-//  fraction of the window it is centred in, and the two windows are not the
-//  same window. 295pt of 1042 is 28% of it; 340pt of the 1709pt window this was
-//  looked at in is 20% of that. Matching the fraction outright would mean 484,
-//  which is a third of the way across a wide window and starts to read as a
-//  dialog rather than as a palette, so the width stops at 440 — and the row and
-//  the type come up with it, because holding 12.2 is the whole of what the
-//  reference had to say and 440 over a 29pt row would be 15.2, the shape of the
-//  first wrong attempt again.
+//  What went wrong before is worth keeping, because it was not an arithmetic
+//  error. The panel was first built out of `MenuMetrics` at 352×22 — ratio
+//  16.0 against the reference's 11.7 — and correcting *that* gave 340×29,
+//  which held the ratio to within a fifth of a percent and was within fifty
+//  points of the reference's actual width. It was right, and it was reported
+//  as too small, so it was scaled to 440×36 and then aimed at 422×36 at 19pt
+//  type, each step holding the proportions and drifting further from the size.
 //
-//  So the panel keeps `MenuMetrics`'s padding and corner radii — a person sees
-//  the two surfaces a second apart and they should be cut from the same cloth —
-//  but its width, its row and its type are its own. The dropdown is a list of
-//  names; this is a list of sentences with a chord or a value after them, and
-//  it needs both the air and the extra point of type.
+//  The premise under all of that was that the reference is a fullscreen app,
+//  so the palette should occupy the same *fraction* of the window. It is not:
+//  its window measures 1025pt with desktop visible on three sides, which is
+//  smaller than the window this was being compared in. The palette reads large
+//  there because the window is small. A fixed-width panel cannot hold a
+//  fraction anyway — the same 440 was 25% of one window and 33% of the same
+//  window resized — so the fraction was never a property of the palette to
+//  copy. The absolute size is.
+//
+//  The panel still takes `MenuMetrics`'s padding and corner radii, because a
+//  person sees the two surfaces a second apart and they should be cut from the
+//  same cloth. Only the width, the row and the leading inset are its own, and
+//  each is measured rather than derived.
 //
 //  Icons are inline in both lists: a row without one starts its title at the
 //  text inset, and a row with one is pushed right. No glyph in either list ever
@@ -98,33 +101,31 @@ extension Palette {
 }
 
 enum PaletteMetrics {
-    /// Proportioned off the reference rather than derived from the dropdown,
-    /// and then sized against the window rather than off the reference — the
-    /// file header sets out both corrections. 440 is 26% of the 1709pt window
-    /// it was looked at in, against the reference's 28%, and deliberately short
-    /// of the 484 that would match that exactly.
+    /// The reference's own width, measured rather than proportioned: its
+    /// highlight is 342px and its scroller ends at 834, which with the panel's
+    /// padding puts the panel at ~357px, or 290 at 1.225px/pt.
     ///
-    /// Wider than the dropdown whatever the reference said, because these rows
-    /// carry two things — a title, and either the value it acts on or the chord
-    /// that reaches it.
-    static let width: CGFloat = 440
+    /// Still wider than the dropdown's 220, because these rows carry two things
+    /// — a title, and either the value it acts on or the chord that reaches
+    /// it — where a dropdown row carries a session name.
+    static let width: CGFloat = 290
 
     /// Taller than `MenuMetrics.rowHeight`'s 22, and deliberately not it. The
     /// dropdown's row holds a session name; this one holds a sentence with a
     /// chord after it, and at 22 the two columns read as one crowded line.
     ///
-    /// 36 rather than 29 because the width moved and the row is tied to it:
-    /// width over row height is the one proportion a photograph of a screen can
-    /// be asked for, it is about 11.7 in the reference, and 440 over a 29pt row
-    /// would be 15.2 — within a point of the 16.0 that was wrong the first time.
-    static let rowHeight: CGFloat = 36
+    /// 25 is the reference's row pitch — baselines 30.0px apart at 1.225px/pt.
+    /// Its highlight is shorter than that again, 27px against the 30, so the
+    /// fill is inset a point or so top and bottom where ours fills the row.
+    /// Left alone: the fill only ever abuts another fill when two rows are
+    /// selected at once, and only one ever is.
+    static let rowHeight: CGFloat = 25
 
-    /// Two points larger than `MenuMetrics.font`'s 13, and for the same reason
-    /// the row is taller: this panel is read, where the dropdown is scanned
-    /// for a name you already know. Scaling the type with the panel is what
-    /// keeps 440 from being merely a wider 340 — a panel drawn bigger at the
-    /// same type size is not bigger, it is emptier.
-    static let font: CGFloat = 15
+    /// The same 13 the dropdown sets, and measured to be so rather than
+    /// inherited: the reference's cap height is 11.5px, which at 1.225px/pt and
+    /// SF Pro's 0.73 cap ratio is 12.8pt of type. The ratio was checked against
+    /// this app at a known size before it was trusted on a photograph.
+    static let font: CGFloat = 13
 
     /// How far under the toolbar the panel hangs.
     ///
@@ -134,11 +135,9 @@ enum PaletteMetrics {
     /// pane header rather than tucked behind it, so the top of the window
     /// still reads as the window's.
     ///
-    /// 36 rather than 32 for the reason the row moved: a gap is read against
-    /// the thing it holds off, so it grew with the panel to stay the same gap.
-    /// It is also the margin kept at the *bottom* of the window, where it is
-    /// what stops a clamped panel looking cut off — see `listHeight(rows:in:)`.
-    static let topInset: CGFloat = 36
+    /// 30 because that is where the reference puts it: its panel starts about
+    /// 36px below the toolbar's lower edge, which is 29.4pt.
+    static let topInset: CGFloat = 30
 
     /// The field matches a row, so the panel has one vertical rhythm from the
     /// top down — the same rule `MenuMetrics.fieldHeight` follows, applied to
@@ -174,23 +173,26 @@ enum PaletteMetrics {
     /// off-centre in its own panel looks like a mistake even when nobody can
     /// say why. The fill spans the row; only what it contains stops short.
     ///
-    /// Twelve rather than ten now the row is 36pt, and the two extra points are
-    /// air rather than lane: the scroller in it is the system's and is the same
-    /// width whatever this panel does. They moved for the reason `rowLeading`
-    /// gained two — a taller row wearing the old insets reads as pinched at
-    /// both ends.
-    static let scrollGutter: CGFloat = 12
+    /// Ten, and not scaled with anything: the scroller in it is the system's
+    /// and is a fixed physical width whatever this panel does. The reference's
+    /// is 7px — 5.7pt — so ten is that plus a little air, which is what the
+    /// lane is for.
+    static let scrollGutter: CGFloat = 10
 
     /// The row's left inset, wider than `MenuMetrics.rowPadding`'s 7.
     ///
     /// The dropdown can be tight against its edge because its rows are short
     /// names; here a title starts a sentence, and at 7 it began hard against
     /// the highlight's own corner radius — the fill's curve and the first
-    /// letter fighting for the same few points. Fourteen rather than twelve
-    /// since the row grew: the corner radius is unchanged, but there is more
-    /// fill above and below the text to be framed by, and the sides have to
-    /// keep up with it.
-    static let rowLeading: CGFloat = 14
+    /// letter fighting for the same few points.
+    ///
+    /// The reference measures 8.2pt from the highlight's edge to the first ink
+    /// of the title, and a glyph carries a little left side bearing ahead of
+    /// its ink, so the true inset there is nearer 8. Nine rather than eight
+    /// because 7 was looked at and rejected, and a point the other side of the
+    /// measurement is worth more than a point of false precision on a
+    /// photograph.
+    static let rowLeading: CGFloat = 9
 
     /// Everything in the panel that is not the list: the padding above and
     /// below it, the field, and the gap under the field. Written down because
@@ -243,18 +245,18 @@ enum PaletteMetrics {
     /// because it sits flush against the field's left inset and a capsule's
     /// end-cap would leave a crescent of field colour inside the corner.
     ///
-    /// Its type is a point under the row's, and stays a point under it now the
-    /// row's is 15: the chip says what the field has become, and set at `font`
-    /// it would carry the same weight as the answer being typed beside it.
+    /// Its type is two points under the row's: the chip says what the field has
+    /// become, and set at `font` it would carry the same weight as the answer
+    /// being typed beside it.
     static let chipCorner: CGFloat = 5
-    static let chipFont: CGFloat = 13
+    static let chipFont: CGFloat = 11
     static let chipPadding: CGFloat = 6
 
     /// The one line a free-text stage two draws under its hairline. Smaller
     /// than a row: it is a label, not something to click — the same rule
     /// `MenuMetrics.headerFont` follows, and the same size the chip is set at,
     /// so the two things in the panel that are not rows agree with each other.
-    static let hintFont: CGFloat = 13
+    static let hintFont: CGFloat = 11
 }
 
 struct CommandPalette: View {
@@ -445,7 +447,7 @@ struct CommandPalette: View {
                 // against 14pt text and the field's type is 15 now, and a
                 // magnifier that stays behind is not smaller, it is faint.
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12))
+                    .font(.system(size: 11))
                     .foregroundStyle(Palette.menuShortcut)
             }
 
@@ -748,7 +750,7 @@ private struct PaletteRow: View {
                 // it, where widening the column would push every title with an
                 // icon away from every title without one.
                 Image(systemName: icon)
-                    .font(.system(size: 12))
+                    .font(.system(size: 11))
                     .frame(width: MenuMetrics.iconColumn, alignment: .center)
 
                 Spacer().frame(width: MenuMetrics.iconToTitle)
@@ -772,7 +774,7 @@ private struct PaletteRow: View {
             // sized for 14pt type reads as tentative next to 15.
             if let trailingIcon {
                 Image(systemName: trailingIcon)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(trailingColor)
             }
 
@@ -784,7 +786,7 @@ private struct PaletteRow: View {
             // hard to see.
             if chevron {
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(trailingColor)
                     .padding(.leading, 6)
             }

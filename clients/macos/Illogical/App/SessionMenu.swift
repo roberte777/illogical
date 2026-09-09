@@ -32,7 +32,7 @@
 //  the window, and it uses the app's own palette. So it is an in-window overlay
 //  anchored to the session button's leading edge, just below the toolbar.
 //
-//  Geometry measured from the reference at 1.256 px/pt (toolbar = 39pt):
+//  Geometry measured from the reference at 1.256 px/pt (toolbar = 40pt):
 //  panel ~125pt tall at x=80, corner radius 10, 4pt padding; icon column at 11pt
 //  from the panel edge, titles at 33pt; hover fill #5C9DF9 with dark text.
 //

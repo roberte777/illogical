@@ -12,7 +12,7 @@
 //  more than either can explain away. See the note on the constant.
 //
 //      ┌──────────────────────────────────────────────────────────────┐
-//      │ ● ● ●  ▤ Demo │ ▣ ~> btop │ ▣ ~> htop │(▣ ~/…> nvim)      +  │ 39pt
+//      │ ● ● ●  ▤ Demo │ ▣ ~> btop │ ▣ ~> htop │(▣ ~/…> nvim)      +  │ 40pt
 //      ├──────────────────────────────────────────────────────────────┤ 1px
 //      │ ▢ ~/Documents/ghostty> nvim                                  │ 27pt
 //      │                                                              │
@@ -62,7 +62,16 @@ extension View {
 /// So: tab slots are a fixed ~197pt, laid out edge to edge, with a 1pt hairline
 /// drawn on the boundary between two inactive tabs.
 enum Metrics {
-    static let toolbarHeight: CGFloat = 39
+    /// 40, and the band really is 40 now.
+    ///
+    /// It was 39 and drew 32. A `.top` titlebar accessory lives inside
+    /// `NSTitlebarView`, which is a fixed 32pt on a plain window, so seven
+    /// points were being clipped off every frame — see `WindowChrome`, which
+    /// now attaches a `.unifiedCompact` toolbar to make that band 40 and says
+    /// how the reference was shown to be built the same way. 40 rather than 39
+    /// because the band is 40 exactly and a 39pt strip inside it would leave a
+    /// half-point of window background top and bottom.
+    static let toolbarHeight: CGFloat = 40
 
     static let breadcrumbHeight: CGFloat = 27
 
@@ -92,12 +101,12 @@ enum Metrics {
     /// bar, so the likeliest reading is not that one of them is wrong: it is
     /// that the pill grew. Parity is being judged against the newer one.
     ///
-    /// The same pass is why `toolbarHeight` did *not* move. It is 39 from the
-    /// recording, the photograph puts its toolbar at 48px — 39.2 — and the two
-    /// agree to within a rounding, so a detour through 44 was measured wrong
-    /// and reverted. The chrome was never small. A window 64% wider than the
-    /// reference's makes all of it read that way, and `PaletteMetrics.width`
-    /// carries the same story and what was done about it there.
+    /// The same pass settled `toolbarHeight` too, though not the way it looked
+    /// at the time. Both sources agree the band is about 39 — the recording
+    /// said so and the photograph puts it at 48px, or 39.2 — so a detour
+    /// through 44 was reverted as unfounded. What neither source could show is
+    /// that the band was *drawing* 32: see `toolbarHeight`, where the seven
+    /// points were going, and why the constant is 40 now.
     static let tabHeight: CGFloat = 29
 
     /// Half the tab's height, so the pill's ends are true semicircles. 13 was a
@@ -115,7 +124,12 @@ enum Metrics {
     /// coordinate space from `contentInset`: AppKit already offsets the
     /// accessory past the traffic lights, so this only adds the remainder
     /// needed to land the session icon at 90.7pt in the window.
-    static let toolbarLeading: CGFloat = 3
+    ///
+    /// That remainder is now zero. A unified titlebar moves the lights right by
+    /// 3pt and the accessory's own inset with them — measured at 78 before and
+    /// 81 after, and 81 is already `contentInset`. Left at 3 this would be 3pt
+    /// of drift rather than 3pt of padding.
+    static let toolbarLeading: CGFloat = 0
     static let sessionPadding: CGFloat = 8
     /// Gap between the session button and the first tab slot.
     static let sessionToTabs: CGFloat = 6
