@@ -365,6 +365,16 @@ struct SessionMenu: View {
         } else {
             // A session with no tabs is one whose terminals have all gone.
             // Making one is what "switch to it" means.
+            //
+            // The move comes first, and it is not redundant with the create.
+            // `createTerminal` sends through `try?`, so on a machine whose
+            // control connection has dropped this whole branch was: no tab, no
+            // host change, no error — the toolbar went on naming the machine
+            // you had left, and `currentHostError`, the one screen that would
+            // have said why, is only ever reached by *being* on that machine.
+            // "Go to that machine, even with nothing on it" is exactly what
+            // `switchHost` exists for, so this path goes through it too.
+            store.switchHost(host.host)
             store.createTerminal(sessionName: session.name, on: host.host)
         }
         isPresented = false

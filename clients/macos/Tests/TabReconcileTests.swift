@@ -382,30 +382,11 @@ final class TabReconcileTests: XCTestCase {
         XCTAssertEqual(store.connectionError, "No illogicald")
     }
 
-    /// A new terminal goes to the machine the window is on, and a machine that
-    /// cannot make one says so.
-    ///
-    /// This used to assert the opposite: ⌘T went to "the first host that is
-    /// connected", because `createTerminal` sends through `try?` and a ⌘T at a
-    /// dead local daemon did nothing at all, silently. That answered a real
-    /// problem in the one way nobody can follow — the terminal appeared on a
-    /// machine nothing on screen named. The reason is on screen now instead.
-    func testANewTerminalFollowsTheCurrentHostRatherThanWhoIsConnected() {
-        let store = emptyStore([Self.local, Self.remote])
-        store.host(Self.local)?.setStatusForTesting(.failed("No illogicald"))
-        store.host(Self.remote)?.setStatusForTesting(.connected)
-
-        XCTAssertEqual(store.current?.host, Self.local, "⌘T was quietly rerouted")
-        XCTAssertEqual(
-            store.currentHostError, "No illogicald",
-            "a machine that cannot make a terminal said nothing about why")
-
-        // And going to the working one is a thing the user does, not a thing
-        // the store does behind them.
-        store.switchHost(Self.remote)
-        XCTAssertEqual(store.current?.host, Self.remote)
-        XCTAssertNil(store.currentHostError)
-    }
+    // ⌘T's routing used to be asserted here, as `current?.host` and
+    // `currentHostError` on a store that never made a terminal — so putting the
+    // reroute back inside `createTerminal` left it green. It has moved to
+    // `CurrentHostTests`, where the socket-backed harness that can see which
+    // machine a `create` actually left by already lives.
 
     /// Persistence round-trips, and `ILLOGICAL_HOSTS` entries are not written.
     func testOnlyUserAddedHostsAreRemembered() throws {

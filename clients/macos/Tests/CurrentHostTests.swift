@@ -59,13 +59,35 @@ final class CurrentHostTests: XCTestCase {
     /// and calls `onListChanged` on the next line, and the launch restore waits
     /// on exactly that — so a helper that only assigned the arrays would be
     /// driving a state the wire cannot produce.
-    private func list(_ store: SessionStore, host: ServerHost = local, _ sessions: [Listing]) {
+    ///
+    /// `terminalOrder` names the terminals in the order the host reports them,
+    /// and it is what lets a fixture tell "the host's first *session*" from
+    /// "the host's first *tab*". `reconcileTabs` appends tabs in
+    /// `host.terminals` order, so with the default — every session's terminals,
+    /// in session order — the two answers always agree, and an assertion meant
+    /// to pin a lookup by session passes just as well under code that took the
+    /// first tab it saw. Two of the tests below were exactly that.
+    private func list(
+        _ store: SessionStore, host: ServerHost = local, _ sessions: [Listing],
+        terminalOrder: [UInt64]? = nil
+    ) {
         guard let connection = store.host(host) else { return XCTFail("no such host") }
         connection.sessions = sessions.map {
             SessionSummary(id: $0.id, name: $0.name, terminals: $0.terminals)
         }
-        connection.terminals = sessions.flatMap { session in
+        let listed = sessions.flatMap { session in
             session.terminals.map { terminal($0, session: session.id) }
+        }
+        if let terminalOrder {
+            // Reordered, never re-invented: a fixture that named a terminal no
+            // session holds would be driving a list the wire cannot produce,
+            // and the reconcile would answer it perfectly reasonably.
+            connection.terminals = terminalOrder.compactMap { id in listed.first { $0.id == id } }
+            XCTAssertEqual(
+                connection.terminals.count, listed.count,
+                "terminalOrder does not name exactly the terminals the sessions hold")
+        } else {
+            connection.terminals = listed
         }
         connection.setStatusForTesting(.connected)
         store.reconcileTabs()
@@ -136,15 +158,23 @@ final class CurrentHostTests: XCTestCase {
 
     /// A machine this window has never been on has no memory to honour, so it
     /// opens on the first session the machine lists.
+    ///
+    /// The first *session*, which is only a different answer from "the first
+    /// tab" when the host lists its terminals in some other order — so it does
+    /// here. Session `a` is the one to land in; the tab that happens to be
+    /// first belongs to `b`, which is where `switchHost` with its
+    /// `?? connection.sessions.first` deleted lands instead.
     func testSwitchHostFallsBackToTheFirstSession() throws {
         let store = emptyStore([Self.local, Self.remote])
         list(store, [(1, "here", [1])])
-        list(store, host: Self.remote, [(1, "a", [1]), (2, "b", [2])])
+        list(store, host: Self.remote, [(1, "a", [1]), (2, "b", [2])], terminalOrder: [2, 1])
         store.selectedTabID = try tab(store, 1).id
 
         store.switchHost(Self.remote)
 
-        XCTAssertEqual(store.selectedTabID, try tab(store, 1, on: Self.remote).id)
+        XCTAssertEqual(
+            store.selectedTabID, try tab(store, 1, on: Self.remote).id,
+            "it took the machine's first tab rather than its first session")
         XCTAssertEqual(store.selectedSession?.session, 1)
     }
 
@@ -261,7 +291,17 @@ final class CurrentHostTests: XCTestCase {
         let store = emptyStore([Self.local, Self.remote], defaults: defaults)
 
         XCTAssertEqual(store.currentHost, Self.remote)
-        XCTAssertNil(store.selectedTabID)
+
+        // And the local daemon answering — a unix socket against an ssh
+        // handshake is not a close race — does not become the window. Without
+        // a list here there are no tabs at all, so the two assertions below
+        // hold under every implementation there is, including the one this test
+        // exists to refuse: the tab that appears is exactly what a window that
+        // had opened on the local machine would now be showing.
+        list(store, [(1, "here", [1])])
+
+        XCTAssertEqual(store.currentHost, Self.remote)
+        XCTAssertNil(store.selectedTabID, "the window opened on whichever machine answered first")
         XCTAssertTrue(store.visibleTabs.isEmpty)
     }
 
@@ -284,14 +324,23 @@ final class CurrentHostTests: XCTestCase {
     /// window: the machine is up and has work on it, so the restore gives up
     /// and takes the first session, which is where a launch with no memory at
     /// all would have gone.
+    ///
+    /// Two sessions, listed terminals-last-first, so that "the host's first
+    /// session" and "whatever tab the reconcile appended first" are different
+    /// tabs. With one session — or with the terminals in session order — this
+    /// passes with the whole restore block deleted, since `repairSelection`
+    /// reaches the same tab on its own.
     func testARestoreNamingAGoneSessionFallsBackToTheHostsFirst() throws {
         let defaults = InMemoryDefaults()
         FrontSessionStore.save(FrontSession(host: Self.local, name: "work"), to: defaults)
         let store = emptyStore(defaults: defaults)
 
-        list(store, [(3, "scratch", [1])])
+        list(store, [(3, "scratch", [1]), (5, "spare", [2])], terminalOrder: [2, 1])
 
-        XCTAssertEqual(store.selectedTabID, try tab(store, 1).id)
+        XCTAssertEqual(
+            store.selectedTabID, try tab(store, 1).id,
+            "the restore took the first tab rather than the machine's first session")
+        XCTAssertEqual(store.selectedSession?.session, 3)
     }
 
     /// Anything the person selects first wins, and wins permanently. The
@@ -486,5 +535,213 @@ final class CurrentHostTests: XCTestCase {
         XCTAssertTrue(
             here.frames(.create).isEmpty,
             "the session was made on the machine the window had left")
+    }
+
+    /// ⌘T follows the machine the window is on, and a machine that cannot make
+    /// a terminal says why rather than having its work done elsewhere.
+    ///
+    /// This used to assert the opposite: ⌘T went to "the first host that is
+    /// connected", because `createTerminal` sends through `try?` and a ⌘T at a
+    /// dead local daemon did nothing at all, silently. That answered a real
+    /// problem in the one way nobody can follow — the terminal appeared on a
+    /// machine nothing on screen named. The reason is on screen now instead.
+    ///
+    /// Socket-backed, and it lives here rather than in `TabReconcileTests` for
+    /// that reason: the version there asserted `current?.host` and
+    /// `currentHostError` and never made a terminal, so the reroute could have
+    /// been put straight back inside `createTerminal` without reddening it.
+    /// Which socket the frame left by is the only evidence there is.
+    func testANewTerminalFollowsTheCurrentHostRatherThanWhoIsConnected() async throws {
+        let here = try RecordingServer()
+        let there = try RecordingServer()
+        defer {
+            here.stop()
+            there.stop()
+        }
+        let (store, hosts) = try await connected([here, there])
+        defer { for host in hosts { host.disconnect() } }
+
+        // The machine the window is on has fallen over and the other one is
+        // fine, so "the first host that is connected" is the *other* one. The
+        // sockets stay open underneath, which is what lets this tell a refusal
+        // from a reroute: a create really would arrive if one were sent.
+        hosts[0].setStatusForTesting(.failed("No illogicald"))
+        hosts[1].setStatusForTesting(.connected)
+
+        XCTAssertEqual(store.current?.host, hosts[0].host, "⌘T was quietly rerouted")
+        XCTAssertEqual(
+            store.currentHostError, "No illogicald",
+            "a machine that cannot make a terminal said nothing about why")
+
+        store.createTerminal()
+
+        try await waitFor("the create") { !here.frames(.create).isEmpty }
+        XCTAssertTrue(
+            there.frames(.create).isEmpty,
+            "⌘T went to whichever machine happened to be connected")
+
+        // And going to the working one is a thing the user does, not a thing
+        // the store does behind them — after which ⌘T goes there and nowhere
+        // else.
+        store.switchHost(hosts[1].host)
+        XCTAssertEqual(store.current?.host, hosts[1].host)
+        XCTAssertNil(store.currentHostError)
+
+        store.createTerminal()
+        try await waitFor("the second create") { !there.frames(.create).isEmpty }
+        XCTAssertEqual(here.frames(.create).count, 1, "the switch did not move ⌘T")
+    }
+
+    /// An `on:` naming a machine that is not in the list is refused, not sent
+    /// somewhere else. The dropdown's rows and ＋ buttons all carry a host, and
+    /// a host can be forgotten between the panel being drawn and a row being
+    /// clicked — under `?? current` that made a terminal on whatever machine
+    /// the window happened to be on, which is worse than the button doing
+    /// nothing.
+    func testACreateForAHostThatIsGoneIsRefusedRatherThanRerouted() async throws {
+        let here = try RecordingServer()
+        defer { here.stop() }
+        let (store, hosts) = try await connected([here])
+        defer { for host in hosts { host.disconnect() } }
+
+        store.createTerminal(sessionName: "work", on: Self.remote)
+
+        // Nothing arrives, and the way to be sure of that is to send something
+        // that must: a frame the store *does* route proves the socket was
+        // listening all along.
+        store.createTerminal(sessionName: "real")
+        try await waitFor("the create") { !here.frames(.create).isEmpty }
+        XCTAssertEqual(
+            try createdNames(here), ["real"],
+            "a create for a machine that is not here was rerouted to the one that is")
+    }
+
+    // MARK: - What is remembered, and what is not this window's to remember
+
+    /// A remembered machine that is not in this window's list is not somewhere
+    /// to open on. Forget a host and relaunch, or launch with `ILLOGICAL_HOSTS`
+    /// once and not the next time, and the blob names a machine that has no
+    /// `HostConnection` — so `currentHost` would name a host `current` can
+    /// never resolve. `current` nil for the life of the window: ⌘T does
+    /// nothing, the strip is empty, and `currentHostError` cannot say why
+    /// because it reads `current` too.
+    func testARememberedMachineThatIsGoneIsNotOpenedOn() {
+        let defaults = InMemoryDefaults()
+        FrontSessionStore.save(FrontSession(host: Self.remote, name: "work"), to: defaults)
+
+        let store = emptyStore([Self.local], defaults: defaults)
+
+        XCTAssertEqual(store.currentHost, Self.local)
+        XCTAssertNotNil(
+            store.current, "the window opened on a machine it has no connection to")
+    }
+
+    /// The front session obeys the host list's provenance rule, because it is
+    /// the same `UserDefaults`. A window handed its machines by the environment
+    /// writes a blob naming one that will not be in the list next launch — so
+    /// `init` drops it, and the session the person was really last in is gone
+    /// with it. `scripts/bench-remote.sh` launches the shipped bundle with
+    /// `ILLOGICAL_HOSTS`, and it, `bench-launch.sh` and `bench-attach.sh`
+    /// launch it with `ILLOGICAL_SOCK`; all of them write to the developer's
+    /// real defaults, since only the tests get a `HostDefaults` of their own.
+    ///
+    /// Driven through the parameterized form for the reason
+    /// `hostsToRemember(injected:)` has one: both signals come from
+    /// `ProcessInfo`, which cannot be changed underneath a running process.
+    func testAnInjectedMachineIsNotRememberedAsTheFrontSession() {
+        let defaults = InMemoryDefaults()
+        let store = emptyStore([Self.local, Self.remote], defaults: defaults)
+
+        store.rememberFront(
+            FrontSession(host: Self.remote, name: "work"), injected: [Self.remote],
+            socketInjected: false)
+        XCTAssertNil(
+            FrontSessionStore.load(defaults),
+            "an ILLOGICAL_HOSTS machine overwrote the remembered front session")
+
+        // The local half is the same rule through the other injection point:
+        // the local daemon is never on disk, so "is it saved" has no answer for
+        // it and "did the environment name it" is the same question.
+        store.rememberFront(
+            FrontSession(host: Self.local, name: "here"), injected: [], socketInjected: true)
+        XCTAssertNil(
+            FrontSessionStore.load(defaults), "an ILLOGICAL_SOCK window wrote a front session")
+
+        // And a machine somebody actually added is written, injected list or
+        // not — the union clause `hostsToRemember` already has.
+        RemoteHostStore.save([Self.remote], to: defaults)
+        store.rememberFront(
+            FrontSession(host: Self.remote, name: "work"), injected: [Self.remote],
+            socketInjected: false)
+        XCTAssertEqual(
+            FrontSessionStore.load(defaults), FrontSession(host: Self.remote, name: "work"))
+    }
+
+    /// The remembered session is checked at use rather than trusted. It is
+    /// never pruned — walking it on every list from every host would save
+    /// nothing anybody can measure — so an entry outlives the session it names
+    /// whenever another window deletes one while you are elsewhere.
+    ///
+    /// Both readers. Coming back to the machine must land on its first session
+    /// rather than on whatever tab happens to be first, and with no tabs at all
+    /// `selectedSession` must be nil: a stale ref there is what the session
+    /// button draws its name from, and it is what leaves File ▸ Rename
+    /// Session… enabled for a session that is not there, whose only effect when
+    /// chosen is `requestRenameSession`'s guard refusing it silently.
+    func testARememberedSessionThatWasDeletedIsNotComeBackTo() throws {
+        let store = emptyStore([Self.local, Self.remote])
+        list(store, [(1, "here", [1])])
+        // Listed newest-tab-first, so that "the machine's first session" and
+        // "the machine's first tab" are two different answers.
+        list(
+            store, host: Self.remote, [(1, "a", [1]), (2, "b", [2]), (3, "c", [3])],
+            terminalOrder: [3, 2, 1])
+
+        store.selectedTabID = try tab(store, 2, on: Self.remote).id
+        store.switchHost(Self.local)
+
+        // Another window deletes `b` while we are on the local machine.
+        list(store, host: Self.remote, [(1, "a", [1]), (3, "c", [3])], terminalOrder: [3, 1])
+
+        store.switchHost(Self.remote)
+
+        XCTAssertEqual(
+            store.selectedSession?.session, 1,
+            "it came back to a deleted session, so the repair fell through to a tab")
+        XCTAssertEqual(store.selectedTabID, try tab(store, 1, on: Self.remote).id)
+
+        // ...and with the machine emptied entirely there is no session to name,
+        // rather than the last one it remembers.
+        list(store, host: Self.remote, [])
+        XCTAssertNil(
+            store.selectedSession, "the session button named a session the machine no longer has")
+        XCTAssertNil(store.selectedSessionSummary)
+    }
+
+    /// A machine still dialling says nothing. `.connecting` is where every
+    /// `HostConnection` starts and where the whole launch restore sits — the
+    /// window opens on the remembered machine and shows its empty screen for
+    /// the length of an ssh handshake, which behind 2FA is a long time — so a
+    /// message here is a failure flashed at somebody on every launch.
+    /// `currentHostError` is pinned for `.reconnecting`, `.connected` and
+    /// `.failed`; this is the state all three are measured against.
+    func testACurrentHostStillDiallingSaysNothingYet() {
+        let defaults = InMemoryDefaults()
+        FrontSessionStore.save(FrontSession(host: Self.remote, name: "work"), to: defaults)
+        let store = emptyStore([Self.local, Self.remote], defaults: defaults)
+
+        XCTAssertEqual(store.currentHost, Self.remote)
+        XCTAssertEqual(store.host(Self.remote)?.status, .connecting)
+        XCTAssertNil(store.currentHostError, "a handshake was reported as a failure")
+
+        // Still nothing once the local daemon has answered and the window is
+        // still standing on the machine that has not.
+        list(store, [(1, "here", [1])])
+        XCTAssertNil(store.currentHostError)
+        XCTAssertNil(store.connectionError)
+
+        // Only a machine that has actually gone wrong says so.
+        store.host(Self.remote)?.setStatusForTesting(.failed("build-box: Connection refused"))
+        XCTAssertEqual(store.currentHostError, "build-box: Connection refused")
     }
 }
