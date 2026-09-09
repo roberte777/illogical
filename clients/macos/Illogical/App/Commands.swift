@@ -260,10 +260,13 @@ enum Commands {
             action: .prompt(
                 Command.Prompt(
                     chip: "Switch Host", placeholder: "Search hosts...", hint: nil,
-                    // Every machine, the one the window is on included. That
-                    // row is the only thing on either surface that says which
-                    // machine that is — the checkmark in the palette, the
-                    // checked item in the menu bar's `Toggle` — so it is drawn.
+                    // Every machine, the one the window is on included. In the
+                    // menu bar the checked `Toggle` is the only thing that says
+                    // which machine that is, which is what excluding this row
+                    // cost and why it is back. In the palette it is a second
+                    // statement of it — the stage-one row already carries the
+                    // machine's name as its `detail` — but the two surfaces
+                    // read one table, so the row is drawn for both.
                     //
                     // And drawn *dimmed*. `switchHost` guards on `target !=
                     // currentHost` and returns — being somewhere is not a move

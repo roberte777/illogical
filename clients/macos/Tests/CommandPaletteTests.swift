@@ -397,7 +397,7 @@ final class CommandPaletteTests: XCTestCase {
     }
 
     /// The machine you are already on is offered, and offered as somewhere you
-    /// cannot go: checked, because that mark is the only thing either surface
+    /// cannot go: checked, because that mark is the only thing the *menu bar*
     /// says about where the window is, and not actionable, because `switchHost`
     /// guards on `target != currentHost` and returns.
     ///
