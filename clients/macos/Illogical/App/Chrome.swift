@@ -1,9 +1,15 @@
 //  Chrome.swift
 //  The window chrome, matched to the Superlogical Mac app.
 //
-//  Every value below was measured off Mitchell's pre-alpha demo recording at
-//  2160p, where the traffic lights give a known scale: 25 frame pixels for a
-//  12pt light, so 2.083 px/pt. Colours are sampled pixels, not guesses.
+//  Almost every value below was measured off Mitchell's pre-alpha demo
+//  recording at 2160p, where the traffic lights give a known scale: 25 frame
+//  pixels for a 12pt light, so 2.083 px/pt. Colours are sampled pixels, not
+//  guesses.
+//
+//  The exception is `tabHeight`, and its corner radius with it. Those come from
+//  a later photograph of the app running, which is a far worse instrument and a
+//  far better subject — the recording is a pre-alpha and the two disagree by
+//  more than either can explain away. See the note on the constant.
 //
 //      ┌──────────────────────────────────────────────────────────────┐
 //      │ ● ● ●  ▤ Demo │ ▣ ~> btop │ ▣ ~> htop │(▣ ~/…> nvim)      +  │ 39pt
@@ -69,10 +75,13 @@ enum Metrics {
     /// against a known 12. At that scale the reference's pill is 35px tall —
     /// 28.6pt — where this was drawing 27.
     ///
-    /// Small, and still the thing you see, because the pill is concentric with
-    /// the lights in both: the whole difference lands on the edge that is
-    /// easiest to compare, how far the pill's underside drops past the bottom
-    /// of the green light. 7.75pt in the reference against 6.5 here.
+    /// Small, and still the thing you see. The pill is concentric with the
+    /// lights in both, so half the difference lands on the edge that is easiest
+    /// to compare against a fixed round object: how far the pill's underside
+    /// drops past the bottom of the green light. Measured rather than derived,
+    /// because a photograph's light has a soft edge and its apparent diameter
+    /// is a point wider than the 12 it really is — the reference drops 9px past
+    /// it, which is 7.35pt, where this dropped 6.5 and now drops 7.5.
     ///
     /// Two sources disagree here and it is worth saying which won and why. The
     /// 27 came from the 2160p recording this file's header names, at 2.083px/pt
@@ -91,8 +100,10 @@ enum Metrics {
     /// carries the same story and what was done about it there.
     static let tabHeight: CGFloat = 29
 
-    /// Half the tab's height, so the pill's ends stay semicircular as they were
-    /// at 27/13. A radius left behind at 13 would have flattened them.
+    /// Half the tab's height, so the pill's ends are true semicircles. 13 was a
+    /// half-point under that at 27 and would be a point and a half under it at
+    /// 29 — the flattening compounds rather than staying put, which is why this
+    /// moves whenever `tabHeight` does.
     static let tabCornerRadius: CGFloat = 14.5
     /// One tab's slot. Content is left-aligned in it and truncates.
     static let tabWidth: CGFloat = 197
