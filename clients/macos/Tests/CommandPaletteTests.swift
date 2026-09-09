@@ -471,7 +471,7 @@ final class CommandPaletteTests: XCTestCase {
     /// fourteen rows of nothing under it.
     func testTheListIsAsTallAsItsRowsUpToSixteen() {
         XCTAssertEqual(
-            PaletteMetrics.listHeight(rows: 2), 2 * MenuMetrics.rowHeight,
+            PaletteMetrics.listHeight(rows: 2), 2 * PaletteMetrics.rowHeight,
             "a two-row filter drew a full-height panel")
         XCTAssertEqual(PaletteMetrics.listHeight(rows: 16), PaletteMetrics.listMaxHeight)
         // The unfiltered table is longer than sixteen, so the panel opens
@@ -484,7 +484,14 @@ final class CommandPaletteTests: XCTestCase {
         // Nothing matched, so the panel is one row of "no matching commands".
         // Zero would collapse the list to a hairline and leave the notice
         // clipped out of a panel that looks broken.
-        XCTAssertEqual(PaletteMetrics.listHeight(rows: 0), MenuMetrics.rowHeight)
+        XCTAssertEqual(PaletteMetrics.listHeight(rows: 0), PaletteMetrics.rowHeight)
+        // The panel's row is its own and taller than the dropdown's, which is
+        // the correction the file header records: built out of `MenuMetrics`
+        // throughout, the panel came out too wide for rows that were too
+        // tight. Asserted rather than left implicit so that folding this back
+        // into `MenuMetrics.rowHeight` — the obvious tidy-up — fails here
+        // instead of silently undoing the measurement.
+        XCTAssertGreaterThan(PaletteMetrics.rowHeight, MenuMetrics.rowHeight)
     }
 
     // MARK: - The two key rules

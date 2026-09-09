@@ -33,13 +33,26 @@
 //  which is the whole argument for it over a second panel: there is nowhere
 //  else to look and nothing else to dismiss.
 //
-//  Geometry, measured from the reference: 1.6× the session dropdown's width,
-//  so 352pt against `MenuMetrics.width`'s 220; sixteen rows before it scrolls,
-//  with the indicator visible; horizontally centred in the window with its top
-//  edge just below the toolbar. Everything else — row height, padding, corner
-//  radii, the field's height, the type size — is `MenuMetrics` by name rather
-//  than a second set of numbers, because this panel and the dropdown are the
-//  same kind of surface and a person sees them a second apart.
+//  Geometry, measured from the reference: 300pt wide, rows 26pt tall, sixteen
+//  of them before it scrolls; horizontally centred in the window with its top
+//  edge just below the toolbar.
+//
+//  Those two numbers were 352 and 22 first, and both were wrong, which is worth
+//  writing down because the error is not visible in either one alone. The panel
+//  was built out of `MenuMetrics` on the reasoning that this and the dropdown
+//  are the same kind of surface — so it took the dropdown's 22pt row and a
+//  width guessed as a multiple of the dropdown's. Against the reference the
+//  result was both too wide and too tight, and the tell is a ratio rather than
+//  a measurement: width over row height is 11.7 in the reference and was 16.0
+//  here. A ratio survives not knowing the reference's scale, which a screenshot
+//  of a video does not tell you. Fixing it needs both numbers to move, and 300
+//  ÷ 26 is 11.5.
+//
+//  So the panel keeps `MenuMetrics`'s padding, corner radii and type size — a
+//  person sees the two surfaces a second apart and they should be cut from the
+//  same cloth — but its width and its row are its own. The dropdown is a list
+//  of names; this is a list of sentences with a chord or a value after them,
+//  and it needs the air.
 //
 //  Two rulings about icons, both worth stating because both went the other way
 //  once. In the **command** list an icon is inline: a row without one starts
@@ -52,18 +65,46 @@
 
 import SwiftUI
 
+/// The panel's own two colours. Everything else it draws with is `Palette`'s
+/// menu set, shared with the dropdown — see `SessionMenu`.
+extension Palette {
+    /// The chip's fill: the terminal's own foreground, pulled a little back
+    /// toward the background so it reads as a label rather than as a block of
+    /// pure white. Neutral on purpose, and the one place in the panel that is
+    /// deliberately *not* the accent — see `CommandPalette.chip(_:)`.
+    static var paletteChip: Color { text(0.12) }
+
+    /// On that: the terminal's background, which is the colour guaranteed to
+    /// read against its foreground, because a theme that failed to do so would
+    /// be unusable as a terminal long before it got here.
+    static var paletteChipText: Color { background }
+}
+
 enum PaletteMetrics {
-    /// 1.6× `MenuMetrics.width`, as the reference measures the panel against
-    /// the dropdown it sits above. Wider than the dropdown because the rows
-    /// carry two things: a title, and either the value it acts on or the chord
-    /// that reaches it.
-    static let width: CGFloat = 352
+    /// Measured off the reference rather than derived from the dropdown, for
+    /// the reason the file header gives: a width picked as a multiple of
+    /// `MenuMetrics.width` came out half again too wide for its own rows.
+    /// Wider than the dropdown all the same, because these rows carry two
+    /// things — a title, and either the value it acts on or the chord that
+    /// reaches it.
+    static let width: CGFloat = 300
+
+    /// Taller than `MenuMetrics.rowHeight`'s 22, and deliberately not it. The
+    /// dropdown's row holds a session name; this one holds a sentence with a
+    /// chord after it, and at 22 the two columns read as one crowded line.
+    /// The reference's own row is the same 4pt taller.
+    static let rowHeight: CGFloat = 26
+
+    /// The field matches a row, so the panel has one vertical rhythm from the
+    /// top down — the same rule `MenuMetrics.fieldHeight` follows, applied to
+    /// this panel's row rather than the dropdown's.
+    static let fieldHeight: CGFloat = rowHeight
 
     /// How many rows fit before it scrolls. Sixteen is the reference's, and it
     /// is also about right for the table: the whole of it is twenty-two, so
     /// the panel is honest about there being more without becoming a window.
     static let maxRows = 16
-    static let listMaxHeight = CGFloat(maxRows) * MenuMetrics.rowHeight
+    static let listMaxHeight = CGFloat(maxRows) * rowHeight
 
     /// How tall the list is for a given number of rows.
     ///
@@ -73,7 +114,7 @@ enum PaletteMetrics {
     /// fourteen rows of nothing under them. The floor of one is the "no
     /// matching commands" notice, which is a row like any other.
     static func listHeight(rows: Int) -> CGFloat {
-        min(CGFloat(max(rows, 1)) * MenuMetrics.rowHeight, listMaxHeight)
+        min(CGFloat(max(rows, 1)) * rowHeight, listMaxHeight)
     }
 
     /// The command-turned-token in the field. Rounded rather than a capsule
@@ -256,7 +297,7 @@ struct CommandPalette: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 7)
-        .frame(height: MenuMetrics.fieldHeight)
+        .frame(height: PaletteMetrics.fieldHeight)
         .background(
             // A rounded rect where the dropdown's filter field is a capsule.
             // The chip sits flush at this field's left inset, and a capsule's
@@ -274,20 +315,25 @@ struct CommandPalette: View {
 
     /// The command, collapsed into the field it was chosen from.
     ///
-    /// It keeps the selected row's colours — the theme's blue with whichever
-    /// terminal colour reads on it — because that is what it *is*: the row you
-    /// pressed Return on, still highlighted, now living in the field.
+    /// Neutral rather than the selected row's accent, which is what this was
+    /// first, on the reasoning that the chip *is* the row you pressed Return
+    /// on and should stay highlighted. The reference says otherwise and is
+    /// right: in the panel the accent means "this is what Return will take",
+    /// and by the time there is a chip that question is settled — the accent
+    /// would be pointing at a decision already made, next to a field where
+    /// Return now means something else entirely. So the chip reads as a label
+    /// on the field, not as a selection in a list.
     private func chip(_ text: String) -> some View {
         Text(text)
             .font(.system(size: PaletteMetrics.chipFont, weight: .medium))
-            .foregroundStyle(Palette.menuHighlightText)
+            .foregroundStyle(Palette.paletteChipText)
             .lineLimit(1)
             .fixedSize()
             .padding(.horizontal, PaletteMetrics.chipPadding)
             .padding(.vertical, 1)
             .background(
                 RoundedRectangle(cornerRadius: PaletteMetrics.chipCorner, style: .continuous)
-                    .fill(Palette.menuHighlight))
+                    .fill(Palette.paletteChip))
     }
 
     // MARK: - Stage one
@@ -360,7 +406,7 @@ struct CommandPalette: View {
                 .foregroundStyle(Palette.menuShortcut)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity)
-                .frame(height: MenuMetrics.rowHeight)
+                .frame(height: PaletteMetrics.rowHeight)
         }
     }
 
@@ -546,7 +592,7 @@ private struct PaletteRow: View {
         }
         .foregroundStyle(titleColor)
         .padding(.horizontal, MenuMetrics.rowPadding)
-        .frame(height: MenuMetrics.rowHeight)
+        .frame(height: PaletteMetrics.rowHeight)
         .background {
             if isSelected {
                 RoundedRectangle(cornerRadius: MenuMetrics.rowCornerRadius, style: .continuous)

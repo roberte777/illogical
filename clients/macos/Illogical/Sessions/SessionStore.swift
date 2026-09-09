@@ -105,7 +105,12 @@ final class SessionStore {
     ///
     /// ILLOGICAL_OPEN_PALETTE opens it at launch, on the same rule
     /// ILLOGICAL_OPEN_SESSION_MENU is there for: the panel can be
-    /// screenshotted without driving the mouse.
+    /// screenshotted without driving the mouse. Set it to a `CommandID` —
+    /// `ILLOGICAL_OPEN_PALETTE=addRemoteHost` — and it opens on that command's
+    /// prompt rather than on the list, which is the only way to photograph
+    /// stage two at all: reaching it by hand means typing into the field, and
+    /// a keystroke has to come from a person. A value naming no command with a
+    /// prompt, `1` included, opens the list.
     ///
     /// Three invariants, held here rather than asked of the callers:
     ///
@@ -124,11 +129,26 @@ final class SessionStore {
     /// 3. What has been typed resets on every stage change. That is view state
     ///    (`CommandPalette`'s `query`, like the dropdown's `filter`), so the
     ///    view watches this property for it.
-    var palette: PaletteStage? = SessionStore.launchFlag("ILLOGICAL_OPEN_PALETTE") ? .commands : nil
+    var palette: PaletteStage? = SessionStore.launchStage()
     {
         didSet {
             if palette != nil { sessionMenuOpen = false }
         }
+    }
+
+    /// Which stage ILLOGICAL_OPEN_PALETTE asks for, or nil when it is unset.
+    ///
+    /// The prompt check is the same one `runCommand` makes, so the flag cannot
+    /// put the panel into a stage the app has no way to reach: a command with
+    /// no prompt falls back to the list rather than opening an argument field
+    /// for something that takes no argument.
+    private static func launchStage() -> PaletteStage? {
+        guard let value = ProcessInfo.processInfo.environment["ILLOGICAL_OPEN_PALETTE"]
+        else { return nil }
+        guard let id = CommandID(rawValue: value), Commands.prompt(id) != nil else {
+            return .commands
+        }
+        return .argument(id)
     }
 
     /// One of the launch-time overlay switches. Named rather than repeated so
