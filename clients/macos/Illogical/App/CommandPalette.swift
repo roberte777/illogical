@@ -51,14 +51,18 @@
 //  names; this is a list of sentences with a chord or a value after them, and
 //  it needs both the air and the extra point of type.
 //
-//  Two rulings about icons, both worth stating because both went the other way
-//  once. In the **command** list an icon is inline: a row without one starts
-//  its title at the text inset, and a row with one is pushed right. That is
-//  what the reference does, and it is affordable here because no command's
-//  glyph depends on state, so nothing ever reflows under the pointer. In the
-//  **choice** list the column is reserved (`MenuMetrics.iconColumn`), because
-//  there the glyph is exactly the state-dependent one — the current machine's
-//  checkmark — that made the dropdown reserve its column in the first place.
+//  Icons are inline in both lists: a row without one starts its title at the
+//  text inset, and a row with one is pushed right. No glyph in either list ever
+//  appears or disappears in place, so nothing reflows under the pointer.
+//
+//  Holding that for the **choice** list took moving the current-machine
+//  checkmark to the trailing side. It was a reserved leading column first —
+//  the dropdown's answer, and defensible, because a checkmark that comes and
+//  goes on the left would shift every title beside it. But reserving indents a
+//  whole list to make room for one glyph, and the reference's choice rows begin
+//  exactly where its command rows do. Trailing satisfies both: nothing on the
+//  left can move because nothing is on the left, and the column it lands in is
+//  empty in a choice row anyway.
 
 import SwiftUI
 
@@ -232,8 +236,20 @@ struct CommandPalette: View {
         VStack(spacing: 0) {
             field
             if let prompt {
-                hairline
-                argument(prompt)
+                // The hairline belongs to the *sentence* under a free-text
+                // prompt, not to a list. A hint is one line floating in an
+                // otherwise empty panel and needs something to hold it away
+                // from the field; a list already reads as a list, and a rule
+                // drawn over the top of one that scrolls underneath it looks
+                // like a seam in the panel. The reference draws it in the
+                // first case and not in the second.
+                if case .choice = prompt.kind {
+                    argument(prompt)
+                        .padding(.top, MenuMetrics.fieldToRows)
+                } else {
+                    hairline
+                    argument(prompt)
+                }
             } else {
                 // The dropdown's own gap between its field and its rows, by
                 // name. On the list rather than on the field because stage two
@@ -471,13 +487,10 @@ struct CommandPalette: View {
                 VStack(spacing: 0) {
                     ForEach(Array(choices.enumerated()), id: \.element.id) { index, choice in
                         PaletteRow(
-                            // Reserved rather than inline, unlike the command
-                            // list: the checkmark comes and goes with which
-                            // machine you are on, and an icon that appears
-                            // would shift every title beside it.
-                            icon: choice.isCurrent ? "checkmark" : nil,
-                            reservesIcon: true,
                             title: choice.title,
+                            // Trailing, so these rows begin where the command
+                            // rows do — see `PaletteRow.trailingIcon`.
+                            trailingIcon: choice.isCurrent ? "checkmark" : nil,
                             isSelected: selected == index,
                             isEnabled: true,
                             hover: { inside in
@@ -581,13 +594,20 @@ struct CommandPalette: View {
 /// flags would make the dropdown's rows pay for the palette's.
 private struct PaletteRow: View {
     var icon: String?
-    /// Whether the leading glyph gets a column of its own whether or not there
-    /// is one. False in the command list, where icons are inline because no
-    /// command's glyph moves; true in the choice list, where the checkmark
-    /// does.
-    var reservesIcon = false
     let title: String
     var trailing: String?
+    /// A glyph after the title rather than before it — the checkmark on the
+    /// machine you are already on.
+    ///
+    /// It was a reserved *leading* column first, on the reasoning that a
+    /// checkmark which comes and goes would otherwise shift every title beside
+    /// it. That reasoning is sound and the conclusion was still wrong: the
+    /// reference's choice rows begin exactly where its command rows do, and
+    /// reserving a column ahead of them indents a whole list to make room for
+    /// one glyph. Putting it on the trailing side answers both — nothing on
+    /// the left ever moves, because nothing is on the left, and the column it
+    /// lands in is empty in a choice row anyway.
+    var trailingIcon: String?
     var chevron = false
     let isSelected: Bool
     let isEnabled: Bool
@@ -610,14 +630,10 @@ private struct PaletteRow: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            if reservesIcon || icon != nil {
-                Group {
-                    if let icon {
-                        Image(systemName: icon)
-                            .font(.system(size: 11))
-                    }
-                }
-                .frame(width: MenuMetrics.iconColumn, alignment: .center)
+            if let icon {
+                Image(systemName: icon)
+                    .font(.system(size: 11))
+                    .frame(width: MenuMetrics.iconColumn, alignment: .center)
 
                 Spacer().frame(width: MenuMetrics.iconToTitle)
             }
@@ -632,6 +648,12 @@ private struct PaletteRow: View {
                 Text(trailing)
                     .font(.system(size: PaletteMetrics.font))
                     .lineLimit(1)
+                    .foregroundStyle(trailingColor)
+            }
+
+            if let trailingIcon {
+                Image(systemName: trailingIcon)
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(trailingColor)
             }
 
