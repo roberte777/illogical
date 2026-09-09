@@ -559,7 +559,7 @@ never be typed into a terminal.
 | ⌘D / ⇧⌘D | Split Right / Split Down | File |
 | ⇧⌘↩ | Zoom / Unzoom pane | File |
 | ⌥⌘← → ↑ ↓ | Focus pane left/right/above/below | View |
-| ⇧⌘K | Change Session — toggles the dropdown | View |
+| ⌘K | Change Session — toggles the dropdown. Unshifted, so the terminal cannot be sent ⌘K | View |
 | ⌘R | Refresh Sessions | View |
 | ⇧⌘] / ⇧⌘[ | Show Next / Previous Tab, wrapping | Window |
 | ⌃⇥ / ⌃⇧⇥ | The same two, under the chord every browser uses | `ContentView.onTabCycle` — a local `NSEvent` monitor |
