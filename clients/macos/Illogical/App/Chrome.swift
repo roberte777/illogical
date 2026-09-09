@@ -323,10 +323,18 @@ struct TerminalTab: View {
     /// Draw the hairline on this tab's leading edge. Only between two inactive
     /// tabs — the active pill provides its own edge.
     let showsLeadingSeparator: Bool
-    /// A tab is being dragged over this slot, so say where it would land.
-    var isDropTarget: Bool = false
-    /// This slot is the one being dragged.
+    /// This slot is the one being dragged, so it is lifted off the strip and
+    /// rides under the pointer. Where it would land is said by the gap its
+    /// neighbours have opened, not by anything drawn on this slot.
     var isDragging: Bool = false
+    /// The pointer is over this slot.
+    ///
+    /// Passed in rather than read from an `onHover` of this slot's own, which
+    /// is a flag that goes stale the moment the strip rearranges under a
+    /// pointer that is holding still — see `TabStrip.slot(at:)`, which is what
+    /// answers this now. It is also false for the whole of a drag, on every
+    /// slot, which is what keeps the ✕ off a tab in flight.
+    var isHovered: Bool = false
     /// The strip's namespace for the active pill. One pill moves between slots
     /// rather than one per slot fading in and out, which is what makes
     /// selecting a tab slide rather than blink.
@@ -340,23 +348,30 @@ struct TerminalTab: View {
     /// what it shows is handed to it, so that a strip of them is one `ForEach`
     /// over values rather than twenty views each observing the world.
     @Environment(SessionStore.self) private var store
-    @State private var isHovering = false
 
     private let closeWidth: CGFloat = 16
     /// One id for the whole strip, not one per tab: the pill is a single view
     /// moving between slots.
     private static let pillID = "active-pill"
 
-    /// Always on the active tab, on hover for the rest — the way tab bars
-    /// everywhere behave. Hover-only made it undiscoverable.
+    /// On hover, and on hover only — including on the active tab.
     ///
-    /// Never on the slot being dragged. The dragged slot rides under the
-    /// pointer, so the ✕ rides with it and the mouse-up that ends the drag
-    /// lands *inside* the close button — dragging a tab by its ✕ closed it,
-    /// measured. Taking the ✕ away for the length of the drag leaves the
-    /// mouse-up on the select button instead, which is the behaviour the strip
-    /// already wants: a dragged tab comes to the front.
-    private var showsClose: Bool { (isActive || isHovering) && !isDragging }
+    /// It used to sit on the active tab permanently, on the theory that a
+    /// hover-only ✕ is undiscoverable. What that actually bought was a button
+    /// parked under the pointer's usual resting place on the one tab you are
+    /// most likely to be clicking, and a strip whose active slot was a
+    /// different shape from every other one. Hover is where a tab bar puts
+    /// this; File ▸ Close Tab and the ⇧⌘W beside it are the discoverable
+    /// path, and they are the ones that ask before closing a split tab.
+    ///
+    /// Never during a drag, which the strip guarantees by holding `isHovered`
+    /// false for the length of one. The dragged slot rides under the pointer,
+    /// so a ✕ on it rides with it and the mouse-up that ends the drag lands
+    /// *inside* the close button — dragging a tab by its ✕ closed it,
+    /// measured. Taking the ✕ away leaves the mouse-up on the select button
+    /// instead, which is the behaviour the strip already wants: a dragged tab
+    /// comes to the front.
+    private var showsClose: Bool { isHovered }
 
     private var name: String { terminal?.name ?? "terminal" }
     private var residency: Residency { terminal?.residency ?? .live }
@@ -425,7 +440,7 @@ struct TerminalTab: View {
                     // source and a destination and slides the pill between
                     // them instead of fading one out and another in.
                     .matchedGeometryEffect(id: Self.pillID, in: pill)
-            } else if isHovering {
+            } else if isHovered {
                 RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
                     .fill(Palette.tabHoverFill)
             }
@@ -433,18 +448,34 @@ struct TerminalTab: View {
         .overlay(alignment: .leading) {
             if showsLeadingSeparator { TabSeparator() }
         }
-        // Where a dragged tab would land. An outline rather than a moving gap:
-        // the slots are a fixed width laid edge to edge, so opening one would
-        // shove every tab after it sideways for the length of the drag.
-        .overlay {
-            if isDropTarget {
+        // The lift, under everything else the slot draws.
+        //
+        // A background rather than an overlay, and three things rather than
+        // one. The *ground* is opaque because a dragged slot passes over its
+        // neighbours and an inactive tab has no fill of its own, so without it
+        // two labels read through each other. The *edge* is what an inactive
+        // tab is picked up by — it has no pill to be recognised from. The
+        // *shadow* is the whole of "off the strip": a tab that is merely
+        // sliding is being scrolled, and a tab that is casting is being
+        // carried.
+        .background {
+            if isDragging {
                 RoundedRectangle(cornerRadius: Metrics.tabCornerRadius, style: .continuous)
-                    .strokeBorder(Palette.menuHighlight, lineWidth: 2)
-                    .padding(1)
+                    .fill(Palette.toolbar)
+                    .overlay(
+                        RoundedRectangle(
+                            cornerRadius: Metrics.tabCornerRadius, style: .continuous
+                        )
+                        .strokeBorder(Palette.tabActiveStroke, lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.30), radius: 5, y: 2)
             }
         }
-        .animation(Motion.tabs.animation(reduceMotion: reduceMotion), value: isDropTarget)
-        .onHover { isHovering = $0 }
+        // So the lift fades in under the pointer and out again as the tab
+        // settles, rather than switching on and off between two frames. The
+        // slot's *travel* is animated a level up, by the strip, because it is
+        // the strip that knows where the gap is.
+        .animation(Motion.tabs.animation(reduceMotion: reduceMotion), value: isDragging)
         .traceFrame("tab-\(traceID)")
     }
 

@@ -724,8 +724,82 @@ all; a reorder that silently does nothing would be worse than none. The gesture
 is attached with `simultaneousGesture` so it runs beside the button rather than
 against it, which also means the button still fires on the mouse-up that ends a
 drag — a dragged tab comes to the front, the way it does in every tabbed app.
-`TabStrip.dropIndex` turns the translation into a slot and is the one part of
-this that is unit-tested; the gesture plumbing around it cannot be simulated.
+
+What the strip *does* with the drag is the native tab bar's answer, and it is
+three things at once. The dragged slot is **lifted** — an opaque ground, an
+edge and a shadow, so a tab with no fill of its own does not read through the
+one it is passing over — and **carried** under the pointer, held inside the
+strip so it stops at the first slot and the last rather than sailing out over
+`+`. Every other slot **slides** to where it would be if you let go, so the gap
+under the pointer is the answer and there is nothing left to annotate. At the
+mouse-up all three unwind inside one `withAnimation` alongside `moveTab`, and
+because they add up the tab travels continuously from under the pointer into
+its slot instead of snapping.
+
+The first version drew none of that: the strip held still and outlined the slot
+the tab pointed at, on the grounds that fixed-width slots laid edge to edge
+would have to shove their neighbours to open a gap. They do, and that shove is
+the whole effect — what made it read as broken was doing it once, at the drop.
+
+Four pure functions in `TabStrip` carry it, and they are the part that is
+unit-tested; the gesture plumbing around them cannot be simulated.
+`dropIndex` turns a translation into a slot, `clampedTranslation` holds the
+carried tab inside the strip, `displayOrder` gives the order the strip is
+*drawn* in on this frame — which is where both the slide (a slot's drawn
+position less its stored index) and the hairlines come from, so a separator
+travels with its tab instead of staying behind at an index, and neither side of
+the gap draws one — and `slot(at:)` says which slot a pointer is in.
+
+**Hover is the strip's, not each slot's.** One hovered slot held by the strip,
+set from the pointer's position — by a local event monitor as it moves, and by
+the drag gesture while a button is down. The difference
+is the case a flag cannot answer: a drop rearranges the tabs under a pointer
+that never moved, so every flag then describes the arrangement before it — the
+tab you just dropped sat under the pointer believing it was not hovered, with
+no ✕, until you took the pointer out to the terminal and brought it back,
+because that was the next enter event it would see. `Cursor.swift` documents
+the same bug from the other direction, where a view leaves under a stationary
+pointer and its `onHover(false)` never arrives. A stored *position* survives
+the reorder that caused the trouble: the region the pointer is in did not
+change, and which tab is drawn there is read off the new order. The position is
+written only when it crosses into another slot, so this costs no more redraws
+than the flags did.
+
+The event source is a **local `NSEvent` monitor** (`PointerTracker` in
+`WindowChrome.swift`), which is a strange answer to "is the pointer over this
+view" and the only one that works here. Every ordinary way of asking stops
+reporting to a view once a drag ends on it — SwiftUI's `onHover` and
+`onContinuousHover`, and an `NSTrackingArea` on the same view — and stays
+silent until the pointer leaves the window and returns. Every drop ends a drag
+under the pointer, so that is precisely when the strip needs an answer and
+precisely when it stops getting one.
+
+This was measured, not reasoned; three fixes reasoned their way to the wrong
+mechanism first. In one traced reproduction, after the drop: **0** events from
+the tracking area, **0** from SwiftUI's hover, **390** from the monitor. The
+window never stops *generating* the events — delivery to the view is what
+breaks — so a monitor, which watches what the app dispatches rather than what a
+view is offered, sees all of them. It needs
+`window.acceptsMouseMovedEvents = true`, which `WindowChrome.configure` sets:
+without it the window makes no mouse-moved events for anyone at all, monitor or
+tracking area, and SwiftUI turning it on for its own hover tracking is not
+something to depend on.
+
+A **drag does not select.** The select button and the drag run side by side, so
+the mouse-up that finishes a reorder also fired the button under it and opening
+a tab was the price of moving it. The button stands down once the drag
+threshold has been passed — reordering and selecting are different intentions,
+and a click that never became a drag still selects.
+
+The ✕ on a slot appears on **hover**, on every tab including the active one. It
+sat on the active tab permanently until it did not: that parks a close button
+under the pointer's usual resting place on the tab you are most likely to be
+clicking, and gives the active slot a different shape from every other one.
+File ▸ Close Tab and the ⇧⌘W beside it are the discoverable path. The strip
+holds hover false on *every* slot for the length of a drag, which is also what
+keeps the ✕ off a tab in flight: the dragged slot rides under the pointer, so
+the mouse-up that ends the drag would otherwise land inside its close button —
+dragging a tab by its ✕ closed it, measured.
 
 ### Renaming and deleting a session
 
