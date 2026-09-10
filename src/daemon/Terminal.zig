@@ -157,6 +157,17 @@ park_config: illogical.park.Config,
 id: session.TerminalId,
 session_id: session.Id,
 name: []u8,
+/// What this terminal's foreground process is called, and the directory it is
+/// in: the two halves of the client's breadcrumb.
+///
+/// They start as what the child was spawned with and are re-read from the
+/// kernel on the maintenance tick, because a person who types `cd` has moved
+/// and nothing in the byte stream says so. See `probeForeground`.
+///
+/// Guarded by `mutex` and reachable only through `label`, which copies them
+/// under it. That is also why they are not on `summary`: a summary hands out
+/// borrowed slices, and these two are freed and replaced under a client
+/// thread that may be halfway through building a `list` reply out of them.
 command: []u8,
 cwd: []u8,
 
@@ -202,6 +213,16 @@ exit_code: ?i32 = null,
 /// Monotonic timestamp of the last PTY *read*. This — not general activity —
 /// is what drives parking. See docs/PARKING.md.
 last_read_ns: u64,
+/// Monotonic timestamp of the last `probeForeground`, compared against
+/// `last_read_ns` to decide whether another one could tell us anything.
+///
+/// Starts at the terminal's own creation rather than at zero, so a child that
+/// has not said a word is never asked about. That is not only the cheap
+/// answer, it is the correct one twice over: the spawn is what such a terminal
+/// still is, and a probe racing the microseconds between `fork` and `exec`
+/// would catch the daemon's own name on a child that has not become anything
+/// yet -- and, having produced no output, would never be corrected.
+last_probe_ns: u64,
 /// Monotonic timestamp of the last thing that asked the child a question it is
 /// expected to answer with output. A resize, today: the winsize raises
 /// SIGWINCH and the mode 2048 report goes out, and a full-screen program
@@ -310,6 +331,9 @@ pub fn create(gpa: Allocator, opts: SpawnOptions) !*Terminal {
         .max_scrollback_bytes = opts.max_scrollback_bytes,
         .last_read_ns = sys.monotonicNs(),
         .last_wake_ns = sys.monotonicNs(),
+        // Read after the clock it is compared against, so the gate starts
+        // shut: nothing has been read from a PTY that does not exist yet.
+        .last_probe_ns = sys.monotonicNs(),
         // Nobody is watching a terminal that has just been created, and the
         // clock starts now rather than at the first `unsubscribe`.
         .unobserved_since_ns = sys.monotonicNs(),
@@ -1159,8 +1183,6 @@ pub fn summary(self: *Terminal) session.TerminalSummary {
         .id = self.id,
         .session = self.session_id,
         .name = self.name,
-        .command = self.command,
-        .cwd = self.cwd,
         .cols = cols,
         .rows = rows,
         .residency = residency,
@@ -1169,6 +1191,88 @@ pub fn summary(self: *Terminal) session.TerminalSummary {
         .pty_read_idle_ns = self.ptyReadIdleNs(),
         .exit_code = exit_code,
     };
+}
+
+/// What the breadcrumb says. Copied, not borrowed: see `command` above.
+pub const Label = struct {
+    command: []const u8,
+    cwd: []const u8,
+};
+
+/// This terminal's breadcrumb, duplicated into `alloc`.
+pub fn label(self: *Terminal, alloc: Allocator) Allocator.Error!Label {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const command = try alloc.dupe(u8, self.command);
+    errdefer alloc.free(command);
+    return .{ .command = command, .cwd = try alloc.dupe(u8, self.cwd) };
+}
+
+/// Re-read where this terminal's child is and what it is running. Returns
+/// whether either moved, which is the server's cue to tell the clients.
+///
+/// Asked of the kernel rather than of the byte stream, because the byte stream
+/// does not know. OSC 7 would carry the directory, and only from a shell set
+/// up to emit it -- shell integration this project does not ship -- while no
+/// escape sequence names the running command at all. `sys.foregroundPgrp` and
+/// the two lookups beside it are where tmux's `pane_current_path` and
+/// `pane_current_command` come from too.
+///
+/// Runs on the maintenance tick and not on the reader thread: it is three
+/// syscalls, and nothing belongs between a `read` and the fan-out that is not
+/// the fan-out (goal G2).
+///
+/// **Gated on the terminal having produced something since the last probe.** A
+/// PTY echoes what is typed into it, so anyone who runs anything at all makes
+/// output before the program they ran does -- and a terminal that has said
+/// nothing is one whose breadcrumb cannot have moved. So an idle terminal
+/// costs nothing here, which is the rule the whole daemon is built on (see
+/// docs/PARKING.md).
+pub fn probeForeground(self: *Terminal) bool {
+    self.mutex.lock();
+    // A reaped child's pid is the kernel's to hand out again, and asking about
+    // it after that is asking about a stranger's process.
+    const worth_asking = self.residency != .exited and self.exit_code == null and
+        self.last_read_ns > self.last_probe_ns;
+    if (worth_asking) self.last_probe_ns = sys.monotonicNs();
+    self.mutex.unlock();
+    if (!worth_asking) return false;
+
+    // The foreground group's leader when the child has given the terminal away
+    // -- `zsh` running `nvim` -- and the child itself when it has not, which is
+    // every shell sitting at its own prompt and every `sh -c` there is.
+    const front = sys.foregroundPgrp(self.pty_pair.master) orelse self.child;
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var name_buf: [64]u8 = undefined;
+    // The child is the fallback for both: a job that exited between the
+    // `tcgetpgrp` above and the lookup here leaves a group id nothing answers
+    // for any more, and the shell behind it is the honest answer for that
+    // moment. Anything still unanswerable leaves the field as it was.
+    const cwd = sys.processCwd(front, &cwd_buf) orelse sys.processCwd(self.child, &cwd_buf);
+    const command = sys.processName(front, &name_buf) orelse
+        sys.processName(self.child, &name_buf);
+
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    var moved = false;
+    if (cwd) |d| moved = self.replaceLocked(&self.cwd, d) or moved;
+    if (command) |c| moved = self.replaceLocked(&self.command, c) or moved;
+    return moved;
+}
+
+/// Put `value` in one of the two label slots, and say whether that changed
+/// anything. Under `mutex`, which is what `label` reads them under.
+///
+/// A failed allocation keeps the old string rather than emptying the field: a
+/// stale breadcrumb is worth more than a blank one, and this runs on a tick
+/// that will come round again.
+fn replaceLocked(self: *Terminal, slot: *[]u8, value: []const u8) bool {
+    if (std.mem.eql(u8, slot.*, value)) return false;
+    const copy = self.gpa.dupe(u8, value) catch return false;
+    self.gpa.free(slot.*);
+    slot.* = copy;
+    return true;
 }
 
 // -- parking ---------------------------------------------------------------
@@ -2077,6 +2181,111 @@ test "idle clock tracks PTY reads, not wall time" {
     // even though it was just created and its child is running.
     try testing.expect(t.ptyReadIdleNs() >= 40 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u32, 0), t.attachedCount());
+}
+
+/// Probe until the breadcrumb says what it should, or give up.
+///
+/// The probe is gated on the terminal having spoken since the last one, and a
+/// child that has printed its piece and `exec`ed never speaks again -- so this
+/// clears the gate rather than waiting on output that is not coming. On a
+/// server it is the next tick's read that clears it, and there is always one.
+fn awaitBreadcrumb(t: *Terminal, gpa: Allocator, cwd: []const u8, command: []const u8) !void {
+    var waited: usize = 0;
+    while (waited < 5000) : (waited += 10) {
+        t.mutex.lock();
+        t.last_probe_ns = 0;
+        t.mutex.unlock();
+        _ = t.probeForeground();
+
+        const crumb = try t.label(gpa);
+        defer gpa.free(crumb.cwd);
+        defer gpa.free(crumb.command);
+        if (std.mem.eql(u8, crumb.cwd, cwd) and std.mem.eql(u8, crumb.command, command)) return;
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    }
+    return error.BreadcrumbNeverMoved;
+}
+
+test "the breadcrumb follows the child into a directory and into a command" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    const t = try Terminal.create(gpa, .{
+        .io = threaded.io(),
+        .store = .{ .root = "/tmp/illogical-unused" },
+        .id = 1,
+        .session_id = 1,
+        .name = "crumbs",
+        // Spawned somewhere it is not going to stay, so that a passing test
+        // cannot be the spawn cwd sitting still. `/usr` because it is a real
+        // directory on both platforms and neither makes it a symlink -- macOS
+        // would answer `/tmp` with `/private/tmp`, since what comes back is
+        // the path the kernel resolved rather than the one that was typed.
+        .cwd = "/",
+        // `/bin/sleep` by absolute path, not `sleep`: what comes back is the
+        // name of the *executable*, and the `sleep` on this shell's `PATH` is
+        // a coreutils multi-call binary that answers to `coreutils`. Which is
+        // the honest answer -- it is the program that is running -- but it
+        // makes for a test that pins the machine it was written on.
+        .argv = &.{ "/bin/sh", "-c", "cd /usr; exec /bin/sleep 30" },
+    });
+    defer t.destroy();
+    defer t.hangup();
+
+    // What it says before anything has been asked of the kernel: the spawn,
+    // which is all a terminal used to know about itself for its whole life.
+    {
+        const spawned = try t.label(gpa);
+        defer gpa.free(spawned.cwd);
+        defer gpa.free(spawned.command);
+        try testing.expectEqualStrings("/", spawned.cwd);
+        try testing.expectEqualStrings("/bin/sh", spawned.command);
+    }
+
+    try t.start();
+    // `exec`, so the pid that had the terminal still has it and the name it
+    // answers to is the new one. That is the shape of the thing being tested:
+    // an interactive shell hands its terminal to the job it starts, and what a
+    // person is looking at is that job.
+    try awaitBreadcrumb(t, gpa, "/usr", "sleep");
+}
+
+test "a terminal that has never said anything is never asked about" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    const t = try Terminal.create(gpa, .{
+        .io = threaded.io(),
+        .store = .{ .root = "/tmp/illogical-unused" },
+        .id = 1,
+        .session_id = 1,
+        .name = "quiet",
+        // Says nothing, ever. The gate is the whole reason a daemon holding
+        // ten thousand terminals can afford to ask this question at all.
+        .argv = &.{ "/bin/sh", "-c", "sleep 30" },
+    });
+    defer t.destroy();
+    defer t.hangup();
+    try t.start();
+
+    // Not on the first tick and not on any tick after it, however long the
+    // child runs for.
+    try testing.expect(!t.probeForeground());
+    sys.sleepNs(20 * std.time.ns_per_ms);
+    try testing.expect(!t.probeForeground());
+
+    // And what it says meanwhile is the spawn, which is the whole truth about
+    // a terminal that has not done anything yet.
+    const crumb = try t.label(gpa);
+    defer gpa.free(crumb.cwd);
+    defer gpa.free(crumb.command);
+    try testing.expectEqualStrings("/bin/sh", crumb.command);
 }
 
 /// Read a whole park file. Caller owns the bytes.
