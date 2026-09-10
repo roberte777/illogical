@@ -8,7 +8,7 @@
 //      │ ─────────────────────────────  │
 //      │ ⊞   New Session          ⇧⌘N   │
 //      │ ─────────────────────────────  │
-//      │ ⊕   Add Remote Host...         │  hover: blue capsule, dark text
+//      │ ⊕   Add Remote Host...         │  selected: blue capsule, dark text
 //      └────────────────────────────────┘
 //
 //  With more than one machine connected it grows a header per host, and the
@@ -31,6 +31,14 @@
 //  It is not an NSMenu or a system popover: there is no arrow, it is clipped by
 //  the window, and it uses the app's own palette. So it is an in-window overlay
 //  anchored to the session button's leading edge, just below the toolbar.
+//
+//  The keyboard reaches all of it. The filter field holds first responder the
+//  whole time the panel is up, so ↑ and ↓ are taken off it by the palette's own
+//  local monitor — `PaletteKeys`, which is where the rule for telling a bare
+//  arrow from a chord is argued, and where the clamping and the hover rules
+//  live — and Return acts on whichever row the highlight is on rather than on a
+//  rule of its own. `MenuTarget` is which rows an arrow can land on and why the
+//  headers, the notice and a row mid-rename are not among them.
 //
 //  Geometry measured from the reference at 1.256 px/pt, calibrated on the
 //  toolbar *in that image*: 49px for a band of 39pt, and 49/39 is where the
@@ -111,12 +119,115 @@ extension Palette {
     static var menuShortcut: Color { text(0.37) }
 }
 
+/// A row of the dropdown the keyboard can land on.
+///
+/// Only the rows that *do* something. A host header is a label with two buttons
+/// on it, the "No matches" notice is a sentence, and a session mid-rename is a
+/// text field — an arrow that stopped on any of the three would be an arrow
+/// that stopped where Return means nothing, which is the silent no-op this app
+/// keeps killing. `PaletteKeys.step` skips the palette's dimmed rows for
+/// exactly that reason; here the unreachable rows are simply not in the list.
+///
+/// A row is named by what it *is* rather than by where it sits, because the
+/// list moves under the highlight — see `SessionMenu.selected`.
+enum MenuTarget: Hashable {
+    case create
+    case session(SessionRef)
+    case newSession
+    case addRemoteHost
+}
+
+/// The dropdown's list, as a rule rather than as a view.
+///
+/// Both halves are here because they have to agree: `matches` decides which
+/// session rows are drawn, `targets` decides which of them an arrow can reach,
+/// and a panel where those two disagree is one whose highlight sits on a row
+/// that is not on screen. The view calls both, and a test can call either
+/// without building a window.
+@MainActor
+enum SessionMenuRows {
+    /// Sessions on one host that survive the filter.
+    ///
+    /// Normalized, so that ` wo` finds `work`: the ends of what is typed are
+    /// never part of what is meant, and the create path already reads it that
+    /// way.
+    static func matches(_ sessions: [SessionSummary], filter: String) -> [SessionSummary] {
+        let typed = SessionName.normalized(filter)
+        guard !typed.isEmpty else { return sessions }
+        return sessions.filter { $0.name.localizedCaseInsensitiveContains(typed) }
+    }
+
+    /// Every row an arrow can land on, top to bottom.
+    ///
+    /// The order is the panel's own, and that is the whole contract: Create
+    /// when it is offered, then each machine's surviving sessions in host
+    /// order, then the two rows at the foot which are always there. Which is
+    /// also what makes the *first* of them the right thing for a freshly
+    /// opened panel's Return to take: this dropdown's Enter has always meant
+    /// "create it, or switch to the first match", and the list is that sentence
+    /// with the rest of the panel added to the end of it.
+    ///
+    /// A `.refused` offer contributes nothing, because it draws a sentence
+    /// rather than a row — there is nothing there to press Return on, which is
+    /// the whole difference between the two.
+    ///
+    /// `renaming` drops one row for as long as its field is open: that field
+    /// has its own Return, and the highlight has no business on it.
+    static func targets(
+        offer: FilterOffer, hosts: [HostConnection], filter: String, renaming: SessionRef?
+    ) -> [MenuTarget] {
+        var targets: [MenuTarget] = []
+        if case .create = offer { targets.append(.create) }
+        for host in hosts {
+            for session in matches(host.sessions, filter: filter) {
+                let ref = SessionRef(host: host.host, session: session.id)
+                if ref != renaming { targets.append(.session(ref)) }
+            }
+        }
+        // Always, and never filtered: neither row is a session, so there is
+        // nothing for the field to exclude them by, and a panel filtered down
+        // to nothing must still have somewhere for the highlight to be.
+        return targets + [.newSession, .addRemoteHost]
+    }
+}
+
 struct SessionMenu: View {
     @Environment(SessionStore.self) private var store
     @Binding var isPresented: Bool
 
     @State private var filter = ""
-    @State private var hovered: String?
+
+    /// The row the highlight is on, which is the row Return acts on.
+    ///
+    /// Held as the row *itself* rather than as an index into the list, and
+    /// that is where this differs from the palette's `selected`: the palette's
+    /// list changes when somebody types, where this one also changes
+    /// underneath them — a session deleted from another window, a machine's
+    /// `session_list` arriving, a rename opening a field over the row the
+    /// highlight was on. An index survives all of those still pointing at
+    /// whichever row slid into that position, which is a Return aimed at a
+    /// session nobody chose.
+    ///
+    /// Nil only until `onAppear` has run: `targets` always ends with New
+    /// Session and Add Remote Host, so even a dropdown with no sessions at all
+    /// has a row for the highlight to be on.
+    @State private var selected: MenuTarget?
+
+    /// Where the pointer was when this panel last heard from it, in window
+    /// coordinates — the whole of `PaletteKeys.hoverMoved`'s memory. See there
+    /// for why a hover is not on its own evidence that the mouse moved. It
+    /// matters here for the same reason it matters in the palette and arrives
+    /// by a shorter route: this panel opens directly under the session button,
+    /// so a row landing beneath a resting pointer would otherwise take the
+    /// highlight `onAppear` had just put on the first row.
+    @State private var pointer: CGPoint?
+
+    /// The host header the pointer is on, which is a different question from
+    /// which row is selected and is kept in its own state for that reason. A
+    /// header is a label rather than a row: hovering one reveals its ＋ and
+    /// moves no highlight, and an arrow steps straight past it.
+    @State private var hoveredHost: ServerHost?
+
     @FocusState private var fieldFocused: Bool
 
     /// The session whose row is currently a text field, and what is in it.
@@ -125,15 +236,15 @@ struct SessionMenu: View {
     @State private var renaming: SessionRef?
     @State private var renameText = ""
 
-    /// Sessions on one host that survive the filter.
-    ///
-    /// Normalized, so that ` wo` finds `work`: the ends of what is typed are
-    /// never part of what is meant, and the create path already reads it that
-    /// way.
     private func matches(_ host: HostConnection) -> [SessionSummary] {
-        let typed = SessionName.normalized(filter)
-        guard !typed.isEmpty else { return host.sessions }
-        return host.sessions.filter { $0.name.localizedCaseInsensitiveContains(typed) }
+        SessionMenuRows.matches(host.sessions, filter: filter)
+    }
+
+    /// Where the arrows can go, in the order this body draws them — see
+    /// `SessionMenuRows.targets`.
+    private var targets: [MenuTarget] {
+        SessionMenuRows.targets(
+            offer: offer, hosts: store.hosts, filter: filter, renaming: renaming)
     }
 
     /// "Filter **or create**", and why not when not. The decision belongs to
@@ -162,8 +273,8 @@ struct SessionMenu: View {
             case .create(let name):
                 MenuRow(
                     icon: "plus", title: "Create “\(name)”", shortcut: "↩",
-                    isHovered: hovered == "__create",
-                    hover: { hovered = $0 ? "__create" : nil },
+                    isSelected: selected == .create,
+                    hover: { hover(.create, at: $0) },
                     action: create)
                 if anyMatches { MenuSeparator() }
             case .refused(let refusal):
@@ -189,8 +300,8 @@ struct SessionMenu: View {
                 {
                     HostHeader(
                         host: host,
-                        isHovered: hovered == "h\(host.id)",
-                        hover: { hovered = $0 ? "h\(host.id)" : nil },
+                        isHovered: hoveredHost == host.host,
+                        hover: { hoveredHost = $0 ? host.host : nil },
                         remove: { store.removeHost(host.host) },
                         retry: { store.reconnect(host.host) },
                         newSession: { newSession(on: host) })
@@ -205,11 +316,11 @@ struct SessionMenu: View {
                             cancel: cancelRename)
                     } else {
                         MenuRow(
-                            icon: isSelected(session, on: host) ? "checkmark" : nil,
+                            icon: store.selectedSession == ref ? "checkmark" : nil,
                             title: session.name,
-                            isHovered: hovered == rowID(session, on: host),
-                            hover: { hovered = $0 ? rowID(session, on: host) : nil },
-                            action: { select(session, on: host) }
+                            isSelected: selected == .session(ref),
+                            hover: { hover(.session(ref), at: $0) },
+                            action: { select(ref) }
                         )
                         // Right-click, rather than a hover affordance: the
                         // row is 22pt with an icon column already spoken
@@ -263,8 +374,8 @@ struct SessionMenu: View {
             MenuRow(
                 icon: "rectangle.stack.badge.plus", title: newSessionCommand.title(store),
                 shortcut: newSessionCommand.shortcut.map(ShortcutDisplay.string),
-                isHovered: hovered == "__new",
-                hover: { hovered = $0 ? "__new" : nil },
+                isSelected: selected == .newSession,
+                hover: { hover(.newSession, at: $0) },
                 action: newSession)
 
             MenuSeparator()
@@ -282,8 +393,8 @@ struct SessionMenu: View {
             // `isPresented = false` here to be a second door.
             MenuRow(
                 icon: addRemoteHost.icon, title: addRemoteHost.title(store),
-                isHovered: hovered == "__remote",
-                hover: { hovered = $0 ? "__remote" : nil },
+                isSelected: selected == .addRemoteHost,
+                hover: { hover(.addRemoteHost, at: $0) },
                 action: { store.beginAddRemoteHost() })
         }
         .padding(MenuMetrics.padding)
@@ -311,7 +422,10 @@ struct SessionMenu: View {
         // when it was already open, which `sessionMenuOpen = true` cannot
         // reopen and which used to strand the flag until some later, unrelated
         // opening picked it up and put the wrong row into a text field.
-        .onAppear { adoptPendingRename(orFocusFilter: true) }
+        .onAppear {
+            adoptPendingRename(orFocusFilter: true)
+            resetSelection()
+        }
         .onChange(of: store.pendingRename) { _, _ in
             adoptPendingRename(orFocusFilter: false)
         }
@@ -328,6 +442,48 @@ struct SessionMenu: View {
         // be. Closing hands the
         // keyboard back to the terminal (SessionStore.focusTerminal).
         .onEscape { isPresented = false }
+        // What is typed re-aims the list, so the highlight goes back to the top
+        // of it. The palette's rule, and the one this panel's Return already
+        // followed before there was a highlight to see: Enter on a filter took
+        // the first match.
+        .onChange(of: filter) { _, _ in resetSelection() }
+        // The list also changes with nothing typed at all — a session deleted
+        // from another window, a machine's `session_list` arriving, a rename
+        // opening a field over the row the highlight was on. Staying on the
+        // same row while it is still there, and falling back to the first when
+        // it has gone, is what keeps Return aimed at the row somebody chose
+        // rather than at whatever took its place.
+        .onChange(of: targets) { _, targets in
+            if let selected, targets.contains(selected) { return }
+            selected = targets.first
+        }
+        // ↑ and ↓, taken off the filter field the way the palette takes them
+        // off its own: the same monitor, the same rule for telling a bare
+        // arrow from a chord, and the same nothing for an arrow to do in a
+        // one-line field. See `PaletteKeys`.
+        //
+        // Inert while a rename field is open, which is the one thing this panel
+        // has and the palette does not. That field is a second owner of the
+        // keyboard — Return there already means "commit this name" — and moving
+        // a highlight behind it, on a list the person is not looking at, would
+        // be the panel acting on a keystroke aimed somewhere else.
+        .onPaletteKey { keyCode, modifiers in
+            guard renaming == nil else { return false }
+            switch PaletteKeys.claim(
+                keyCode: keyCode, modifiers: modifiers, stageIsArgument: false,
+                queryIsEmpty: filter.isEmpty)
+            {
+            // `.popArgument` cannot arrive: it is `stageIsArgument`'s answer
+            // and this panel has no chip to pop, so ⌫ stays the field's.
+            case .pass, .popArgument: return false
+            case .up:
+                move(by: -1)
+                return true
+            case .down:
+                move(by: 1)
+                return true
+            }
+        }
     }
 
     /// The registry's entries for the two rows below the session list, so
@@ -335,14 +491,6 @@ struct SessionMenu: View {
     /// rows draw.
     private var newSessionCommand: Command { Commands.command(.newSession) }
     private var addRemoteHost: Command { Commands.command(.addRemoteHost) }
-
-    private func rowID(_ session: SessionSummary, on host: HostConnection) -> String {
-        "s\(host.id)-\(session.id)"
-    }
-
-    private func isSelected(_ session: SessionSummary, on host: HostConnection) -> Bool {
-        store.selectedSession == SessionRef(host: host.host, session: session.id)
-    }
 
     private var filterField: some View {
         HStack(spacing: 6) {
@@ -354,15 +502,7 @@ struct SessionMenu: View {
                 .font(.system(size: MenuMetrics.font))
                 .foregroundStyle(Palette.menuText)
                 .focused($fieldFocused)
-                .onSubmit {
-                    if case .create = offer {
-                        create()
-                    } else if let host = store.hosts.first(where: { !matches($0).isEmpty }),
-                        let first = matches(host).first
-                    {
-                        select(first, on: host)
-                    }
-                }
+                .onSubmit(commit)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 7)
@@ -376,13 +516,17 @@ struct SessionMenu: View {
         .cursor(.iBeam)
     }
 
-    private func select(_ session: SessionSummary, on host: HostConnection) {
-        let ref = SessionRef(host: host.host, session: session.id)
+    private func select(_ ref: SessionRef) {
         if let first = store.tabs.first(where: { $0.session == ref }) {
             store.selectedTabID = first.id
-        } else {
+        } else if let name = store.session(ref)?.name {
             // A session with no tabs is one whose terminals have all gone.
             // Making one is what "switch to it" means.
+            //
+            // The name is read back off the store rather than carried in from
+            // the row, on the rule `SessionStore.session(_:)` sets out: a
+            // `SessionRef` survives a rename because the id does, and every
+            // place a name is *used* goes through there.
             //
             // A known no-op on a machine whose control connection has dropped,
             // and deliberately left as one — issue #100. `createTerminal` sends
@@ -405,7 +549,7 @@ struct SessionMenu: View {
             // and `reconcileTabs` to tell a deliberately empty selection from
             // one awaiting repair, which is a change to the selection model
             // rather than to this click, and its own piece of work.
-            store.createTerminal(sessionName: session.name, on: host.host)
+            store.createTerminal(sessionName: name, on: ref.host)
         }
         isPresented = false
     }
@@ -433,6 +577,63 @@ struct SessionMenu: View {
     private func newSession(on host: HostConnection) {
         store.createSession(on: host.host)
         isPresented = false
+    }
+
+    // MARK: - The highlight
+
+    /// The first row, which is the row Return took before there was a
+    /// highlight to see it on — see `SessionMenuRows.targets`.
+    private func resetSelection() {
+        selected = targets.first
+    }
+
+    /// ↑ and ↓.
+    ///
+    /// `PaletteKeys.step` does the walking, against a mask that is all true,
+    /// and the mask is not a fudge to switch the skipping off: the palette
+    /// draws rows it will not run and this panel does not, so "every row in
+    /// this list can be run" is the literal truth about the dropdown. What is
+    /// borrowed is the decision the palette argues at length — clamp at the
+    /// ends rather than wrap, because an arrow that teleports from the last
+    /// row to the first loses the person's place — and it is borrowed rather
+    /// than restated so that the two panels cannot come to disagree about it.
+    private func move(by delta: Int) {
+        let targets = self.targets
+        let from = selected.flatMap { targets.firstIndex(of: $0) } ?? -1
+        let next = PaletteKeys.step(
+            from: from, by: delta, enabled: Array(repeating: true, count: targets.count))
+        selected = targets.indices.contains(next) ? targets[next] : nil
+    }
+
+    /// A hover, which moves the highlight exactly as an arrow does — one
+    /// highlight, and it is always on the row Return would take — but only
+    /// once the pointer has actually moved. See `pointer` above.
+    private func hover(_ target: MenuTarget, at point: CGPoint) {
+        let moved = PaletteKeys.hoverMoved(from: pointer, to: point)
+        // Noted on every hover, including the ones that do not count: a row
+        // arriving under a still pointer is how this view learns where that
+        // pointer is, and refusing to remember it would leave the first real
+        // move with nothing to be different from.
+        pointer = point
+        guard moved else { return }
+        selected = target
+    }
+
+    /// Return, on whichever row the highlight is on.
+    ///
+    /// Every branch is the door a *click* on that row goes through, which is
+    /// what keeps a keystroke and a click from meaning two different things —
+    /// and it is why there is no guard here: each of the four already carries
+    /// its own, `create` on the offer and `select` on the session still being
+    /// there.
+    private func commit() {
+        switch selected {
+        case .create: create()
+        case .session(let ref): select(ref)
+        case .newSession: newSession()
+        case .addRemoteHost: store.beginAddRemoteHost()
+        case nil: break
+        }
     }
 
     // MARK: - Renaming in place
@@ -688,8 +889,15 @@ struct MenuRow: View {
     var icon: String?
     let title: String
     var shortcut: String?
-    let isHovered: Bool
-    let hover: (Bool) -> Void
+    /// The highlight is on this row. One flag whether an arrow put it there or
+    /// the pointer did, because the two are one thing: the row Return acts on.
+    let isSelected: Bool
+    /// The pointer is over this row, and here is where the pointer is.
+    ///
+    /// A position rather than the `Bool` `.onHover` would hand over, because
+    /// whether this hover means anything is not a question the row can answer
+    /// — see `PaletteKeys.hoverMoved`. The row reports; the panel decides.
+    let hover: (CGPoint) -> Void
     let action: () -> Void
 
     var body: some View {
@@ -714,20 +922,30 @@ struct MenuRow: View {
                 Text(shortcut)
                     .font(.system(size: MenuMetrics.font))
                     .foregroundStyle(
-                        isHovered ? Palette.menuHighlightText.opacity(0.7) : Palette.menuShortcut)
+                        isSelected ? Palette.menuHighlightText.opacity(0.7) : Palette.menuShortcut)
             }
         }
-        .foregroundStyle(isHovered ? Palette.menuHighlightText : Palette.menuText)
+        .foregroundStyle(isSelected ? Palette.menuHighlightText : Palette.menuText)
         .padding(.horizontal, MenuMetrics.rowPadding)
         .frame(height: MenuMetrics.rowHeight)
         .background {
-            if isHovered {
+            if isSelected {
                 RoundedRectangle(cornerRadius: MenuMetrics.rowCornerRadius, style: .continuous)
                     .fill(Palette.menuHighlight)
             }
         }
         .contentShape(Rectangle())
-        .onHover(perform: hover)
+        // `.onContinuousHover` rather than `.onHover`, for the location: the
+        // panel needs to know whether the mouse moved, and "the pointer is
+        // inside me" cannot say. `.global` because the answer must be measured
+        // in a space the panel does not move in. `.ended` is dropped — a row
+        // the pointer has left has nothing to say about a highlight that now
+        // belongs to the keyboard as much as to the mouse, where the old
+        // `inside == false` used to clear it.
+        .onContinuousHover(coordinateSpace: .global) { phase in
+            guard case .active(let point) = phase else { return }
+            hover(point)
+        }
         .onTapGesture(perform: action)
     }
 }
