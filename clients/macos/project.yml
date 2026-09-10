@@ -162,6 +162,12 @@ targets:
       - path: Illogical/Sessions/SessionStore.swift
       - path: Illogical/Sessions/HostConnection.swift
       - path: Illogical/Sessions/Reconnect.swift
+      # The word lists a new session is named from. `SessionStore` does not
+      # compile without them, and they are worth holding on their own: the
+      # server refuses a name outside `[A-Za-z0-9._-]` and voids every create
+      # outstanding on that host when it does, so one word typed with an
+      # apostrophe in it would break ⇧⌘N for everyone at once.
+      - path: Illogical/Sessions/SessionNames.swift
       - path: Illogical/Terminal/TerminalController.swift
       # The pane view, for its `TerminalSurfaceDelegate` coordinator -- the one
       # line that turns ⌘W into a store call. It was outside the target, so

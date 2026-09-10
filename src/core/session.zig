@@ -47,14 +47,16 @@ pub const Residency = enum {
 };
 
 /// One terminal: a PTY, its state, and where that state lives.
+///
+/// What is *not* here: the foreground command and its directory, the two
+/// fields a client draws its breadcrumb from. They are re-read from the kernel
+/// on the maintenance tick and so are not safe to borrow -- `Terminal.label`
+/// copies them out under the lock that guards them.
 pub const TerminalSummary = struct {
     id: TerminalId,
     session: Id,
     /// User-visible name. Defaults to the terminal's index, renameable.
     name: []const u8,
-    /// Argv[0] of the child, for the client's session dropdown.
-    command: []const u8,
-    cwd: []const u8,
     cols: u16,
     rows: u16,
     residency: Residency,

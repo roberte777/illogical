@@ -766,8 +766,8 @@ final class SessionStore {
         target.createTerminal(sessionName: name)
     }
 
-    /// A fresh session on `host` — the machine in front by default — named
-    /// `session-N` for the lowest N no session there already uses.
+    /// A fresh session on `host` — the machine in front by default — under a
+    /// name no session there is using: `drifting-cedar`, from ``SessionNames``.
     ///
     /// The one place that name is made. Three call sites in two files had their
     /// own `session-\(count + 1)` — the File ▸ New Session command in
@@ -780,13 +780,16 @@ final class SessionStore {
     ///
     /// That is the *deleted lower number* case, and it is all this closes. The
     /// join is still reachable by racing: two ⇧⌘Ns inside one ssh round trip
-    /// both read `host.sessions` before either `created` lands, both propose
-    /// `session-1`, and `Server.sessionByNameLocked` joins by name rather than
-    /// refusing — so the second terminal opens in the session the first has
-    /// just made. Closing that needs the server to be able to say "this name,
-    /// only if it is new"; the protocol has no such flag today, so the race is
-    /// left standing rather than papered over with a client-side counter that
-    /// would be wrong across two windows anyway.
+    /// both read `host.sessions` before either `created` lands, and
+    /// `Server.sessionByNameLocked` joins by name rather than refusing — so if
+    /// both land on the same name, the second terminal opens in the session the
+    /// first has just made. Random names make that far less likely than
+    /// `session-1` twice did, which is a real improvement and not a fix: 9,120
+    /// pairs is still a collision every 9,120 races. Closing it needs the
+    /// server to be able to say "this name, only if it is new"; the protocol
+    /// has no such flag today, so the race is left standing rather than papered
+    /// over with a client-side counter that would be wrong across two windows
+    /// anyway.
     func createSession(on host: ServerHost? = nil) {
         let target = host ?? currentHost
         guard let connection = self.host(target) else { return }
@@ -794,13 +797,7 @@ final class SessionStore {
     }
 
     private func nextSessionName(on host: HostConnection) -> String {
-        // Exact comparison, mirroring the server's `mem.eql` — the same
-        // reasoning `renameRefusal` sets out. Being case-insensitive here would
-        // skip a name the daemon would have given us.
-        let taken = Set(host.sessions.map(\.name))
-        var index = 1
-        while taken.contains("session-\(index)") { index += 1 }
-        return "session-\(index)"
+        SessionNames.fresh(avoiding: Set(host.sessions.map(\.name)))
     }
 
     /// The session name a `create` should carry, or nil when it must not be

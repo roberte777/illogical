@@ -801,6 +801,48 @@ keeps the ✕ off a tab in flight: the dragged slot rides under the pointer, so
 the mouse-up that ends the drag would otherwise land inside its close button —
 dragging a tab by its ✕ closed it, measured.
 
+### The name a new session starts with
+
+⇧⌘N names the session it makes rather than numbering it: two words and a
+hyphen, drawn from the lists in `SessionNames` — `drifting-cedar`,
+`cosmic-summit`. What that replaces is `session-1`, `session-2`, `session-3`,
+and the reason is that a session name is the one label this app asks you to
+recognise. It is what the dropdown lists, what the session button says, what ⌘K
+matches against and what `illogical rename` takes; three numbers on screen at
+once are three rows you cannot tell apart without opening each. The machine
+already has an identifier for a session — the id, which every frame carries and
+no user ever reads.
+
+The name is a *starting* name. Rename is right there, and `drifting-cedar`
+being obviously arbitrary is part of it: nothing about it claims the app knows
+what the session is for, so it reads as a handle rather than as a description
+that has gone stale.
+
+**The draw avoids names already on that machine, and that is not cosmetic.** A
+`create` is addressed by name and `Server.sessionByNameLocked` *joins* a
+session whose name it already has rather than refusing it — so a name that is
+already there does not make a confusingly-labelled second session, it makes no
+session at all and opens a second tab in the one that was there. That was the
+whole of the `session-N` bug this replaces (`count + 1` named a session still
+on screen, once a lower-numbered one had been deleted), and it survives the
+change to random names, so the check does too. Sixteen draws, then the last
+pair plus the lowest free number: the numbered fallback is reachable only by a
+machine holding a large share of the 9,120 pairs, and it is the one step that
+cannot fail to terminate.
+
+Both word lists are ASCII, lower-case and free of `-`, so every pair satisfies
+the naming rule below. That is load-bearing in the same way the typed-name
+check is: a word added later with an apostrophe in it would not make one odd
+session, it would make ⇧⌘N do nothing at all, for everyone, whenever it came
+up. `SessionNamesTests` holds every word against `SessionName.isValid` rather
+than against a reading of the list.
+
+What this does *not* close is the race — two ⇧⌘Ns inside one SSH round trip
+both read `host.sessions` before either `created` lands. Random names make a
+collision there far less likely than `session-1` twice did, which is an
+improvement and not a fix; "A session is addressed by name on the way in" below
+is what closing it would actually take.
+
 ### Renaming and deleting a session
 
 Right-click a session row: **Rename** turns the row into a text field in place

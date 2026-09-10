@@ -123,6 +123,7 @@ works at all:
 | Input serialization | one writer; all client input funnels to the PTY |
 | Terminal queries | answered by the server, always — see below |
 | Parking | three levels ([PARKING.md](PARKING.md)) |
+| Breadcrumbs | where each child is and what it runs, re-read on the tick |
 | Attach | snapshot then live output ([PROTOCOL.md](PROTOCOL.md)) |
 | Control socket | unix socket; also speaks the protocol over stdio for SSH |
 
@@ -165,6 +166,34 @@ Where the entry is already installed on the machine, `TERM` alone is enough and
 nothing is pointed anywhere. Where there is no database to be found — a daemon
 installed by some other means, on a host with no ghostty — the child is told
 `xterm-256color`, which is a smaller terminal but a real one.
+
+**Where a terminal is, and what it is running,** are asked of the kernel rather
+than read out of the byte stream. `Terminal.probeForeground` takes the PTY's
+foreground process group with `tcgetpgrp` — the job an interactive shell handed
+the terminal to, so `nvim` and not the `zsh` that started it — and asks for that
+process's directory and name: `proc_pidinfo`/`proc_name` on macOS,
+`/proc/<pid>/{cwd,comm}` on Linux. It is where tmux's `pane_current_path` and
+`pane_current_command` come from too.
+
+The alternative was OSC 7, which is what Ghostty does and what issue #38 wrote
+down first. It is exact and instant where it works, and it needs shell
+integration to emit it — which this project does not ship, and cannot require of
+a machine you only reach over SSH. It also answers half the question: no escape
+sequence names the running command, so a terminal sitting in `nvim` would still
+have said `zsh`.
+
+The cost is bounded by a gate rather than by a timer. A probe only happens for a
+terminal that has produced output since the last one — and a PTY echoes what is
+typed into it, so anyone who *runs* anything makes output before the program
+does. A terminal nobody is using costs nothing, which is the same rule parking
+is built on. One `sessions_changed` covers the whole tick however many terminals
+moved.
+
+The gate starts shut, so a child that has never said a word keeps the label it
+was spawned with. That is the honest answer for such a terminal, and it avoids
+a first probe landing in the microseconds between `fork` and `exec` — where it
+would read the daemon's own name off a child that has not become anything yet,
+and, there being no output to come, would never be corrected.
 
 **Threading.** A terminal is never touched by two threads at once — libghostty-vt
 requires this. Each terminal has a lock; its hot PTY thread holds it while

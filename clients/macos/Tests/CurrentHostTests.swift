@@ -514,28 +514,40 @@ final class CurrentHostTests: XCTestCase {
         }
     }
 
-    /// The lowest unused number, not one more than the count. A `create` is
-    /// addressed by name and the daemon *joins* a session whose name it already
-    /// has, so with `session-1` deleted and `session-2` still open, `count + 1`
-    /// named the session already on screen — and "New Session" quietly opened a
-    /// second tab in it.
-    func testNewSessionPicksTheLowestUnusedName() async throws {
+    /// A name no session on that machine is using. A `create` is addressed by
+    /// name and the daemon *joins* a session whose name it already has, so a
+    /// name that is already there does not make a second session under a
+    /// confusing label — it makes no session at all and opens a second tab in
+    /// the one that was there.
+    ///
+    /// The name is drawn at random (``SessionNames``), so what is asserted is
+    /// the property rather than the string: what it must not be is either of
+    /// the two on screen. `SessionNamesTests` holds the draw itself, against a
+    /// generator it can pin — the collision path cannot be reached from here,
+    /// because reaching it means a host holding thousands of sessions.
+    func testNewSessionAvoidsANameAlreadyOnThatMachine() async throws {
         let server = try RecordingServer()
         defer { server.stop() }
         let (store, hosts) = try await connected([server])
         defer { for host in hosts { host.disconnect() } }
-        list(store, host: hosts[0].host, [(1, "session-1", [1]), (2, "session-2", [2])])
-        list(store, host: hosts[0].host, [(2, "session-2", [2])])
+        let taken = ["drifting-cedar", "cosmic-summit"]
+        list(
+            store, host: hosts[0].host,
+            [(1, taken[0], [1]), (2, taken[1], [2])])
 
         store.createSession()
 
         try await waitFor("the create") { !server.frames(.create).isEmpty }
-        XCTAssertEqual(try createdNames(server), ["session-1"])
+        let names = try createdNames(server)
+        XCTAssertEqual(names.count, 1)
+        let name = try XCTUnwrap(names.first)
+        XCTAssertFalse(taken.contains(name), "the create would have joined a session on screen")
+        XCTAssertTrue(SessionName.isValid(name), "the server would have refused \(name)")
     }
 
-    /// And it goes to the machine the window is on. Two machines each number
-    /// their sessions from 1, so "session-1" is not evidence of anything on its
-    /// own — which socket it left by is.
+    /// And it goes to the machine the window is on. A name says nothing about
+    /// which machine made it — both draw from the same lists — so which socket
+    /// the frame left by is the only evidence there is.
     func testCreateSessionGoesToTheCurrentHost() async throws {
         let here = try RecordingServer()
         let there = try RecordingServer()
@@ -551,7 +563,7 @@ final class CurrentHostTests: XCTestCase {
         store.createSession()
 
         try await waitFor("the create") { !there.frames(.create).isEmpty }
-        XCTAssertEqual(try createdNames(there), ["session-1"])
+        XCTAssertEqual(try createdNames(there).count, 1)
         XCTAssertTrue(
             here.frames(.create).isEmpty,
             "the session was made on the machine the window had left")

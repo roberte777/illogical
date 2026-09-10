@@ -194,6 +194,12 @@ pub fn maintenanceTick(self: *Server) void {
         ids.appendSlice(self.gpa, self.terminals.keys()) catch return;
     }
 
+    // Whether any terminal's breadcrumb moved on this tick. One broadcast for
+    // all of them: `sessions_changed` sends every client back for a whole
+    // `list`, and a tick where four terminals changed directory is still one
+    // thing that happened.
+    var breadcrumbs_moved = false;
+
     for (ids.items) |id| {
         const t = self.terminal(id) orelse continue;
         // First: a child that hung up while its PTY was polled is waiting for
@@ -202,6 +208,12 @@ pub fn maintenanceTick(self: *Server) void {
 
         const summary = t.summary();
         if (summary.residency == .exited) continue;
+
+        // Where the child is and what it is running. Before the parking
+        // below, which does not care either way -- a probe touches none of the
+        // clocks parking reads, and a parked terminal's child is as alive and
+        // as askable as a hot one's.
+        if (t.probeForeground()) breadcrumbs_moved = true;
 
         if (illogical.park.shouldPark(
             self.park_config,
@@ -219,6 +231,10 @@ pub fn maintenanceTick(self: *Server) void {
 
         self.applyRegime(t);
     }
+
+    // Outside the loop and outside the registry lock, like every other
+    // broadcast on this tick.
+    if (breadcrumbs_moved) self.notifySessionsChanged();
 }
 
 /// Put one terminal's PTY in the regime it belongs in now (A3, level 2).
@@ -673,12 +689,16 @@ pub fn listInto(self: *Server, arena: Allocator) !protocol.body.SessionList {
     var terms: std.ArrayList(protocol.body.TerminalInfo) = .empty;
     for (self.terminals.values()) |t| {
         const sum = t.summary();
+        // Copied under the terminal's own lock rather than borrowed off the
+        // summary: the maintenance tick rewrites both while this runs on a
+        // client's thread. See `Terminal.label`.
+        const crumb = try t.label(arena);
         try terms.append(arena, .{
             .id = sum.id,
             .session = sum.session,
             .name = try arena.dupe(u8, sum.name),
-            .command = try arena.dupe(u8, sum.command),
-            .cwd = try arena.dupe(u8, sum.cwd),
+            .command = crumb.command,
+            .cwd = crumb.cwd,
             .cols = sum.cols,
             .rows = sum.rows,
             .residency = @tagName(sum.residency),
@@ -854,6 +874,45 @@ const TestDaemon = struct {
         return try gpa.dupe(u8, parsed.value.name);
     }
 };
+
+test "a terminal that moves is followed by the list, on the tick" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const d = try TestDaemon.start(gpa, "crumbs");
+    defer d.stop();
+
+    const made = try d.server.createTerminal(.{
+        .session_name = "work",
+        .name = "1",
+        // Moves, says one thing, and stays. The order is what makes this
+        // deterministic rather than a race: the probe is gated on output, and
+        // the byte that opens the gate is written from a process that has
+        // already arrived. A person at a prompt is the same shape -- the
+        // prompt they are looking at was printed after the `cd` returned.
+        .argv = &.{ "/bin/sh", "-c", "cd /usr; printf .; sleep 30" },
+    });
+
+    // Nothing here drives the probe: the maintenance thread does it, on its
+    // own clock, which is the path the Mac client actually gets this on.
+    var waited: usize = 0;
+    while (waited < 5000) : (waited += 10) {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const list = try d.server.listInto(arena.allocator());
+        for (list.terminals) |t| {
+            if (t.id != made.terminal) continue;
+            // Not the command as well: `/bin/sh` is Apple's `sh` on one
+            // platform and a symlink to `dash` on the other, and what comes
+            // back is the name of the executable. The command half is pinned
+            // in `Terminal.zig`, against a binary that is called the same
+            // thing everywhere.
+            if (std.mem.eql(u8, t.cwd, "/usr")) return;
+        }
+        sys.sleepNs(10 * std.time.ns_per_ms);
+    }
+    return error.ListNeverMoved;
+}
 
 test "renaming a session is validated, persisted, and visible in the list" {
     const testing = std.testing;
