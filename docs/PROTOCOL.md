@@ -164,6 +164,16 @@ park store and part of a JSON document written to it. The *terminal* name in
 `create` is **not** validated: it never reaches disk, so `illogical new -n "my
 name"` keeps working.
 
+### Where a created terminal starts
+
+`create.cwd` is a directory on the server's machine. Absent, the terminal starts
+in the daemon's `$HOME`. A `cwd` that is not there is treated as absent, rather
+than handed to a `chdir` that fails silently in the child and leaves the shell
+wherever the daemon itself stands — Ghostty's rule for a working directory it
+cannot access. The Mac client sends the directory of the terminal a new one is
+made from, and only within one session; see [CLIENT.md](CLIENT.md), "Where a
+new terminal starts".
+
 ### Session-scoped frames
 
 Everything above addresses a *terminal*: the header's u64 is a terminal id, and

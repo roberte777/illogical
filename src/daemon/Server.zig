@@ -633,7 +633,16 @@ pub fn createTerminal(self: *Server, req: protocol.body.Create) !CreateResult {
 
     // A terminal always has a working directory, because clients label tabs
     // with it. Fall back to the user's home rather than reporting nothing.
-    const cwd = req.cwd orelse sys.getenv("HOME") orelse "/";
+    //
+    // A directory that is not there counts as no directory at all, which is
+    // Ghostty's rule too ("cannot access cwd, ignoring", `termio/Exec.zig`).
+    // The Mac app sends the directory of the terminal a new one was made
+    // from, and that can be a worktree removed since. The child's `chdir`
+    // fails silently, so without this the shell would start wherever the
+    // daemon itself stands: `/` when it is detached, the checkout for
+    // `just serve`.
+    const asked = req.cwd orelse "";
+    const cwd = if (sys.pathExists(asked)) asked else sys.getenv("HOME") orelse "/";
 
     const t = try Terminal.create(self.gpa, .{
         .io = self.io,
@@ -912,6 +921,48 @@ test "a terminal that moves is followed by the list, on the tick" {
         sys.sleepNs(10 * std.time.ns_per_ms);
     }
     return error.ListNeverMoved;
+}
+
+test "a create whose directory is not there starts at home" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+
+    const d = try TestDaemon.start(gpa, "gone-cwd");
+    defer d.stop();
+
+    const kept = try d.server.createTerminal(.{
+        .session_name = "work",
+        .name = "kept",
+        .argv = &.{ "/bin/sh", "-c", "sleep 30" },
+        .cwd = "/usr",
+    });
+    // The worktree the terminal it was made from was standing in, removed.
+    const gone = try d.server.createTerminal(.{
+        .session_name = "work",
+        .name = "gone",
+        .argv = &.{ "/bin/sh", "-c", "sleep 30" },
+        .cwd = "/illogical-no-such-directory",
+    });
+
+    // Read off the label rather than the child. The probe gate starts shut and
+    // `sleep` never opens it, so the list reports exactly the directory
+    // `createTerminal` chose to spawn in -- which is the decision under test,
+    // with no tick to wait for.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const list = try d.server.listInto(arena.allocator());
+    var seen: usize = 0;
+    for (list.terminals) |t| {
+        if (t.id == kept.terminal) {
+            try testing.expectEqualStrings("/usr", t.cwd);
+            seen += 1;
+        }
+        if (t.id == gone.terminal) {
+            try testing.expectEqualStrings(sys.getenv("HOME") orelse "/", t.cwd);
+            seen += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), seen);
 }
 
 test "renaming a session is validated, persisted, and visible in the list" {

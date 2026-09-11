@@ -801,6 +801,42 @@ keeps the ✕ off a tab in flight: the dragged slot rides under the pointer, so
 the mouse-up that ends the drag would otherwise land inside its close button —
 dragging a tab by its ✕ closed it, measured.
 
+### Where a new terminal starts
+
+⌘T and a split open in the directory of the terminal they were made from, the
+way Ghostty's `tab-inherit-working-directory` and
+`split-inherit-working-directory` do by default. ⌘T — the `+` and the
+empty-state button are the same command — reads the focused pane of the front
+tab. A split reads the pane being split, which is not always the one in front,
+since every pane's header carries its own split buttons. The directory is that
+terminal's breadcrumb, so a new terminal opens where its neighbour's header
+says you are. It goes out as `create.cwd`, which the daemon has spawned in
+since before protocol v2, so this half works against a remote machine on an
+older build too. `SessionStore.inheritedDirectory` is the one place that
+decides.
+
+**Nothing crosses a session.** The terminal read from has to be in the session
+the new one joins, found the way `Server.sessionByNameLocked` will find it:
+that name, exactly, on that machine. ⇧⌘N and a name typed into the dropdown
+make a session that does not exist yet, so they start at home even with a
+terminal in front — where Ghostty's new *window* would inherit, and this
+deliberately does not. Picking a session with no tabs in the dropdown makes a
+terminal in it with nothing of its own to inherit, so that starts at home too.
+And the host is compared before the terminal id, because two daemons both
+number their terminals from 1.
+
+Two edges, both the daemon's. The breadcrumb is re-read on the 250 ms
+maintenance tick, and only for a terminal that has printed something since the
+last read, so a ⌘T in the same instant as a `cd` can open one directory behind
+— the directory the header is still showing. And a directory that has gone
+since, like the worktree you were standing in, starts the terminal at home
+rather than wherever the daemon itself stands: `Server.createTerminal` treats a
+`cwd` that is not there as no `cwd` at all, which is Ghostty's rule too. That
+half is a daemon change, so an older daemon on a remote machine still starts
+such a terminal wherever it was itself started. None of this is configurable
+yet; the `*-inherit-working-directory` keys belong with the rest of the
+configuration in #39.
+
 ### The name a new session starts with
 
 ⇧⌘N names the session it makes rather than numbering it: two words and a

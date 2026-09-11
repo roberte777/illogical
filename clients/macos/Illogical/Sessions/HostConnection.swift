@@ -644,9 +644,13 @@ final class HostConnection: Identifiable {
         try? control?.send(.list)
     }
 
-    func createTerminal(sessionName: String) {
+    /// `cwd` is a directory on this machine; nil leaves it to the daemon, which
+    /// starts the terminal in `$HOME`. It has no default because
+    /// `SessionStore.inheritedDirectory` is what decides it, and every caller
+    /// has to have asked.
+    func createTerminal(sessionName: String, cwd: String?) {
         try? control?.send(
-            .create, json: CreateBody(sessionName: sessionName, cols: 120, rows: 40))
+            .create, json: CreateBody(sessionName: sessionName, cwd: cwd, cols: 120, rows: 40))
     }
 
     func kill(_ id: UInt64) {

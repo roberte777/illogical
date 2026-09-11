@@ -763,7 +763,39 @@ final class SessionStore {
         let target = host.map { self.host($0) } ?? current
         guard let target, let name = createName(typed: sessionName, joining: nil, on: target)
         else { return }
-        target.createTerminal(sessionName: name)
+        let cwd = inheritedDirectory(from: selectedRef, joining: name, on: target)
+        target.createTerminal(sessionName: name, cwd: cwd)
+    }
+
+    /// Where a new terminal starts: the directory of the terminal it was made
+    /// from, the way Ghostty's `tab-inherit-working-directory` and
+    /// `split-inherit-working-directory` have it by default — or nil, which the
+    /// daemon reads as `$HOME`, when that terminal is not in the session the
+    /// new one joins.
+    ///
+    /// `from` is the terminal the verb was aimed at: the focused pane of the
+    /// front tab for ⌘T, the pane being split for a split. That is what Ghostty
+    /// reads too — the surface the action targeted, and the default when there
+    /// is none. The directory is the breadcrumb's, so a new terminal opens
+    /// where that pane's header says you are.
+    ///
+    /// **Nothing crosses a session.** A `create` is addressed by name, so the
+    /// session it will land in is found here the way
+    /// `Server.sessionByNameLocked` will find it: that name, exactly, on that
+    /// machine. A name no session there holds is a session that does not exist
+    /// yet — ⇧⌘N, a name typed into the dropdown — so a new session starts at
+    /// home even with a terminal in front, which is where this parts from
+    /// Ghostty's new-window rule. The host is compared before the id because
+    /// two daemons both number their terminals from 1.
+    private func inheritedDirectory(
+        from ref: TerminalRef?, joining name: String, on host: HostConnection
+    ) -> String? {
+        guard let ref, ref.host == host.host,
+            let session = host.sessions.first(where: { $0.name == name }),
+            let terminal = host.terminal(ref.terminal), terminal.session == session.id,
+            !terminal.cwd.isEmpty
+        else { return nil }
+        return terminal.cwd
     }
 
     /// A fresh session on `host` — the machine in front by default — under a
@@ -1049,7 +1081,9 @@ final class SessionStore {
         // already-open channel, which is the same order of magnitude.
         pendingSplits.append(
             PendingSplit(host: host.host, tab: tabID, pane: paneID, direction: direction))
-        host.createTerminal(sessionName: name)
+        let splitting = tab.root.pane(paneID)?.terminal
+        let cwd = inheritedDirectory(from: splitting, joining: name, on: host)
+        host.createTerminal(sessionName: name, cwd: cwd)
     }
 
     /// Close one pane. The last pane in a tab closes the tab.
