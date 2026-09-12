@@ -615,6 +615,32 @@ pub fn createTerminal(self: *Server, req: protocol.body.Create) !CreateResult {
     // the rule for terminal names belongs with terminal rename (#38).
     try session.validateName(req.session_name);
 
+    // Also before the lock, and for a sharper reason than the name check: this
+    // is a syscall on a path a *client* chose. `access` on a wedged network
+    // mount blocks uninterruptibly, and under the registry lock that would
+    // stall every other client's `list`, `create` and `kill` -- and the
+    // maintenance tick with them -- on one dead NFS server. Nothing here reads
+    // the registry, so it has no business holding it.
+    //
+    // A terminal always has a working directory, because clients label tabs
+    // with it. Fall back to the user's home rather than reporting nothing.
+    //
+    // A directory that cannot be entered counts as no directory at all, which
+    // is Ghostty's rule too ("cannot access cwd, ignoring", `termio/Exec.zig`).
+    // The Mac app sends the directory of the terminal a new one was made from,
+    // and that can be a worktree removed since. The child's `chdir` fails
+    // silently, so without this the shell would start wherever the daemon
+    // itself stands -- `/` when it is detached, the checkout for `just serve`
+    // -- under a label naming the directory it is not in. `$HOME` is checked
+    // the same way rather than trusted: a daemon whose home is gone or
+    // unmounted would otherwise hand the child a path that fails identically.
+    const cwd = cwd: {
+        if (req.cwd) |dir| if (sys.isEnterableDir(dir)) break :cwd dir;
+        const home = sys.getenv("HOME") orelse "";
+        if (sys.isEnterableDir(home)) break :cwd home;
+        break :cwd "/";
+    };
+
     self.mutex.lock();
     defer self.mutex.unlock();
 
@@ -630,19 +656,6 @@ pub fn createTerminal(self: *Server, req: protocol.body.Create) !CreateResult {
 
     const default_argv = defaultArgv();
     const argv: []const []const u8 = if (req.argv.len > 0) req.argv else &default_argv;
-
-    // A terminal always has a working directory, because clients label tabs
-    // with it. Fall back to the user's home rather than reporting nothing.
-    //
-    // A directory that is not there counts as no directory at all, which is
-    // Ghostty's rule too ("cannot access cwd, ignoring", `termio/Exec.zig`).
-    // The Mac app sends the directory of the terminal a new one was made
-    // from, and that can be a worktree removed since. The child's `chdir`
-    // fails silently, so without this the shell would start wherever the
-    // daemon itself stands: `/` when it is detached, the checkout for
-    // `just serve`.
-    const asked = req.cwd orelse "";
-    const cwd = if (sys.pathExists(asked)) asked else sys.getenv("HOME") orelse "/";
 
     const t = try Terminal.create(self.gpa, .{
         .io = self.io,
@@ -923,7 +936,7 @@ test "a terminal that moves is followed by the list, on the tick" {
     return error.ListNeverMoved;
 }
 
-test "a create whose directory is not there starts at home" {
+test "a create whose directory cannot be entered starts at home" {
     const testing = std.testing;
     const gpa = testing.allocator;
 
@@ -943,6 +956,17 @@ test "a create whose directory is not there starts at home" {
         .argv = &.{ "/bin/sh", "-c", "sleep 30" },
         .cwd = "/illogical-no-such-directory",
     });
+    // There, and still not somewhere a child can stand. An existence check
+    // passes this one through to a `chdir` that fails silently, which is the
+    // whole difference between `F_OK` and the `X_OK` the spawn actually needs.
+    // `/etc/hosts` carries no execute bit on either platform, so it fails for
+    // root as well.
+    const file = try d.server.createTerminal(.{
+        .session_name = "work",
+        .name = "file",
+        .argv = &.{ "/bin/sh", "-c", "sleep 30" },
+        .cwd = "/etc/hosts",
+    });
 
     // Read off the label rather than the child. The probe gate starts shut and
     // `sleep` never opens it, so the list reports exactly the directory
@@ -951,18 +975,19 @@ test "a create whose directory is not there starts at home" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const list = try d.server.listInto(arena.allocator());
+    const home = sys.getenv("HOME") orelse "/";
     var seen: usize = 0;
     for (list.terminals) |t| {
         if (t.id == kept.terminal) {
             try testing.expectEqualStrings("/usr", t.cwd);
             seen += 1;
         }
-        if (t.id == gone.terminal) {
-            try testing.expectEqualStrings(sys.getenv("HOME") orelse "/", t.cwd);
+        if (t.id == gone.terminal or t.id == file.terminal) {
+            try testing.expectEqualStrings(home, t.cwd);
             seen += 1;
         }
     }
-    try testing.expectEqual(@as(usize, 2), seen);
+    try testing.expectEqual(@as(usize, 3), seen);
 }
 
 test "renaming a session is validated, persisted, and visible in the list" {

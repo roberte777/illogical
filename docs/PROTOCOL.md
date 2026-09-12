@@ -167,10 +167,12 @@ name"` keeps working.
 ### Where a created terminal starts
 
 `create.cwd` is a directory on the server's machine. Absent, the terminal starts
-in the daemon's `$HOME`. A `cwd` that is not there is treated as absent, rather
-than handed to a `chdir` that fails silently in the child and leaves the shell
-wherever the daemon itself stands — Ghostty's rule for a working directory it
-cannot access. The Mac client sends the directory of the terminal a new one is
+in the daemon's `$HOME`. A `cwd` the daemon cannot enter — gone, or a directory
+it has no search permission on — is treated as absent, rather than handed to a
+`chdir` that fails silently in the child and leaves the shell wherever the
+daemon itself stands under a label naming the directory it is not in. That is
+Ghostty's rule for a working directory it cannot access. `$HOME` is tested the
+same way, and `/` is the last resort. The Mac client sends the directory of the terminal a new one is
 made from, and only within one session; see [CLIENT.md](CLIENT.md), "Where a
 new terminal starts".
 

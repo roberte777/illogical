@@ -831,7 +831,7 @@ last read, so a ⌘T in the same instant as a `cd` can open one directory behind
 — the directory the header is still showing. And a directory that has gone
 since, like the worktree you were standing in, starts the terminal at home
 rather than wherever the daemon itself stands: `Server.createTerminal` treats a
-`cwd` that is not there as no `cwd` at all, which is Ghostty's rule too. That
+`cwd` it cannot enter as no `cwd` at all, which is Ghostty's rule too. That
 half is a daemon change, so an older daemon on a remote machine still starts
 such a terminal wherever it was itself started. None of this is configurable
 yet; the `*-inherit-working-directory` keys belong with the rest of the

@@ -1038,7 +1038,8 @@ final class SessionLifecycleTests: XCTestCase {
         try await waitFor("the create") { !server.frames(.create).isEmpty }
         let body = try JSONDecoder().decode(
             CreateBody.self, from: try XCTUnwrap(server.frames(.create).first).payload)
-        XCTAssertEqual(body.cwd, "/src/web", "the split took the directory of the pane in front")
+        XCTAssertEqual(
+            body.cwd, "/src/web", "the split took the front tab's directory, not the pane it split")
     }
 
     /// Nothing crosses a session. ⇧⌘N, a name typed into the dropdown, and
