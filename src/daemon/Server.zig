@@ -975,7 +975,15 @@ test "a create whose directory cannot be entered starts at home" {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const list = try d.server.listInto(arena.allocator());
-    const home = sys.getenv("HOME") orelse "/";
+    // Worked out the way `createTerminal` works it out, rather than as
+    // `getenv("HOME") orelse "/"`: a `$HOME` that is set and cannot be entered
+    // falls back to `/` there, and a test that expected the literal `$HOME`
+    // would fail on such a machine against a daemon doing exactly the right
+    // thing.
+    const home = home: {
+        const h = sys.getenv("HOME") orelse "";
+        break :home if (sys.isEnterableDir(h)) h else "/";
+    };
     var seen: usize = 0;
     for (list.terminals) |t| {
         if (t.id == kept.terminal) {
