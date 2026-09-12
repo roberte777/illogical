@@ -66,6 +66,17 @@ final class SessionLifecycleTests: XCTestCase {
             cols: 80, rows: 24, residency: .live, attached: 0, ptyReadIdleNanoseconds: 0)
     }
 
+    /// Where each terminal's breadcrumb says it is: what a `session_list`
+    /// reports once the daemon's probe has seen a `cd`.
+    private func move(_ store: SessionStore, host: ServerHost = local, _ cwds: [UInt64: String]) {
+        guard let connection = store.host(host) else { return XCTFail("no such host") }
+        connection.terminals = connection.terminals.map { terminal in
+            var terminal = terminal
+            terminal.cwd = cwds[terminal.id] ?? terminal.cwd
+            return terminal
+        }
+    }
+
     private func ref(_ session: UInt64, on host: ServerHost = local) -> SessionRef {
         SessionRef(host: host, session: session)
     }
@@ -981,6 +992,112 @@ final class SessionLifecycleTests: XCTestCase {
         XCTAssertEqual(
             body.sessionName, "second",
             "the split was spliced into a different session's tab")
+    }
+
+    // MARK: - Where a new terminal starts
+
+    /// ⌘T opens where the terminal in front is, as Ghostty's
+    /// `tab-inherit-working-directory` does — *that* terminal, not merely one
+    /// in the same session. Two tabs of one session in two directories is the
+    /// case that tells them apart.
+    func testANewTerminalStartsWhereTheOneInFrontIs() async throws {
+        let server = try RecordingServer()
+        defer { server.stop() }
+        let (store, host) = try await connected(server)
+        defer { host.disconnect() }
+        list(store, host: host.host, [(1, "work", [1, 2])])
+        move(store, host: host.host, [1: "/src/api", 2: "/src/web"])
+        let web = try XCTUnwrap(store.tabs.first { $0.focusedTerminal?.terminal == 2 })
+        store.selectedTabID = web.id
+
+        store.createTerminal()
+
+        try await waitFor("the create") { !server.frames(.create).isEmpty }
+        let body = try JSONDecoder().decode(
+            CreateBody.self, from: try XCTUnwrap(server.frames(.create).first).payload)
+        XCTAssertEqual(body.sessionName, "work")
+        XCTAssertEqual(body.cwd, "/src/web")
+    }
+
+    /// A split starts where the pane it splits is — the pane named, which is
+    /// not necessarily the one in front: every pane's header carries its own
+    /// split buttons, and Ghostty splits the surface the action targeted.
+    func testASplitStartsWhereThePaneItSplitsIs() async throws {
+        let server = try RecordingServer()
+        defer { server.stop() }
+        let (store, host) = try await connected(server)
+        defer { host.disconnect() }
+        list(store, host: host.host, [(1, "work", [1, 2])])
+        move(store, host: host.host, [1: "/src/api", 2: "/src/web"])
+        let api = try XCTUnwrap(store.tabs.first { $0.focusedTerminal?.terminal == 1 })
+        let web = try XCTUnwrap(store.tabs.first { $0.focusedTerminal?.terminal == 2 })
+        store.selectedTabID = api.id
+
+        store.split(pane: web.focused, in: web.id, direction: .columns)
+
+        try await waitFor("the create") { !server.frames(.create).isEmpty }
+        let body = try JSONDecoder().decode(
+            CreateBody.self, from: try XCTUnwrap(server.frames(.create).first).payload)
+        XCTAssertEqual(
+            body.cwd, "/src/web", "the split took the front tab's directory, not the pane it split")
+    }
+
+    /// Nothing crosses a session. ⇧⌘N, a name typed into the dropdown, and
+    /// picking a session whose terminals have all gone each make a terminal in
+    /// a session the one in front is not in — and each starts at home, however
+    /// deep in a directory the terminal in front is.
+    func testNoDirectoryIsInheritedIntoAnotherSession() async throws {
+        let server = try RecordingServer()
+        defer { server.stop() }
+        let (store, host) = try await connected(server)
+        defer { host.disconnect() }
+        list(store, host: host.host, [(1, "work", [1]), (2, "emptied", [])])
+        move(store, host: host.host, [1: "/Users/me/client-work"])
+        XCTAssertEqual(store.selectedSession, ref(1, on: host.host))
+
+        store.createSession()
+        store.createTerminal(sessionName: "fresh")
+        // What `SessionMenu.select` does for a session with no tabs.
+        store.createTerminal(sessionName: "emptied", on: host.host)
+
+        try await waitFor("three creates") { server.frames(.create).count == 3 }
+        let bodies = try server.frames(.create).map {
+            try JSONDecoder().decode(CreateBody.self, from: $0.payload)
+        }
+        XCTAssertEqual(Array(bodies.map(\.sessionName).dropFirst()), ["fresh", "emptied"])
+        XCTAssertEqual(
+            bodies.map(\.cwd), [nil, nil, nil],
+            "a directory in session 'work' was sent into another session")
+    }
+
+    /// Nor across machines. Both daemons number from 1, so the terminal in
+    /// front — terminal 1, in a session called `work` — names a terminal on the
+    /// other machine too, in a session of the same name. Its directory is a
+    /// path on this machine and must not reach the other's `chdir`, and the
+    /// other machine's terminal 1 must not answer for it either.
+    func testNoDirectoryIsInheritedOntoAnotherMachine() async throws {
+        let here = try RecordingServer()
+        let there = try RecordingServer()
+        defer {
+            here.stop()
+            there.stop()
+        }
+        let (store, hosts) = try await connected([here, there])
+        defer { for host in hosts { host.disconnect() } }
+        list(store, host: hosts[0].host, [(1, "work", [1])])
+        list(store, host: hosts[1].host, [(1, "work", [1])])
+        move(store, host: hosts[0].host, [1: "/here"])
+        move(store, host: hosts[1].host, [1: "/there"])
+        let front = try XCTUnwrap(store.tabs.first { $0.session.host == hosts[0].host })
+        store.selectedTabID = front.id
+
+        store.createTerminal(on: hosts[1].host)
+
+        try await waitFor("the create") { !there.frames(.create).isEmpty }
+        let body = try JSONDecoder().decode(
+            CreateBody.self, from: try XCTUnwrap(there.frames(.create).first).payload)
+        XCTAssertEqual(body.sessionName, "work")
+        XCTAssertNil(body.cwd, "a path from one machine was sent to another")
     }
 
     /// The app always cascades: it has already asked. `only_if_empty` is for

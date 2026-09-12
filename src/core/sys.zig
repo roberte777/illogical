@@ -308,6 +308,30 @@ pub fn pathExists(path: []const u8) bool {
     return access(@ptrCast(&buf), F_OK) == 0;
 }
 
+/// `access(path, X_OK)`: whether this process could `chdir` into `path`.
+///
+/// Search permission is what `chdir` needs, and existence is not the same
+/// question: a directory with no `x` bit for this user passes `pathExists` and
+/// then fails the `chdir` -- which `chdirPath` discards, so the child stays
+/// where the daemon was standing while the list labels it with the directory it
+/// asked for. A terminal that lies about where it is is worse than one that
+/// starts at home.
+///
+/// An executable *file* still passes, because `access` cannot tell a file from
+/// a directory. That is a client sending nonsense rather than a directory that
+/// moved, and it fails the way it always did.
+///
+/// Real-uid, and it races anything that chmods a microsecond later, on the same
+/// terms as `isWritableDir`: the child still has to survive its own `chdir`,
+/// and this only decides which path is worth handing it.
+pub fn isEnterableDir(path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len == 0 or path.len >= buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return access(@ptrCast(&buf), X_OK) == 0;
+}
+
 const F_OK: c_int = 0;
 const W_OK: c_int = 2;
 const X_OK: c_int = 1;
