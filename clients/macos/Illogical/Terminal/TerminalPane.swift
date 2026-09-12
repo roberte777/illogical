@@ -258,6 +258,18 @@ struct TerminalSurface: NSViewRepresentable {
         // shell. Read rather than observed on purpose: this is a question about
         // right now, not an input the view needs rebuilding for.
         guard store.existingController(for: pane.terminal)?.search.isOpen != true else { return }
+        // Nor while the dropdown or the palette is up, for the same reason:
+        // each has a field that holds first responder for as long as the panel
+        // is on screen. This runs whenever SwiftUI updates the representable,
+        // not only when `focusGeneration` asks — a terminal appearing on any
+        // machine rewrites `tabs`, which is read below — and each of those
+        // updates took the keyboard back from the panel. The filter could not
+        // be typed into and Return, which the field reads as `.onSubmit`, went
+        // to the shell, while the arrows went on working, because `PaletteKeys`
+        // takes them before first responder is consulted — so the panel looked
+        // as though it had the keyboard when it did not. Closing either one
+        // lifts this, and `ContentView` bumps `focusGeneration` besides.
+        guard !store.overlayHoldsKeyboard else { return }
         // The tab may have moved focus without a click — a keyboard move, or
         // the pane the tree collapsed onto. AppKit is the authority on first
         // responder, so tell it rather than tracking focus separately.

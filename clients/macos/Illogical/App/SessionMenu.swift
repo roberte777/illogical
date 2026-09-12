@@ -434,10 +434,11 @@ struct SessionMenu: View {
         .onDisappear { store.pendingRename = nil }
         // Escape closes the menu, the way it closes an NSMenu. Not
         // `.onExitCommand`, which was W10's bug: that fires only for the
-        // *focused* view, and the focus the line above asks for does not
-        // reliably land -- with the menu open the app's focused element was
+        // *focused* view, and the focus the line above asks for did not
+        // reliably hold -- with the menu open the app's focused element was
         // still the terminal surface underneath, so Escape went to the
-        // terminal and the menu stayed. `onEscape` watches the event rather
+        // terminal and the menu stayed. (The surface was taking it back; see
+        // `SessionStore.overlayHoldsKeyboard`.) `onEscape` watches the event rather
         // than the focus, so it works wherever first responder happens to
         // be. Closing hands the
         // keyboard back to the terminal (SessionStore.focusTerminal).

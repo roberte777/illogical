@@ -237,6 +237,25 @@ final class TabNavigationTests: XCTestCase {
         XCTAssertNotEqual(store.focusGeneration, before)
     }
 
+    /// What `TerminalSurface` asks before re-asserting first responder. Either
+    /// overlay on its own holds the keyboard — including across the handover
+    /// from one to the other, where the exclusion closes the first as the
+    /// second opens — and once both have gone the terminal may take it back.
+    func testAnOpenOverlayHoldsTheKeyboard() {
+        let store = store([1])
+        XCTAssertFalse(store.overlayHoldsKeyboard)
+
+        store.toggleSessionMenu()
+        XCTAssertTrue(store.overlayHoldsKeyboard, "the terminal could take the dropdown's keyboard")
+
+        store.runCommand(.commandPalette)
+        XCTAssertFalse(store.sessionMenuOpen)
+        XCTAssertTrue(store.overlayHoldsKeyboard, "the terminal could take the palette's keyboard")
+
+        store.closePalette()
+        XCTAssertFalse(store.overlayHoldsKeyboard, "the terminal never gets the keyboard back")
+    }
+
     // MARK: - ⌃⇥
     //
     // The monitor itself needs a window and cannot be driven from here; the
