@@ -251,7 +251,23 @@ struct TerminalSurface: NSViewRepresentable {
 
     func updateNSView(_ view: TerminalSurfaceView, context: Context) {
         context.coordinator.store = store
-        // Not while this pane's find bar is up. The field holds first responder
+        // Not while the dropdown or the palette is up: each has a field that
+        // holds first responder for as long as the panel is on screen. This
+        // runs whenever SwiftUI updates the representable, not only when
+        // `focusGeneration` asks — a terminal appearing on any machine
+        // rewrites `tabs`, which is read below — and each of those updates
+        // took the keyboard back from the panel. The filter could not be typed
+        // into and Return, which the field reads as `.onSubmit`, went to the
+        // shell, while the arrows went on working, because `PaletteKeys` takes
+        // them before first responder is consulted — so the panel looked as
+        // though it had the keyboard when it did not. Closing either one lifts
+        // this, and `ContentView` bumps `focusGeneration` besides.
+        //
+        // First because it is the cheapest question here — two stored
+        // properties, against the two lookups the find bar's costs — and every
+        // update while a panel is open ends on this line.
+        guard !store.overlayHoldsKeyboard else { return }
+        // Nor while this pane's find bar is up. The field holds first responder
         // for as long as it is open, and this runs on *every* update — so
         // anything that touches the store while you are typing a query would
         // take the keyboard back mid-word and put the rest of it into the
@@ -332,6 +348,13 @@ struct TerminalSurface: NSViewRepresentable {
         /// like it landed.
         func surfaceDidBecomeFocused(_ surface: TerminalSurfaceView) {
             store.focus(pane, in: tab)
+        }
+
+        /// The window's panels own the keyboard for as long as they are up —
+        /// `updateNSView`'s guard above, asked again for the surface a tab
+        /// switch has just built, which that guard is too early to cover.
+        func surfaceMayTakeKeyboard(_ surface: TerminalSurfaceView) -> Bool {
+            !store.overlayHoldsKeyboard
         }
 
         func surface(_ surface: TerminalSurfaceView, didPresentFirstFrameAt moment: Date) {

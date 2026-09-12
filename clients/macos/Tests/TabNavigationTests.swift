@@ -237,6 +237,39 @@ final class TabNavigationTests: XCTestCase {
         XCTAssertNotEqual(store.focusGeneration, before)
     }
 
+    /// What `TerminalSurface` asks before taking first responder, and what
+    /// `ContentView` asks before handing the keyboard back.
+    ///
+    /// Each panel is driven on its own as well as across the handover, because
+    /// alone is how both of them shipped broken: ⌘K and ⇧⌘P each opened a
+    /// panel the terminal then took the keyboard from. A predicate that only
+    /// held for a palette the dropdown had opened would pass the handover and
+    /// fail every ⇧⌘P.
+    func testAnOpenOverlayHoldsTheKeyboard() {
+        let store = store([1])
+        XCTAssertFalse(store.overlayHoldsKeyboard)
+
+        store.toggleSessionMenu()
+        XCTAssertTrue(store.overlayHoldsKeyboard, "the terminal could take the dropdown's keyboard")
+        store.toggleSessionMenu()
+        XCTAssertFalse(store.overlayHoldsKeyboard, "the terminal never gets the keyboard back")
+
+        store.togglePalette()
+        XCTAssertTrue(store.overlayHoldsKeyboard, "the terminal could take the palette's keyboard")
+        store.closePalette()
+        XCTAssertFalse(store.overlayHoldsKeyboard, "the terminal never gets the keyboard back")
+
+        // The handover, where `palette`'s `didSet` closes the dropdown as the
+        // panel opens: the keyboard is never the terminal's in between.
+        store.toggleSessionMenu()
+        store.runCommand(.commandPalette)
+        XCTAssertFalse(store.sessionMenuOpen)
+        XCTAssertTrue(store.overlayHoldsKeyboard, "the handover dropped the keyboard")
+
+        store.closePalette()
+        XCTAssertFalse(store.overlayHoldsKeyboard, "the terminal never gets the keyboard back")
+    }
+
     // MARK: - ⌃⇥
     //
     // The monitor itself needs a window and cannot be driven from here; the

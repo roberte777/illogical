@@ -245,7 +245,8 @@ struct ContentView: View {
     }
 
     /// Hand the keyboard back to the terminal, but only once *both* overlays
-    /// have gone.
+    /// have gone — `SessionStore.overlayHoldsKeyboard`, the same question the
+    /// surface asks before it takes first responder.
     ///
     /// The guard on both is load-bearing and subtle. `beginAddRemoteHost`
     /// closes the dropdown in the very act of opening the palette — that is
@@ -255,7 +256,7 @@ struct ContentView: View {
     /// from the palette's field in the frame the panel appeared in. The person
     /// would watch a field open and then type into the shell behind it.
     private func returnFocusIfNothingIsOpen() {
-        guard !store.sessionMenuOpen, store.palette == nil else { return }
+        guard !store.overlayHoldsKeyboard else { return }
         store.focusTerminal()
     }
 

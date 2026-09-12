@@ -8,11 +8,17 @@
 //
 //  That is why W10 shipped broken. The session menu asks for focus as it appears
 //  -- `.onAppear { fieldFocused = true }` on the filter field -- and the request
-//  does not land: with the menu open, the app's `AXFocusedUIElement` is still
-//  the terminal surface underneath, and the field's `AXFocused` is false. So the
+//  did not hold: with the menu open, the app's `AXFocusedUIElement` was still
+//  the terminal surface underneath, and the field's `AXFocused` was false. So the
 //  menu was never in the focus chain, `.onExitCommand` never fired, and Escape
 //  went to the terminal. (Clicking the field first *does* focus it, and Escape
 //  then closes the menu, which is how the mechanism was pinned down.)
+//
+//  Traced since: the field does take first responder, and what took it back
+//  was `TerminalSurface.updateNSView`, which re-asserted the surface on any
+//  update while an overlay was up — see `SessionStore.overlayHoldsKeyboard`.
+//  The monitor stays regardless. It never depended on where first responder
+//  is, and that is the property an overlay's Escape needs.
 //
 //  A local `NSEvent` monitor does not care. It runs inside
 //  `NSApplication.sendEvent(_:)`, before the event is routed anywhere, so it

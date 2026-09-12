@@ -665,11 +665,22 @@ re-run `updateNSView`, which is where first responder is re-asserted. Only the
 counter is under test; the rest of that chain needs a running app and was
 checked by hand.
 
-**Escape does not go where focus is, because focus is not in the menu.** W10
+The other half is that the surface stands down while either overlay is up —
+`SessionStore.overlayHoldsKeyboard`, the same rule the find bar already had.
+`updateNSView` runs whenever SwiftUI updates the representable, which is not
+only when `focusGeneration` asks: a terminal appearing on any machine rewrites
+`tabs`, which the surface reads. Without the stand-down each of those updates
+took the keyboard back from the panel's field, so ⌘K and ⇧⌘P opened a panel
+that could not be typed into and whose Return (`.onSubmit`) went to the shell —
+while the arrows, which `PaletteKeys` takes off the event stream before first
+responder is consulted, went on working and made the panel look as though it
+had the keyboard.
+
+**Escape does not go where focus is.** W10
 shipped Escape as `.onExitCommand` on `SessionMenu`'s root, on the stated
 assumption that the filter field takes first responder as the menu appears. It
-does not: with the menu open the app's `AXFocusedUIElement` is still the
-terminal surface underneath and the field's `AXFocused` is `false`, so nothing
+did not hold: with the menu open the app's `AXFocusedUIElement` was still the
+terminal surface underneath and the field's `AXFocused` was `false`, so nothing
 in the menu was ever in the focus chain, `.onExitCommand` never fired, and
 Escape went to the terminal. (Click the field first and Escape *does* close the
 menu — which is how the mechanism was pinned down, against the running app.) So
@@ -680,7 +691,9 @@ removed by its `onDisappear`, so Escape belongs to the terminal the rest of the
 time, and it returns `nil` so the keystroke that closed the menu is not also
 delivered underneath it. Both halves were checked against a terminal running
 `cat -v`: with the menu closed, Escape puts `^[` on its screen; with the menu
-open, the menu closes and the screen does not change.
+open, the menu closes and the screen does not change. The field not holding
+focus turned out to be the surface taking it back (above), and the monitor stays
+now that it no longer does: it never depended on where first responder is.
 
 Clicking away *does* dismiss the menu and always did — the full-window
 `Color.black.opacity(0.001)` layer under it works. A report that it does not is

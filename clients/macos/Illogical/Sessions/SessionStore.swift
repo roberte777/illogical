@@ -1590,6 +1590,20 @@ final class SessionStore {
 
     func focusTerminal() { focusGeneration &+= 1 }
 
+    /// Whether the dropdown or the palette is on screen, which is to say
+    /// whether one of their fields has the keyboard.
+    ///
+    /// The one question two places have to agree on. `TerminalSurface` must
+    /// not take first responder back while this is true, and `ContentView`
+    /// hands the keyboard back to the terminal only once it has gone false.
+    /// Written once so that they cannot drift: an overlay added to one and not
+    /// the other is a panel whose field loses the keyboard to the shell behind
+    /// it, or one that never gives it back.
+    ///
+    /// Not the find bar, which belongs to a pane rather than to the window, and
+    /// which the surface under it already asks about directly.
+    var overlayHoldsKeyboard: Bool { sessionMenuOpen || palette != nil }
+
     // MARK: - Reconciling
 
     private func terminalCreated(_ ref: TerminalRef) {
