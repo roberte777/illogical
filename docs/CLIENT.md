@@ -676,11 +676,11 @@ while the arrows, which `PaletteKeys` takes off the event stream before first
 responder is consulted, went on working and made the panel look as though it
 had the keyboard.
 
-**Escape does not go where focus is, because focus is not in the menu.** W10
+**Escape does not go where focus is.** W10
 shipped Escape as `.onExitCommand` on `SessionMenu`'s root, on the stated
 assumption that the filter field takes first responder as the menu appears. It
-does not: with the menu open the app's `AXFocusedUIElement` is still the
-terminal surface underneath and the field's `AXFocused` is `false`, so nothing
+did not hold: with the menu open the app's `AXFocusedUIElement` was still the
+terminal surface underneath and the field's `AXFocused` was `false`, so nothing
 in the menu was ever in the focus chain, `.onExitCommand` never fired, and
 Escape went to the terminal. (Click the field first and Escape *does* close the
 menu — which is how the mechanism was pinned down, against the running app.) So

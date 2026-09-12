@@ -459,7 +459,10 @@ struct CommandPalette: View {
         // Escape closes it, the way it closes an NSMenu. Not `.onExitCommand`,
         // for the reason `EscapeKey` sets out at length: that fires only for
         // the *focused* view, and with an overlay up the app's focused element
-        // is reliably still the terminal surface underneath.
+        // was reliably still the terminal surface underneath — the surface was
+        // taking the keyboard back, which `SessionStore.overlayHoldsKeyboard`
+        // now stops. The monitor stays: it never depended on where first
+        // responder is.
         .onEscape { store.closePalette() }
         .onPaletteKey { keyCode, modifiers in
             switch PaletteKeys.claim(

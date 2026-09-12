@@ -438,10 +438,10 @@ struct SessionMenu: View {
         // reliably hold -- with the menu open the app's focused element was
         // still the terminal surface underneath, so Escape went to the
         // terminal and the menu stayed. (The surface was taking it back; see
-        // `SessionStore.overlayHoldsKeyboard`.) `onEscape` watches the event rather
-        // than the focus, so it works wherever first responder happens to
-        // be. Closing hands the
-        // keyboard back to the terminal (SessionStore.focusTerminal).
+        // `SessionStore.overlayHoldsKeyboard`.) `onEscape` watches the event
+        // rather than the focus, so it works wherever first responder happens
+        // to be. Closing hands the keyboard back to the terminal
+        // (SessionStore.focusTerminal).
         .onEscape { isPresented = false }
         // What is typed re-aims the list, so the highlight goes back to the top
         // of it. The palette's rule, and the one this panel's Return already

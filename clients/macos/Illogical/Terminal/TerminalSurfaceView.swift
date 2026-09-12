@@ -55,6 +55,25 @@ protocol TerminalSurfaceDelegate: AnyObject {
     /// This surface submitted its first frame, at `moment`. The launch budget
     /// is measured against it.
     func surface(_ surface: TerminalSurfaceView, didPresentFirstFrameAt moment: Date)
+    /// Whether this surface may take first responder as it arrives in a
+    /// window — a tab switched to, a split, the pane a tree collapsed onto.
+    ///
+    /// No while a panel of the window's owns the keyboard, which is
+    /// `SessionStore.overlayHoldsKeyboard` and the same question
+    /// `TerminalSurface.updateNSView` asks before re-asserting. Taking it here
+    /// is the other door into the same bug: ⌘1–⌘9 and a click on a tab pill
+    /// both stay live under an open panel, and either builds a fresh surface
+    /// whose arrival would otherwise hand the shell the keys meant for the
+    /// filter. `mouseDown` is a third caller and needs no guard — the panel's
+    /// scrim covers the content area, so a click there dismisses it rather
+    /// than reaching a surface.
+    func surfaceMayTakeKeyboard(_ surface: TerminalSurfaceView) -> Bool
+}
+
+extension TerminalSurfaceDelegate {
+    /// Yes, for a delegate with no opinion — which is what the renderer tests'
+    /// doubles are, and what this view did before the question existed.
+    func surfaceMayTakeKeyboard(_ surface: TerminalSurfaceView) -> Bool { true }
 }
 
 @MainActor
@@ -167,7 +186,17 @@ final class TerminalSurfaceView: NSView {
         }
         setupRenderingIfNeeded()
         observeWindowFocus()
-        window?.makeFirstResponder(self)
+        // Arriving in a window is this view's own claim on the keyboard, and
+        // the one claim `TerminalSurface.updateNSView`'s stand-down cannot
+        // speak for: that update ran before there was a window to make
+        // anything first responder in. So the delegate is asked the same
+        // question here — see `surfaceMayTakeKeyboard`. A panel open over a tab
+        // switched with ⌘1, or by a click on a pill the panel does not cover,
+        // keeps its field, and the keyboard comes back the moment the panel
+        // closes through `focusGeneration`.
+        if delegate?.surfaceMayTakeKeyboard(self) ?? true {
+            window?.makeFirstResponder(self)
+        }
     }
 
     override func viewDidChangeBackingProperties() {
